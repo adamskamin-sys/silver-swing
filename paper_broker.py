@@ -146,12 +146,15 @@ class PaperBroker:
                 self.open_orders.pop(oid)
                 self.history.append(o)
                 filled_now.append(o)
-                self._check_margin_call()
                 if self._halted:
                     break
 
-        # HWM / drawdown must track equity even when no fill happens — a mark
-        # against the resting position moves equity via unrealized P&L.
+        # Margin call is a mark-to-market check, not a fill event: a price crash
+        # against a resting long position can blow the account without a single
+        # order filling. Check on every tick.
+        self._check_margin_call()
+
+        # HWM / drawdown also tracks equity even without a fill.
         self._update_drawdown()
         return filled_now
 
