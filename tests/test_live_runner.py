@@ -58,6 +58,29 @@ def test_dry_run_broker_status_of_real_order_passes_through():
     assert st["status"] == "FILLED"
 
 
+def test_dry_run_broker_status_of_stale_dry_run_id_reports_cancelled():
+    """Regression: state.live_order_id can carry a `dry-run-N` id from a
+    prior process across restarts (state lives in Redis, _fake_orders does
+    not). Forwarding that id to Coinbase 400s and crashes the worker at
+    reconcile. It must be treated as CANCELLED so reconcile clears it and
+    re-arms cleanly."""
+    real = MagicMock()
+    dry = DryRunBroker(real)
+    # Note: dry.place_limit was NEVER called on this instance — simulating a
+    # fresh process that inherited a stale id from Redis.
+    st = dry.order_status("dry-run-42")
+    assert st["status"] == "CANCELLED"
+    real.order_status.assert_not_called()
+
+
+def test_dry_run_broker_cancel_of_stale_dry_run_id_is_noop():
+    """Same regression for cancel: must not forward stale dry-run ids to Coinbase."""
+    real = MagicMock()
+    dry = DryRunBroker(real)
+    dry.cancel("dry-run-42")
+    real.cancel.assert_not_called()
+
+
 # ---- preflight -------------------------------------------------------------
 
 

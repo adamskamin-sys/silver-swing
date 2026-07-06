@@ -77,12 +77,25 @@ class DryRunBroker:
                 "status": o["status"], "filled_qty": o["filled_qty"],
                 "raw_status": "DRY_RUN", "average_filled_price": None,
             }
+        # Stale dry-run id persisted from a prior process (state lives in
+        # Redis, this instance's _fake_orders dict does not). Treat as
+        # CANCELLED so reconcile clears it and the strategy re-arms cleanly.
+        # Without this, we'd forward the fake id to Coinbase and 400.
+        if str(order_id).startswith("dry-run-"):
+            _log(f"[DRY RUN] stale order id {order_id} from prior session — treating as CANCELLED")
+            return {
+                "status": "CANCELLED", "filled_qty": 0,
+                "raw_status": "DRY_RUN_STALE", "average_filled_price": None,
+            }
         return self._real.order_status(order_id)
 
     def cancel(self, order_id):
         if order_id in self._fake_orders:
             self._fake_orders[order_id]["status"] = "CANCELLED"
             _log(f"[DRY RUN] would cancel {order_id}")
+            return
+        if str(order_id).startswith("dry-run-"):
+            _log(f"[DRY RUN] stale order id {order_id} from prior session — noop cancel")
             return
         self._real.cancel(order_id)
 

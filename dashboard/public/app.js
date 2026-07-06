@@ -335,7 +335,9 @@ function renderCard(tenant, symbol, { config, state, snapshot }) {
   const c = config || {};
   const snap = snapshot || {};
   const halted = s.state === 'HALTED';
-  const modeLabel = snap.mode === 'live' ? 'LIVE' : snap.mode === 'paper' ? 'PAPER' : '';
+  const modeLabel = snap.mode === 'live' ? 'LIVE' :
+                    snap.mode === 'dry_run' ? 'DRY-RUN' :
+                    snap.mode === 'paper' ? 'PAPER' : '';
   // Card-level pill: aggregate across primary + all sleeves and pick the most
   // meaningful active state. Ordering: HALTED > sell-capable > waiting-to-buy
   // (already sold, cycling) > idle (nothing possible). This way if the primary
