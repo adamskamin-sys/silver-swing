@@ -1,0 +1,194 @@
+"""
+CoinbaseBroker — Broker adapter for Coinbase Advanced Trade / CFM (spec §12 step 2).
+
+Wraps `coinbase.rest.RESTClient` to implement swing_leg.py's `Broker` Protocol
+so the strategy code stays exchange-agnostic. Adds `preview_order` for the §2A
+pre-trade fee gate and `contract_spec` / `futures_balance` for the empirical
+inputs the strategy math needs.
+
+READ-side methods (order_status, position_qty, preview_order, contract_spec,
+futures_balance) are safe to call today — they only fetch data.
+
+WRITE-side methods (place_limit, cancel) execute real trades against the live
+account and must NOT be called until the full main loop is wired up against
+either a PaperBroker or a deliberate live run. Nothing in this file wires them
+to a caller.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from dataclasses import dataclass
+from typing import Optional
+
+from dotenv import load_dotenv
+from coinbase.rest import RESTClient
+
+
+# Map Coinbase Advanced Trade order statuses to the vocabulary swing_leg.py checks against
+# (FILLED / CANCELLED / EXPIRED / UNKNOWN). OPEN is added so the strategy can distinguish
+# "resting on the book" from "unknown," which the original prototype conflated.
+STATUS_MAP = {
+    "OPEN": "OPEN",
+    "PENDING": "OPEN",
+    "QUEUED": "OPEN",
+    "FILLED": "FILLED",
+    "CANCELLED": "CANCELLED",
+    "CANCEL_QUEUED": "CANCELLED",
+    "EXPIRED": "EXPIRED",
+    "FAILED": "UNKNOWN",
+}
+
+
+def _dump(obj):
+    """Normalize a typed SDK response (or a dict, or None) to a plain dict."""
+    if obj is None:
+        return {}
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    if isinstance(obj, dict):
+        return obj
+    return {}
+
+
+@dataclass
+class BrokerConfig:
+    product_id: str                    # e.g., "SLR-27AUG26-CDE"
+    key_file: Optional[str] = None     # path to Coinbase JSON key; falls back to $COINBASE_API_KEY_JSON_PATH
+    price_decimals: int = 3            # SLR tick is 0.005 → 3 decimals is enough; override per instrument
+
+
+class CoinbaseBroker:
+    """Implements the Broker Protocol against Coinbase Advanced Trade / CFM."""
+
+    def __init__(self, cfg: BrokerConfig, client: Optional[RESTClient] = None):
+        self.cfg = cfg
+        if client is not None:
+            # Injected client (tests, or an already-authenticated instance)
+            self.client = client
+            return
+        load_dotenv()
+        key_path = cfg.key_file or os.getenv("COINBASE_API_KEY_JSON_PATH")
+        if not key_path:
+            raise ValueError(
+                "no key file: pass BrokerConfig(key_file=...) or set COINBASE_API_KEY_JSON_PATH"
+            )
+        self.client = RESTClient(key_file=key_path)
+
+    # ---- Broker Protocol -------------------------------------------------
+
+    def place_limit(self, side: str, qty: int, price: float) -> str:
+        """Place a GTC limit order. Returns the exchange order_id.
+
+        Idempotency: generates a fresh client_order_id (UUIDv4) per call. The
+        caller must NOT blindly retry on network error — a retry with a new UUID
+        creates a second order. Coordinate retries at the SwingTrader layer.
+        """
+        s = side.upper()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        method = self.client.limit_order_gtc_buy if s == "BUY" else self.client.limit_order_gtc_sell
+        resp = _dump(method(
+            client_order_id=str(uuid.uuid4()),
+            product_id=self.cfg.product_id,
+            base_size=str(int(qty)),
+            limit_price=f"{price:.{self.cfg.price_decimals}f}",
+        ))
+        if resp.get("success"):
+            oid = (resp.get("success_response") or {}).get("order_id")
+            if oid:
+                return oid
+        err = resp.get("error_response") or resp.get("failure_reason") or resp
+        raise RuntimeError(f"place_limit failed: {err}")
+
+    def order_status(self, order_id: str) -> dict:
+        """Return {'status': mapped, 'filled_qty': int, 'raw_status': ..., 'average_filled_price': ...}."""
+        order = _dump(self.client.get_order(order_id)).get("order") or {}
+        raw = order.get("status") or "UNKNOWN"
+        try:
+            filled = int(float(order.get("filled_size") or 0))
+        except (TypeError, ValueError):
+            filled = 0
+        return {
+            "status": STATUS_MAP.get(raw, raw),
+            "filled_qty": filled,
+            "raw_status": raw,
+            "average_filled_price": order.get("average_filled_price"),
+        }
+
+    def cancel(self, order_id: str) -> None:
+        """Cancel one live order by its exchange order_id."""
+        resp = _dump(self.client.cancel_orders(order_ids=[order_id]))
+        results = resp.get("results") or []
+        if not results:
+            raise RuntimeError(f"cancel returned no results: {resp}")
+        r = results[0]
+        if not r.get("success"):
+            raise RuntimeError(f"cancel failed: {r}")
+
+    def position_qty(self) -> int:
+        """Signed net contract count for this product. LONG > 0, SHORT < 0, flat = 0."""
+        for p in _dump(self.client.list_futures_positions()).get("positions") or []:
+            if p.get("product_id") == self.cfg.product_id:
+                n = int(float(p.get("number_of_contracts") or 0))
+                return n if (p.get("side") or "").upper() == "LONG" else -n
+        return 0
+
+    # ---- §2A fee gate ----------------------------------------------------
+
+    def preview_order(self, side: str, qty: int, price: float) -> dict:
+        """Preview a limit order. Read-only — does NOT create the order.
+
+        Returns the fee, projected margin, and preview_id needed by the §2A gate.
+        `raw` is the full SDK response for anything else the caller wants.
+        """
+        s = side.upper()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        method = (
+            self.client.preview_limit_order_gtc_buy if s == "BUY"
+            else self.client.preview_limit_order_gtc_sell
+        )
+        resp = _dump(method(
+            product_id=self.cfg.product_id,
+            base_size=str(int(qty)),
+            limit_price=f"{price:.{self.cfg.price_decimals}f}",
+        ))
+        commission = resp.get("commission_total")
+        detail = resp.get("commission_detail_total") or {}
+        return {
+            "commission_total": float(commission) if commission is not None else None,
+            "client_commission": float(detail.get("client_commission") or 0),
+            "projected_margin_ratio": (resp.get("margin_ratio_data") or {}).get("projected_margin_ratio"),
+            "projected_liquidation_buffer": resp.get("projected_liquidation_buffer"),
+            "preview_id": resp.get("preview_id"),
+            "errs": resp.get("errs") or [],
+            "raw": resp,
+        }
+
+    # ---- Empirical spec inputs (spec §3A refresh on startup) --------------
+
+    def contract_spec(self) -> dict:
+        """Per-instrument spec block, pulled live so it can't drift from reality."""
+        resp = _dump(self.client.get_product(self.cfg.product_id))
+        details = resp.get("future_product_details") or {}
+        tick = float(resp.get("price_increment") or 0)
+        size = float(details.get("contract_size") or 0)
+        return {
+            "product_id": resp.get("product_id"),
+            "contract_size": size,
+            "tick_size": tick,
+            "tick_value": tick * size,
+            "contract_expiry": details.get("contract_expiry"),
+            "intraday_margin_rate": details.get("intraday_margin_rate"),
+            "overnight_margin_rate": details.get("overnight_margin_rate"),
+            "current_price": resp.get("price"),
+            "best_bid": resp.get("best_bid_price"),
+            "best_ask": resp.get("best_ask_price"),
+            "session_open": (resp.get("fcm_trading_session_details") or {}).get("is_session_open"),
+        }
+
+    def futures_balance(self) -> dict:
+        """Real-time futures account balance summary — empirical inputs for §4 gates."""
+        return _dump(self.client.get_futures_balance_summary()).get("balance_summary") or {}

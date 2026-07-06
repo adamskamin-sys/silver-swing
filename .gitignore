@@ -5,3 +5,6 @@ swing_state.json
 __pycache__/
 *.pyc
 .venv/
+.coinbase_key.json
+scratch/
+data/

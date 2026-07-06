@@ -35,22 +35,33 @@ Three separate processes, sharing exactly one datastore:
 
 ---
 
-## 1. Exchange access [OPEN — first decision, gates the Broker adapter]
+## 1. Exchange access [RESOLVED 2026-07-06 — Path A]
 
-Determine how the SLVR contracts are actually reached:
+**Resolution:** Coinbase's dated silver futures are reached through **Path A** — the Coinbase
+Advanced Trade REST API — with the FCM/CDE endpoints exposed as a sub-route (`/api/v3/brokerage/cfm/*`)
+of the same API. No separate broker adapter is needed: Coinbase Financial Markets IS the FCM,
+accessed directly through the same SDK as spot.
 
-- **Path A — Coinbase Advanced Trade API:** clean REST + WebSocket, official Python SDK, one
-  CDP key. Applies if trading US perpetual-style or international silver perps. Preferred if available.
-- **Path B — Coinbase Derivatives Exchange via FCM/broker:** the classic dated/nano contracts.
-  Access is through a CFTC-regulated FCM (StoneX, Marex, Dorman, Advantage, etc.) using FIX/SBE/UDP,
-  or whatever API that broker exposes. Requires a broker-specific adapter.
+- **Venue:** Coinbase Financial Markets (CFM) / Coinbase Derivatives Exchange (CDE). Same venue,
+  Coinbase uses both names — the ticker suffix says `-CDE`, the API's `product_venue` field says `FCM`.
+- **SDK:** `coinbase-advanced-py` v1.8.4 (official Python).
+- **Auth:** CDP-portal-issued **ECDSA (ES256)** API key, `trade + view` permissions only.
+  Ed25519 keys will NOT authenticate with the trading SDK — the Coinbase App API docs are explicit
+  about that. Key is scoped to the account's **Primary/Default** portfolio (NOT the empty "futures"
+  CONSUMER portfolio — that's a separate, easy-to-mistake-for-it portfolio).
+- **Instrument (nearest dated as of 2026-07-06):** `SLR-27AUG26-CDE` — see §3A for the full spec block.
+  Ticker family is `SLR-DDMMMYY-CDE`; UI displays as "SLVR N MMM YY".
+- **Perpetual silver (`SILVER-PERP-INTX`)** exists on the same API but is INTX/international only —
+  US clients cannot trade it. Not our path.
 
-**Action:** identify the exact contract ticker and the FCM. That determines which `Broker`
-adapter gets built.
+**Historical context:** the file at `docs/reference_old_silver_bot.py` was pointed at this same
+venue (`/api/v3/brokerage/*` + `/cfm/*`) but hand-rolled a legacy Coinbase Exchange/Pro HMAC signer
+that Advanced Trade doesn't accept — likely why the old attempt stalled. Do NOT reuse that signer;
+use the official SDK.
 
 **Security (non-negotiable):** the trading API key must be scoped **trade-only, no withdrawal
-permission.** Keys live only in the bot process's environment variables, never in the repo,
-never in the dashboard.
+permission.** Keys live only in the bot process's environment variables (or a chmod-600
+project-local file referenced by env var), never in the repo, never in the dashboard.
 
 ---
 
@@ -97,9 +108,19 @@ not reconciled after.
 5. **Post-fill reconciliation:** compare the *actual* fee reported on the fill against the assumption.
    Persistent mismatch (e.g. a silent tier change) → flag it so the config baseline gets corrected.
 
-**Capability requirement [HARD]:** this depends on being able to see/derive a queued order's fee
-**before** submitting. Advanced Trade exposes fee tiers + per-fill fees cleanly; an FCM route may
-report fees differently. Confirming this capability is part of resolving the access path (§1).
+**Capability requirement [RESOLVED 2026-07-06 — feasible]:** verified against the live API. The
+`preview_limit_order_gtc_sell` endpoint (and its buy / market / stop-limit siblings) returns a
+`PreviewOrderResponse` containing:
+- `commission_total` — total fee for the order (this is what the §2A gate reads).
+- `commission_detail_total.{client_commission, venue_commission, clearing_commission,
+  regulatory_commission, gst_commission, withholding_commission}` — full breakdown; useful for
+  audit/reconciliation.
+- `preview_id` — persistable ID to pair with a placed order for post-fill reconciliation.
+- `projected_margin_ratio`, `projected_liquidation_buffer` — bonus, feeds richer gate logic.
+
+Concrete values pulled 2026-07-06 for `SLR-27AUG26-CDE` at Adam's current fee tier: **$2.34 per
+fill per contract** (= $2.1966 client + $0.10 venue + $0.03 clearing + $0.01 regulatory). Round-trip
+per contract = **$4.68**. See `scratch/verify_access.py` for the retrieval.
 
 ---
 
@@ -131,7 +152,28 @@ The user is in charge of **two distinct things** — don't conflate them:
 different metal, or a crypto perp and `contract_size` / `tick_value` change — so the slider, the
 minimum-viable-swing guard, and the P&L must all compute from the spec block, not assume silver's 50.
 Getting the spec block right is what makes the take-home number honest across instruments.
-**[OPEN: real contract specs per instrument — pull from the venue/FCM contract specification.]**
+
+**[RESOLVED 2026-07-06 — SLR-27AUG26-CDE spec block, pulled from live API]:**
+
+```
+product_id            : SLR-27AUG26-CDE     (family: SLR-DDMMMYY-CDE; display "SLVR N MMM YY")
+product_venue         : FCM                 (Coinbase's internal label for the CDE/CFM venue)
+contract_size         : 50                  (troy oz per contract)
+tick_size             : 0.005               (USD)
+tick_value            : $0.25               (= tick_size × contract_size)
+quote_currency        : USD
+contract_expiry       : 2026-08-27T17:25 UTC
+region_enabled        : US ✓  CA ✓  GB ✓  EU ✗
+session               : Sun 22:00 UTC → Fri 21:00 UTC (standard commodities window)
+margin_per_contract   : ~$275 intraday / ~$356 overnight (empirical, from get_futures_balance_summary)
+commission_per_fill   : $2.34 (client + venue + clearing + regulatory, empirical)
+typical spread        : ~1 tick ($0.005 = $0.25/contract) at time of measurement — thin
+funding_rate          : N/A (dated futures — no funding; only INTX perps have funding)
+```
+
+Refresh the block on startup (contract expires; a roll swaps in `SLR-27NOV26-CDE` etc.). Fees can
+change tier-by-tier; re-pull from the fee-tier endpoint or from an order preview on each session
+open. Do not hardcode.
 
 ---
 
@@ -147,10 +189,15 @@ Adam's rule: **never add the next contract until banked profit covers it.**
   `margin_per_contract × scale_up_buffer_mult`.
   - `scale_up_buffer_mult = 1.0` means "add once profit literally covers one contract's margin."
     Adam wants roughly this; a value >1.0 adds a cushion. **[OPEN: confirm value]**
-  - "Covers a contract" = the **margin** to hold it (small), NOT the full notional (~$3,250 at 65×50). **[OPEN: real `margin_per_contract` from FCM]**
+  - "Covers a contract" = the **margin** to hold it (small), NOT the full notional (~$3,140 at $62.80 × 50).
+  - **`margin_per_contract` [RESOLVED 2026-07-06]:** ~**$275 intraday, ~$356 overnight** empirical
+    (2026-07-06 balance summary: $3,297.27 initial / 12 contracts intraday; $4,275.50 / 12 overnight).
+    Use overnight if the bot ever holds through the session close; the intraday number is the floor.
 - `reserved_margin` prevents spending the same profit twice — once a contract's margin is
   committed, that money no longer counts toward funding the next one.
-- **Net, not gross:** realized P&L must subtract fees. **[OPEN: real `fee_per_contract_roundtrip`]**
+- **Net, not gross:** realized P&L must subtract fees.
+  **`fee_per_contract_roundtrip` [RESOLVED 2026-07-06]:** **$4.68** (= 2 × $2.34 per fill,
+  at current fee tier for `SLR-27AUG26-CDE`).
 - **Later:** fractional / 0.5–1.0 point swings. Flag when building: at tighter ranges fees become
   a large fraction of each cycle, so the fee number stops being a rounding error.
 
@@ -620,7 +667,11 @@ Every fill runs through the same cost model the live account faces:
   paper run holding through funding windows must debit it.
 - **Slippage estimate** — in fast markets fills land worse than the requested price; model it as an
   estimate so paper isn't unrealistically clean.
-- **[OPEN: real commission, typical spread, and funding values per instrument from the venue/FCM.]**
+- **[RESOLVED 2026-07-06 for SLR-27AUG26-CDE]:**
+  - Commission: **$2.34/fill/contract** (see §2A and §3A).
+  - Typical spread at measurement: **~1 tick ($0.005)** = $0.25/contract. Sample once per session
+    at minimum; ideally track live.
+  - Funding: **N/A** on dated futures. Only INTX perps carry funding — not applicable to Adam.
 
 ### Two run speeds (same `PaperBroker` underneath)
 
@@ -674,19 +725,36 @@ result as proof the live fills will match.
 
 ## Open decisions checklist (fill before going live)
 
-- [ ] Access path A vs B; exact contract ticker + FCM (§1)
-- [ ] `margin_per_contract` — real number from FCM (§4)
-- [ ] `fee_per_contract_roundtrip` — real number (§4)
+- [x] Access path A vs B; exact contract ticker + FCM (§1) — **Path A, `SLR-27AUG26-CDE`, CFM sub-route**
+- [x] `margin_per_contract` — real number from FCM (§4) — **~$275 intraday / ~$356 overnight**
+- [x] `fee_per_contract_roundtrip` — real number (§4) — **$4.68**
 - [ ] `scale_up_buffer_mult` — confirm ~1.0 (§4)
 - [ ] Default trail distance / ATR multiple (§5)
-- [ ] FCM native trailing-stop support? (§5)
+- [ ] FCM native trailing-stop support? (§5) — SDK exposes `stop_limit_order_gtc_*`; TBD whether
+      that's a true trailing stop or just a static stop-limit (likely the latter — synthesize the
+      trail in the bot)
 - [ ] Risk preset definitions — conservative/moderate/aggressive values (§7)
 - [ ] "Kleinman" author/book name confirmation (§6)
-- [ ] Paper-mode cost inputs — real commission, typical spread, funding per instrument (§10A)
-- [ ] Contract specs per instrument — contract_size, tick_size, tick_value, margin (§3A)
+- [x] Paper-mode cost inputs (§10A) — **commission $2.34/fill, spread ~1 tick, funding N/A**
+- [x] Contract specs per instrument (§3A) — **filled from live API for SLR-27AUG26-CDE**
 - [ ] Default ATR multiplier per asset class for the trail (§5B)
-- [ ] Pre-trade fee visibility on a queued order — confirm the API exposes it (§1, §2A)
+- [x] Pre-trade fee visibility on a queued order (§1, §2A) — **YES via `preview_*_order` endpoints**
 - [ ] Abnormal-widen threshold for the fee-gate sanity ceiling (§2A)
+
+### Current live baseline (2026-07-06) — reconcile() target
+
+Bot is being built into an already-live account, not a clean slate. On first startup, `reconcile()`
+must read the book and find:
+- **Position:** 12 contracts `SLR-27AUG26-CDE` LONG, avg entry $58.44, unrealized ~$2,616 at mark $62.80
+- **Cash:** $2,917.37 CBI + $2,784.30 CFM = $5,701.67 USD; $1,503.11 USDC; dust crypto
+- **Open orders:** 1 manual bracket (Adam's take-profit/stop) — NOT bot-placed; must not be cancelled
+  until deliberate hand-off. See §2 note on interoperation with pre-existing manual orders.
+- **Buying power:** $6,516.61 intraday / $5,538.57 overnight
+- **Est. liquidation:** $50.10 (well below the `abort_below` = $60 in swing_leg.py; risk governor
+  fires long before liquidation would)
+
+The 12 = 10 core + 2 swing mapping in swing_leg.py's defaults is intentional; it reflects Adam's
+already-established position.
 
 ---
 
