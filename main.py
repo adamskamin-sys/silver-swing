@@ -140,6 +140,13 @@ def run_paper_mode() -> int:
     trader = SwingTrader(paper, store, TENANT, SYMBOL, trade_log=log,
                          kill_switch=ks, microstructure=ms)
 
+    # Start backtest worker if Redis is wired. Dashboard pushes jobs onto a
+    # queue; this thread runs them here (where Python + Coinbase creds live)
+    # and writes results back for the dashboard to poll. See backtest_worker.py.
+    if os.getenv("REDIS_URL"):
+        import backtest_worker
+        backtest_worker.start(os.getenv("REDIS_URL"))
+
     _log(f"connecting to WS feed (waiting up to {FEED_READY_TIMEOUT}s for first tick)...")
     feed = LiveTickerFeed(
         SYMBOL,

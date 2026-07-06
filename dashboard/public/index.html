@@ -129,6 +129,26 @@
     </div>
   </div>
 
+  <!-- scanner detail modal (chart + purchase) -->
+  <div id="scanner-detail-modal" class="modal" hidden>
+    <div class="modal-panel wide">
+      <div class="modal-header">
+        <h2 id="scanner-detail-title">product</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <div id="scanner-detail-summary" class="scanner-detail-summary"></div>
+      <div id="scanner-detail-timeframes" class="scanner-detail-timeframes"></div>
+      <div id="scanner-detail-chart" class="scanner-detail-chart">
+        <div class="chart-status">loading candles…</div>
+      </div>
+      <div id="scanner-detail-warning" class="scanner-detail-warning" hidden></div>
+      <div class="modal-footer">
+        <button data-close>close</button>
+        <button id="scanner-buy-btn" class="primary">buy contracts</button>
+      </div>
+    </div>
+  </div>
+
   <!-- backtest modal -->
   <div id="backtest-modal" class="modal" hidden>
     <div class="modal-panel wide">

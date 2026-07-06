@@ -245,12 +245,19 @@ export function makeApp({
     }
   });
 
-  // --- backtest (spawns Python subprocess) ---
+  // --- backtest ---
+  // In prod (Redis wired): push job onto a Redis queue, poll for the paper
+  // worker's response. Keeps Coinbase creds on the one service that needs
+  // them. In local dev (no Redis): fall back to spawning the Python script
+  // directly so `npm run dev` still works.
   app.post('/api/backtest', requireAuth, async (req, res) => {
     const payload = req.body || {};
     if (!payload.symbol) return res.status(400).json({ ok: false, error: 'symbol required' });
     try {
-      const result = await runPythonBacktest(payload);
+      const r = await getRedis();
+      const result = r
+        ? await runBacktestViaRedis(r, payload)
+        : await runPythonBacktest(payload);
       res.json(result);
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
@@ -440,6 +447,24 @@ export function makeApp({
     }
   });
 
+  // Candles for the scanner's chart modal. Same Redis queue pattern as
+  // backtest — dashboard queues, paper worker fetches from Coinbase, result
+  // is cached ~60s so a re-open doesn't re-hit the API.
+  app.get('/api/candles', requireAuth, async (req, res) => {
+    const product_id = String(req.query.product_id || '');
+    const granularity = String(req.query.granularity || 'FIVE_MINUTE');
+    const days = Math.max(1, Math.min(30, parseInt(req.query.days || '7', 10)));
+    if (!product_id) return res.status(400).json({ ok: false, error: 'product_id required' });
+    const r = await getRedis();
+    if (!r) return res.status(503).json({ ok: false, error: 'redis not configured' });
+    try {
+      const result = await fetchCandlesViaRedis(r, { product_id, granularity, days });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/trades', requireAuth, async (req, res) => {
     const n = Math.min(parseInt(req.query.n || '50', 10), 500);
     try {
@@ -513,6 +538,65 @@ function runPythonBacktest(payload) {
     proc.stdin.write(JSON.stringify(payload));
     proc.stdin.end();
   });
+}
+
+const BACKTEST_QUEUE_KEY = 'silver-swing:backtest:queue';
+const BACKTEST_REQ_PREFIX = 'silver-swing:backtest:req:';
+const BACKTEST_RES_PREFIX = 'silver-swing:backtest:res:';
+const BACKTEST_MAX_WAIT_MS = 180_000;   // 3 min — 90d @ 1min candles can push toward 2 min
+const BACKTEST_KEY_TTL_SECS = 300;
+
+const CANDLES_QUEUE_KEY = 'silver-swing:candles:queue';
+const CANDLES_REQ_PREFIX = 'silver-swing:candles:req:';
+const CANDLES_RES_PREFIX = 'silver-swing:candles:res:';
+const CANDLES_MAX_WAIT_MS = 30_000;     // 30s — candle fetches are usually fast, cache hits <100ms
+const CANDLES_KEY_TTL_SECS = 60;
+
+const JOB_POLL_INTERVAL_MS = 300;
+
+async function runBacktestViaRedis(redis, payload) {
+  return jobViaRedis(redis, {
+    queueKey: BACKTEST_QUEUE_KEY,
+    reqPrefix: BACKTEST_REQ_PREFIX,
+    resPrefix: BACKTEST_RES_PREFIX,
+    reqTtl: BACKTEST_KEY_TTL_SECS,
+    maxWaitMs: BACKTEST_MAX_WAIT_MS,
+    timeoutMsg: 'backtest timed out after 180s. Check the paper worker logs.',
+  }, payload);
+}
+
+async function fetchCandlesViaRedis(redis, payload) {
+  return jobViaRedis(redis, {
+    queueKey: CANDLES_QUEUE_KEY,
+    reqPrefix: CANDLES_REQ_PREFIX,
+    resPrefix: CANDLES_RES_PREFIX,
+    reqTtl: CANDLES_KEY_TTL_SECS,
+    maxWaitMs: CANDLES_MAX_WAIT_MS,
+    timeoutMsg: 'candles fetch timed out after 30s. Paper worker may be down.',
+  }, payload);
+}
+
+async function jobViaRedis(redis, cfg, payload) {
+  const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const reqKey = `${cfg.reqPrefix}${jobId}`;
+  const resKey = `${cfg.resPrefix}${jobId}`;
+  await redis.set(reqKey, JSON.stringify(payload), { EX: cfg.reqTtl });
+  await redis.lPush(cfg.queueKey, jobId);
+
+  const started = Date.now();
+  while (Date.now() - started < cfg.maxWaitMs) {
+    await new Promise(r => setTimeout(r, JOB_POLL_INTERVAL_MS));
+    const raw = await redis.get(resKey);
+    if (raw) {
+      await redis.del(resKey);
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        return { ok: false, error: `worker returned unparseable result: ${e.message}` };
+      }
+    }
+  }
+  return { ok: false, error: cfg.timeoutMsg };
 }
 
 async function tailJsonl(logPath, n) {

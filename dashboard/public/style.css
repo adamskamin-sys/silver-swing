@@ -1125,7 +1125,36 @@ header { padding: 20px 32px; }
 #scanner-table th { text-transform: uppercase; letter-spacing: 1px;
   font-size: 10px; color: var(--muted); font-weight: normal; }
 #scanner-table tr:hover { background: var(--panel-3); }
+#scanner-table tr.scanner-row { cursor: pointer; transition: background 100ms; }
+#scanner-table tr.scanner-row:hover { background: rgba(143, 122, 224, 0.10); }
 .mode-tab.mode-scanner.active { border-color: #8f7ae0; color: #d5cef5; }
+
+/* ---- scanner detail modal ---------------------------------------------- */
+.scanner-detail-summary { display: flex; justify-content: space-between;
+  align-items: center; padding: 10px 0 14px 0; border-bottom: 1px solid var(--border);
+  margin-bottom: 12px; }
+.scanner-detail-price { display: flex; gap: 24px; align-items: baseline;
+  font-family: var(--mono); }
+.scanner-detail-price > .mono { font-size: 22px; font-weight: 600; }
+.scanner-detail-range { font-size: 13px; color: var(--muted); }
+.scanner-detail-vol { font-size: 13px; color: var(--muted); }
+.scanner-detail-vol b { color: var(--text); }
+.scanner-detail-timeframes { display: flex; gap: 6px; margin-bottom: 8px; }
+.timeframe-btn { padding: 4px 12px; font-size: 12px; background: var(--panel-3);
+  color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+  cursor: pointer; font-family: var(--mono); }
+.timeframe-btn:hover { color: var(--text); border-color: var(--muted); }
+.timeframe-btn.active { color: var(--text); border-color: #8f7ae0;
+  background: rgba(143, 122, 224, 0.15); }
+.scanner-detail-chart { min-height: 340px; padding: 10px 0;
+  border: 1px solid var(--border); border-radius: 4px; background: #0b1220;
+  margin-bottom: 12px; }
+.chart-status { padding: 40px 12px; text-align: center; color: var(--muted);
+  font-family: var(--mono); font-size: 12px; }
+.chart-status.error { color: #ef4444; }
+.scanner-detail-warning { padding: 12px 14px; margin-bottom: 12px;
+  background: rgba(234, 179, 8, 0.10); border-left: 3px solid #eab308;
+  border-radius: 3px; font-size: 13px; line-height: 1.6; color: var(--text); }
 
 /* ---- backtest leaderboard ranking -------------------------------------- */
 .leaderboard tr.winner { background: rgba(75, 184, 144, 0.08); }
@@ -1150,4 +1179,9 @@ header { padding: 20px 32px; }
 .backtest-empty-note code {
   background: var(--panel-3); padding: 1px 5px; border-radius: 3px;
   font-family: var(--mono); font-size: 12px;
+}
+.backtest-auto-fit {
+  margin-bottom: 12px; padding: 10px 12px;
+  background: rgba(143, 122, 224, 0.08); border-left: 3px solid #8f7ae0;
+  border-radius: 4px; font-size: 12px; line-height: 1.6;
 }

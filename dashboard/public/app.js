@@ -1300,6 +1300,13 @@ async function refreshScanner() {
     }
     top.forEach((row, i) => {
       const tr = document.createElement('tr');
+      tr.className = 'scanner-row';
+      tr.dataset.product = row.product_id;
+      tr.dataset.price = String(row.price);
+      tr.dataset.high = String(row.high_24h);
+      tr.dataset.low = String(row.low_24h);
+      tr.dataset.volPct = String(row.vol_pct);
+      tr.dataset.volume = String(row.volume_24h || 0);
       tr.innerHTML = `
         <td>${i + 1}</td>
         <td class="mono">${escapeHtml(row.product_id)}</td>
@@ -1309,6 +1316,7 @@ async function refreshScanner() {
         <td class="mono"><b>${fmtNum(row.vol_pct, 2)}%</b></td>
         <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
       `;
+      tr.onclick = () => openScannerDetail(row);
       tbody.appendChild(tr);
     });
   } catch (err) {
@@ -1410,6 +1418,7 @@ const CONFIG_SECTIONS = [
 ];
 
 const PRESET_META = {
+  swing_10_net: { name: '$10 net swing', desc: '2 contracts, ~$0.20 spread anchored to current silver. Nets ~$10 per completed cycle after fees.' },
   conservative: { name: 'Conservative', desc: 'Small size, wide abort bracket. Range-scalp only.' },
   moderate: { name: 'Moderate', desc: 'Adam\'s current setup. 2-point range.' },
   aggressive: { name: 'Aggressive', desc: 'Trailing-first, tight trail. Rides breakouts.' },
@@ -1534,7 +1543,29 @@ function openConfigEditor(tenant, symbol) {
 }
 
 function applyPreset(name) {
-  const preset = PRESETS[name];
+  let preset = PRESETS[name];
+  // The $10-net-swing preset anchors buy/sell around the current silver mark
+  // rather than hardcoded 63/65, so the config still makes sense whether
+  // silver is $58 or $72. Math: $10 net for 2 contracts needs ~$0.20 spread
+  // after ~$9.36 in roundtrip fees.
+  if (name === 'swing_10_net') {
+    const ctx = configEditContext || {};
+    const snap = currentStore?.[ctx.tenant]?.[ctx.symbol]?.snapshot || {};
+    const mark = Number(snap.last_mark) || 62.50;
+    const buy = round3(mark - 0.10);
+    const sell = round3(mark + 0.10);
+    preset = {
+      core_qty: 0, swing_qty: 2, max_swing_qty: 2,
+      sell_px: sell, buy_px: buy,
+      abort_below: round3(mark - 2.50),
+      abort_above: round3(mark + 2.50),
+      exit_mode: 'fixed_limit',
+      trail_trigger: sell, trail_distance: 0.20, reanchor_threshold: 2.0,
+      contract_size: 50, margin_per_contract: 275.0,
+      fee_per_contract_roundtrip: 4.68,
+      scale_up_buffer_mult: 1.5, fee_sanity_multiplier: 2.0,
+    };
+  }
   if (!preset) return;
   for (const [key, val] of Object.entries(preset)) {
     const input = configForm.querySelector(`[name="${key}"]`);
@@ -1547,16 +1578,20 @@ function applyPreset(name) {
   });
 }
 
+function round3(n) { return Math.round(n * 1000) / 1000; }
+
 async function saveConfig() {
   if (!configEditContext) return;
   const cfg = {};
-  for (const [key, , type] of CONFIG_FIELD_SPEC) {
-    const input = configForm.querySelector(`[name="${key}"]`);
-    if (!input) continue;
-    let val = input.value;
-    if (val === '' || val === null || val === undefined) continue;
-    if (type === 'number') val = Number(val);
-    cfg[key] = val;
+  for (const section of CONFIG_SECTIONS) {
+    for (const [key, , type] of section.fields) {
+      const input = configForm.querySelector(`[name="${key}"]`);
+      if (!input) continue;
+      let val = input.value;
+      if (val === '' || val === null || val === undefined) continue;
+      if (type === 'number') val = Number(val);
+      cfg[key] = val;
+    }
   }
   const res = await putJson('/api/config', {
     tenant: configEditContext.tenant,
@@ -1700,9 +1735,9 @@ async function runBacktest(e) {
   }
 
   if (mode === 'compare_all') {
-    backtestResult.innerHTML = renderLeaderboard(res.results);
+    backtestResult.innerHTML = renderLeaderboard(res.results, res.applied_cfg);
   } else {
-    backtestResult.innerHTML = renderBacktestSummary(res.result);
+    backtestResult.innerHTML = renderBacktestSummary(res.result, res.applied_cfg);
   }
 }
 
@@ -1724,7 +1759,7 @@ function renderBacktestSummary(r) {
   `;
 }
 
-function renderLeaderboard(results) {
+function renderLeaderboard(results, appliedCfg) {
   if (!results?.length) return '<div class="dim">no results</div>';
   // Rank by total_return (highest first). Errored runs go last.
   const ranked = results.slice().sort((a, b) => {
@@ -1743,6 +1778,15 @@ function renderLeaderboard(results) {
        – <b>$${fmtNum(first.price_max, 3)}</b>
        · candles: ${first.candle_count}
        · start $${fmtNum(first.price_start, 3)} → end $${fmtNum(first.price_end, 3)}
+    </div>
+  ` : '';
+  const fitInfo = (appliedCfg && appliedCfg.auto_fit) ? `
+    <div class="backtest-auto-fit">
+      Auto-fit thresholds to this window:
+      <b>buy $${fmtNum(appliedCfg.buy_px, 3)}</b> ·
+      <b>sell $${fmtNum(appliedCfg.sell_px, 3)}</b> ·
+      abort below $${fmtNum(appliedCfg.abort_below, 3)} / above $${fmtNum(appliedCfg.abort_above, 3)}.
+      Ranking below reflects strategy MECHANICS, not whether a specific price target was hit.
     </div>
   ` : '';
 
@@ -1777,6 +1821,7 @@ function renderLeaderboard(results) {
 
   return `
     ${priceInfo}
+    ${fitInfo}
     <table class="leaderboard">
       <thead>
         <tr>
@@ -2408,6 +2453,177 @@ tradeQty.addEventListener('input', () => {
   markActiveChip(document.getElementById('trade-qty-quick'), Number(tradeQty.value));
 });
 tradeConfirm.addEventListener('click', submitTrade);
+
+// ---- scanner detail: chart + purchase ----------------------------------
+
+const scannerDetailModal = document.getElementById('scanner-detail-modal');
+const scannerDetailTitle = document.getElementById('scanner-detail-title');
+const scannerDetailSummary = document.getElementById('scanner-detail-summary');
+const scannerDetailTimeframes = document.getElementById('scanner-detail-timeframes');
+const scannerDetailChart = document.getElementById('scanner-detail-chart');
+const scannerDetailWarning = document.getElementById('scanner-detail-warning');
+const scannerBuyBtn = document.getElementById('scanner-buy-btn');
+
+// {product_id, price, high_24h, low_24h, vol_pct, volume_24h}
+let scannerDetailContext = null;
+// {days, granularity}
+let scannerChartWindow = { days: 7, granularity: 'FIVE_MINUTE' };
+
+const TIMEFRAMES = [
+  { label: '1D', days: 1,  granularity: 'FIVE_MINUTE' },
+  { label: '7D', days: 7,  granularity: 'FIVE_MINUTE' },
+  { label: '30D', days: 30, granularity: 'ONE_HOUR' },
+];
+
+function openScannerDetail(row) {
+  scannerDetailContext = row;
+  scannerChartWindow = { days: 7, granularity: 'FIVE_MINUTE' };
+  scannerDetailTitle.textContent = row.product_id;
+  scannerDetailSummary.innerHTML = `
+    <div class="scanner-detail-price">
+      <span class="mono">$${fmtNum(row.price, 4)}</span>
+      <span class="scanner-detail-range"><span class="pos">$${fmtNum(row.high_24h, 4)}</span> / <span class="neg">$${fmtNum(row.low_24h, 4)}</span></span>
+      <span class="scanner-detail-vol">24h range <b>${fmtNum(row.vol_pct, 2)}%</b></span>
+    </div>
+  `;
+
+  // Timeframe buttons
+  scannerDetailTimeframes.innerHTML = '';
+  for (const tf of TIMEFRAMES) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'timeframe-btn' + (tf.days === scannerChartWindow.days ? ' active' : '');
+    b.textContent = tf.label;
+    b.onclick = () => {
+      scannerChartWindow = { days: tf.days, granularity: tf.granularity };
+      scannerDetailTimeframes.querySelectorAll('.timeframe-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
+      loadScannerChart();
+    };
+    scannerDetailTimeframes.appendChild(b);
+  }
+
+  // Purchase button behavior depends on whether the active tenant tracks this symbol
+  updateScannerBuyButton();
+
+  scannerDetailModal.hidden = false;
+  loadScannerChart();
+}
+
+function updateScannerBuyButton() {
+  if (!scannerDetailContext) return;
+  const symbol = scannerDetailContext.product_id;
+  const tenant = tenantForActiveMode();
+  const tracks = tenant && currentStore[tenant] && currentStore[tenant][symbol];
+  if (tenant && tracks) {
+    scannerBuyBtn.textContent = `buy on ${activeMode}`;
+    scannerBuyBtn.disabled = false;
+    scannerDetailWarning.hidden = true;
+  } else if (tenant) {
+    scannerBuyBtn.textContent = `buy on ${activeMode}`;
+    scannerBuyBtn.disabled = true;
+    scannerDetailWarning.hidden = false;
+    scannerDetailWarning.innerHTML = `
+      <b>${escapeHtml(symbol)}</b> isn't a tracked instrument on your <b>${escapeHtml(activeMode || 'paper')}</b> account.
+      To trade it here, add it as a tracked symbol first (the bot needs a
+      running strategy on this product to route the order through). Silver
+      (SLR-27AUG26-CDE) is the currently tracked instrument.
+    `;
+  } else {
+    scannerBuyBtn.disabled = true;
+    scannerDetailWarning.hidden = false;
+    scannerDetailWarning.innerHTML = `No <b>${escapeHtml(activeMode || 'paper')}</b> account configured.`;
+  }
+}
+
+function tenantForActiveMode() {
+  const mode = activeMode === 'scanner' ? 'paper' : (activeMode || 'paper');
+  for (const t of Object.keys(currentStore || {})) {
+    if (modeOfTenant(t) === mode) return t;
+  }
+  return null;
+}
+
+scannerBuyBtn.addEventListener('click', () => {
+  if (scannerBuyBtn.disabled || !scannerDetailContext) return;
+  const symbol = scannerDetailContext.product_id;
+  const tenant = tenantForActiveMode();
+  if (!tenant) return;
+  scannerDetailModal.hidden = true;
+  openTradeModal(tenant, symbol, 'BUY');
+});
+
+async function loadScannerChart() {
+  if (!scannerDetailContext) return;
+  const { product_id } = scannerDetailContext;
+  const { days, granularity } = scannerChartWindow;
+  scannerDetailChart.innerHTML = '<div class="chart-status">loading candles…</div>';
+  try {
+    const resp = await fetch(`/api/candles?product_id=${encodeURIComponent(product_id)}&days=${days}&granularity=${granularity}`, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.error || 'unknown error');
+    renderCandleChart(data.candles || [], scannerDetailChart);
+  } catch (err) {
+    scannerDetailChart.innerHTML = `<div class="chart-status error">chart failed: ${escapeHtml(String(err.message || err))}</div>`;
+  }
+}
+
+// Compact SVG candlestick chart. Candles are [ts, open, high, low, close].
+// No external charting lib — keeps the dashboard tiny and avoids CSP hassle.
+function renderCandleChart(candles, container) {
+  if (!candles.length) {
+    container.innerHTML = '<div class="chart-status">no candles in window.</div>';
+    return;
+  }
+  const W = container.clientWidth || 800;
+  const H = 340;
+  const padL = 60, padR = 12, padT = 14, padB = 28;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const c of candles) {
+    if (c[3] < lo) lo = c[3];
+    if (c[2] > hi) hi = c[2];
+  }
+  if (lo === hi) { lo -= 0.5; hi += 0.5; }
+  const range = hi - lo;
+  const y = (p) => padT + plotH * (1 - (p - lo) / range);
+
+  const n = candles.length;
+  const stepW = plotW / n;
+  const bodyW = Math.max(1, Math.min(6, stepW * 0.7));
+
+  const parts = [];
+  parts.push(`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">`);
+  // Y-axis gridlines and price labels — 5 ticks across the range
+  for (let i = 0; i <= 4; i++) {
+    const p = lo + (range * i / 4);
+    const yy = y(p);
+    parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="#1e2a3a" stroke-width="1" />`);
+    parts.push(`<text x="${padL - 6}" y="${yy.toFixed(1) + 4}" fill="#7a8899" font-size="10" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(3)}</text>`);
+  }
+  // X-axis: first and last timestamps
+  const first = new Date(candles[0][0] * 1000);
+  const last = new Date(candles[n - 1][0] * 1000);
+  parts.push(`<text x="${padL}" y="${H - 8}" fill="#7a8899" font-size="10" font-family="ui-monospace,monospace">${first.toLocaleDateString()} ${first.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</text>`);
+  parts.push(`<text x="${W - padR}" y="${H - 8}" fill="#7a8899" font-size="10" text-anchor="end" font-family="ui-monospace,monospace">${last.toLocaleDateString()} ${last.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</text>`);
+
+  for (let i = 0; i < n; i++) {
+    const [, o, h, l, c] = candles[i];
+    const x = padL + i * stepW + stepW / 2;
+    const up = c >= o;
+    const color = up ? '#22c55e' : '#ef4444';
+    const yh = y(h), yl = y(l), yo = y(o), yc = y(c);
+    const top = Math.min(yo, yc);
+    const bh = Math.max(1, Math.abs(yc - yo));
+    parts.push(`<line x1="${x.toFixed(1)}" y1="${yh.toFixed(1)}" x2="${x.toFixed(1)}" y2="${yl.toFixed(1)}" stroke="${color}" stroke-width="1"/>`);
+    parts.push(`<rect x="${(x - bodyW/2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill="${color}"/>`);
+  }
+  parts.push(`</svg>`);
+  container.innerHTML = parts.join('');
+}
 
 // ---- delegated events ---------------------------------------------------
 
