@@ -33,8 +33,10 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 from typing import Optional, Protocol
 
+from alerting import Notifier, Priority
 from state_store import StateStore
 from safety import KillSwitch, TradeLog
+from strategies import ExitStrategy, strategy_by_name
 
 
 class State(str, Enum):
@@ -75,6 +77,13 @@ class SwingConfig:
     # data-glitch / broken conditions, not normal drift. [OPEN in spec §2A]
     fee_sanity_multiplier: float = 2.0
 
+    # Exit-mode toggle (spec §5)
+    exit_mode: str = "fixed_limit"          # or "trailing_stop"
+    trail_trigger: float = 65.0             # arm the trail at/above this price
+    trail_distance: float = 0.20            # $0.20 = 40 ticks on SLR
+    reanchor_threshold: float = 2.0         # if trailing exit fills > this above sell_px, re-anchor
+    tick_size: float = 0.005                # per-instrument (needed for trail-stop fill price)
+
 
 @dataclass
 class SwingState:
@@ -83,9 +92,14 @@ class SwingState:
     filled_qty: int = 0
     swing_qty: int = 2
     last_sell_qty: int = 0
+    last_sell_fill_price: Optional[float] = None
     realized_pnl: float = 0.0
     reserved_margin: float = 0.0
     cycles: int = 0
+    last_heartbeat_ts: float = 0.0
+    # Trailing-stop state (spec §5 "MUST persist")
+    trail_armed: bool = False
+    trail_high_water_price: float = 0.0
 
 
 class SwingTrader:
@@ -97,6 +111,7 @@ class SwingTrader:
         symbol: str,
         trade_log: Optional[TradeLog] = None,
         kill_switch: Optional[KillSwitch] = None,
+        notifier: Optional[Notifier] = None,
     ):
         self.b = broker
         self.store = store
@@ -104,6 +119,7 @@ class SwingTrader:
         self.symbol = symbol
         self.log = trade_log
         self.ks = kill_switch
+        self.notifier = notifier
 
         self.cfg = self._load_config()
         self.s = self._load_state()
@@ -126,16 +142,30 @@ class SwingTrader:
             filled_qty=d.get("filled_qty", 0),
             swing_qty=d.get("swing_qty", self.cfg.swing_qty),
             last_sell_qty=d.get("last_sell_qty", 0),
+            last_sell_fill_price=d.get("last_sell_fill_price"),
             realized_pnl=d.get("realized_pnl", 0.0),
             reserved_margin=d.get("reserved_margin", 0.0),
             cycles=d.get("cycles", 0),
+            last_heartbeat_ts=d.get("last_heartbeat_ts", 0.0),
+            trail_armed=d.get("trail_armed", False),
+            trail_high_water_price=d.get("trail_high_water_price", 0.0),
         )
 
     def _save_state(self) -> None:
+        import time as _time
+        self.s.last_heartbeat_ts = _time.time()
         self.store.put_state(self.tenant_id, self.symbol, {
             **asdict(self.s),
             "state": self.s.state.value,
         })
+
+    def _notify(self, subject: str, body: str, priority: Priority) -> None:
+        if self.notifier is None:
+            return
+        try:
+            self.notifier.send(subject, body, priority)
+        except Exception:
+            pass  # alerting failure must not affect the bot
 
     def _record(self, event_type: str, **payload) -> None:
         if self.log is None:
@@ -249,19 +279,32 @@ class SwingTrader:
         )
         self._save_state()
 
-    def _ensure_armed(self) -> None:
+    def _exit_strategy(self) -> ExitStrategy:
+        return strategy_by_name(self.cfg.exit_mode)
+
+    def _ensure_armed(self, current_price: float) -> None:
         if self.s.live_order_id or self.s.state == State.HALTED:
             return
         pos = self.b.position_qty()
+        strat = self._exit_strategy()
         if self.s.state == State.ARMED_SELL:
             if not self._floor_ok(pos, self.s.swing_qty):
                 return self._halt(
                     f"sell {self.s.swing_qty} would breach floor at pos {pos}"
                 )
-            self._arm("SELL", self.s.swing_qty, self.cfg.sell_px)
+            directive = strat.sell_action(self.s, self.cfg, current_price)
+            if directive is None:
+                return  # trailing waiting for trigger / trail crossover
+            self._arm("SELL", directive.qty, directive.limit_price)
         elif self.s.state == State.ARMED_BUY:
             self._maybe_scale_up()
-            self._arm("BUY", self.s.swing_qty, self.cfg.buy_px)
+            directive = strat.buy_action(
+                self.s, self.cfg, current_price,
+                last_sell_fill_price=self.s.last_sell_fill_price,
+            )
+            if directive is None:
+                return
+            self._arm("BUY", directive.qty, directive.limit_price)
 
     def _maybe_scale_up(self) -> None:
         if self.s.swing_qty >= self.cfg.max_swing_qty:
@@ -304,8 +347,9 @@ class SwingTrader:
                 f"price {last_price} fell below abort_below {self.cfg.abort_below} while holding swing"
             )
 
-        self._ensure_armed()
+        self._ensure_armed(last_price)
         if not self.s.live_order_id:
+            self._save_state()
             return
 
         st = self.b.order_status(self.s.live_order_id)
@@ -322,19 +366,31 @@ class SwingTrader:
             average_filled_price=fill_price,
             leg=self.s.state.value,
         )
+        strat = self._exit_strategy()
         self.s.live_order_id = None
         self.s.filled_qty = 0
         if self.s.state == State.ARMED_SELL:
             self.s.last_sell_qty = self.s.swing_qty
+            if fill_price is not None:
+                try:
+                    self.s.last_sell_fill_price = float(fill_price)
+                except (TypeError, ValueError):
+                    self.s.last_sell_fill_price = None
+            strat.on_sell_filled(self.s, self.cfg, fill_price or 0.0)
             self.s.state = State.ARMED_BUY
         else:
-            gross = (self.cfg.sell_px - self.cfg.buy_px) * self.cfg.contract_size * self.s.last_sell_qty
+            # Use the actual sell fill price for realized-P&L calc when we have
+            # it (trailing exits can fill above cfg.sell_px). Fall back to the
+            # configured sell_px for fixed-limit runs.
+            effective_sell_px = self.s.last_sell_fill_price or self.cfg.sell_px
+            gross = (effective_sell_px - self.cfg.buy_px) * self.cfg.contract_size * self.s.last_sell_qty
             fees = self.cfg.fee_per_contract_roundtrip * self.s.last_sell_qty
             self.s.realized_pnl += gross - fees
             added = self.s.swing_qty - self.s.last_sell_qty
             if added > 0:
                 self.s.reserved_margin += added * self.cfg.margin_per_contract
             self.s.cycles += 1
+            strat.on_buy_filled(self.s, self.cfg, fill_price or 0.0)
             self.s.state = State.ARMED_SELL
             self._record(
                 "cycle_completed",
@@ -343,6 +399,7 @@ class SwingTrader:
                 fees=fees,
                 realized_pnl_total=self.s.realized_pnl,
                 swing_qty=self.s.swing_qty,
+                effective_sell_px=effective_sell_px,
             )
         self._save_state()
 
@@ -356,6 +413,12 @@ class SwingTrader:
         self.s.state = State.HALTED
         self._save_state()
         self._record("halt", reason=reason)
+        self._notify(
+            f"HALT: {self.symbol}",
+            f"tenant={self.tenant_id}\nreason: {reason}\ncore_qty={self.cfg.core_qty}, "
+            f"swing_qty={self.s.swing_qty}, cycles={self.s.cycles}",
+            Priority.CRIT,
+        )
 
     def run(self, price_feed) -> None:
         self.reconcile()

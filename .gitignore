@@ -8,3 +8,4 @@ __pycache__/
 .coinbase_key.json
 scratch/
 data/
+dashboard/node_modules/

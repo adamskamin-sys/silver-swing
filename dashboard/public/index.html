@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>silver-swing — dashboard</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>silver-swing</h1>
+    <div id="header-meta">
+      <span id="last-updated"></span>
+      <button id="logout-btn" hidden>logout</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="login-view" hidden>
+      <h2>login</h2>
+      <form id="login-form">
+        <input type="password" id="password" placeholder="password" autofocus autocomplete="current-password">
+        <button type="submit">enter</button>
+      </form>
+      <div id="login-error" class="error"></div>
+    </section>
+
+    <section id="dashboard-view" hidden>
+      <div id="instrument-cards"></div>
+      <section id="trades-section">
+        <h2>recent events</h2>
+        <ol id="trade-log"></ol>
+      </section>
+    </section>
+  </main>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
