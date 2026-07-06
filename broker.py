@@ -192,3 +192,54 @@ class CoinbaseBroker:
     def futures_balance(self) -> dict:
         """Real-time futures account balance summary — empirical inputs for §4 gates."""
         return _dump(self.client.get_futures_balance_summary()).get("balance_summary") or {}
+
+    def snapshot(self) -> dict:
+        """Unified snapshot in the same shape as PaperBroker.snapshot() so the
+        dashboard can render either without branching. Best-effort — any subcall
+        that fails returns {} rather than propagating."""
+        try:
+            balance = self.futures_balance()
+        except Exception:
+            balance = {}
+        try:
+            positions = _dump(self.client.list_futures_positions()).get("positions") or []
+        except Exception:
+            positions = []
+
+        pos_qty = 0
+        avg_entry = 0.0
+        mark = 0.0
+        for p in positions:
+            if p.get("product_id") == self.cfg.product_id:
+                n = int(float(p.get("number_of_contracts") or 0))
+                pos_qty = n if (p.get("side") or "").upper() == "LONG" else -n
+                try: avg_entry = float(p.get("avg_entry_price") or 0)
+                except (TypeError, ValueError): pass
+                try: mark = float(p.get("current_price") or 0)
+                except (TypeError, ValueError): pass
+                break
+
+        def _num(node, key):
+            try: return float(((balance.get(node) or {}).get("value")) or 0)
+            except (TypeError, ValueError): return 0.0
+
+        cfm_balance = _num("cfm_usd_balance", "value")
+        cbi_balance = _num("cbi_usd_balance", "value")
+        return {
+            "mode": "live",
+            "product_id": self.cfg.product_id,
+            "position_qty": pos_qty,
+            "position_avg_entry": avg_entry,
+            "last_mark": mark,
+            "balance": cbi_balance + cfm_balance,
+            "cfm_usd_balance": cfm_balance,
+            "cbi_usd_balance": cbi_balance,
+            "unrealized_pnl": _num("unrealized_pnl", "value"),
+            "realized_pnl": _num("daily_realized_pnl", "value"),
+            "initial_margin": _num("initial_margin", "value"),
+            "maintenance_margin": _num("liquidation_threshold", "value"),
+            "available_margin": _num("available_margin", "value"),
+            "futures_buying_power": _num("futures_buying_power", "value"),
+            "liquidation_buffer": _num("liquidation_buffer_amount", "value"),
+            "equity": cbi_balance + cfm_balance + _num("unrealized_pnl", "value"),
+        }

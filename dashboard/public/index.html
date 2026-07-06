@@ -8,12 +8,16 @@
 </head>
 <body>
   <header>
-    <h1>silver-swing</h1>
+    <div class="brand"><h1>silver-swing</h1></div>
     <div id="header-meta">
       <span id="last-updated"></span>
+      <button id="kill-switch-btn" class="danger" hidden>PAUSE ALL</button>
       <button id="logout-btn" hidden>logout</button>
     </div>
   </header>
+
+  <div id="halt-banner" class="halt-banner" hidden></div>
+  <div id="kill-banner" class="kill-banner" hidden></div>
 
   <main id="main">
     <section id="login-view" hidden>
@@ -26,6 +30,7 @@
     </section>
 
     <section id="dashboard-view" hidden>
+      <nav id="asset-tabs" class="tabs"></nav>
       <div id="instrument-cards"></div>
       <section id="trades-section">
         <h2>recent events</h2>
@@ -33,6 +38,97 @@
       </section>
     </section>
   </main>
+
+  <!-- config editor modal -->
+  <div id="config-modal" class="modal" hidden>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <h2 id="config-modal-title">edit config</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <form id="config-form" class="config-form"></form>
+      <div id="config-errors" class="issues"></div>
+      <div class="modal-footer">
+        <button data-close>cancel</button>
+        <button id="config-save" class="primary">save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- kill switch confirm modal -->
+  <div id="kill-modal" class="modal" hidden>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <h2 id="kill-modal-title">pause all trading?</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <p id="kill-modal-body"></p>
+      <input type="text" id="kill-reason" placeholder="reason (optional)">
+      <div class="modal-footer">
+        <button data-close>cancel</button>
+        <button id="kill-confirm" class="danger">confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- strategy explainer modal -->
+  <div id="strategy-modal" class="modal" hidden>
+    <div class="modal-panel wide">
+      <div class="modal-header">
+        <h2 id="strategy-modal-title">strategy</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <div id="strategy-body"></div>
+      <div class="modal-footer">
+        <button data-close>back</button>
+        <button id="strategy-select" class="primary">select this strategy</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- backtest modal -->
+  <div id="backtest-modal" class="modal" hidden>
+    <div class="modal-panel wide">
+      <div class="modal-header">
+        <h2>backtest</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <form id="backtest-form" class="backtest-form">
+        <div class="row">
+          <label>window
+            <select id="bt-window">
+              <option value="7">last 7 days</option>
+              <option value="30" selected>last 30 days</option>
+              <option value="90">last 90 days</option>
+              <option value="180">last 180 days</option>
+            </select>
+          </label>
+          <label>granularity
+            <select id="bt-gran">
+              <option value="ONE_MINUTE">1 min</option>
+              <option value="FIVE_MINUTE" selected>5 min</option>
+              <option value="FIFTEEN_MINUTE">15 min</option>
+              <option value="ONE_HOUR">1 hour</option>
+              <option value="ONE_DAY">1 day</option>
+            </select>
+          </label>
+          <label>mode
+            <select id="bt-mode">
+              <option value="single">single strategy</option>
+              <option value="compare_all">compare all</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit" class="primary">run</button>
+      </form>
+      <div class="overfit-warning">
+        Backtests show how a strategy <em>would have</em> done. A great backtest on
+        one window is often just fit to that window. Trust results that hold
+        across ranging + trending + choppy periods, not one-off winners.
+      </div>
+      <div id="backtest-result"></div>
+    </div>
+  </div>
 
   <script src="/app.js" type="module"></script>
 </body>

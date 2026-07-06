@@ -57,6 +57,37 @@ def _log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
 
 
+def _mirror_live_position_into_paper(paper, product_id: str) -> bool:
+    """Query real Coinbase (read-only) and preload the paper broker with the
+    same position at the same avg entry. Returns True if a position was
+    mirrored, False if flat or query failed. Paper starts flat on any error.
+    """
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        live = CoinbaseBroker(BrokerConfig(product_id=product_id))
+        qty = live.position_qty()
+        if qty == 0:
+            _log("live position: flat. paper starts flat.")
+            return False
+        resp = live.client.list_futures_positions()
+        positions = (resp.to_dict() if hasattr(resp, "to_dict") else resp).get("positions") or []
+        avg_entry = None
+        for p in positions:
+            if p.get("product_id") == product_id:
+                avg_entry = float(p.get("avg_entry_price") or 0)
+                break
+        if not avg_entry or avg_entry <= 0:
+            _log(f"live position {qty} exists but avg_entry unavailable — paper starts flat")
+            return False
+        _log(f"mirroring live position into paper: {qty} @ ${avg_entry:.4f}")
+        paper.place_limit("BUY" if qty > 0 else "SELL", abs(qty), avg_entry)
+        paper.tick(avg_entry, avg_entry)
+        return True
+    except Exception as e:
+        _log(f"could not query live position ({type(e).__name__}: {e}) — paper starts flat")
+        return False
+
+
 def run_paper_mode() -> int:
     """Live feed → PaperBroker → SwingTrader. Real market prices, simulated fills.
     Safe: no path to Coinbase's order endpoint."""
@@ -85,6 +116,9 @@ def run_paper_mode() -> int:
     ))
     _log(f"paper broker seeded: balance=${starting_balance:,.2f}")
 
+    if os.getenv("SWING_PAPER_MIRROR_LIVE", "1") != "0":
+        _mirror_live_position_into_paper(paper, SYMBOL)
+
     trader = SwingTrader(paper, store, TENANT, SYMBOL, trade_log=log, kill_switch=ks)
 
     _log(f"connecting to WS feed (waiting up to {FEED_READY_TIMEOUT}s for first tick)...")
@@ -109,6 +143,8 @@ def run_paper_mode() -> int:
                    starting_balance=starting_balance)
         trader.reconcile()
 
+        snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
+        last_snapshot = 0.0
         while not stopping:
             t = feed.latest_ticker()
             if t is None:
@@ -116,6 +152,16 @@ def run_paper_mode() -> int:
                 continue
             paper.tick(t["best_bid"], t["best_ask"])
             trader.step(t["price"])
+            now = time.time()
+            if now - last_snapshot >= snapshot_interval:
+                snap = paper.snapshot()
+                snap["mode"] = "paper"
+                snap["product_id"] = SYMBOL
+                snap["best_bid"] = t["best_bid"]
+                snap["best_ask"] = t["best_ask"]
+                snap["generated_at"] = now
+                store.put_snapshot(TENANT, SYMBOL, snap)
+                last_snapshot = now
             time.sleep(LOOP_INTERVAL_SECS)
 
     finally:

@@ -27,12 +27,20 @@ from typing import Optional, Protocol
 
 
 class StateStore(Protocol):
-    """Namespaced key-value store split into config (human-writes) and state (bot-writes) scopes."""
+    """Namespaced key-value store split into three scopes:
+      config    — human-writes (dashboard), read by bot each loop
+      state     — bot-writes, read by dashboard for display
+      snapshot  — bot-writes derived numbers (equity, unrealized, margin) for
+                  the dashboard. Not read by the strategy — never a source of
+                  truth, always regenerable from broker + fills.
+    """
 
     def get_config(self, tenant_id: str, symbol: str) -> Optional[dict]: ...
     def put_config(self, tenant_id: str, symbol: str, config: dict) -> None: ...
     def get_state(self, tenant_id: str, symbol: str) -> Optional[dict]: ...
     def put_state(self, tenant_id: str, symbol: str, state: dict) -> None: ...
+    def get_snapshot(self, tenant_id: str, symbol: str) -> Optional[dict]: ...
+    def put_snapshot(self, tenant_id: str, symbol: str, snapshot: dict) -> None: ...
     def list_symbols(self, tenant_id: str) -> list[str]: ...
     def list_tenants(self) -> list[str]: ...
 
@@ -87,6 +95,12 @@ class JsonFileStateStore:
 
     def put_state(self, tenant_id: str, symbol: str, state: dict) -> None:
         self._put_scope(tenant_id, symbol, "state", state)
+
+    def get_snapshot(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        return self._get_scope(tenant_id, symbol, "snapshot")
+
+    def put_snapshot(self, tenant_id: str, symbol: str, snapshot: dict) -> None:
+        self._put_scope(tenant_id, symbol, "snapshot", snapshot)
 
     def list_symbols(self, tenant_id: str) -> list[str]:
         return sorted((self._load().get(tenant_id) or {}).keys())

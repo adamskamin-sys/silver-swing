@@ -23,6 +23,8 @@ import session from 'express-session';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { validateConfig } from './validator.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -102,12 +104,90 @@ export function makeApp({
           view[tenant][symbol] = {
             config: block.config || null,
             state: block.state || null,
+            snapshot: block.snapshot || null,
           };
         }
       }
       res.json({ store: view, generated_at: new Date().toISOString() });
     } catch (err) {
       res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // --- editable config (PUT), validated server-side (spec §10) ---
+  app.put('/api/config', requireAuth, async (req, res) => {
+    const { tenant, symbol, config } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ error: 'tenant and symbol required' });
+    if (!config || typeof config !== 'object') return res.status(400).json({ error: 'config object required' });
+
+    const result = validateConfig(config);
+    if (!result.ok) return res.status(400).json({ ok: false, issues: result.issues });
+
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      store[tenant][symbol].config = config;
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // --- kill switch ---
+  app.post('/api/kill-switch/activate', requireAuth, async (req, res) => {
+    const { tenant, reason, confirm } = req.body || {};
+    if (!tenant) return res.status(400).json({ error: 'tenant required' });
+    if (confirm !== 'YES') return res.status(400).json({ error: 'confirm must be "YES"' });
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant]['__account_kill_switch__'] = store[tenant]['__account_kill_switch__'] || {};
+      store[tenant]['__account_kill_switch__'].config = {
+        active: true,
+        reason: reason || 'triggered from dashboard',
+        activated_ts: Date.now() / 1000,
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/kill-switch/clear', requireAuth, async (req, res) => {
+    const { tenant, confirm, cleared_by } = req.body || {};
+    if (!tenant) return res.status(400).json({ error: 'tenant required' });
+    if (confirm !== 'YES') return res.status(400).json({ error: 'confirm must be "YES"' });
+    try {
+      const store = await readStore(storePath);
+      const prev = store?.[tenant]?.['__account_kill_switch__']?.config || {};
+      store[tenant] = store[tenant] || {};
+      store[tenant]['__account_kill_switch__'] = store[tenant]['__account_kill_switch__'] || {};
+      store[tenant]['__account_kill_switch__'].config = {
+        active: false,
+        reason: null,
+        cleared_ts: Date.now() / 1000,
+        cleared_by: cleared_by || 'dashboard',
+        previous_reason: prev.reason || null,
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // --- backtest (spawns Python subprocess) ---
+  app.post('/api/backtest', requireAuth, async (req, res) => {
+    const payload = req.body || {};
+    if (!payload.symbol) return res.status(400).json({ ok: false, error: 'symbol required' });
+    try {
+      const result = await runPythonBacktest(payload);
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
     }
   });
 
@@ -134,6 +214,42 @@ async function readStore(storePath) {
     if (err.code === 'ENOENT') return {};  // no store yet, empty view
     throw err;
   }
+}
+
+async function writeStoreAtomic(storePath, data) {
+  // Mirror the Python JsonFileStateStore atomicity: write tmp, rename.
+  await fs.mkdir(path.dirname(storePath), { recursive: true });
+  const tmp = storePath + '.tmp';
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2));
+  await fs.rename(tmp, storePath);
+}
+
+const PYTHON_BIN = process.env.SWING_PYTHON_BIN ||
+  path.resolve(__dirname, '..', '.venv', 'bin', 'python');
+const BACKTEST_SCRIPT = path.resolve(__dirname, '..', 'scripts', 'run_backtest.py');
+
+function runPythonBacktest(payload) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(PYTHON_BIN, [BACKTEST_SCRIPT], {
+      cwd: path.resolve(__dirname, '..'),
+      env: process.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => { stdout += d; });
+    proc.stderr.on('data', d => { stderr += d; });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      try {
+        const parsed = JSON.parse(stdout);
+        resolve(parsed);
+      } catch (e) {
+        reject(new Error(`bad backtest output (code=${code}): ${stderr || stdout}`));
+      }
+    });
+    proc.stdin.write(JSON.stringify(payload));
+    proc.stdin.end();
+  });
 }
 
 async function tailJsonl(logPath, n) {
