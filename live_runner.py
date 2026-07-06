@@ -172,6 +172,16 @@ def run() -> int:
     ks = KillSwitch(store, TENANT)
     notifier = default_notifier()
 
+    # In dry-run only, seed a default config if the tenant/symbol has no
+    # config yet — otherwise the preflight validator rejects the run before
+    # the operator can configure via dashboard (chicken-and-egg on first
+    # deploy). Real-money mode still requires the config to be pre-set:
+    # we don't want defaults touching production.
+    if dry_run and not store.get_config(TENANT, SYMBOL):
+        from main import _default_paper_config
+        _log(f"dry-run: seeding default config for {TENANT}/{SYMBOL}")
+        store.put_config(TENANT, SYMBOL, _default_paper_config())
+
     coinbase = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
     ok, issues = _preflight(coinbase, store, TENANT, SYMBOL, notifier)
     if not ok:
