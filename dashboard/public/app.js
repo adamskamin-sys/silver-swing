@@ -29,6 +29,7 @@ const killBanner = document.getElementById('kill-banner');
 const killBtn = document.getElementById('kill-switch-btn');
 const resetPaperBtn = document.getElementById('reset-paper-btn');
 const assetTabs = document.getElementById('asset-tabs');
+const modeTabs = document.getElementById('mode-tabs');
 
 const configModal = document.getElementById('config-modal');
 const configForm = document.getElementById('config-form');
@@ -64,6 +65,7 @@ const tradeConfirm = document.getElementById('trade-confirm');
 let pollHandle = null;
 let currentStore = {};          // last full /api/status
 let activeAssetClass = null;    // sidebar-tab filter
+let activeMode = 'paper';       // 'paper' | 'live' | null(all) — top-level mode tab
 let configEditContext = null;   // {tenant, symbol} while modal open
 let killContext = null;         // {tenant, mode: 'activate'|'clear'} while modal open
 let strategyContext = null;     // {tenant, symbol, name} while modal open
@@ -222,6 +224,40 @@ function renderBanners(store) {
 }
 
 // ---- asset-class tabs ---------------------------------------------------
+
+function modeOfTenant(tenant) {
+  // Tenant naming convention: `adam-paper` and `adam-live`. Fall back to
+  // matching the snapshot's `mode` when the tenant name doesn't disclose it.
+  const t = String(tenant || '').toLowerCase();
+  if (t.includes('live')) return 'live';
+  if (t.includes('paper')) return 'paper';
+  return null;
+}
+
+function renderModeTabs(store) {
+  const counts = { paper: 0, live: 0 };
+  for (const [tenant, symbols] of Object.entries(store)) {
+    const m = modeOfTenant(tenant);
+    if (!m) continue;
+    for (const symbol of Object.keys(symbols || {})) {
+      if (symbol === '__account_kill_switch__') continue;
+      counts[m] = (counts[m] || 0) + 1;
+    }
+  }
+  modeTabs.innerHTML = '';
+  if (!counts.paper && !counts.live) return;
+
+  const mk = (label, mode, badgeClass) => {
+    const b = document.createElement('button');
+    b.className = 'tab mode-tab' + (activeMode === mode ? ' active' : '')
+      + (badgeClass ? ' ' + badgeClass : '');
+    b.innerHTML = `${label} <span class="tab-count">${counts[mode] || 0}</span>`;
+    b.onclick = () => { activeMode = mode; refreshOnce(); };
+    return b;
+  };
+  modeTabs.appendChild(mk('paper', 'paper', 'mode-paper'));
+  modeTabs.appendChild(mk('live', 'live', 'mode-live'));
+}
 
 function renderAssetTabs(store) {
   const counts = {};
@@ -382,6 +418,7 @@ function renderCard(tenant, symbol, { config, state, snapshot }) {
       ${renderPositionBar(s, c, snap)}
       ${renderLotsTable(snap, c, tenant, symbol, s)}
       ${renderRiskStrip(snap)}
+      ${renderMicrostructurePanel(snap)}
       ${renderSleevesSection(tenant, symbol, c, s, snap)}
     </div>
 
@@ -585,6 +622,77 @@ function renderLotsTable(snapshot, config, tenant, symbol, state) {
         </thead>
         <tbody>${rows}</tbody>
       </table>
+    </section>
+  `;
+}
+
+function renderMicrostructurePanel(snapshot) {
+  const ms = snapshot?.microstructure;
+  if (!ms) return '';
+  const cells = [];
+  const cell = (label, val, sub, cls = '') =>
+    `<div class="ms-cell ${cls}">
+       <span class="ms-label">${label}</span>
+       <span class="ms-value">${val}</span>
+       ${sub ? `<span class="ms-sub">${sub}</span>` : ''}
+     </div>`;
+
+  if ('spread_median' in ms) {
+    const s = ms.spread_median;
+    cells.push(cell('Effective spread',
+      s == null ? '—' : `$${Number(s).toFixed(4)}`,
+      `band k=${ms.spread_k}`));
+  }
+  if ('autocorr_lag1' in ms) {
+    const a = ms.autocorr_lag1;
+    const bad = a != null && a > (ms.autocorr_max ?? 0);
+    cells.push(cell('Return autocorr (lag 1)',
+      a == null ? '—' : a.toFixed(3),
+      bad ? `paused > ${ms.autocorr_max}` : `≤ ${ms.autocorr_max}, OK`,
+      bad ? 'bad' : ''));
+  }
+  if ('obi' in ms) {
+    const o = ms.obi;
+    const th = ms.obi_threshold;
+    const bad = o != null && Math.abs(o) > th;
+    cells.push(cell('Order-book imbalance',
+      o == null ? '—' : o.toFixed(3),
+      bad ? `|OBI| > ${th}` : `|OBI| ≤ ${th}, OK`,
+      bad ? 'warn' : ''));
+  }
+  if ('vpin' in ms) {
+    const v = ms.vpin;
+    const bad = v != null && v > ms.vpin_max;
+    cells.push(cell('VPIN (toxicity)',
+      v == null ? '—' : v.toFixed(3),
+      bad ? `paused > ${ms.vpin_max}` : `≤ ${ms.vpin_max}, OK`,
+      bad ? 'bad' : ''));
+  }
+  if ('kyle_lambda' in ms) {
+    const l = ms.kyle_lambda;
+    const scale = ms.size_scale;
+    const bad = scale != null && scale < 1.0;
+    cells.push(cell('Kyle λ (impact)',
+      l == null ? '—' : Number(l).toExponential(2),
+      bad ? `size ×${scale?.toFixed(2)}` : `full size`,
+      bad ? 'warn' : ''));
+  }
+
+  const pc = ms.pause_counts || {};
+  const totalPauses = (pc.autocorr || 0) + (pc.vpin || 0) + (pc.obi_buy || 0) + (pc.obi_sell || 0);
+  const summary = `
+    <div class="ms-summary">
+      <span>arm attempts: <b>${ms.arm_attempts ?? 0}</b></span>
+      <span>total pauses: <b>${totalPauses}</b></span>
+      <span class="dim">autocorr ${pc.autocorr || 0} · vpin ${pc.vpin || 0} · obi buy ${pc.obi_buy || 0} · obi sell ${pc.obi_sell || 0} · size tapers ${ms.size_taper_count || 0}</span>
+    </div>
+  `;
+
+  return `
+    <section class="ms-panel">
+      <h3 class="ms-heading">Microstructure signals</h3>
+      <div class="ms-grid">${cells.join('')}</div>
+      ${summary}
     </section>
   `;
 }
@@ -1180,12 +1288,15 @@ async function refreshOnce() {
   if (status._unauthorized || trades._unauthorized) { showLogin(); return; }
   currentStore = status.store || {};
   renderBanners(currentStore);
+  renderModeTabs(currentStore);
   renderAssetTabs(currentStore);
 
   cardsEl.innerHTML = '';
   const tenants = Object.keys(currentStore).sort();
   let anyRendered = false;
   for (const tenant of tenants) {
+    const m = modeOfTenant(tenant);
+    if (activeMode && m && m !== activeMode) continue;
     const symbols = Object.keys(currentStore[tenant] || {}).sort();
     for (const symbol of symbols) {
       if (symbol === '__account_kill_switch__') continue;

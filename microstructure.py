@@ -354,6 +354,14 @@ class MicrostructureFilter:
         self.enable_vpin = all_on or _envb("SWING_MS_VPIN")
         self.enable_lambda = all_on or _envb("SWING_MS_LAMBDA")
 
+        # Cumulative counters — persist through the snapshot so the dashboard
+        # can show "signal X paused N times this run". Multi-week test data.
+        self._pause_counts = {
+            "autocorr": 0, "vpin": 0, "obi_buy": 0, "obi_sell": 0,
+        }
+        self._size_taper_count = 0
+        self._arm_attempts = 0
+
         self.spread = EffectiveSpreadEstimator(
             window_secs=_envf("SWING_MS_SPREAD_WINDOW", 60.0),
         )
@@ -402,21 +410,25 @@ class MicrostructureFilter:
 
     def should_pause_arm(self, side: str) -> Optional[str]:
         """Return reason string if any enabled gate says pause, else None."""
+        self._arm_attempts += 1
         if self.enable_autocorr:
             v = self.autocorr.value()
             if v is not None and v > self.autocorr_max:
+                self._pause_counts["autocorr"] += 1
                 return f"autocorr={v:.3f} > {self.autocorr_max} (trending regime)"
         if self.enable_vpin:
             v = self.vpin.value()
             if v is not None and v > self.vpin_max:
+                self._pause_counts["vpin"] += 1
                 return f"vpin={v:.3f} > {self.vpin_max} (toxic flow)"
         if self.enable_obi:
             v = self.obi.value()
             if v is not None:
-                # BUY into ask-heavy book (OBI << 0) is bad; SELL into bid-heavy is bad
                 if side.upper() == "BUY" and v < -self.obi_threshold:
+                    self._pause_counts["obi_buy"] += 1
                     return f"obi={v:.3f} < -{self.obi_threshold} (ask-heavy, wait)"
                 if side.upper() == "SELL" and v > self.obi_threshold:
+                    self._pause_counts["obi_sell"] += 1
                     return f"obi={v:.3f} > {self.obi_threshold} (bid-heavy, wait)"
         return None
 
@@ -446,13 +458,20 @@ class MicrostructureFilter:
         if v <= self.lambda_max:
             return 1.0
         # Linear taper down to 0.5 as λ hits 2× the max; floor at 0.5
-        return max(0.5, 1.0 - 0.5 * (v - self.lambda_max) / self.lambda_max)
+        scale = max(0.5, 1.0 - 0.5 * (v - self.lambda_max) / self.lambda_max)
+        if scale < 1.0:
+            self._size_taper_count += 1
+        return scale
 
     # ---- observation for the dashboard ----------------------------------
 
     def snapshot(self) -> dict:
-        """Current values of every enabled signal, for the dashboard."""
-        out: dict = {}
+        """Current values of every enabled signal + cumulative counters."""
+        out: dict = {
+            "arm_attempts": self._arm_attempts,
+            "pause_counts": dict(self._pause_counts),
+            "size_taper_count": self._size_taper_count,
+        }
         if self.enable_spread:
             out["spread_median"] = self.spread.value()
             out["spread_k"] = self.spread_k

@@ -1063,3 +1063,52 @@ header { padding: 20px 32px; }
   border-top: 1px solid var(--border);
   font-size: 11px; color: var(--dim); line-height: 1.5;
 }
+
+/* ---- mode tabs (paper / live) ------------------------------------------ */
+.mode-tabs {
+  display: flex; gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.mode-tab { text-transform: uppercase; letter-spacing: 1px; }
+.mode-tab.mode-live.active { border-color: #e0505c; color: #ffd7db; }
+.mode-tab.mode-paper.active { border-color: #4bb890; color: #d7f5e9; }
+
+/* ---- microstructure panel ---------------------------------------------- */
+.ms-panel {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.ms-heading {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
+  color: var(--muted); margin: 0 0 12px 0;
+}
+.ms-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+.ms-cell {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px; background: var(--panel-3);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.ms-cell.warn { border-color: #d4a04c; }
+.ms-cell.bad  { border-color: #e0505c; }
+.ms-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--muted);
+}
+.ms-value { font-family: var(--mono); font-size: 18px; color: var(--text); }
+.ms-cell.warn .ms-value { color: #f5c56a; }
+.ms-cell.bad  .ms-value { color: #ff8f95; }
+.ms-sub { font-size: 11px; color: var(--dim); }
+.ms-summary {
+  display: flex; flex-wrap: wrap; gap: 16px;
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+}
