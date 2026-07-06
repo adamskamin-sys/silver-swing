@@ -25,13 +25,17 @@ def test_seed_config_does_not_clobber_existing(tmp_path):
 
 
 def test_live_mode_refuses_without_confirm(monkeypatch, capsys):
+    """live mode now delegates to live_runner.run(), which enforces the
+    dry-run OR confirm env var before doing anything else. Same net effect
+    from main.py's perspective: exit code 2 with a REFUSING message."""
     monkeypatch.setenv("SWING_MODE", "live")
     monkeypatch.delenv("SWING_LIVE_CONFIRM", raising=False)
+    monkeypatch.delenv("SWING_LIVE_DRY_RUN", raising=False)
     from main import run_live_mode
     rc = run_live_mode()
     assert rc == 2  # explicit non-zero exit
     out = capsys.readouterr().out
-    assert "REFUSING to run live" in out
+    assert "REFUSING" in out
 
 
 def test_unknown_mode_exits_with_code_2(monkeypatch, capsys):

@@ -6,6 +6,12 @@ __pycache__/
 *.pyc
 .venv/
 .coinbase_key.json
+*.coinbase_key.json
+coinbase*.json
 scratch/
 data/
 dashboard/node_modules/
+# Render Secret Files should NEVER be committed. Add matching patterns here
+# defensively so a stray copy of the key JSON can't slip into git.
+/secrets/
+/etc/secrets/

@@ -80,6 +80,7 @@ def _mirror_live_position_into_paper(paper, product_id: str) -> bool:
             _log(f"live position {qty} exists but avg_entry unavailable — paper starts flat")
             return False
         _log(f"mirroring live position into paper: {qty} @ ${avg_entry:.4f}")
+        paper.set_pending_source("mirror")
         paper.place_limit("BUY" if qty > 0 else "SELL", abs(qty), avg_entry)
         paper.tick(avg_entry, avg_entry)
         return True
@@ -116,8 +117,13 @@ def run_paper_mode() -> int:
     ))
     _log(f"paper broker seeded: balance=${starting_balance:,.2f}")
 
-    if os.getenv("SWING_PAPER_MIRROR_LIVE", "1") != "0":
+    # Default: paper is fully isolated (no mirror) so a fresh run gives a fresh
+    # sandbox — no real-account cost basis leaks in. Set SWING_PAPER_MIRROR_LIVE=1
+    # to explicitly opt in (useful for "practice managing my current position").
+    if os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1":
         _mirror_live_position_into_paper(paper, SYMBOL)
+    else:
+        _log("paper starts flat (mirror disabled — set SWING_PAPER_MIRROR_LIVE=1 to enable)")
 
     trader = SwingTrader(paper, store, TENANT, SYMBOL, trade_log=log, kill_switch=ks)
 
@@ -151,6 +157,10 @@ def run_paper_mode() -> int:
                 time.sleep(0.1)
                 continue
             paper.tick(t["best_bid"], t["best_ask"])
+            # Forward exchange-provided 24h high/low if the feed shipped them.
+            set_range = getattr(paper, "set_external_day_range", None)
+            if callable(set_range):
+                set_range(t.get("high_24h"), t.get("low_24h"))
             trader.step(t["price"])
             now = time.time()
             if now - last_snapshot >= snapshot_interval:
@@ -211,12 +221,15 @@ def run_backtest_mode() -> int:
 
 
 def run_live_mode() -> int:
-    """CoinbaseBroker + LiveTickerFeed. REAL ORDERS."""
-    if os.getenv("SWING_LIVE_CONFIRM") != "I_UNDERSTAND":
-        _log("REFUSING to run live: set SWING_LIVE_CONFIRM=I_UNDERSTAND to override")
-        return 2
-    _log("live mode not yet wired — safety-first: aborting until reviewed")
-    return 2
+    """Delegate to live_runner.py — the safety-gated real-money entry point.
+
+    live_runner enforces preflight (broker health, product session, config
+    validation, kill switch, roll check, position vs floor) and refuses to
+    start on any failure. Requires SWING_LIVE_DRY_RUN=1 (fake orders) or
+    SWING_LIVE_CONFIRM=I_UNDERSTAND (real orders) to run at all.
+    """
+    from live_runner import run as run_live
+    return run_live()
 
 
 def main() -> int:

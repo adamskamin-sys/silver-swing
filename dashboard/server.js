@@ -30,13 +30,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ---- config -----------------------------------------------------------------
 
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const STORE_PATH = process.env.SWING_STORE_PATH ||
-  path.resolve(__dirname, '..', 'data', 'store.json');
-const TRADE_LOG_PATH = process.env.SWING_TRADE_LOG_PATH ||
-  path.resolve(__dirname, '..', 'data', 'trades.jsonl');
+const PORT = parseInt(process.env.PORT || process.env.DASHBOARD_PORT || '3000', 10);
+// SWING_DATA_DIR is the source of truth in prod (Render disk mount path).
+// SWING_STORE_PATH / SWING_TRADE_LOG_PATH still work for explicit override.
+const DATA_DIR = process.env.SWING_DATA_DIR || path.resolve(__dirname, '..', 'data');
+const STORE_PATH = process.env.SWING_STORE_PATH || path.join(DATA_DIR, 'store.json');
+const TRADE_LOG_PATH = process.env.SWING_TRADE_LOG_PATH || path.join(DATA_DIR, 'trades.jsonl');
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
-const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-do-not-ship-this';
+const SESSION_SECRET = process.env.DASHBOARD_SESSION_SECRET
+  || process.env.SESSION_SECRET
+  || 'dev-only-do-not-ship-this';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
 
 if (!DASHBOARD_PASSWORD) {
   console.warn('WARNING: DASHBOARD_PASSWORD not set. Login is disabled — dev mode only.');
@@ -52,6 +56,9 @@ export function makeApp({
 } = {}) {
   const app = express();
   app.use(express.json());
+  // Trust the Render proxy so req.secure reflects the client-facing HTTPS
+  // rather than the internal HTTP hop. Without this, secure cookies never set.
+  if (IS_PRODUCTION) app.set('trust proxy', 1);
   app.use(session({
     secret: sessionSecret,
     resave: false,
@@ -59,7 +66,7 @@ export function makeApp({
     cookie: {
       httpOnly: true,
       sameSite: 'lax',
-      // secure: true — set to true when serving over HTTPS in prod
+      secure: IS_PRODUCTION,
     },
   }));
 
@@ -179,6 +186,49 @@ export function makeApp({
     }
   });
 
+  // --- manual market order intent (dashboard queues, bot executes) ---
+  app.post('/api/manual-trade', requireAuth, async (req, res) => {
+    const { tenant, symbol, side, qty, confirm } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    if (confirm !== 'YES') return res.status(400).json({ ok: false, error: 'confirm must be "YES"' });
+    const s = String(side || '').toUpperCase();
+    if (!['BUY', 'SELL'].includes(s)) return res.status(400).json({ ok: false, error: 'side must be BUY or SELL' });
+    const q = Number(qty);
+    if (!Number.isFinite(q) || q < 1 || q > 100 || q !== Math.floor(q)) {
+      return res.status(400).json({ ok: false, error: 'qty must be a whole number 1–100' });
+    }
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      // Server-side floor check for SELL — mirror the bot's guard so the UI
+      // can show an immediate error rather than silently rejecting later.
+      if (s === 'SELL') {
+        const snap = store[tenant][symbol].snapshot || {};
+        const cfg = store[tenant][symbol].config || {};
+        const pos = Number(snap.position_qty ?? 0);
+        const core = Number(cfg.core_qty ?? 0);
+        if (pos - q < core) {
+          return res.status(400).json({
+            ok: false,
+            error: `sell ${q} would take position ${pos} below core ${core}. Increase core, or sell fewer contracts.`,
+          });
+        }
+      }
+      const snap = store[tenant][symbol].snapshot || {};
+      store[tenant][symbol].intent = {
+        side: s, qty: q,
+        mark: Number(snap.last_mark) || null,
+        submitted_ts: Date.now() / 1000,
+        submitted_by: 'dashboard',
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, queued: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // --- backtest (spawns Python subprocess) ---
   app.post('/api/backtest', requireAuth, async (req, res) => {
     const payload = req.body || {};
@@ -188,6 +238,177 @@ export function makeApp({
       res.json(result);
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // --- paper reset (wipe all paper state, restore starting balance) ------
+  // Live mode is refused — the bot's broker.reset() check prevents damage
+  // even if this endpoint fires, but we also gate here as defense in depth.
+  app.post('/api/reset-paper', requireAuth, async (req, res) => {
+    const { tenant, symbol, confirm, starting_balance } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    if (confirm !== 'YES') return res.status(400).json({ ok: false, error: 'confirm must be "YES"' });
+    try {
+      const store = await readStore(storePath);
+      const mode = store?.[tenant]?.[symbol]?.snapshot?.mode;
+      if (mode && mode !== 'paper') {
+        return res.status(400).json({ ok: false, error: `refusing to reset — current mode is ${mode}, not paper` });
+      }
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      // Full wipe: also clear user-defined strategies (sleeves) so the reset
+      // gives a genuine clean slate. Bot picks up the resulting empty sleeves
+      // list on its next tick, cancels any live orders those sleeves held,
+      // and their state is reset by _maybe_consume_reset_intent().
+      if (store[tenant][symbol].config?.sleeves) {
+        store[tenant][symbol].config.sleeves = [];
+      }
+      store[tenant][symbol].reset_intent = {
+        requested_ts: Date.now() / 1000,
+        requested_by: 'dashboard',
+        starting_balance: Number(starting_balance) || 100000,
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, queued: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // --- cancel a strategy's live order (primary or sleeve) -----------------
+  app.post('/api/cancel-order', requireAuth, async (req, res) => {
+    const { tenant, symbol, sleeve_id } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      store[tenant][symbol].cancel_intent = {
+        requested_ts: Date.now() / 1000,
+        sleeve_id: sleeve_id || null,  // null = primary
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, queued: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // --- resume a HALTED strategy (dashboard → bot bridge) ------------------
+  app.post('/api/resume', requireAuth, async (req, res) => {
+    const { tenant, symbol } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      const prevReason = store[tenant][symbol].state?.halt_reason || null;
+      store[tenant][symbol].resume_intent = {
+        requested_ts: Date.now() / 1000,
+        requested_by: 'dashboard',
+        previous_reason: prevReason,
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, queued: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // --- sleeves: additional per-symbol strategies -------------------------
+  // Each sleeve manages its own qty of contracts with its own params. Sum
+  // across sleeves + primary swing_qty must fit under (position - core_qty).
+  // We validate that ceiling here; the bot re-checks it on every arm as the
+  // last line of defense.
+  app.put('/api/sleeves', requireAuth, async (req, res) => {
+    const { tenant, symbol, sleeves } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    if (!Array.isArray(sleeves)) return res.status(400).json({ ok: false, error: 'sleeves must be an array' });
+
+    const issues = [];
+    const seenIds = new Set();
+    for (const s of sleeves) {
+      if (!s.id || typeof s.id !== 'string') { issues.push({ field: 'id', message: 'sleeve id required' }); continue; }
+      if (seenIds.has(s.id)) issues.push({ field: 'id', message: `duplicate sleeve id ${s.id}` });
+      seenIds.add(s.id);
+      const q = Number(s.qty);
+      if (!Number.isFinite(q) || q < 1 || q !== Math.floor(q))
+        issues.push({ field: `${s.id}.qty`, message: 'qty must be integer >= 1' });
+      const sell = Number(s.sell_px); const buy = Number(s.buy_px);
+      if (!Number.isFinite(sell) || !Number.isFinite(buy) || buy >= sell)
+        issues.push({ field: `${s.id}.buy_px`, message: 'buy_px must be < sell_px' });
+      if (s.exit_mode === 'hybrid') {
+        const act = Number(s.trail_activation_px);
+        const delay = Number(s.hybrid_delay_secs);
+        if (!Number.isFinite(act) || act <= sell)
+          issues.push({ field: `${s.id}.trail_activation_px`, message: 'trail_activation_px must be > sell_px' });
+        if (!Number.isFinite(delay) || delay < 1)
+          issues.push({ field: `${s.id}.hybrid_delay_secs`, message: 'hybrid_delay_secs must be >= 1' });
+      }
+    }
+    if (issues.length) return res.status(400).json({ ok: false, issues });
+
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      const cfg = store[tenant][symbol].config || {};
+
+      // Capacity check: only count sleeves CURRENTLY holding contracts
+      // (ARMED_SELL) toward the budget. ARMED_BUY sleeves already sold —
+      // their rebuys will consume position later. Otherwise a freshly bought
+      // batch of contracts appears "committed" the moment a sleeve rotates
+      // into sold-and-waiting state.
+      const primaryQty = Number(cfg.swing_qty ?? 0);
+      const core = Number(cfg.core_qty ?? 0);
+      const snap = store[tenant][symbol].snapshot || {};
+      const stateBlock = store[tenant][symbol].state || {};
+      const sleeveStates = stateBlock.sleeves || {};
+      const pos = Number(snap.position_qty ?? 0);
+      const activeSleeveQty = sleeves.reduce((n, s) => {
+        const st = sleeveStates[s.id]?.state || 'ARMED_SELL';
+        return n + (st === 'ARMED_SELL' ? Number(s.qty) : 0);
+      }, 0);
+      const budget = pos - core;
+      if (activeSleeveQty + primaryQty > budget) {
+        return res.status(400).json({
+          ok: false,
+          error: `active sleeves (ARMED_SELL) sum to ${activeSleeveQty} + primary ${primaryQty} = ${activeSleeveQty + primaryQty}, exceeds available ${budget} (position ${pos} - core ${core}). Buy more contracts or reduce sleeve qtys.`,
+        });
+      }
+
+      cfg.sleeves = sleeves;
+      store[tenant][symbol].config = cfg;
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  app.get('/api/positions', requireAuth, async (req, res) => {
+    // Read lots straight from the snapshot (paper broker writes them there
+    // every ~5s). No enrichment here — the snapshot already carries mark and
+    // per-lot unrealized P/L, so the dashboard just needs to render.
+    try {
+      const store = await readStore(storePath);
+      const view = {};
+      for (const [tenant, symbols] of Object.entries(store)) {
+        view[tenant] = {};
+        for (const [symbol, block] of Object.entries(symbols || {})) {
+          if (symbol.startsWith('__')) continue;  // skip sentinels (kill switch)
+          const snap = block.snapshot || {};
+          view[tenant][symbol] = {
+            position_qty: snap.position_qty || 0,
+            position_avg_entry: snap.position_avg_entry || 0,
+            last_mark: snap.last_mark || 0,
+            lots: snap.lots || [],
+          };
+        }
+      }
+      res.json({ positions: view, generated_at: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
     }
   });
 
@@ -218,8 +439,11 @@ async function readStore(storePath) {
 
 async function writeStoreAtomic(storePath, data) {
   // Mirror the Python JsonFileStateStore atomicity: write tmp, rename.
+  // Use a PID- and timestamp-suffixed tmp so we don't collide with the Python
+  // bot's tmp file when both processes write concurrently. Without this,
+  // whichever renames first wins and the other gets ENOENT on rename.
   await fs.mkdir(path.dirname(storePath), { recursive: true });
-  const tmp = storePath + '.tmp';
+  const tmp = `${storePath}.tmp-${process.pid}-${Date.now()}`;
   await fs.writeFile(tmp, JSON.stringify(data, null, 2));
   await fs.rename(tmp, storePath);
 }
@@ -230,9 +454,10 @@ const BACKTEST_SCRIPT = path.resolve(__dirname, '..', 'scripts', 'run_backtest.p
 
 function runPythonBacktest(payload) {
   return new Promise((resolve, reject) => {
+    const projectRoot = path.resolve(__dirname, '..');
     const proc = spawn(PYTHON_BIN, [BACKTEST_SCRIPT], {
-      cwd: path.resolve(__dirname, '..'),
-      env: process.env,
+      cwd: projectRoot,
+      env: { ...process.env, PYTHONPATH: projectRoot },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '', stderr = '';

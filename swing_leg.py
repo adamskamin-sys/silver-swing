@@ -37,6 +37,7 @@ from alerting import Notifier, Priority
 from state_store import StateStore
 from safety import KillSwitch, TradeLog
 from strategies import ExitStrategy, strategy_by_name
+from sleeves import SleeveConfig, SleeveState, SleeveStateEnum
 
 
 class State(str, Enum):
@@ -100,6 +101,12 @@ class SwingState:
     # Trailing-stop state (spec §5 "MUST persist")
     trail_armed: bool = False
     trail_high_water_price: float = 0.0
+    # Additional sleeves — each runs its own state machine in parallel to
+    # the primary strategy above. Empty dict = legacy single-strategy mode.
+    sleeves: dict[str, SleeveState] = field(default_factory=dict)
+    # Why the primary halted (last _halt() call). Displayed on the dashboard
+    # so the user can see what to fix before resuming. Cleared by resume.
+    halt_reason: Optional[str] = None
 
 
 class SwingTrader:
@@ -128,15 +135,23 @@ class SwingTrader:
 
     def _load_config(self) -> SwingConfig:
         d = self.store.get_config(self.tenant_id, self.symbol) or {}
-        return SwingConfig(**d) if d else SwingConfig()
+        if not d:
+            return SwingConfig()
+        # Strip fields SwingConfig doesn't own (sleeves live on a separate model,
+        # any unrecognized future field should be tolerated so the dashboard can
+        # add config keys without crashing the bot).
+        allowed = set(SwingConfig.__dataclass_fields__.keys())
+        clean = {k: v for k, v in d.items() if k in allowed}
+        return SwingConfig(**clean)
 
     def _load_state(self) -> SwingState:
         d = self.store.get_state(self.tenant_id, self.symbol)
         if not d:
             s = SwingState()
             s.swing_qty = self.cfg.swing_qty
+            s.sleeves = self._init_sleeves_state({})
             return s
-        return SwingState(
+        state = SwingState(
             state=State(d["state"]),
             live_order_id=d.get("live_order_id"),
             filled_qty=d.get("filled_qty", 0),
@@ -150,14 +165,33 @@ class SwingTrader:
             trail_armed=d.get("trail_armed", False),
             trail_high_water_price=d.get("trail_high_water_price", 0.0),
         )
+        state.sleeves = self._init_sleeves_state(d.get("sleeves") or {})
+        state.halt_reason = d.get("halt_reason")
+        return state
+
+    def _init_sleeves_state(self, persisted: dict) -> dict[str, SleeveState]:
+        """Materialize a SleeveState per configured additional sleeve. Missing
+        entries (new sleeve just added) start fresh in ARMED_SELL."""
+        out: dict[str, SleeveState] = {}
+        for sc in self._load_sleeves_cfg():
+            raw = persisted.get(sc.id)
+            out[sc.id] = SleeveState.from_dict(raw, sc.id) if raw else SleeveState(id=sc.id)
+        return out
+
+    def _load_sleeves_cfg(self) -> list[SleeveConfig]:
+        """Additional sleeves from cfg.sleeves list. The primary strategy
+        (cfg.swing_qty + cfg.sell_px/buy_px/exit_mode) is NOT a sleeve here —
+        it's the legacy state machine already on SwingState."""
+        raw = self.store.get_config(self.tenant_id, self.symbol) or {}
+        return [SleeveConfig.from_dict(s) for s in (raw.get("sleeves") or [])]
 
     def _save_state(self) -> None:
         import time as _time
         self.s.last_heartbeat_ts = _time.time()
-        self.store.put_state(self.tenant_id, self.symbol, {
-            **asdict(self.s),
-            "state": self.s.state.value,
-        })
+        d = asdict(self.s)
+        d["state"] = self.s.state.value
+        d["sleeves"] = {sid: s.to_dict() for sid, s in self.s.sleeves.items()}
+        self.store.put_state(self.tenant_id, self.symbol, d)
 
     def _notify(self, subject: str, body: str, priority: Priority) -> None:
         if self.notifier is None:
@@ -188,6 +222,9 @@ class SwingTrader:
         """
         pos = self.b.position_qty()
         if pos < self.cfg.core_qty:
+            # Position below core is a real invariant break — the "protected core"
+            # promise has already been violated. Halt so the user reviews. With
+            # core_qty=0 (free trading), this branch never fires.
             self._record(
                 "reconcile_halt",
                 actual_position=pos,
@@ -201,11 +238,24 @@ class SwingTrader:
             if st["status"] in ("FILLED", "CANCELLED", "EXPIRED", "UNKNOWN"):
                 self.s.live_order_id = None
                 self.s.filled_qty = st.get("filled_qty", 0)
+        # Same sweep for sleeves — a live_order_id that persisted across a bot
+        # restart (or a live-exchange cancel) points at nothing on the fresh
+        # broker. Clear it here so the sleeve state machine can re-arm on the
+        # first tick instead of polling a dead id every cycle.
+        cleared_sleeves = []
+        for sid, ss in self.s.sleeves.items():
+            if not ss.live_order_id: continue
+            st = self.b.order_status(ss.live_order_id)
+            if st.get("status") in ("FILLED", "CANCELLED", "EXPIRED", "UNKNOWN"):
+                cleared_sleeves.append((sid, ss.live_order_id, st.get("status")))
+                ss.live_order_id = None
+                ss.filled_qty = 0
         self._record(
             "reconciled",
             actual_position=pos,
             live_order_id=self.s.live_order_id,
             state=self.s.state.value,
+            cleared_sleeves=cleared_sleeves,
         )
         self._save_state()
 
@@ -218,6 +268,161 @@ class SwingTrader:
 
     def _kill_switch_active(self) -> bool:
         return self.ks is not None and self.ks.is_active()
+
+    # ---- manual intent (dashboard → bot bridge) --------------------------
+
+    def _maybe_execute_intent(self) -> None:
+        """Look for a dashboard-queued manual order and execute it.
+
+        Safety rules that override the intent (dashboard also validates, but
+        the bot is the last line of defense):
+          - SELL that would breach core_qty is REFUSED (logged, cleared)
+          - qty <= 0 is REFUSED
+          - broker without place_market falls back to aggressive place_limit
+        """
+        intent = self.store.get_intent(self.tenant_id, self.symbol)
+        if not intent:
+            return
+        try:
+            side = str(intent.get("side", "")).upper()
+            qty = int(intent.get("qty", 0))
+            if side not in ("BUY", "SELL") or qty <= 0:
+                self._record("intent_rejected", reason="bad side or qty", intent=intent)
+                return
+            if side == "SELL":
+                pos = self.b.position_qty()
+                if not self._floor_ok(pos, qty):
+                    self._record(
+                        "intent_rejected",
+                        reason=f"sell {qty} would breach floor (pos={pos}, core={self.cfg.core_qty})",
+                        intent=intent,
+                    )
+                    self._notify(
+                        f"manual trade REFUSED: {self.symbol}",
+                        f"tried to SELL {qty} but that breaches core {self.cfg.core_qty} at pos {pos}",
+                        Priority.WARN,
+                    )
+                    return
+
+            # Tag the resulting lot as "manual" so the positions page shows
+            # you clicked BUY vs the bot's swing running.
+            set_src = getattr(self.b, "set_pending_source", None)
+            if callable(set_src):
+                set_src("manual")
+            place_market = getattr(self.b, "place_market", None)
+            if callable(place_market):
+                oid = self.b.place_market(side, qty)
+                self._record("manual_market_order", side=side, qty=qty, order_id=oid)
+            else:
+                # Fallback: aggressive limit far from mid — should fill immediately
+                # against a normal book.
+                spread_est = self.cfg.tick_size * 100
+                anchor = intent.get("mark") or self.cfg.sell_px
+                px = float(anchor) + spread_est if side == "BUY" else float(anchor) - spread_est
+                oid = self.b.place_limit(side, qty, px)
+                self._record("manual_limit_order", side=side, qty=qty, order_id=oid, price=px)
+            self._notify(
+                f"manual {side} {qty} filled: {self.symbol}",
+                f"order_id={oid}",
+                Priority.INFO,
+            )
+        except Exception as e:
+            self._record("intent_execution_failed", error=str(e), intent=intent)
+        finally:
+            self.store.clear_intent(self.tenant_id, self.symbol)
+
+    # ---- cancel intent (dashboard cancels a strategy's live order) --------
+
+    def _maybe_execute_cancel_intent(self) -> None:
+        """Dashboard queued a cancel for a specific strategy's live order.
+        sleeve_id=None targets the primary. The strategy stays in its current
+        state — next tick, if the arm conditions still hold, it'll re-arm.
+        For a persistent stop, use Pause bot (kill switch) instead."""
+        get_ci = getattr(self.store, "get_cancel_intent", None)
+        if not callable(get_ci):
+            return
+        intent = get_ci(self.tenant_id, self.symbol)
+        if not intent:
+            return
+        try:
+            target = intent.get("sleeve_id")
+            if target is None:
+                # Primary strategy cancel
+                if self.s.live_order_id:
+                    try: self.b.cancel(self.s.live_order_id)
+                    except Exception as e:
+                        self._record("cancel_failed", order_id=self.s.live_order_id, error=str(e))
+                    self._record("primary_order_cancelled", order_id=self.s.live_order_id, requested_by="dashboard")
+                    self.s.live_order_id = None
+                    self.s.filled_qty = 0
+            else:
+                ss = self.s.sleeves.get(target)
+                if ss and ss.live_order_id:
+                    try: self.b.cancel(ss.live_order_id)
+                    except Exception as e:
+                        self._record("cancel_failed", sleeve_id=target, order_id=ss.live_order_id, error=str(e))
+                    self._record("sleeve_order_cancelled", sleeve_id=target, order_id=ss.live_order_id, requested_by="dashboard")
+                    ss.live_order_id = None
+                    ss.filled_qty = 0
+        finally:
+            self.store.clear_cancel_intent(self.tenant_id, self.symbol)
+
+    # ---- reset intent (dashboard wipes paper state) -----------------------
+
+    def _maybe_consume_reset_intent(self) -> None:
+        """Full paper-state wipe. Only applies to paper brokers — the broker
+        must implement a reset() method. Live CoinbaseBroker doesn't (and
+        shouldn't) — you can't wipe real positions from a dashboard button."""
+        if not hasattr(self.store, "get_reset_intent"):
+            return
+        intent = self.store.get_reset_intent(self.tenant_id, self.symbol)
+        if not intent:
+            return
+        reset_fn = getattr(self.b, "reset", None)
+        if not callable(reset_fn):
+            self._record("reset_ignored", reason="broker has no reset() — live mode?")
+            self.store.clear_reset_intent(self.tenant_id, self.symbol)
+            return
+        starting_balance = intent.get("starting_balance")
+        try:
+            reset_fn(starting_balance=starting_balance)
+        except TypeError:
+            reset_fn()
+        # Wipe trader state too — sleeves, cycles, live_order_id, everything.
+        self.s = SwingState(swing_qty=self.cfg.swing_qty)
+        self.s.sleeves = self._init_sleeves_state({})
+        self._save_state()
+        self._record(
+            "paper_reset",
+            starting_balance=starting_balance,
+            requested_by=intent.get("requested_by"),
+        )
+        self.store.clear_reset_intent(self.tenant_id, self.symbol)
+
+    # ---- resume intent (dashboard clears a HALT) --------------------------
+
+    def _maybe_consume_resume_intent(self) -> None:
+        """Dashboard posts to /api/resume to clear a HALT. That writes a
+        resume_intent to the store; we consume it here and reset state so the
+        strategy re-arms next tick. Sleeves halted for their own reasons get
+        reset too — the user made a deliberate call to un-pause everything."""
+        intent = self.store.get_resume_intent(self.tenant_id, self.symbol) if hasattr(self.store, "get_resume_intent") else None
+        if not intent:
+            return
+        if self.s.state == State.HALTED:
+            self.s.state = State.ARMED_SELL
+            self.s.halt_reason = None
+            self.s.live_order_id = None
+            self.s.filled_qty = 0
+            self._record("resume", cleared_reason=intent.get("previous_reason"))
+        for sid, ss in self.s.sleeves.items():
+            if ss.state == SleeveStateEnum.HALTED:
+                ss.state = SleeveStateEnum.ARMED_SELL
+                ss.live_order_id = None
+                ss.filled_qty = 0
+                self._record("sleeve_resume", sleeve_id=sid)
+        self.store.clear_resume_intent(self.tenant_id, self.symbol)
+        self._save_state()
 
     # ---- §2A fee gate (sanity ceiling only for MVP) ----------------------
 
@@ -270,6 +475,9 @@ class SwingTrader:
                 self._record("order_cancelled_for_rearm", order_id=self.s.live_order_id)
             except Exception as e:
                 self._record("cancel_failed", order_id=self.s.live_order_id, error=str(e))
+        set_src = getattr(self.b, "set_pending_source", None)
+        if callable(set_src):
+            set_src("strategy", strategy_id=getattr(self, "sleeve_id", None))
         self.s.live_order_id = self.b.place_limit(side, qty, price)
         self.s.filled_qty = 0
         self._record(
@@ -289,9 +497,19 @@ class SwingTrader:
         strat = self._exit_strategy()
         if self.s.state == State.ARMED_SELL:
             if not self._floor_ok(pos, self.s.swing_qty):
-                return self._halt(
-                    f"sell {self.s.swing_qty} would breach floor at pos {pos}"
+                # Transient: not enough contracts to arm the sell right now.
+                # Skip this tick and wait for more contracts — no HALT.
+                # HALT is reserved for genuine failures (margin call, bad config,
+                # explicit governor trip). Missing contracts is recoverable by
+                # buying more, which the user can do at any time.
+                self._record(
+                    "arm_sell_skipped",
+                    reason="insufficient contracts",
+                    position=pos,
+                    swing_qty=self.s.swing_qty,
+                    core_qty=self.cfg.core_qty,
                 )
+                return
             directive = strat.sell_action(self.s, self.cfg, current_price)
             if directive is None:
                 return  # trailing waiting for trigger / trail crossover
@@ -324,6 +542,14 @@ class SwingTrader:
     # ---- main loop -------------------------------------------------------
 
     def step(self, last_price: float) -> None:
+        # Dashboard can request a full paper-state wipe. Consume BEFORE any
+        # other work so a stale state doesn't try to run on the fresh account.
+        self._maybe_consume_reset_intent()
+
+        # Dashboard can request an unhalt via a resume intent. Consume it BEFORE
+        # the HALTED early-return so a halted strategy can actually restart.
+        self._maybe_consume_resume_intent()
+
         if self.s.state == State.HALTED:
             return
 
@@ -333,6 +559,12 @@ class SwingTrader:
         if self._kill_switch_active():
             self._record("kill_switch_pause", reason=self.ks.reason() if self.ks else None)
             return
+
+        # Manual intent: dashboard may have queued a market order for us to
+        # execute. Consume it BEFORE the strategy step so the state machine
+        # sees the resulting position, not the pre-intent one.
+        self._maybe_execute_intent()
+        self._maybe_execute_cancel_intent()
 
         # Refresh config from store — dashboard edits take effect next cycle.
         cfg = self._load_config()
@@ -348,15 +580,352 @@ class SwingTrader:
             )
 
         self._ensure_armed(last_price)
-        if not self.s.live_order_id:
-            self._save_state()
+        if self.s.live_order_id:
+            st = self.b.order_status(self.s.live_order_id)
+            self.s.filled_qty = st.get("filled_qty", 0)
+            if st.get("status") == "FILLED" and self.s.filled_qty >= self.s.swing_qty:
+                self._on_fill(fill_price=st.get("average_filled_price"))
+
+        # Reload sleeve configs each tick — user may have added/removed sleeves
+        # from the dashboard. Ensure state dict has entries for all configured.
+        sleeves_cfg = self._load_sleeves_cfg()
+        configured_ids = {sc.id for sc in sleeves_cfg}
+        # Drop state for removed sleeves; add fresh state for new ones.
+        for sid in list(self.s.sleeves.keys()):
+            if sid not in configured_ids:
+                # Cancel any live order first
+                st_obj = self.s.sleeves[sid]
+                if st_obj.live_order_id:
+                    try: self.b.cancel(st_obj.live_order_id)
+                    except Exception: pass
+                del self.s.sleeves[sid]
+        for sc in sleeves_cfg:
+            if sc.id not in self.s.sleeves:
+                self.s.sleeves[sc.id] = SleeveState(id=sc.id)
+
+        # Run each additional sleeve's state machine independently.
+        for sc in sleeves_cfg:
+            self._sleeve_step(sc, self.s.sleeves[sc.id], last_price)
+
+        self._save_state()
+
+    def _sleeve_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
+        """Independent state machine for one additional sleeve. Shares broker,
+        position, and floor guard with siblings and with the primary strategy."""
+        if ss.state == SleeveStateEnum.HALTED:
             return
 
-        st = self.b.order_status(self.s.live_order_id)
-        self.s.filled_qty = st.get("filled_qty", 0)
-        if st.get("status") == "FILLED" and self.s.filled_qty >= self.s.swing_qty:
-            self._on_fill(fill_price=st.get("average_filled_price"))
-        self._save_state()
+        # Abort governor uses the symbol-level bands.
+        if ss.state == SleeveStateEnum.ARMED_SELL and last_price >= self.cfg.abort_above:
+            return self._sleeve_halt(sc, ss, f"price {last_price} above abort_above {self.cfg.abort_above}")
+        if ss.state == SleeveStateEnum.ARMED_BUY and last_price <= self.cfg.abort_below:
+            return self._sleeve_halt(sc, ss, f"price {last_price} below abort_below {self.cfg.abort_below}")
+
+        # Arm if no live order.
+        if not ss.live_order_id:
+            if ss.state == SleeveStateEnum.ARMED_SELL:
+                # Floor guard: sum of all pending sells (primary + sleeves) + this sleeve
+                # must not take the position below core_qty.
+                pos = self.b.position_qty()
+                pending = self._pending_sell_qty_excluding(sc.id)
+                if pos - pending - sc.qty < self.cfg.core_qty:
+                    # Transient — try again next tick when more contracts free up.
+                    self._record(
+                        "sleeve_arm_skipped",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        reason="insufficient contracts",
+                        position=pos, other_pending=pending,
+                        sleeve_qty=sc.qty, core_qty=self.cfg.core_qty,
+                    )
+                    return
+
+                # Mode-specific arm price.
+                # fixed_limit / percentage_swing: sell resting at sc.sell_px.
+                # trailing_stop: wait for trigger, then track high water, place a
+                #   sell one tick below current when pullback exceeds trail_distance.
+                # hybrid: sell_px triggers a delay window; within the window a
+                #   push through trail_activation_px flips to trailing, otherwise
+                #   we market-sell when the delay expires.
+                if sc.exit_mode == "trailing_stop":
+                    if not ss.trail_armed:
+                        if last_price < sc.trail_trigger:
+                            return  # not at trigger yet — no order, just wait
+                        ss.trail_armed = True
+                        ss.trail_high_water_price = last_price
+                    if last_price > ss.trail_high_water_price:
+                        ss.trail_high_water_price = last_price
+                    stop = ss.trail_high_water_price - sc.trail_distance
+                    if last_price > stop:
+                        return  # still trailing; don't fire yet
+                    # Spec §5A minimum lock-in: refuse to fire if the projected
+                    # net is below the sleeve's configured target. Keep trailing
+                    # until HWM rises enough to lock in at least the target.
+                    if not self._sleeve_lockin_ok(sc, ss, stop):
+                        return
+                    self._sleeve_market_sell(sc, ss, last_price, trail_exit=True)
+                elif sc.exit_mode == "hybrid":
+                    self._sleeve_hybrid_step(sc, ss, last_price)
+                else:
+                    self._sleeve_arm(sc, ss, "SELL", sc.qty, sc.sell_px)
+            else:  # ARMED_BUY
+                self._sleeve_arm(sc, ss, "BUY", sc.qty, sc.buy_px)
+            return
+
+        # Poll the live order.
+        st = self.b.order_status(ss.live_order_id)
+        filled = st.get("filled_qty", 0) or 0
+        status = st.get("status")
+        if status == "FILLED" and filled >= sc.qty:
+            self._sleeve_on_fill(sc, ss, st.get("average_filled_price"))
+        elif status in ("CANCELLED", "EXPIRED", "UNKNOWN"):
+            # Zombie order — most commonly a live_order_id persisted through a
+            # restart while the broker was re-created (paper) or the exchange
+            # cancelled after a timeout (live). Clear it so the state machine
+            # can re-arm next tick instead of polling a dead id forever.
+            self._record("sleeve_order_cleared",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                order_id=ss.live_order_id, status=status)
+            ss.live_order_id = None
+            ss.filled_qty = 0
+
+    def _pending_sell_qty_excluding(self, exclude_sleeve_id: Optional[str]) -> int:
+        """Total qty of SELL orders currently armed across the primary strategy
+        and all sleeves EXCEPT the given one. Used by the floor guard so a
+        sleeve considers the other outstanding sells when deciding if it can
+        safely arm its own sell."""
+        n = 0
+        # Primary strategy: if armed sell with a live order, it's pending.
+        if self.s.state == State.ARMED_SELL and self.s.live_order_id:
+            n += int(self.s.swing_qty)
+        for sid, ss in self.s.sleeves.items():
+            if sid == exclude_sleeve_id: continue
+            sc = next((c for c in self._load_sleeves_cfg() if c.id == sid), None)
+            if sc is None: continue
+            if ss.state == SleeveStateEnum.ARMED_SELL and ss.live_order_id:
+                n += int(sc.qty)
+        return n
+
+    def _sleeve_lockin_ok(self, sc: SleeveConfig, ss: SleeveState, stop_price: float) -> bool:
+        """Spec §5A minimum lock-in guard for trailing exits.
+
+        The sleeve's target net is the round-trip P/L it was configured for:
+          target_net = (sell_px - buy_px) × size × qty − fee_roundtrip × qty
+        The projected NET if the trail fires at `stop_price`:
+          net_at_stop = (stop_price - cost_basis) × size × qty − fee_roundtrip × qty
+        Refuse to fire if net_at_stop < target_net. The trail keeps riding
+        until HWM climbs enough that the projected net clears the target.
+        """
+        cs = self.cfg.contract_size
+        fees = self.cfg.fee_per_contract_roundtrip * sc.qty
+        # Sleeve's configured target: what the swing was designed to earn.
+        target_net = (sc.sell_px - sc.buy_px) * cs * sc.qty - fees
+        if target_net <= 0:
+            return True  # weirdly configured — don't gate
+        basis = ss.sell_entry_avg
+        if basis is None:
+            basis = self._sleeve_avg_entry(sc)
+            if basis is not None:
+                ss.sell_entry_avg = basis
+        if basis is None:
+            basis = float(sc.buy_px)  # last-resort fallback
+        net_at_stop = (stop_price - basis) * cs * sc.qty - fees
+        if net_at_stop < target_net:
+            self._record(
+                "sleeve_trail_lockin_skipped",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                stop=stop_price, cost_basis=basis,
+                projected_net=net_at_stop, target_net=target_net,
+            )
+            return False
+        return True
+
+    def _sleeve_market_sell(self, sc: SleeveConfig, ss: SleeveState, last_price: float, trail_exit: bool = False, hybrid_timeout: bool = False) -> None:
+        """Exit at market — the fill happens NOW, not at some limit price that
+        the bid may never cross while price rolls over. In paper this fills at
+        the current bid; live hits the exchange's market path. If the broker
+        has no place_market, fall back to an aggressive limit that crosses."""
+        # Anchor realized P/L on what THIS sleeve actually paid for the
+        # contracts it's about to sell. Captured BEFORE the fill because
+        # after the sell those lots are consumed.
+        if ss.sell_entry_avg is None:
+            ss.sell_entry_avg = self._sleeve_avg_entry(sc) or float(sc.buy_px)
+        set_src = getattr(self.b, "set_pending_source", None)
+        if callable(set_src):
+            set_src("strategy", strategy_id=sc.id)
+        place_market = getattr(self.b, "place_market", None)
+        if callable(place_market):
+            ss.live_order_id = self.b.place_market("SELL", sc.qty)
+            self._record("sleeve_order_placed",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                side="SELL", qty=sc.qty, price=last_price,
+                trail_exit=trail_exit, hybrid_timeout=hybrid_timeout,
+                cost_basis=ss.sell_entry_avg, order_id=ss.live_order_id)
+        else:
+            tick = self.cfg.tick_size or 0.005
+            aggressive_px = last_price - 10 * tick
+            self._sleeve_arm(sc, ss, "SELL", sc.qty, aggressive_px)
+
+    def _sleeve_hybrid_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
+        """Hybrid exit: sell_px triggers a delay window. Inside the window a
+        cross of trail_activation_px flips to trailing (ride the breakout);
+        otherwise the sleeve market-sells at the end of the window (took the
+        swing at the target).
+
+        Sub-states are encoded on SleeveState:
+          hybrid_sell_triggered_ts is None   → waiting for price to reach sell_px
+          hybrid_sell_triggered_ts set, trail_armed False → inside delay window
+          trail_armed True                    → trailing engaged (rode breakout)
+        """
+        import time as _time
+        # Stage 1: waiting for sell_px to be hit.
+        if ss.hybrid_sell_triggered_ts is None:
+            if last_price < sc.sell_px:
+                return
+            ss.hybrid_sell_triggered_ts = _time.time()
+            self._record("sleeve_hybrid_triggered",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                sell_px=sc.sell_px, last_price=last_price,
+                delay_secs=sc.hybrid_delay_secs,
+                activation_px=sc.trail_activation_px)
+            # Fall through so a tick that clears both sell_px AND activation_px
+            # in the same instant can engage the trail immediately.
+
+        # Stage 3: trail already engaged — normal trailing logic.
+        if ss.trail_armed:
+            if last_price > ss.trail_high_water_price:
+                ss.trail_high_water_price = last_price
+            stop = ss.trail_high_water_price - sc.trail_distance
+            if last_price > stop:
+                return
+            # Spec §5A: hybrid → trailing inherits the min lock-in rule.
+            if not self._sleeve_lockin_ok(sc, ss, stop):
+                return
+            self._sleeve_market_sell(sc, ss, last_price, trail_exit=True)
+            return
+
+        # Stage 2: inside the delay window.
+        if last_price >= sc.trail_activation_px:
+            # Real breakout — engage trail and let it ride.
+            ss.trail_armed = True
+            ss.trail_high_water_price = last_price
+            self._record("sleeve_hybrid_trail_engaged",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                activation_px=sc.trail_activation_px, last_price=last_price)
+            return
+
+        elapsed = _time.time() - ss.hybrid_sell_triggered_ts
+        if elapsed < sc.hybrid_delay_secs:
+            return  # still watching — no order placed yet
+        # Delay expired without a breakout — take the swing at market.
+        self._record("sleeve_hybrid_timeout_selling",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            elapsed=elapsed, delay_secs=sc.hybrid_delay_secs,
+            last_price=last_price)
+        self._sleeve_market_sell(sc, ss, last_price, hybrid_timeout=True)
+
+    def _sleeve_avg_entry(self, sc: SleeveConfig) -> Optional[float]:
+        """Weighted-avg entry price of the contracts this sleeve OWNS, using
+        the same FIFO allocation the dashboard shows: sleeve-tagged lots first,
+        then unassigned lots FIFO after primary and prior sleeves get their share.
+        Returns None if the broker doesn't expose lots or the sleeve owns nothing.
+        """
+        lots = getattr(self.b, "lots", None)
+        if not lots:
+            return None
+        expanded = []
+        for lot in sorted(lots, key=lambda l: getattr(l, "entry_ts", 0)):
+            for _ in range(int(getattr(lot, "qty", 0) or 0)):
+                expanded.append((float(getattr(lot, "entry_price", 0.0) or 0.0),
+                                 getattr(lot, "strategy_id", None)))
+        mine = [px for px, sid in expanded if sid == sc.id]
+        unassigned = [px for px, sid in expanded if sid != sc.id]
+        skip = int(self.cfg.swing_qty or 0)
+        for other in self._load_sleeves_cfg():
+            if other.id == sc.id:
+                break
+            skip += int(other.qty or 0)
+        pool = unassigned[skip:]
+        need = int(sc.qty) - len(mine)
+        if need > 0:
+            mine.extend(pool[:need])
+        if not mine:
+            return None
+        return sum(mine) / len(mine)
+
+    def _sleeve_arm(self, sc: SleeveConfig, ss: SleeveState, side: str, qty: int, price: float) -> None:
+        # For SELL: capture cost basis of the contracts we're about to sell so
+        # realized P/L on the fill uses the ACTUAL price paid, not sc.buy_px.
+        if side == "SELL" and ss.sell_entry_avg is None:
+            ss.sell_entry_avg = self._sleeve_avg_entry(sc) or float(sc.buy_px)
+        set_src = getattr(self.b, "set_pending_source", None)
+        if callable(set_src):
+            set_src("strategy", strategy_id=sc.id)
+        try:
+            ss.live_order_id = self.b.place_limit(side, qty, price)
+        except Exception as e:
+            self._record("sleeve_arm_failed", sleeve_id=sc.id, error=str(e))
+            return
+        self._record(
+            "sleeve_order_placed",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            side=side, qty=qty, price=price, order_id=ss.live_order_id,
+            **({"cost_basis": ss.sell_entry_avg} if side == "SELL" else {}),
+        )
+
+    def _sleeve_on_fill(self, sc: SleeveConfig, ss: SleeveState, fill_price) -> None:
+        self._record(
+            "sleeve_order_filled",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            leg=ss.state.value, filled_qty=sc.qty,
+            average_filled_price=fill_price,
+        )
+        ss.live_order_id = None
+        half_fee = (self.cfg.fee_per_contract_roundtrip / 2.0) * sc.qty
+        if ss.state == SleeveStateEnum.ARMED_SELL:
+            # Sell fill = profit realization. Anchor on the actual FIFO cost
+            # basis captured at arm time. This matches the position-row math:
+            # you sold contracts you owned, realized P/L happens NOW.
+            try: fill = float(fill_price) if fill_price is not None else 0.0
+            except (TypeError, ValueError): fill = 0.0
+            basis = float(ss.sell_entry_avg) if ss.sell_entry_avg is not None else float(sc.buy_px)
+            gross = (fill - basis) * self.cfg.contract_size * sc.qty
+            ss.realized_pnl += gross - half_fee
+            ss.cycles += 1
+            ss.last_sell_qty = sc.qty
+            ss.last_sell_fill_price = fill if fill else None
+            ss.sell_entry_avg = None  # cleared until next arm recomputes
+            ss.state = SleeveStateEnum.ARMED_BUY
+            # Trail/hybrid sub-states reset here so the rebuy is a clean slate.
+            ss.trail_armed = False
+            ss.trail_high_water_price = 0.0
+            ss.hybrid_sell_triggered_ts = None
+            self._record(
+                "sleeve_cycle_completed",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                cycles=ss.cycles,
+                cost_basis=basis, fill_price=fill,
+                gross=gross, fees=half_fee,
+                realized_pnl_total=ss.realized_pnl,
+            )
+        else:
+            # Buy-back re-arms the sleeve. Deduct the buy-side fee (round-trip
+            # fees are split across both legs so this leg pays its share).
+            ss.realized_pnl -= half_fee
+            ss.state = SleeveStateEnum.ARMED_SELL
+            self._record(
+                "sleeve_rebuy_completed",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                fill_price=fill_price, fees=half_fee,
+                realized_pnl_total=ss.realized_pnl,
+            )
+
+    def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:
+        if ss.live_order_id:
+            try: self.b.cancel(ss.live_order_id)
+            except Exception: pass
+            ss.live_order_id = None
+        ss.state = SleeveStateEnum.HALTED
+        self._record("sleeve_halted", sleeve_id=sc.id, sleeve_name=sc.name, reason=reason)
 
     def _on_fill(self, fill_price: Optional[float] = None) -> None:
         self._record(
@@ -369,37 +938,45 @@ class SwingTrader:
         strat = self._exit_strategy()
         self.s.live_order_id = None
         self.s.filled_qty = 0
+        half_fee = (self.cfg.fee_per_contract_roundtrip / 2.0) * self.s.swing_qty
         if self.s.state == State.ARMED_SELL:
+            # Sell fill = profit realization. Anchor on the position's blended
+            # avg entry (broker-tracked). This matches the sleeve semantics:
+            # realize immediately, cycles++ on the sell, not on the buy-back.
+            try: fill = float(fill_price) if fill_price is not None else 0.0
+            except (TypeError, ValueError): fill = 0.0
+            pos_avg = getattr(getattr(self.b, "position", None), "avg_entry", 0.0) or float(self.cfg.buy_px)
+            gross = (fill - float(pos_avg)) * self.cfg.contract_size * self.s.swing_qty
+            self.s.realized_pnl += gross - half_fee
+            self.s.cycles += 1
             self.s.last_sell_qty = self.s.swing_qty
-            if fill_price is not None:
-                try:
-                    self.s.last_sell_fill_price = float(fill_price)
-                except (TypeError, ValueError):
-                    self.s.last_sell_fill_price = None
+            self.s.last_sell_fill_price = fill if fill else None
             strat.on_sell_filled(self.s, self.cfg, fill_price or 0.0)
             self.s.state = State.ARMED_BUY
-        else:
-            # Use the actual sell fill price for realized-P&L calc when we have
-            # it (trailing exits can fill above cfg.sell_px). Fall back to the
-            # configured sell_px for fixed-limit runs.
-            effective_sell_px = self.s.last_sell_fill_price or self.cfg.sell_px
-            gross = (effective_sell_px - self.cfg.buy_px) * self.cfg.contract_size * self.s.last_sell_qty
-            fees = self.cfg.fee_per_contract_roundtrip * self.s.last_sell_qty
-            self.s.realized_pnl += gross - fees
-            added = self.s.swing_qty - self.s.last_sell_qty
-            if added > 0:
-                self.s.reserved_margin += added * self.cfg.margin_per_contract
-            self.s.cycles += 1
-            strat.on_buy_filled(self.s, self.cfg, fill_price or 0.0)
-            self.s.state = State.ARMED_SELL
+            # Trail state resets per cycle so the rebuy leg starts clean.
+            self.s.trail_armed = False
+            self.s.trail_high_water_price = 0.0
             self._record(
                 "cycle_completed",
                 cycles=self.s.cycles,
-                gross=gross,
-                fees=fees,
+                gross=gross, fees=half_fee,
+                cost_basis=pos_avg, fill_price=fill,
                 realized_pnl_total=self.s.realized_pnl,
                 swing_qty=self.s.swing_qty,
-                effective_sell_px=effective_sell_px,
+            )
+        else:
+            # Buy-back re-arms. Deduct the buy-side share of round-trip fees.
+            self.s.realized_pnl -= half_fee
+            added = self.s.swing_qty - self.s.last_sell_qty
+            if added > 0:
+                self.s.reserved_margin += added * self.cfg.margin_per_contract
+            strat.on_buy_filled(self.s, self.cfg, fill_price or 0.0)
+            self.s.state = State.ARMED_SELL
+            self._record(
+                "rebuy_completed",
+                fill_price=fill_price, fees=half_fee,
+                realized_pnl_total=self.s.realized_pnl,
+                swing_qty=self.s.swing_qty,
             )
         self._save_state()
 
@@ -411,6 +988,7 @@ class SwingTrader:
                 pass
         self.s.live_order_id = None
         self.s.state = State.HALTED
+        self.s.halt_reason = reason or None
         self._save_state()
         self._record("halt", reason=reason)
         self._notify(
