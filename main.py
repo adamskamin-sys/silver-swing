@@ -171,6 +171,10 @@ def run_paper_mode() -> int:
 
         snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
         last_snapshot = 0.0
+        scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "60.0"))
+        last_scanner = 0.0
+        _coinbase_for_scanner = None  # lazy-init: shared REST client
+        redis_url = os.getenv("REDIS_URL")
         while not stopping:
             t = feed.latest_ticker()
             if t is None:
@@ -196,6 +200,19 @@ def run_paper_mode() -> int:
                     snap["microstructure"] = ms.snapshot()
                 store.put_snapshot(TENANT, SYMBOL, snap)
                 last_snapshot = now
+            if redis_url and now - last_scanner >= scanner_interval:
+                try:
+                    from scanner import fetch_and_rank, write_ranking_to_redis
+                    if _coinbase_for_scanner is None:
+                        from broker import BrokerConfig, CoinbaseBroker
+                        _coinbase_for_scanner = CoinbaseBroker(
+                            BrokerConfig(product_id=SYMBOL)
+                        ).client
+                    ranking = fetch_and_rank(_coinbase_for_scanner, top_n=10)
+                    write_ranking_to_redis(redis_url, ranking, generated_at=now)
+                except Exception as e:
+                    _log(f"scanner refresh failed: {type(e).__name__}: {e}")
+                last_scanner = now
             time.sleep(LOOP_INTERVAL_SECS)
 
     finally:

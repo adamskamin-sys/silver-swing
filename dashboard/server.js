@@ -45,6 +45,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.REN
 const REDIS_URL = process.env.REDIS_URL || null;
 const REDIS_STORE_KEY = 'silver-swing:store';
 const REDIS_TRADES_KEY = 'silver-swing:trades';
+const REDIS_SCANNER_KEY = 'silver-swing:scanner';
 
 if (!DASHBOARD_PASSWORD) {
   console.warn('WARNING: DASHBOARD_PASSWORD not set. Login is disabled — dev mode only.');
@@ -422,6 +423,18 @@ export function makeApp({
         }
       }
       res.json({ positions: view, generated_at: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.get('/api/scanner', requireAuth, async (req, res) => {
+    const r = await getRedis();
+    if (!r) return res.json({ top: [], generated_at: null, note: 'redis not configured' });
+    try {
+      const raw = await r.get(REDIS_SCANNER_KEY);
+      if (!raw) return res.json({ top: [], generated_at: null });
+      res.json(JSON.parse(raw));
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }

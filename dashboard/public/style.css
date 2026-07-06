@@ -1112,3 +1112,17 @@ header { padding: 20px 32px; }
   border-top: 1px solid var(--border);
   font-family: var(--mono); font-size: 12px; color: var(--muted);
 }
+
+/* ---- scanner tab ------------------------------------------------------- */
+#scanner-section { margin-top: 16px; padding: 16px 20px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+#scanner-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px;
+  color: var(--muted); margin: 0 0 8px 0; }
+#scanner-updated { font-family: var(--mono); font-size: 11px; margin-bottom: 12px; }
+#scanner-table { width: 100%; border-collapse: collapse; }
+#scanner-table th, #scanner-table td { padding: 10px 12px; text-align: left;
+  border-bottom: 1px solid var(--border); font-size: 13px; }
+#scanner-table th { text-transform: uppercase; letter-spacing: 1px;
+  font-size: 10px; color: var(--muted); font-weight: normal; }
+#scanner-table tr:hover { background: var(--panel-3); }
+.mode-tab.mode-scanner.active { border-color: #8f7ae0; color: #d5cef5; }

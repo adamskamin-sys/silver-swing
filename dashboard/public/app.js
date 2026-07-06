@@ -245,18 +245,18 @@ function renderModeTabs(store) {
     }
   }
   modeTabs.innerHTML = '';
-  if (!counts.paper && !counts.live) return;
 
-  const mk = (label, mode, badgeClass) => {
+  const mk = (label, mode, badgeClass, badge = '') => {
     const b = document.createElement('button');
     b.className = 'tab mode-tab' + (activeMode === mode ? ' active' : '')
       + (badgeClass ? ' ' + badgeClass : '');
-    b.innerHTML = `${label} <span class="tab-count">${counts[mode] || 0}</span>`;
+    b.innerHTML = `${label}${badge ? ` <span class="tab-count">${badge}</span>` : ''}`;
     b.onclick = () => { activeMode = mode; refreshOnce(); };
     return b;
   };
-  modeTabs.appendChild(mk('paper', 'paper', 'mode-paper'));
-  modeTabs.appendChild(mk('live', 'live', 'mode-live'));
+  modeTabs.appendChild(mk('paper', 'paper', 'mode-paper', counts.paper || 0));
+  modeTabs.appendChild(mk('live', 'live', 'mode-live', counts.live || 0));
+  modeTabs.appendChild(mk('scanner', 'scanner', 'mode-scanner'));
 }
 
 function renderAssetTabs(store) {
@@ -1280,6 +1280,42 @@ function renderTradeEvent(ev) {
 
 // ---- refresh loop -------------------------------------------------------
 
+async function refreshScanner() {
+  try {
+    const resp = await fetch('/api/scanner');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const tbody = document.querySelector('#scanner-table tbody');
+    const updated = document.getElementById('scanner-updated');
+    if (!tbody) return;
+    tbody.innerHTML = '';
+    const top = Array.isArray(data.top) ? data.top : [];
+    if (top.length === 0) {
+      updated.textContent = 'no ranking yet — the paper bot writes one every ~60 seconds.';
+      return;
+    }
+    if (data.generated_at) {
+      const dt = new Date(data.generated_at * 1000);
+      updated.textContent = `updated ${dt.toLocaleTimeString()}`;
+    }
+    top.forEach((row, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td class="mono">${escapeHtml(row.product_id)}</td>
+        <td class="mono">$${fmtNum(row.price, 4)}</td>
+        <td class="mono pos">$${fmtNum(row.high_24h, 4)}</td>
+        <td class="mono neg">$${fmtNum(row.low_24h, 4)}</td>
+        <td class="mono"><b>${fmtNum(row.vol_pct, 2)}%</b></td>
+        <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    console.error('scanner refresh failed', err);
+  }
+}
+
 async function refreshOnce() {
   const [status, trades] = await Promise.all([
     fetchJson('/api/status'),
@@ -1291,12 +1327,26 @@ async function refreshOnce() {
   renderModeTabs(currentStore);
   renderAssetTabs(currentStore);
 
+  const scannerSection = document.getElementById('scanner-section');
+  const showScanner = activeMode === 'scanner';
+  if (scannerSection) scannerSection.hidden = !showScanner;
+  cardsEl.hidden = showScanner;
+  document.getElementById('asset-tabs').hidden = showScanner;
+
+  if (showScanner) {
+    refreshScanner();
+    cardsEl.innerHTML = '';
+    tradeLogEl.innerHTML = '';
+    lastUpdated.textContent = `updated ${new Date().toLocaleTimeString()}`;
+    return;
+  }
+
   cardsEl.innerHTML = '';
   const tenants = Object.keys(currentStore).sort();
   let anyRendered = false;
   for (const tenant of tenants) {
     const m = modeOfTenant(tenant);
-    if (activeMode && m && m !== activeMode) continue;
+    if (activeMode && activeMode !== 'scanner' && m && m !== activeMode) continue;
     const symbols = Object.keys(currentStore[tenant] || {}).sort();
     for (const symbol of symbols) {
       if (symbol === '__account_kill_switch__') continue;
