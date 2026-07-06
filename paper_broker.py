@@ -421,6 +421,95 @@ class PaperBroker:
         self._external_high_24h = high_24h
         self._external_low_24h = low_24h
 
+    # ---- Persistence -----------------------------------------------------
+    # Paper positions used to vanish on every worker restart because this
+    # broker's state was in-memory only. Now we serialize the authoritative
+    # bits to the store on each snapshot and restore on boot.
+    #
+    # Deliberately NOT persisted:
+    #   - cfg (comes from PaperConfig which is deterministic from env)
+    #   - _external_high_24h/low_24h (fresh from the feed each tick)
+    #   - _pending_source/_pending_strategy_id (transient — set right before place_*)
+
+    def to_state_dict(self) -> dict:
+        return {
+            "balance": self.balance,
+            "realized_pnl": self.realized_pnl,
+            "fees_paid": self.fees_paid,
+            "position": {
+                "product_id": self.position.product_id,
+                "qty": self.position.qty,
+                "avg_entry": self.position.avg_entry,
+            },
+            "lots": [
+                {"id": l.id, "qty": l.qty, "entry_price": l.entry_price,
+                 "entry_ts": l.entry_ts, "source": l.source,
+                 "strategy_id": l.strategy_id}
+                for l in self.lots
+            ],
+            "high_water_mark": self.high_water_mark,
+            "max_drawdown": self.max_drawdown,
+            "last_mark": self._last_mark,
+            "day_high": self._day_high,
+            "day_low": self._day_low,
+            "day_reset_utc_date": self._day_reset_utc_date,
+            "halted": self._halted,
+            "halt_reason": self._halt_reason,
+            "open_orders": [
+                {"order_id": o.order_id, "product_id": o.product_id,
+                 "side": o.side, "qty": o.qty, "limit_price": o.limit_price,
+                 "placed_at": o.placed_at}
+                for o in self.open_orders.values()
+            ],
+        }
+
+    def restore_from_state_dict(self, d: dict) -> None:
+        """Restore in-memory state from a previously-serialized dict. Called
+        on boot when the store already has paper state for this tenant/symbol.
+        Silently ignores unknown keys so old snapshots don't blow up after
+        we add fields."""
+        self.balance = float(d.get("balance", self.cfg.starting_balance))
+        self.realized_pnl = float(d.get("realized_pnl", 0.0))
+        self.fees_paid = float(d.get("fees_paid", 0.0))
+        p = d.get("position") or {}
+        self.position = PaperPosition(
+            product_id=p.get("product_id", self.cfg.product_id),
+            qty=int(p.get("qty", 0)),
+            avg_entry=float(p.get("avg_entry", 0.0)),
+        )
+        self.lots = [
+            Lot(
+                id=l.get("id") or str(uuid.uuid4()),
+                qty=int(l["qty"]),
+                entry_price=float(l["entry_price"]),
+                entry_ts=float(l.get("entry_ts", 0.0)),
+                source=l.get("source", "unknown"),
+                strategy_id=l.get("strategy_id"),
+            )
+            for l in (d.get("lots") or [])
+        ]
+        self.high_water_mark = float(d.get("high_water_mark", self.balance))
+        self.max_drawdown = float(d.get("max_drawdown", 0.0))
+        self._last_mark = float(d.get("last_mark", 0.0))
+        self._day_high = d.get("day_high")
+        self._day_low = d.get("day_low")
+        self._day_reset_utc_date = d.get("day_reset_utc_date")
+        self._halted = bool(d.get("halted", False))
+        self._halt_reason = d.get("halt_reason")
+        # Restore any resting limit orders. status/filled_qty/fill_price stay
+        # at their defaults from PaperOrder since only OPEN orders serialize.
+        self.open_orders = {}
+        for o in (d.get("open_orders") or []):
+            po = PaperOrder(
+                order_id=o["order_id"],
+                product_id=o["product_id"],
+                side=o["side"],
+                qty=int(o["qty"]),
+                limit_price=float(o["limit_price"]),
+                placed_at=float(o.get("placed_at", 0.0)),
+            )
+            self.open_orders[po.order_id] = po
+
     def _liquidation_price(self) -> Optional[float]:
         """Price at which equity would exactly equal required margin (i.e. the
         margin call trips). None when flat, since there's no directional risk.

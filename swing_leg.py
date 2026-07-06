@@ -394,6 +394,11 @@ class SwingTrader:
         self.s = SwingState(swing_qty=self.cfg.swing_qty)
         self.s.sleeves = self._init_sleeves_state({})
         self._save_state()
+        # Also drop the persisted paper broker state so a restart mid-reset
+        # doesn't restore the pre-reset position from the store. Next snapshot
+        # cycle will write fresh state.
+        if hasattr(self.store, "clear_paper_state"):
+            self.store.clear_paper_state(self.tenant_id, self.symbol)
         self._record(
             "paper_reset",
             starting_balance=starting_balance,

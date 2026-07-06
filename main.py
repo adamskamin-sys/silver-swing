@@ -118,13 +118,20 @@ def run_paper_mode() -> int:
     ))
     _log(f"paper broker seeded: balance=${starting_balance:,.2f}")
 
-    # Default: paper is fully isolated (no mirror) so a fresh run gives a fresh
-    # sandbox — no real-account cost basis leaks in. Set SWING_PAPER_MIRROR_LIVE=1
-    # to explicitly opt in (useful for "practice managing my current position").
-    if os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1":
+    # Restore paper state from the store if it exists — otherwise every Render
+    # redeploy wipes positions and balance to the starting sandbox. Order
+    # matters: restore first (may set position, balance, etc.), then mirror
+    # only if there's no restored state AND mirror is opted-in.
+    persisted = store.get_paper_state(TENANT, SYMBOL)
+    if persisted:
+        paper.restore_from_state_dict(persisted)
+        _log(f"paper state restored: qty={paper.position.qty}, "
+             f"balance=${paper.balance:,.2f}, lots={len(paper.lots)}, "
+             f"realized=${paper.realized_pnl:+,.2f}")
+    elif os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1":
         _mirror_live_position_into_paper(paper, SYMBOL)
     else:
-        _log("paper starts flat (mirror disabled — set SWING_PAPER_MIRROR_LIVE=1 to enable)")
+        _log("paper starts flat (no persisted state; mirror disabled)")
 
     from microstructure import MicrostructureFilter
     ms = MicrostructureFilter()
@@ -206,6 +213,9 @@ def run_paper_mode() -> int:
                 if ms is not None:
                     snap["microstructure"] = ms.snapshot()
                 store.put_snapshot(TENANT, SYMBOL, snap)
+                # Persist the authoritative paper state alongside the derived
+                # snapshot so a Render redeploy doesn't wipe the sandbox.
+                store.put_paper_state(TENANT, SYMBOL, paper.to_state_dict())
                 last_snapshot = now
             if redis_url and now - last_scanner >= scanner_interval:
                 try:

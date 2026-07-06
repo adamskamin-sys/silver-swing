@@ -105,6 +105,21 @@ class JsonFileStateStore:
     def put_snapshot(self, tenant_id: str, symbol: str, snapshot: dict) -> None:
         self._put_scope(tenant_id, symbol, "snapshot", snapshot)
 
+    def get_paper_state(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        """Persisted PaperBroker state (position, balance, lots, etc.). Only
+        used in paper mode — live reads position from Coinbase directly."""
+        return self._get_scope(tenant_id, symbol, "paper_state")
+
+    def put_paper_state(self, tenant_id: str, symbol: str, state: dict) -> None:
+        self._put_scope(tenant_id, symbol, "paper_state", state)
+
+    def clear_paper_state(self, tenant_id: str, symbol: str) -> None:
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if "paper_state" in block:
+            del block["paper_state"]
+            self._save(data)
+
     def get_intent(self, tenant_id: str, symbol: str) -> Optional[dict]:
         """Dashboard-writes/bot-reads pending manual order intent."""
         return self._get_scope(tenant_id, symbol, "intent")
@@ -203,6 +218,9 @@ class RedisJsonStore:
     def put_state(self, tenant_id, symbol, state): self._put_scope(tenant_id, symbol, "state", state)
     def get_snapshot(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "snapshot")
     def put_snapshot(self, tenant_id, symbol, snapshot): self._put_scope(tenant_id, symbol, "snapshot", snapshot)
+    def get_paper_state(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "paper_state")
+    def put_paper_state(self, tenant_id, symbol, state): self._put_scope(tenant_id, symbol, "paper_state", state)
+    def clear_paper_state(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "paper_state")
     def get_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "intent")
     def put_intent(self, tenant_id, symbol, intent): self._put_scope(tenant_id, symbol, "intent", intent)
 
