@@ -27,6 +27,7 @@ const tradeLogEl = document.getElementById('trade-log');
 const haltBanner = document.getElementById('halt-banner');
 const killBanner = document.getElementById('kill-banner');
 const killBtn = document.getElementById('kill-switch-btn');
+const resetPaperBtn = document.getElementById('reset-paper-btn');
 const assetTabs = document.getElementById('asset-tabs');
 
 const configModal = document.getElementById('config-modal');
@@ -50,6 +51,14 @@ const backtestModal = document.getElementById('backtest-modal');
 const backtestForm = document.getElementById('backtest-form');
 const backtestResult = document.getElementById('backtest-result');
 
+const tradeModal = document.getElementById('trade-modal');
+const tradeModalTitle = document.getElementById('trade-modal-title');
+const tradeModalBody = document.getElementById('trade-modal-body');
+const tradeQty = document.getElementById('trade-qty');
+const tradePreview = document.getElementById('trade-preview');
+const tradeError = document.getElementById('trade-error');
+const tradeConfirm = document.getElementById('trade-confirm');
+
 // ---- state ---------------------------------------------------------------
 
 let pollHandle = null;
@@ -59,6 +68,7 @@ let configEditContext = null;   // {tenant, symbol} while modal open
 let killContext = null;         // {tenant, mode: 'activate'|'clear'} while modal open
 let strategyContext = null;     // {tenant, symbol, name} while modal open
 let backtestContext = null;
+let tradeContext = null;
 
 // ---- fetch helpers -------------------------------------------------------
 
@@ -97,8 +107,13 @@ async function logout() {
   showLogin();
 }
 
+function hideAllModals() {
+  for (const m of document.querySelectorAll('.modal')) m.hidden = true;
+}
+
 function showLogin() {
   if (pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+  hideAllModals();  // don't leave modals hanging over the login screen
   loginView.hidden = false;
   dashboardView.hidden = true;
   logoutBtn.hidden = true;
@@ -111,6 +126,7 @@ function showDashboard(authRequired) {
   dashboardView.hidden = false;
   logoutBtn.hidden = !authRequired;
   killBtn.hidden = false;
+  resetPaperBtn.hidden = false;  // paper mode only — hidden in live mode by check below
   refreshOnce();
   pollHandle = setInterval(refreshOnce, POLL_MS);
 }
@@ -185,7 +201,7 @@ function renderBanners(store) {
 
   if (haltedInstruments.length > 0) {
     haltBanner.hidden = false;
-    haltBanner.innerHTML = `⚠ HALTED — ${haltedInstruments.map(h => `${escapeHtml(h.tenant)}/${escapeHtml(h.symbol)}`).join(', ')}. Review the trade log for the reason. Clearing HALT requires a config change AND a deliberate re-arm.`;
+    haltBanner.innerHTML = `⚠ Strategy halted — ${haltedInstruments.map(h => `${escapeHtml(h.tenant)}/${escapeHtml(h.symbol)}`).join(', ')}. See the halt reason on the strategy row, fix the underlying issue, then click <b>Resume</b>.`;
   } else {
     haltBanner.hidden = true;
   }
@@ -193,12 +209,14 @@ function renderBanners(store) {
   if (killActive) {
     killBanner.hidden = false;
     const reason = killActive.reason ? ` — ${escapeHtml(killActive.reason)}` : '';
-    killBanner.innerHTML = `⏸ KILL SWITCH ACTIVE for ${escapeHtml(killActive.tenant)}${reason}. Bot will not arm new legs.`;
-    killBtn.textContent = 'RESUME';
+    killBanner.innerHTML = `⏸ Bot paused${reason}. Not arming new orders until you resume.`;
+    killBtn.textContent = 'Resume bot';
+    killBtn.className = 'primary';
     killBtn.dataset.mode = 'clear';
   } else {
     killBanner.hidden = true;
-    killBtn.textContent = 'PAUSE ALL';
+    killBtn.textContent = 'Pause bot';
+    killBtn.className = 'ghost';
     killBtn.dataset.mode = 'activate';
   }
 }
@@ -245,7 +263,7 @@ function renderPositionLane(state, config, snapshot) {
     <div class="position-lane">
       <div class="position-lane-row">
         <span class="lane-swing">◆ swing sleeve: ${swingHeld} held / ${swingArmed} armed</span>
-        <span class="lane-core">◼ core floor: ${core} (never sold)</span>
+        ${core > 0 ? `<span class="lane-core">◼ core floor: ${core} (never sold)</span>` : `<span class="lane-core">◼ no core floor · free trading</span>`}
       </div>
       <div class="position-lane-row" style="margin-top:4px;color:var(--muted);font-size:11px;">
         <span>total held: ${posQty}</span>
@@ -281,62 +299,807 @@ function renderCard(tenant, symbol, { config, state, snapshot }) {
   const c = config || {};
   const snap = snapshot || {};
   const halted = s.state === 'HALTED';
-  const legPill = { ARMED_SELL: 'armed-sell', ARMED_BUY: 'armed-buy', HALTED: 'halted' }[s.state] || '';
   const modeLabel = snap.mode === 'live' ? 'LIVE' : snap.mode === 'paper' ? 'PAPER' : '';
+  // Card-level pill: aggregate across primary + all sleeves and pick the most
+  // meaningful active state. Ordering: HALTED > sell-capable > waiting-to-buy
+  // (already sold, cycling) > idle (nothing possible). This way if the primary
+  // is off and both sleeves are ARMED_BUY, the hero shows "Waiting for buy"
+  // instead of a misleading "IDLE" — sleeves are actively cycling.
+  const primaryQty = Number(c.swing_qty) || 0;
+  const posQty = Number(snap.position_qty) || 0;
+  const sleeves = Array.isArray(c.sleeves) ? c.sleeves : [];
+  const sleeveStates = s.sleeves || {};
+  const primaryActive = primaryQty > 0 && s.state !== 'HALTED';
+  const primaryCanSell = primaryActive && s.state === 'ARMED_SELL' && posQty >= primaryQty;
+  const primaryWaitingBuy = primaryActive && s.state === 'ARMED_BUY';
+  const anySleeveHalted = sleeves.some(sc => (sleeveStates[sc.id]?.state) === 'HALTED');
+  const anySleeveCanSell = sleeves.some(sc => {
+    const ss = sleeveStates[sc.id] || {};
+    return (ss.state || 'ARMED_SELL') === 'ARMED_SELL' && posQty >= Number(sc.qty || 0);
+  });
+  const anySleeveArmedBuy = sleeves.some(sc => (sleeveStates[sc.id]?.state) === 'ARMED_BUY');
+  let displayState;
+  if (halted || (primaryQty === 0 && sleeves.length && sleeves.every(sc => (sleeveStates[sc.id]?.state) === 'HALTED'))) {
+    displayState = 'HALTED';
+  } else if (primaryCanSell || anySleeveCanSell) {
+    displayState = 'ARMED_SELL';
+  } else if (primaryWaitingBuy || anySleeveArmedBuy) {
+    displayState = 'ARMED_BUY';
+  } else {
+    displayState = 'IDLE';
+  }
+  const stateKey = (displayState || 'unknown').toLowerCase();
+
+  // "Cycles complete" in the hero must include sleeve cycles too. Primary
+  // cycles is the legacy single-strategy counter; if the user runs only
+  // sleeves, that stays at 0 while real trading happens. Sum everything.
+  const sleeveCyclesTotal = Object.values(sleeveStates).reduce(
+    (n, ss) => n + (Number(ss?.cycles) || 0), 0);
+  const totalCycles = (Number(s.cycles) || 0) + sleeveCyclesTotal;
+  const sleeveRealizedTotal = Object.values(sleeveStates).reduce(
+    (n, ss) => n + (Number(ss?.realized_pnl) || 0), 0);
+  const totalRealized = (Number(s.realized_pnl) || 0) + sleeveRealizedTotal;
+
+  const equity = snap.equity;
+  const unrealized = snap.unrealized_pnl;
+  // Sum realized across primary + sleeves so the hero reflects ALL trading,
+  // not just the primary strategy's (which is 0 when only sleeves are running).
+  const realized = totalRealized;
+  const totalPnl = (Number(unrealized) || 0) + (Number(realized) || 0);
 
   const el = document.createElement('article');
   el.className = 'card' + (halted ? ' halted' : '');
   el.innerHTML = `
-    <h2>
-      <span>${escapeHtml(tenant)} / ${escapeHtml(symbol)} ${modeLabel ? `<span class="pill dim">${modeLabel}</span>` : ''}</span>
-      <span class="card-actions">
-        <span class="pill ${legPill}">${escapeHtml(s.state || 'unknown')}</span>
-        <button data-action="edit" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">config</button>
-        <button data-action="explain" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-name="${escapeHtml(c.exit_mode || 'fixed_limit')}">strategy</button>
-        <button data-action="backtest" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">backtest</button>
-      </span>
-    </h2>
-
-    <div class="card-section">
-      <h3>account</h3>
-      <div class="grid">
-        <div class="field"><span class="field-label">equity</span><span class="field-value">${fmtMoney(snap.equity)}</span></div>
-        <div class="field"><span class="field-label">unrealized P&amp;L</span><span class="field-value ${classForValue(snap.unrealized_pnl)}">${fmtMoney(snap.unrealized_pnl)}</span></div>
-        <div class="field"><span class="field-label">realized P&amp;L</span><span class="field-value ${classForValue(s.realized_pnl ?? snap.realized_pnl)}">${fmtMoney(s.realized_pnl ?? snap.realized_pnl)}</span></div>
-        <div class="field"><span class="field-label">fees paid</span><span class="field-value dim">${fmtMoney(snap.fees_paid ?? 0)}</span></div>
-        <div class="field"><span class="field-label">buying power</span><span class="field-value">${fmtMoney(snap.futures_buying_power ?? snap.available_margin)}</span></div>
-        <div class="field"><span class="field-label">liq buffer</span><span class="field-value dim">${fmtMoney(snap.liquidation_buffer)}</span></div>
-        ${renderMarginBar(snap)}
-        <div class="field"><span class="field-label">max drawdown</span><span class="field-value ${classForValue(-(snap.max_drawdown ?? 0))}">${fmtMoney(snap.max_drawdown ?? 0)}</span></div>
+    <div class="card-hero">
+      <div class="hero-top">
+        <div>
+          <h2 class="hero-symbol">${escapeHtml(symbol)} ${modeLabel ? `<span class="hero-mode">${modeLabel}</span>` : ''}</h2>
+          <div class="hero-tenant">${escapeHtml(tenant)}</div>
+        </div>
+        <span class="status-pill ${stateKey}">${escapeHtml(prettyState(displayState))}</span>
+      </div>
+      <div class="hero-numbers">
+        <div class="hero-metric">
+          <span class="hero-label">Total value</span>
+          <span class="hero-value">${fmtMoney(equity)}</span>
+          <span class="hero-value-sub">${(Number(equity) > 100000 ? '+' : '')}${fmtMoney(Number(equity || 0) - 100000)} vs deposit</span>
+        </div>
+        <div class="hero-metric">
+          <span class="hero-label">Today's P&amp;L</span>
+          <span class="hero-value small ${classForValue(totalPnl)}">${totalPnl >= 0 ? '+' : ''}${fmtMoney(totalPnl)}</span>
+          <span class="hero-value-sub">${fmtMoney(unrealized)} unrealized · ${fmtMoney(realized)} banked</span>
+        </div>
+        <div class="hero-metric">
+          <span class="hero-label">Cycles complete</span>
+          <span class="hero-value small">${totalCycles}</span>
+          <span class="hero-value-sub">${fmtMoney(snap.fees_paid ?? 0)} paid in fees</span>
+        </div>
       </div>
     </div>
 
-    ${renderPositionLane(s, c, snap)}
-
-    <div class="card-section">
-      <h3>strategy</h3>
-      <div class="grid">
-        <div class="field"><span class="field-label">exit mode</span><span class="field-value dim">${escapeHtml(c.exit_mode || 'fixed_limit')}</span></div>
-        <div class="field"><span class="field-label">sell / buy</span><span class="field-value">${fmtNum(c.sell_px, 3)} / ${fmtNum(c.buy_px, 3)}</span></div>
-        <div class="field"><span class="field-label">abort ↓ / ↑</span><span class="field-value dim">${fmtNum(c.abort_below, 2)} / ${fmtNum(c.abort_above, 2)}</span></div>
-        <div class="field"><span class="field-label">mark</span><span class="field-value">${fmtNum(snap.last_mark, 3)}</span></div>
-        <div class="field"><span class="field-label">bid / ask</span><span class="field-value dim">${fmtNum(snap.best_bid, 3)} / ${fmtNum(snap.best_ask, 3)}</span></div>
-        <div class="field"><span class="field-label">cycles</span><span class="field-value">${s.cycles ?? 0}</span></div>
-      </div>
+    <div class="card-body">
+      ${renderTargetsRow(c, snap)}
+      ${renderPositionBar(s, c, snap)}
+      ${renderLotsTable(snap, c, tenant, symbol, s)}
+      ${renderRiskStrip(snap)}
+      ${renderSleevesSection(tenant, symbol, c, s, snap)}
     </div>
 
-    ${renderMiniChart(symbol, c, snap)}
+    <div class="card-actions">
+      <button class="primary" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="BUY">Buy at market</button>
+      <button class="danger" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="SELL">Sell at market</button>
+      <button data-action="backtest" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">Backtest</button>
+      <button data-action="explain" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-name="${escapeHtml(c.exit_mode || 'fixed_limit')}">Strategy</button>
+      <button class="ghost" data-action="edit" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">Settings</button>
+    </div>
 
-    <div class="card-section">
-      <h3>runtime</h3>
-      <div class="grid">
-        <div class="field"><span class="field-label">live order</span><span class="field-value dim">${escapeHtml((s.live_order_id || '—').slice(0, 24))}</span></div>
-        <div class="field"><span class="field-label">last heartbeat</span><span class="field-value dim">${fmtHeartbeat(s.last_heartbeat_ts)}</span></div>
-        <div class="field"><span class="field-label">reserved margin</span><span class="field-value dim">${fmtMoney(s.reserved_margin)}</span></div>
+    <button class="details-toggle" data-action="toggle-details" data-target="details-${tenant}-${symbol}">More details</button>
+    <div class="details-content" id="details-${tenant}-${symbol}" hidden>
+      <div class="card-row">
+        <div class="metric"><span class="metric-label">Margin used</span><span class="metric-value">${fmtNum(marginPct(snap), 1)}%</span></div>
+        <div class="metric"><span class="metric-label">Buying power</span><span class="metric-value">${fmtMoney(snap.futures_buying_power ?? snap.available_margin)}</span></div>
+        <div class="metric"><span class="metric-label">Max drawdown</span><span class="metric-value neg">${fmtMoney(snap.max_drawdown ?? 0)}</span></div>
+        <div class="metric"><span class="metric-label">Liq buffer</span><span class="metric-value dim">${fmtMoney(snap.liquidation_buffer)}</span></div>
+      </div>
+      <div class="card-row">
+        <div class="metric"><span class="metric-label">Live order</span><span class="metric-value dim">${escapeHtml((s.live_order_id || '—').slice(0, 12))}${s.live_order_id ? '…' : ''}</span></div>
+        <div class="metric"><span class="metric-label">Heartbeat</span><span class="metric-value dim">${fmtHeartbeat(s.last_heartbeat_ts)}</span></div>
+        <div class="metric"><span class="metric-label">Reserved margin</span><span class="metric-value dim">${fmtMoney(s.reserved_margin)}</span></div>
       </div>
     </div>
   `;
   return el;
+}
+
+function prettyState(state) {
+  if (!state) return 'Unknown';
+  if (state === 'ARMED_SELL') return 'Waiting for sell';
+  if (state === 'ARMED_BUY') return 'Waiting for buy';
+  if (state === 'HALTED') return 'Halted';
+  if (state === 'IDLE') return 'Idle';
+  return state;
+}
+
+function marginPct(snap) {
+  const used = Number(snap.margin_used ?? snap.initial_margin ?? 0);
+  const equity = Number(snap.equity ?? 0);
+  if (!equity) return 0;
+  return Math.min(100, (used / equity) * 100);
+}
+
+function renderLotsTable(snapshot, config, tenant, symbol, state) {
+  const lots = Array.isArray(snapshot?.lots) ? snapshot.lots : [];
+  const mark = Number(snapshot?.last_mark) || 0;
+  const contractSize = Number(config?.contract_size) || 50;
+  const currentLotContext = { tenant: tenant || '', symbol: symbol || '' };
+  // Map sleeve ids → display names so lot rows can show a friendly strategy label
+  const sleeveNamesById = {};
+  for (const s of (config?.sleeves || [])) {
+    sleeveNamesById[s.id] = s.name || s.id;
+  }
+  // FIFO allocation gives us "which strategy will sell this lot" even for
+  // manual buys with no strategy_id tag on them.
+  const primaryQty = Number(config?.swing_qty) || 0;
+  const sleeves = Array.isArray(config?.sleeves) ? config.sleeves : [];
+  const allocation = allocateLotsToStrategies(lots, primaryQty, sleeves, state?.sleeves || {});
+  const ownerLabel = (owner) => owner === '__primary' ? 'Primary' : (sleeveNamesById[owner] || owner);
+
+  if (lots.length === 0) {
+    // Fallback: single aggregate line when the running bot hasn't yet
+    // written per-lot data (older snapshot or non-paper broker).
+    const pos = Number(snapshot?.position_qty) || 0;
+    const avg = Number(snapshot?.position_avg_entry) || 0;
+    if (pos === 0) {
+      return `
+        <section class="positions-section empty">
+          <h3 class="section-title">Open positions</h3>
+          <div class="positions-empty">You hold no contracts right now.</div>
+        </section>
+      `;
+    }
+    const unreal = mark && avg ? (mark - avg) * contractSize * pos : 0;
+    const dist = mark && avg ? mark - avg : 0;
+    return `
+      <section class="positions-section">
+        <div class="section-title-row">
+          <h3 class="section-title">Open positions <span class="section-count">${pos} contracts</span></h3>
+          <div class="section-title-pnl ${classForValue(unreal)}">${unreal >= 0 ? '+' : ''}${fmtMoney(unreal)} unrealized</div>
+        </div>
+        <div class="positions-summary">
+          <div class="summary-cell">
+            <span class="summary-label">Avg entry</span>
+            <span class="summary-value">$${fmtNum(avg, 3)}</span>
+          </div>
+          <div class="summary-cell">
+            <span class="summary-label">Current mark</span>
+            <span class="summary-value">$${fmtNum(mark, 3)}</span>
+          </div>
+          <div class="summary-cell">
+            <span class="summary-label">vs avg entry</span>
+            <span class="summary-value ${classForValue(dist)}">${dist >= 0 ? '+' : ''}$${fmtNum(dist, 3)} / contract</span>
+          </div>
+        </div>
+        <div class="positions-empty">Aggregate view — per-lot history begins with your next fill.</div>
+      </section>
+    `;
+  }
+
+  // Sort newest first, sum totals, compute weighted avg entry across lots.
+  const sorted = [...lots].sort((a, b) => (b.entry_ts || 0) - (a.entry_ts || 0));
+  const totalQty = sorted.reduce((n, l) => n + (Number(l.qty) || 0), 0);
+  const totalUnreal = sorted.reduce((n, l) => n + (Number(l.unrealized_pnl) || 0), 0);
+  const weightedCost = sorted.reduce((n, l) => n + (Number(l.qty) || 0) * (Number(l.entry_price) || 0), 0);
+  const avgEntry = totalQty > 0 ? weightedCost / totalQty : 0;
+  const distFromAvg = mark && avgEntry ? mark - avgEntry : 0;
+
+  const rows = sorted.map(lot => {
+    const qty = Number(lot.qty) || 0;
+    const entry = Number(lot.entry_price) || 0;
+    const unreal = Number(lot.unrealized_pnl) || 0;
+    const perContract = qty > 0 ? unreal / qty : 0;
+    const src = String(lot.source || 'unknown');
+    const age = lotAge(lot.entry_ts);
+    return `
+      <tr class="lot-row">
+        <td class="lot-qty"><b>${qty}</b></td>
+        <td class="lot-entry">$${fmtNum(entry, 3)}</td>
+        <td class="lot-mark">$${fmtNum(mark, 3)}</td>
+        <td class="lot-pnl ${classForValue(unreal)}">
+          <div>${unreal >= 0 ? '+' : ''}${fmtMoney(unreal)}</div>
+          <div class="lot-pnl-sub">${perContract >= 0 ? '+' : ''}${fmtMoney(perContract)} / ea</div>
+        </td>
+        <td class="lot-src"><span class="lot-source-badge src-${escapeHtml(src)}">${escapeHtml(src)}</span></td>
+        <td class="lot-strategy">${
+          (() => {
+            const owners = allocation.byLotOwners[lot.id];
+            if (!owners) return '<span class="lot-strategy-none">—</span>';
+            const entries = Object.entries(owners);
+            if (entries.length === 1) {
+              const [owner, n] = entries[0];
+              const label = ownerLabel(owner);
+              return `<span class="lot-strategy-tag">${escapeHtml(label)}${n < qty ? ` (${n}/${qty})` : ''}</span>`;
+            }
+            // Split across multiple strategies
+            return entries.map(([owner, n]) =>
+              `<span class="lot-strategy-tag">${escapeHtml(ownerLabel(owner))} ${n}</span>`
+            ).join(' ');
+          })()
+        }</td>
+        <td class="lot-age">${age}</td>
+        <td class="lot-actions">
+          ${(() => {
+            // Only offer "+ Strategy" for lots that AREN'T already fully committed
+            // to a running sleeve. Otherwise a click double-counts contracts and
+            // triggers the capacity error, which is confusing.
+            const owners = allocation.byLotOwners[lot.id];
+            const assigned = owners ? Object.values(owners).reduce((a, b) => a + b, 0) : 0;
+            const free = qty - assigned;
+            if (free <= 0) {
+              return `<span class="lot-assigned-badge" title="This lot is already committed to a strategy — add a new sleeve from the ‘+ add strategy’ button after buying more contracts">assigned</span>`;
+            }
+            return `<button class="small primary"
+              data-action="add-sleeve-from-lot"
+              data-tenant="${escapeHtml(currentLotContext.tenant)}"
+              data-symbol="${escapeHtml(currentLotContext.symbol)}"
+              data-lot-qty="${free}"
+              data-lot-entry="${entry}"
+              title="Add a strategy anchored to this lot's entry price (${free} contract${free === 1 ? '' : 's'} free)">+ Strategy</button>`;
+          })()}
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  return `
+    <section class="positions-section">
+      <div class="section-title-row">
+        <h3 class="section-title">Open positions <span class="section-count">${sorted.length} lot${sorted.length === 1 ? '' : 's'} · ${totalQty} contracts</span></h3>
+        <div class="section-title-pnl ${classForValue(totalUnreal)}">${totalUnreal >= 0 ? '+' : ''}${fmtMoney(totalUnreal)} unrealized</div>
+      </div>
+      <div class="positions-summary">
+        <div class="summary-cell">
+          <span class="summary-label">Avg entry</span>
+          <span class="summary-value">$${fmtNum(avgEntry, 3)}</span>
+        </div>
+        <div class="summary-cell">
+          <span class="summary-label">Current mark</span>
+          <span class="summary-value">$${fmtNum(mark, 3)}</span>
+        </div>
+        <div class="summary-cell">
+          <span class="summary-label">vs avg entry</span>
+          <span class="summary-value ${classForValue(distFromAvg)}">${distFromAvg >= 0 ? '+' : ''}$${fmtNum(distFromAvg, 3)} / contract</span>
+        </div>
+      </div>
+      <table class="positions-table">
+        <thead>
+          <tr>
+            <th>Qty</th>
+            <th>Bought at</th>
+            <th>Now</th>
+            <th>Unrealized</th>
+            <th>Source</th>
+            <th>Strategy</th>
+            <th>Age</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </section>
+  `;
+}
+
+function renderRiskStrip(snapshot) {
+  const pos = Number(snapshot?.position_qty) || 0;
+  const mark = Number(snapshot?.last_mark) || 0;
+  const marginUsed = Number(snapshot?.margin_used) || 0;
+  const marginAvail = Number(snapshot?.available_margin) || 0;
+  const marginPer = Number(snapshot?.margin_per_contract) || 0;
+  const liq = snapshot?.liquidation_price;
+  const equity = Number(snapshot?.equity) || 0;
+  const usePct = equity > 0 ? Math.min(100, (marginUsed / equity) * 100) : 0;
+
+  let liqCell;
+  if (pos === 0) {
+    liqCell = `
+      <div class="risk-cell">
+        <span class="risk-label">Liquidation price</span>
+        <span class="risk-value dim">—</span>
+        <span class="risk-sub">flat — no directional risk</span>
+      </div>
+    `;
+  } else if (liq == null) {
+    liqCell = `
+      <div class="risk-cell">
+        <span class="risk-label">Liquidation price</span>
+        <span class="risk-value">safe</span>
+        <span class="risk-sub">account can absorb full drop to $0</span>
+      </div>
+    `;
+  } else {
+    const dist = mark - Number(liq);
+    const distPct = mark > 0 ? Math.abs(dist / mark) * 100 : 0;
+    const cls = distPct < 10 ? 'bad' : distPct < 25 ? 'warn' : '';
+    liqCell = `
+      <div class="risk-cell">
+        <span class="risk-label">Liquidation price</span>
+        <span class="risk-value ${cls}">$${fmtNum(liq, 3)}</span>
+        <span class="risk-sub">$${fmtNum(Math.abs(dist), 3)} away · ${distPct.toFixed(1)}% cushion</span>
+      </div>
+    `;
+  }
+
+  const useCls = usePct > 75 ? 'bad' : usePct > 50 ? 'warn' : '';
+  return `
+    <div class="risk-strip">
+      <div class="risk-cell">
+        <span class="risk-label">Margin used</span>
+        <span class="risk-value ${useCls}">${fmtMoney(marginUsed)}</span>
+        <span class="risk-sub">${usePct.toFixed(1)}% of equity · $${fmtNum(marginPer, 0)}/contract</span>
+      </div>
+      <div class="risk-cell">
+        <span class="risk-label">Available margin</span>
+        <span class="risk-value">${fmtMoney(marginAvail)}</span>
+        <span class="risk-sub">room for ${marginPer > 0 ? Math.floor(marginAvail / marginPer) : 0} more contracts</span>
+      </div>
+      ${liqCell}
+      <div class="risk-cell">
+        <span class="risk-label">Total equity</span>
+        <span class="risk-value">${fmtMoney(equity)}</span>
+        <span class="risk-sub">balance + unrealized</span>
+      </div>
+    </div>
+  `;
+}
+
+function allocateLotsToStrategies(lots, primaryQty, sleeves, sleeveStates = {}) {
+  // Break every lot into 1-contract units and hand them out FIFO so each
+  // strategy knows the ACTUAL cost basis of contracts it will sell. Units
+  // explicitly tagged with a strategy_id go to that sleeve first; whatever's
+  // left goes to primary, then to each sleeve in listed order.
+  // Sleeves in ARMED_BUY (already sold, waiting to rebuy) claim NO contracts —
+  // their tagged orphans from prior cycles go into the unassigned pool for
+  // ARMED_SELL sleeves to consume. Only strategies actively holding a position
+  // should show ownership.
+  // Also returns byLotOwners: { lot_id: [{owner, qty}] } so the lot table
+  // can show which strategy each lot is committed to.
+  const sorted = [...(lots || [])].sort((a, b) => (a.entry_ts || 0) - (b.entry_ts || 0));
+  const units = [];
+  for (const lot of sorted) {
+    const n = Number(lot.qty) || 0;
+    for (let i = 0; i < n; i++) {
+      units.push({
+        entry_price: Number(lot.entry_price) || 0,
+        strategy_id: lot.strategy_id || null,
+        lot_id: lot.id,
+      });
+    }
+  }
+  const bySleeve = {};
+  for (const s of sleeves) bySleeve[s.id] = [];
+  const unassigned = [];
+  // Sleeves get their tagged units first, but ONLY up to their configured qty,
+  // AND only if they're in a state where they hold contracts (ARMED_SELL).
+  // Excess tagged units (from earlier cycles) drop into the unassigned pool
+  // so other sleeves / primary can claim them. This prevents "size drift" AND
+  // stops ARMED_BUY sleeves from showing phantom unrealized gains on orphan lots.
+  const qtyById = {};
+  const holdsContracts = {};
+  for (const s of sleeves) {
+    qtyById[s.id] = Number(s.qty) || 0;
+    const st = (sleeveStates[s.id]?.state) || 'ARMED_SELL';
+    holdsContracts[s.id] = st === 'ARMED_SELL';  // only sell-armed sleeves own contracts
+  }
+  for (const u of units) {
+    if (u.strategy_id && bySleeve[u.strategy_id] !== undefined
+        && holdsContracts[u.strategy_id]
+        && bySleeve[u.strategy_id].length < qtyById[u.strategy_id]) {
+      bySleeve[u.strategy_id].push(u);
+    } else {
+      unassigned.push(u);
+    }
+  }
+  let idx = 0;
+  const takeFor = (n) => {
+    const out = [];
+    while (out.length < n && idx < unassigned.length) out.push(unassigned[idx++]);
+    return out;
+  };
+  const primary = takeFor(primaryQty);
+  for (const s of sleeves) {
+    if (!holdsContracts[s.id]) continue;  // ARMED_BUY sleeves don't take from the pool
+    const need = (Number(s.qty) || 0) - bySleeve[s.id].length;
+    if (need > 0) bySleeve[s.id].push(...takeFor(need));
+  }
+  // Roll up per-lot ownership counts so the lot table can label each lot with
+  // the strategy that will sell it. Accumulate as {owner → qty} to handle
+  // splits when one lot is shared between primary + sleeves.
+  const byLotOwners = {};
+  const addOwn = (owner, unit) => {
+    if (!byLotOwners[unit.lot_id]) byLotOwners[unit.lot_id] = {};
+    byLotOwners[unit.lot_id][owner] = (byLotOwners[unit.lot_id][owner] || 0) + 1;
+  };
+  for (const u of primary) addOwn('__primary', u);
+  for (const s of sleeves) for (const u of bySleeve[s.id]) addOwn(s.id, u);
+  return { primary, bySleeve, byLotOwners };
+}
+
+function sumUnitsUnrealized(units, mark, contractSize) {
+  if (!units || !units.length || !mark) return 0;
+  let sum = 0;
+  for (const u of units) sum += (mark - u.entry_price) * contractSize;
+  return sum;
+}
+
+function fmtTrailingParams(exitMode, live, staticCfg) {
+  // exitMode: "trailing_stop" | "fixed_limit" | "hybrid" | ...
+  // live: { armed, hwm, distance, hybridTriggeredTs, hybridDelaySecs, activationPx } for runtime state
+  // staticCfg: { trigger, distance, sellPx, buyPx, activationPx, hybridDelay, mark, avgEntry, qty, contractSize, feeRt }
+  // The `mark` field lets us project the "if trail engaged NOW, stop would be
+  // here" line so the user sees the trail stop track price in real time even
+  // before activation crosses. avgEntry/qty/contractSize/feeRt let us derive
+  // "Locked profit" — the guaranteed net if the trail fires right now.
+  const mark = Number(staticCfg?.mark) || 0;
+  const dist = Number(staticCfg?.distance) || 0;
+  const projectedStop = mark > 0 && dist > 0 ? mark - dist : null;
+  const avgEntry = Number(staticCfg?.avgEntry) || 0;
+  const qty = Number(staticCfg?.qty) || 0;
+  const contractSize = Number(staticCfg?.contractSize) || 50;
+  const feeRt = Number(staticCfg?.feeRt) || 0;
+  const totalFees = feeRt * qty;
+  // Locked profit at a given stop price = (stop - avg_entry) × size × qty − round-trip fees.
+  // Positive = we guaranteed a gain the moment we fire; negative = trail would
+  // sell for a loss (relative to entry). If we don't have a cost basis yet
+  // (no allocated contracts) or no armed/projected stop, we return null.
+  const lockedAt = (stopPrice) => {
+    if (!stopPrice || !avgEntry || qty <= 0) return null;
+    return (stopPrice - avgEntry) * contractSize * qty - totalFees;
+  };
+  const lockedArmed = live && live.armed && live.hwm
+    ? lockedAt(Number(live.hwm) - Number(live.distance || 0)) : null;
+  const lockedProjected = projectedStop !== null ? lockedAt(projectedStop) : null;
+  const fmtLockedLine = (val, label = 'Locked') => {
+    if (val === null || !isFinite(val)) return '';
+    const cls = val >= 0 ? 'pos' : 'neg';
+    return `<div class="params-line params-locked"><span class="params-label">${label}</span><b class="${cls}">${val >= 0 ? '+' : ''}${fmtMoney(val)}</b></div>`;
+  };
+  if (exitMode === 'trailing_stop') {
+    if (live && live.armed && live.hwm) {
+      const stop = Number(live.hwm) - Number(live.distance || 0);
+      return `
+        <div class="params-block trail-armed">
+          <div class="params-mode"><span class="dot dot-live"></span>Trailing <em>(armed)</em></div>
+          <div class="params-line"><span class="params-label">Stop</span><b>$${fmtNum(stop, 3)}</b></div>
+          <div class="params-line"><span class="params-label">HWM</span>$${fmtNum(live.hwm, 3)}</div>
+          <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+          ${fmtLockedLine(lockedArmed, 'Locked in profit')}
+          <div class="params-line params-sub">Rises with price · sells at market on pullback</div>
+        </div>`;
+    }
+    return `
+      <div class="params-block">
+        <div class="params-mode">Trailing stop</div>
+        <div class="params-line"><span class="params-label">Trigger</span>$${fmtNum(staticCfg.trigger, 3)}</div>
+        <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+        <div class="params-line"><span class="params-label">Distance</span>$${fmtNum(staticCfg.distance, 3)}</div>
+        ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If armed now</span><b class="dim-b">$${fmtNum(projectedStop, 3)}</b></div>` : ''}
+        ${fmtLockedLine(lockedProjected, 'If armed: locked')}
+        <div class="params-line params-sub">Waits for trigger, then trails</div>
+      </div>`;
+  }
+  if (exitMode === 'hybrid') {
+    // Stage 3: trail engaged (breakout confirmed)
+    if (live && live.armed && live.hwm) {
+      const stop = Number(live.hwm) - Number(live.distance || 0);
+      return `
+        <div class="params-block trail-armed">
+          <div class="params-mode"><span class="dot dot-live"></span>Hybrid → Trailing <em>(breakout)</em></div>
+          <div class="params-line"><span class="params-label">Stop</span><b>$${fmtNum(stop, 3)}</b></div>
+          <div class="params-line"><span class="params-label">HWM</span>$${fmtNum(live.hwm, 3)}</div>
+          <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+          ${fmtLockedLine(lockedArmed, 'Locked in profit')}
+          <div class="params-line params-sub">Rode past activation · trailing on breakout</div>
+        </div>`;
+    }
+    // Stage 2: sell triggered, in delay window
+    if (live && live.hybridTriggeredTs) {
+      const elapsed = Math.max(0, (Date.now() / 1000) - Number(live.hybridTriggeredTs));
+      const remaining = Math.max(0, Number(live.hybridDelaySecs || 5) - elapsed);
+      return `
+        <div class="params-block trail-armed">
+          <div class="params-mode"><span class="dot dot-live"></span>Hybrid <em>(watching)</em></div>
+          <div class="params-line"><span class="params-label">Target hit</span>$${fmtNum(staticCfg.sellPx, 3)}</div>
+          <div class="params-line"><span class="params-label">Watch until</span><b>$${fmtNum(staticCfg.activationPx, 3)}</b></div>
+          <div class="params-line"><span class="params-label">Remaining</span>${remaining.toFixed(1)}s</div>
+          <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+          ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If trail now</span><b class="dim-b">$${fmtNum(projectedStop, 3)}</b></div>` : ''}
+          ${fmtLockedLine(lockedProjected, 'If trail: locked')}
+          <div class="params-line params-sub">Cross activation → trail · else sell at market</div>
+        </div>`;
+    }
+    // Stage 1: idle, waiting for sell target
+    return `
+      <div class="params-block">
+        <div class="params-mode">Hybrid</div>
+        <div class="params-line"><span class="params-label">Sell target</span>$${fmtNum(staticCfg.sellPx, 3)}</div>
+        <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+        <div class="params-line"><span class="params-label">Activation</span>$${fmtNum(staticCfg.activationPx, 3)}</div>
+        <div class="params-line"><span class="params-label">Delay</span>${fmtNum(staticCfg.hybridDelay || 5, 0)}s</div>
+        <div class="params-line"><span class="params-label">Trail dist</span>$${fmtNum(staticCfg.distance, 3)}</div>
+        ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If trail now</span><b class="dim-b">$${fmtNum(projectedStop, 3)}</b></div>` : ''}
+        ${fmtLockedLine(lockedProjected, 'If trail: locked')}
+      </div>`;
+  }
+  return `
+    <div class="params-block">
+      <div class="params-mode">Fixed limit</div>
+      <div class="params-line"><span class="params-label">Sell</span>$${fmtNum(staticCfg.sellPx, 3)}</div>
+      <div class="params-line"><span class="params-label">Buy</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+    </div>`;
+}
+
+function renderSleevesSection(tenant, symbol, config, state, snapshot) {
+  const primaryQty = Number(config?.swing_qty) || 0;
+  const core = Number(config?.core_qty) || 0;
+  const pos = Number(snapshot?.position_qty) || 0;
+  const sleeves = Array.isArray(config?.sleeves) ? config.sleeves : [];
+  const sleeveStates = state?.sleeves || {};
+  const sleeveQtySum = sleeves.reduce((n, s) => n + (Number(s.qty) || 0), 0);
+  const budget = pos - core;
+  const used = primaryQty + sleeveQtySum;
+  const remaining = budget - used;
+
+  // Allocate lots FIFO across primary + sleeves so each strategy's unrealized
+  // reflects the ACTUAL price paid for the contracts it will sell, not its
+  // configured buy_px target. Passing sleeveStates so ARMED_BUY sleeves
+  // (already sold, waiting to rebuy) correctly claim zero.
+  const allocation = allocateLotsToStrategies(snapshot?.lots || [], primaryQty, sleeves, sleeveStates);
+
+  const primaryHalted = state?.state === 'HALTED';
+  const primaryStateLabel = prettyState(state?.state);
+  const cyclesTotal = Number(state?.cycles) || 0;
+  const realizedTotal = Number(state?.realized_pnl) || 0;
+
+  const anyHaltedSleeves = Object.values(sleeveStates).filter(ss => ss?.state === 'HALTED').length;
+  const primaryActive = primaryQty > 0;
+  const running = (primaryActive ? 1 : 0) + sleeves.length
+    - (primaryActive && primaryHalted ? 1 : 0) - anyHaltedSleeves;
+  const haltedCount = (primaryActive && primaryHalted ? 1 : 0) + anyHaltedSleeves;
+  const totalStrategies = (primaryActive ? 1 : 0) + sleeves.length;
+
+  const resumeBtn = (t, sym) =>
+    `<button class="small primary" data-action="resume" data-tenant="${escapeHtml(t)}" data-symbol="${escapeHtml(sym)}">Resume</button>`;
+  const cancelBtn = (t, sym, sid, enabled) =>
+    `<button class="small ghost" ${enabled ? '' : 'disabled'} data-action="cancel-order" data-tenant="${escapeHtml(t)}" data-symbol="${escapeHtml(sym)}"${sid ? ` data-sleeve-id="${escapeHtml(sid)}"` : ''} title="${enabled ? 'Cancel this strategy\'s pending order' : 'No pending order to cancel'}">Cancel order</button>`;
+  const sellNowBtn = (t, sym, qty, enabled) => {
+    // Only render the button when a sell is actually possible. If the strategy
+    // is waiting to buy or has no contracts, the button would be a no-op — don't
+    // clutter the row with disabled controls.
+    if (!enabled) return '';
+    return `<button class="small danger" data-action="sell-now" data-tenant="${escapeHtml(t)}" data-symbol="${escapeHtml(sym)}" data-qty="${qty}" title="Market-sell ${qty} contract${qty === 1 ? '' : 's'} now">Sell ${qty} now</button>`;
+  };
+
+  const primaryHasOrder = !!state?.live_order_id;
+  // Sell-now only makes sense when the strategy is in ARMED_SELL AND actually
+  // has contracts to sell. When ARMED_BUY (already sold, waiting to rebuy) or
+  // HALTED, there's nothing to sell — hide the button entirely.
+  const primaryCanSellNow = state?.state === 'ARMED_SELL' && pos >= primaryQty && primaryQty > 0;
+  // Hide the primary row entirely when the user has disabled it (swing_qty=0).
+  // The bot's primary state machine still runs but does nothing — the UI just
+  // stops showing an irrelevant row.
+  const primaryEnabled = primaryQty > 0;
+
+  const primaryHint = primaryHalted && state?.halt_reason
+    ? `<span class="halt-why">Halted: ${escapeHtml(state.halt_reason)}</span>`
+    : (pos < primaryQty
+        ? `<span class="idle-why">Idle — needs ${primaryQty} contracts (you have ${pos})</span>`
+        : 'From your main config — edit in Settings');
+
+  const primaryMark = Number(snapshot?.last_mark) || 0;
+  const primaryCS = Number(config?.contract_size) || 50;
+  // Unrealized = sum over ACTUAL lot entries the primary owns (via FIFO allocation).
+  // Always shown as a number (even $0.00) so the user knows the field is live.
+  const primaryUnreal = sumUnitsUnrealized(allocation.primary, primaryMark, primaryCS);
+
+  const primaryAvgEntry = allocation.primary.length > 0
+    ? allocation.primary.reduce((n, u) => n + u.entry_price, 0) / allocation.primary.length
+    : 0;
+  const primaryParamsHtml = fmtTrailingParams(
+    config?.exit_mode || 'fixed_limit',
+    { armed: !!state?.trail_armed, hwm: state?.trail_high_water_price, distance: config?.trail_distance,
+      hybridTriggeredTs: state?.hybrid_sell_triggered_ts, hybridDelaySecs: config?.hybrid_delay_secs,
+      activationPx: config?.trail_activation_px },
+    { trigger: config?.trail_trigger, distance: config?.trail_distance,
+      sellPx: config?.sell_px, buyPx: config?.buy_px,
+      activationPx: config?.trail_activation_px, hybridDelay: config?.hybrid_delay_secs,
+      mark: snapshot?.last_mark,
+      avgEntry: primaryAvgEntry, qty: allocation.primary.length,
+      contractSize: primaryCS, feeRt: config?.fee_per_contract_roundtrip }
+  );
+
+  const primaryRow = primaryEnabled ? `
+    <tr class="sleeve-row primary ${primaryHalted ? 'halted' : ''}">
+      <td class="sleeve-name"><b>Primary</b><div class="sleeve-hint">${primaryHint}</div></td>
+      <td class="sleeve-qty">${primaryQty}</td>
+      <td class="sleeve-params">${primaryParamsHtml}</td>
+      <td class="sleeve-status"><span class="status-pill ${(state?.state || '').toLowerCase()}">${escapeHtml(primaryStateLabel)}</span></td>
+      <td class="sleeve-cycles">${cyclesTotal}</td>
+      <td class="sleeve-unrealized ${classForValue(primaryUnreal)}">${primaryUnreal >= 0 ? '+' : ''}${fmtMoney(primaryUnreal)}</td>
+      <td class="sleeve-realized ${classForValue(realizedTotal)}">${realizedTotal >= 0 ? '+' : ''}${fmtMoney(realizedTotal)}</td>
+      <td class="sleeve-actions">
+        ${primaryHalted ? resumeBtn(tenant, symbol) : ''}
+        ${cancelBtn(tenant, symbol, null, primaryHasOrder)}
+        ${sellNowBtn(tenant, symbol, primaryQty, primaryCanSellNow)}
+        <button class="small ghost" data-action="disable-primary" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" title="Stop the Primary strategy (set swing_qty=0). Any live order cancels next tick.">Stop strategy</button>
+        <button class="small ghost" data-action="edit" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">Edit</button>
+      </td>
+    </tr>
+  ` : '';
+
+  const mark = Number(snapshot?.last_mark) || 0;
+  const contractSize = Number(config?.contract_size) || 50;
+
+  const sleeveRows = sleeves.map(s => {
+    const ss = sleeveStates[s.id] || {};
+    const sState = String(ss.state || 'ARMED_SELL');
+    const cycles = Number(ss.cycles) || 0;
+    const realized = Number(ss.realized_pnl) || 0;
+    const hasOrder = !!ss.live_order_id;
+    const sleeveHalted = sState === 'HALTED';
+    const sleeveQty = Number(s.qty) || 0;
+    // Sell-now: only when the sleeve is ARMED_SELL with enough contracts to
+    // actually sell. Hide in ARMED_BUY (nothing to sell — already sold) and
+    // HALTED. To take a strategy out of rotation, use the ✕ (Stop strategy).
+    const canSellNow = sState === 'ARMED_SELL' && pos >= sleeveQty && sleeveQty > 0;
+
+    // Unrealized against the ACTUAL lots FIFO-allocated to this sleeve, not
+    // its configured buy_px. Matches what the position row shows for the same
+    // contracts — so if this sleeve owns all your open contracts, the two
+    // numbers agree exactly. Shown as a number always (even $0.00) rather
+    // than "—" so the user knows the field is live.
+    const sleeveUnits = allocation.bySleeve[s.id] || [];
+    const unreal = sumUnitsUnrealized(sleeveUnits, mark, contractSize);
+
+    const sleeveAvgEntry = sleeveUnits.length > 0
+      ? sleeveUnits.reduce((n, u) => n + u.entry_price, 0) / sleeveUnits.length
+      : 0;
+    const paramsHtml = fmtTrailingParams(
+      s.exit_mode || 'fixed_limit',
+      { armed: !!ss.trail_armed, hwm: ss.trail_high_water_price, distance: s.trail_distance,
+        hybridTriggeredTs: ss.hybrid_sell_triggered_ts, hybridDelaySecs: s.hybrid_delay_secs,
+        activationPx: s.trail_activation_px },
+      { trigger: s.trail_trigger, distance: s.trail_distance,
+        sellPx: s.sell_px, buyPx: s.buy_px,
+        activationPx: s.trail_activation_px, hybridDelay: s.hybrid_delay_secs,
+        mark: snapshot?.last_mark,
+        avgEntry: sleeveAvgEntry, qty: sleeveUnits.length,
+        contractSize: contractSize, feeRt: config?.fee_per_contract_roundtrip }
+    );
+
+    return `
+      <tr class="sleeve-row ${sleeveHalted ? 'halted' : ''}" data-sleeve-id="${escapeHtml(s.id)}">
+        <td class="sleeve-name">
+          <b>${escapeHtml(s.name || s.id)}</b>
+          ${sleeveHalted && ss.halt_reason ? `<div class="sleeve-hint"><span class="halt-why">${escapeHtml(ss.halt_reason)}</span></div>` : ''}
+        </td>
+        <td class="sleeve-qty">${sleeveQty}</td>
+        <td class="sleeve-params">${paramsHtml}</td>
+        <td class="sleeve-status"><span class="status-pill ${sState.toLowerCase()}">${escapeHtml(prettyState(sState))}</span></td>
+        <td class="sleeve-cycles">${cycles}</td>
+        <td class="sleeve-unrealized ${classForValue(unreal)}">${unreal >= 0 ? '+' : ''}${fmtMoney(unreal)}</td>
+        <td class="sleeve-realized ${classForValue(realized)}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
+        <td class="sleeve-actions">
+          ${sleeveHalted ? resumeBtn(tenant, symbol) : ''}
+          ${cancelBtn(tenant, symbol, s.id, hasOrder)}
+          ${sellNowBtn(tenant, symbol, sleeveQty, canSellNow)}
+          <button class="small ghost" data-action="edit-sleeve" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-sleeve-id="${escapeHtml(s.id)}">Edit</button>
+          <button class="small ghost" data-action="delete-sleeve" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-sleeve-id="${escapeHtml(s.id)}" title="Stop strategy — cancels any pending order and removes it from rotation">Stop strategy</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+
+  let budgetLine;
+  if (budget <= 0 && used > 0) {
+    budgetLine = `<span class="budget-bad">You hold 0 contracts — strategies need contracts to trade. Buy some or lower their sizes.</span>`;
+  } else if (remaining < 0) {
+    budgetLine = `<span class="budget-bad">Strategies want ${used} contracts but you only have ${budget} available. Reduce sizes or buy ${-remaining} more.</span>`;
+  } else {
+    budgetLine = `<span class="budget-ok">${used} / ${budget} contracts assigned${remaining > 0 ? ` · ${remaining} unassigned` : ''}</span>`;
+  }
+
+  const countLabel = haltedCount > 0
+    ? `${Math.max(0, running)} running · ${haltedCount} halted`
+    : `${Math.max(0, running)} running`;
+
+  // Silver price ticker on its own row between the section title and the
+  // strategy table — a full-width, prominent strip so the mark is impossible
+  // to miss while comparing strategies against current price.
+  const mkt = Number(snapshot?.last_mark) || 0;
+  const bid = Number(snapshot?.best_bid);
+  const ask = Number(snapshot?.best_ask);
+  const priceBar = mkt > 0 ? `
+    <div class="section-price-bar">
+      <div class="section-price-side">
+        <span class="section-price-label">SILVER (SLR)</span>
+      </div>
+      <div class="section-price-mark-wrap">
+        <span class="section-price-mark">$${fmtNum(mkt, 3)}</span>
+      </div>
+      <div class="section-price-side right">
+        ${Number.isFinite(bid) && Number.isFinite(ask)
+          ? `<span class="section-price-book">bid $${fmtNum(bid, 3)} &nbsp;·&nbsp; ask $${fmtNum(ask, 3)}</span>`
+          : ''}
+      </div>
+    </div>` : '';
+
+  return `
+    <section class="sleeves-section">
+      <div class="section-title-row">
+        <h3 class="section-title">Strategies <span class="section-count">${countLabel} · ${budgetLine}</span></h3>
+        <button class="small primary" data-action="add-sleeve" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">+ add strategy</button>
+      </div>
+      ${priceBar}
+      <table class="sleeves-table">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Contracts</th>
+            <th>Params</th>
+            <th>Status</th>
+            <th>Cycles</th>
+            <th>Unrealized</th>
+            <th>Realized</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${primaryRow}
+          ${sleeveRows}
+        </tbody>
+      </table>
+    </section>
+  `;
+}
+
+function lotAge(ts) {
+  if (!ts) return '—';
+  const age = Date.now() / 1000 - Number(ts);
+  if (age < 60) return `${age.toFixed(0)}s`;
+  if (age < 3600) return `${(age / 60).toFixed(0)}m`;
+  if (age < 86400) return `${(age / 3600).toFixed(1)}h`;
+  return `${(age / 86400).toFixed(1)}d`;
+}
+
+function renderTargetsRow(config, snapshot) {
+  // Symbol-level market data only. Per-strategy targets (buy/sell prices)
+  // now live INSIDE each strategy row so sleeves with different params
+  // aren't misrepresented by a single primary-derived targets row.
+  const mark = Number(snapshot?.last_mark);
+  if (!isFinite(mark)) return '';
+  const dayHigh = Number(snapshot?.day_high);
+  const dayLow = Number(snapshot?.day_low);
+  const rangeHtml = (isFinite(dayHigh) && isFinite(dayLow) && dayHigh > 0 && dayLow > 0)
+    ? `<div class="mark-range">
+         <span class="mark-range-item"><span class="mark-range-label">Day high</span><span class="mark-range-val pos">$${fmtNum(dayHigh, 3)}</span></span>
+         <span class="mark-range-item"><span class="mark-range-label">Day low</span><span class="mark-range-val neg">$${fmtNum(dayLow, 3)}</span></span>
+       </div>` : '';
+  return `
+    <div class="mark-row">
+      <div class="mark-label">Silver market</div>
+      <div class="mark-value">$${fmtNum(mark, 3)}</div>
+      <div class="mark-sub">bid $${fmtNum(snapshot.best_bid, 3)} · ask $${fmtNum(snapshot.best_ask, 3)}</div>
+      ${rangeHtml}
+    </div>
+  `;
+}
+
+function renderPositionBar(state, config, snapshot) {
+  // Old core/swing visualization was primary-strategy-specific and misleading
+  // when core=0 or sleeves manage the contracts. Removed. Position info is
+  // shown in the Open positions section (which is per-lot) and in the Risk
+  // strip (margin usage). Nothing symbol-level to show here anymore.
+  return '';
 }
 
 // ---- mini SVG chart ------------------------------------------------------
@@ -445,56 +1208,182 @@ async function refreshOnce() {
 
 // ---- CONFIG editor -------------------------------------------------------
 
-const CONFIG_FIELD_SPEC = [
-  ['core_qty', 'core qty (floor)', 'number', { step: 1, min: 1 }],
-  ['swing_qty', 'swing qty', 'number', { step: 1, min: 1 }],
-  ['max_swing_qty', 'max swing qty', 'number', { step: 1, min: 1 }],
-  ['sell_px', 'sell price', 'number', { step: 0.005 }],
-  ['buy_px', 'buy price', 'number', { step: 0.005 }],
-  ['abort_below', 'abort below', 'number', { step: 0.01 }],
-  ['abort_above', 'abort above', 'number', { step: 0.01 }],
-  ['exit_mode', 'exit mode', 'select', { options: ['fixed_limit', 'trailing_stop'] }],
-  ['trail_trigger', 'trail trigger', 'number', { step: 0.005 }],
-  ['trail_distance', 'trail distance', 'number', { step: 0.005 }],
-  ['reanchor_threshold', 're-anchor threshold', 'number', { step: 0.1 }],
-  ['contract_size', 'contract size', 'number', { step: 1 }],
-  ['margin_per_contract', 'margin/contract', 'number', { step: 1 }],
-  ['fee_per_contract_roundtrip', 'fee per roundtrip', 'number', { step: 0.01 }],
-  ['scale_up_buffer_mult', 'scale-up buffer ×', 'number', { step: 0.1, min: 1 }],
-  ['fee_sanity_multiplier', 'fee sanity ×', 'number', { step: 0.1, min: 1 }],
+const CONFIG_SECTIONS = [
+  {
+    title: 'Position size',
+    fields: [
+      ['core_qty', 'Core floor (0 = no floor, free trading)', 'number', { step: 1, min: 0 }],
+      ['swing_qty', 'Swing size (contracts to trade)', 'number', { step: 1, min: 1 }],
+      ['max_swing_qty', 'Max swing size', 'number', { step: 1, min: 1 }],
+    ],
+  },
+  {
+    title: 'Price targets',
+    fields: [
+      ['sell_px', 'Sell at ($)', 'number', { step: 0.005 }],
+      ['buy_px', 'Buy back at ($)', 'number', { step: 0.005 }],
+      ['abort_below', 'Halt if price falls below ($)', 'number', { step: 0.01 }],
+      ['abort_above', 'Halt if price runs above ($)', 'number', { step: 0.01 }],
+    ],
+  },
+  {
+    title: 'Exit strategy',
+    fields: [
+      ['exit_mode', 'Mode', 'select', { options: ['fixed_limit', 'trailing_stop'] }],
+      ['trail_trigger', 'Trail trigger price ($)', 'number', { step: 0.005 }],
+      ['trail_distance', 'Trail distance ($)', 'number', { step: 0.005 }],
+      ['reanchor_threshold', 'Re-anchor threshold ($)', 'number', { step: 0.1 }],
+    ],
+  },
+  {
+    title: 'Costs & margin  (advanced)',
+    advanced: true,
+    fields: [
+      ['contract_size', 'Contract size (oz)', 'number', { step: 1 }],
+      ['margin_per_contract', 'Margin per contract ($)', 'number', { step: 1 }],
+      ['fee_per_contract_roundtrip', 'Fee per roundtrip ($)', 'number', { step: 0.01 }],
+      ['scale_up_buffer_mult', 'Scale-up buffer ×', 'number', { step: 0.1, min: 1 }],
+      ['fee_sanity_multiplier', 'Fee sanity ×', 'number', { step: 0.1, min: 1 }],
+    ],
+  },
 ];
+
+const PRESET_META = {
+  conservative: { name: 'Conservative', desc: 'Small size, wide abort bracket. Range-scalp only.' },
+  moderate: { name: 'Moderate', desc: 'Adam\'s current setup. 2-point range.' },
+  aggressive: { name: 'Aggressive', desc: 'Trailing-first, tight trail. Rides breakouts.' },
+};
+
+const PRESETS = {
+  conservative: {
+    core_qty: 10, swing_qty: 2, max_swing_qty: 3,
+    sell_px: 65.0, buy_px: 63.0, abort_below: 58.0, abort_above: 72.0,
+    exit_mode: 'fixed_limit', trail_trigger: 65.0, trail_distance: 0.25, reanchor_threshold: 2.0,
+    contract_size: 50, margin_per_contract: 275.0, fee_per_contract_roundtrip: 4.68,
+    scale_up_buffer_mult: 2.0, fee_sanity_multiplier: 2.0,
+  },
+  moderate: {
+    core_qty: 10, swing_qty: 2, max_swing_qty: 5,
+    sell_px: 65.0, buy_px: 63.0, abort_below: 60.0, abort_above: 70.0,
+    exit_mode: 'fixed_limit', trail_trigger: 65.0, trail_distance: 0.20, reanchor_threshold: 2.0,
+    contract_size: 50, margin_per_contract: 275.0, fee_per_contract_roundtrip: 4.68,
+    scale_up_buffer_mult: 1.5, fee_sanity_multiplier: 2.0,
+  },
+  aggressive: {
+    core_qty: 10, swing_qty: 2, max_swing_qty: 8,
+    sell_px: 65.0, buy_px: 63.0, abort_below: 61.0, abort_above: 80.0,
+    exit_mode: 'trailing_stop', trail_trigger: 65.0, trail_distance: 0.15, reanchor_threshold: 2.0,
+    contract_size: 50, margin_per_contract: 275.0, fee_per_contract_roundtrip: 4.68,
+    scale_up_buffer_mult: 1.0, fee_sanity_multiplier: 2.0,
+  },
+};
+
+function fieldMatchesPreset(cfg, preset) {
+  const keys = ['core_qty', 'max_swing_qty', 'abort_below', 'abort_above', 'exit_mode', 'trail_distance', 'scale_up_buffer_mult'];
+  return keys.every(k => String(cfg[k]) === String(preset[k]));
+}
+
+function detectActivePreset(cfg) {
+  for (const [name, preset] of Object.entries(PRESETS)) {
+    if (fieldMatchesPreset(cfg, preset)) return name;
+  }
+  return null;
+}
 
 function openConfigEditor(tenant, symbol) {
   const cfg = currentStore[tenant]?.[symbol]?.config || {};
   configEditContext = { tenant, symbol };
-  configTitle.textContent = `edit config — ${tenant} / ${symbol}`;
+  configTitle.textContent = `Settings — ${symbol}`;
   configForm.innerHTML = '';
   configErrors.innerHTML = '';
-  for (const [key, label, type, opts] of CONFIG_FIELD_SPEC) {
-    const wrap = document.createElement('label');
-    wrap.innerHTML = `<span>${label}</span>`;
-    let input;
-    if (type === 'select') {
-      input = document.createElement('select');
-      input.name = key;
-      for (const o of opts.options) {
-        const opt = document.createElement('option');
-        opt.value = o; opt.textContent = o;
-        if (String(cfg[key] || '') === o) opt.selected = true;
-        input.appendChild(opt);
-      }
-    } else {
-      input = document.createElement('input');
-      input.type = type;
-      input.name = key;
-      input.value = cfg[key] ?? '';
-      if (opts?.step != null) input.step = opts.step;
-      if (opts?.min != null) input.min = opts.min;
-    }
-    wrap.appendChild(input);
-    configForm.appendChild(wrap);
+
+  // Presets row at top
+  const activePreset = detectActivePreset(cfg);
+  const presetsWrap = document.createElement('div');
+  presetsWrap.className = 'config-section';
+  presetsWrap.innerHTML = `<h3>Start from a preset</h3>`;
+  const presetGrid = document.createElement('div');
+  presetGrid.className = 'preset-grid';
+  for (const [key, meta] of Object.entries(PRESET_META)) {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'preset-card' + (activePreset === key ? ' active' : '');
+    card.dataset.preset = key;
+    card.innerHTML = `<div class="preset-name">${meta.name}</div><div class="preset-desc">${meta.desc}</div>`;
+    card.onclick = () => applyPreset(key);
+    presetGrid.appendChild(card);
   }
+  presetsWrap.appendChild(presetGrid);
+  configForm.appendChild(presetsWrap);
+
+  // Sections
+  for (const section of CONFIG_SECTIONS) {
+    const sec = document.createElement('div');
+    sec.className = 'config-section';
+    sec.innerHTML = `<h3>${section.title}</h3>`;
+    if (section.advanced) sec.dataset.advanced = 'true';
+    if (section.advanced) sec.hidden = true;
+    const fields = document.createElement('div');
+    fields.className = 'config-fields';
+    for (const [key, label, type, opts] of section.fields) {
+      const wrap = document.createElement('label');
+      const span = document.createElement('span');
+      span.textContent = label;
+      wrap.appendChild(span);
+      let input;
+      if (type === 'select') {
+        input = document.createElement('select');
+        input.name = key;
+        for (const o of opts.options) {
+          const opt = document.createElement('option');
+          opt.value = o; opt.textContent = o;
+          if (String(cfg[key] || '') === o) opt.selected = true;
+          input.appendChild(opt);
+        }
+      } else {
+        input = document.createElement('input');
+        input.type = type;
+        input.name = key;
+        input.value = cfg[key] ?? '';
+        if (opts?.step != null) input.step = opts.step;
+        if (opts?.min != null) input.min = opts.min;
+      }
+      wrap.appendChild(input);
+      fields.appendChild(wrap);
+    }
+    sec.appendChild(fields);
+    configForm.appendChild(sec);
+  }
+
+  // Advanced toggle button
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'advanced-toggle';
+  toggle.textContent = 'Show advanced (fees, margin, contract size)';
+  toggle.onclick = () => {
+    const advanced = configForm.querySelectorAll('[data-advanced="true"]');
+    let anyHidden = false;
+    advanced.forEach(a => { if (a.hidden) anyHidden = true; });
+    advanced.forEach(a => { a.hidden = !anyHidden ? true : false; });
+    toggle.textContent = anyHidden ? 'Hide advanced' : 'Show advanced (fees, margin, contract size)';
+  };
+  configForm.appendChild(toggle);
+
   configModal.hidden = false;
+}
+
+function applyPreset(name) {
+  const preset = PRESETS[name];
+  if (!preset) return;
+  for (const [key, val] of Object.entries(preset)) {
+    const input = configForm.querySelector(`[name="${key}"]`);
+    if (!input) continue;
+    input.value = val;
+  }
+  // Re-mark active preset
+  configForm.querySelectorAll('.preset-card').forEach(c => {
+    c.classList.toggle('active', c.dataset.preset === name);
+  });
 }
 
 async function saveConfig() {
@@ -705,9 +1594,636 @@ function renderLeaderboard(results) {
   `;
 }
 
+// ---- sleeves editor -----------------------------------------------------
+
+function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
+  const block = currentStore[tenant]?.[symbol] || {};
+  const cfg = block.config || {};
+  const snap = block.snapshot || {};
+  const mark = Number(snap.last_mark) || 0;
+  const posAvgEntry = Number(snap.position_avg_entry) || 0;
+  // Priority order for the anchor (the price the swing is centered on):
+  //   1. Lot's entry price if opened from a specific lot ("+ Strategy" per lot)
+  //   2. Existing sleeve's buy_px (preserve on edit)
+  //   3. Current mark for a general "+ add strategy" — reflects RIGHT NOW,
+  //      not a stale blended cost basis that could include ancient positions.
+  let anchor;
+  let anchorLabel;
+  if (lotContext) {
+    anchor = Number(lotContext.entry_price) || mark;
+    anchorLabel = "Anchored to lot's entry price";
+  } else if (sleeveId) {
+    const existingSleeve = (cfg.sleeves || []).find(s => s.id === sleeveId);
+    anchor = existingSleeve ? Number(existingSleeve.buy_px) || mark : mark;
+    anchorLabel = "Anchored to strategy's original entry";
+  } else {
+    anchor = mark;
+    anchorLabel = 'Anchored to current market';
+  }
+  const contractSize = Number(cfg.contract_size) || 50;
+  const feeRt = Number(cfg.fee_per_contract_roundtrip) || 4.68;
+  const sleeves = Array.isArray(cfg.sleeves) ? [...cfg.sleeves] : [];
+  const existing = sleeveId ? sleeves.find(s => s.id === sleeveId) : null;
+
+  // Capacity: how many contracts can this sleeve use?
+  const pos = Number(snap.position_qty ?? 0);
+  const core = Number(cfg.core_qty ?? 0);
+  const primary = Number(cfg.swing_qty ?? 0);
+  const otherSleeves = sleeves.filter(s => s.id !== sleeveId);
+  // Only count sleeves that CURRENTLY own contracts (ARMED_SELL). Sleeves in
+  // ARMED_BUY have already sold their portion — they'll consume capacity when
+  // they rebuy, but that's a future event, not a current claim. This lets a
+  // fresh manual buy actually free up room for a new strategy.
+  const sleeveStates = snap.state?.sleeves || (currentStore[tenant]?.[symbol]?.state?.sleeves) || {};
+  const otherSleeveQty = otherSleeves.reduce((n, s) => {
+    const st = sleeveStates[s.id]?.state || 'ARMED_SELL';
+    return n + (st === 'ARMED_SELL' ? (Number(s.qty) || 0) : 0);
+  }, 0);
+  // Free capacity for THIS sleeve. If everything's already assigned, freeCapacity
+  // is 0 — the modal will show a warning and disable the qty input instead of
+  // pretending the user can add "1 more".
+  const freeCapacity = Math.max(0, pos - core - primary - otherSleeveQty);
+  // When editing an existing sleeve, its own qty is already counted against
+  // freeCapacity via the filter above (otherSleeves), so max = freeCapacity + its own qty.
+  const maxQty = freeCapacity + (existing ? Number(existing.qty || 0) : 0);
+  const atCapacity = maxQty < 1;
+
+  // Slider is TOTAL NET profit (after fees) for the strategy (all contracts, one
+  // swing). Per spec §5A: you set take-home, the bot places gross = target + fees.
+  const startingQty = Math.min(lotContext ? lotContext.qty : (existing?.qty || 1), maxQty);
+  const defaultTotalProfit = 50 * startingQty;
+  const existingTotalProfit = existing
+    ? Math.max(10, Math.round(
+        (existing.sell_px - existing.buy_px) * contractSize * existing.qty
+        - feeRt * existing.qty
+      ))
+    : defaultTotalProfit;
+
+  // The 4 canonical swing-trading authors from the build spec (§5, §6). Each
+  // preset packages the exit mode + profit target + trail distance the way
+  // that author's method suggests. "Custom" lets the user configure freely.
+  const PRESETS = {
+    'Jim Paul': {
+      // What I Learned Losing a Million Dollars — RISK-FIRST. Small, defensible
+      // range. Fixed limit with tight profit target so you're never far offside.
+      exit_mode: 'fixed_limit',
+      profitDollarsPerContract: 25,   // $0.50 spread on a 50oz contract
+      trailDistance: 0.05,
+      note: 'Risk-first fixed limit. Tight range, small targets — Paul cared about not blowing up more than winning big.',
+    },
+    'Livermore': {
+      // Reminiscences of a Stock Operator — PIVOT + PYRAMID. Wider swings,
+      // fixed limit at whole-number pivots. Big spread, meaningful targets.
+      exit_mode: 'fixed_limit',
+      profitDollarsPerContract: 100,  // $2 spread
+      trailDistance: 0.20,
+      note: 'Pivot-based fixed limit. Wider swings around whole-number levels — Livermore traded pivot points, not noise.',
+    },
+    'Carter': {
+      // Mastering the Trade — TRAILING/BREAKOUT. Arms above pivot, rides trend,
+      // exits on structure break. Real trailing stop with medium distance.
+      exit_mode: 'trailing_stop',
+      profitDollarsPerContract: 50,   // arm at anchor + $1
+      trailDistance: 0.15,
+      note: "Trailing stop that rides trend. Arms on breakout, rides upside, exits when structure breaks — Carter's bread and butter.",
+    },
+    'Elder': {
+      // Trading for a Living — TRIPLE SCREEN. Medium fixed limit with wider
+      // range to give the setup room to work.
+      exit_mode: 'fixed_limit',
+      profitDollarsPerContract: 60,   // $1.20 spread
+      trailDistance: 0.10,
+      note: 'Fixed limit with room to breathe. Elder wanted setups to have time to develop — medium targets, patient exits.',
+    },
+    'Custom': {
+      exit_mode: 'fixed_limit',
+      profitDollarsPerContract: 50,
+      trailDistance: 0.10,
+      note: 'You set every parameter. Use this when the presets don\'t match what you want.',
+    },
+  };
+  const nextAuthorName = () => {
+    const used = new Set(sleeves.map(s => s.name));
+    for (const n of Object.keys(PRESETS)) if (!used.has(n) && n !== 'Custom') return n;
+    return 'Custom';
+  };
+
+  const draft = existing || {
+    id: `s${Date.now().toString(36)}`,
+    name: nextAuthorName(),
+    qty: 1,
+    exit_mode: 'fixed_limit',
+    reanchor_threshold: 2.0,
+  };
+
+  // Distance from anchor to current mark — surface a warning when the anchor
+  // (typically a lot's old entry price) is far from where the market is now.
+  const anchorToMarketDist = anchor && mark ? Math.abs(mark - anchor) : 0;
+  const anchorStale = anchorToMarketDist > 0.5;
+
+  let m = document.getElementById('sleeve-modal');
+  if (!m) {
+    m = document.createElement('div');
+    m.id = 'sleeve-modal';
+    m.className = 'modal';
+    document.body.appendChild(m);
+  }
+  m.innerHTML = `
+    <div class="modal-panel">
+      <div class="modal-header">
+        <h2>${existing ? 'Edit strategy' : 'Add strategy'}</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <div class="sleeve-anchor ${anchorStale ? 'stale' : ''}">
+        <div class="sleeve-anchor-header">
+          <div>
+            <div class="sleeve-anchor-label">${anchorLabel}</div>
+            <div class="sleeve-anchor-value">$${fmtNum(anchor, 3)}</div>
+          </div>
+          ${anchorStale ? `<button type="button" class="small ghost" id="sl-reset-anchor">use market instead ($${fmtNum(mark, 3)})</button>` : ''}
+        </div>
+        <div class="sleeve-anchor-sub">
+          Market is at $${fmtNum(mark, 3)}${anchorStale ? ` — <span class="stale-warn">anchor is $${fmtNum(anchorToMarketDist, 3)} away, targets below may be off-market</span>` : ''}
+        </div>
+      </div>
+      <div class="sleeve-form">
+        <label>Preset (author)
+          <select id="sl-preset">
+            ${Object.keys(PRESETS).map(name =>
+              `<option value="${escapeHtml(name)}" ${draft.name === name ? 'selected' : ''}>${escapeHtml(name)}</option>`
+            ).join('')}
+          </select>
+        </label>
+        <label>Name<input type="text" id="sl-name" value="${escapeHtml(draft.name)}"></label>
+        <label>Contracts ${atCapacity
+          ? '<span class="capacity-warn">(no free capacity — buy more or reduce another strategy)</span>'
+          : `(max ${maxQty})`}
+          <input type="number" id="sl-qty" min="1" max="${Math.max(1, maxQty)}" step="1" ${atCapacity ? 'disabled' : ''} value="${Math.min(lotContext ? lotContext.qty : draft.qty, Math.max(1, maxQty))}">
+        </label>
+        <label>Strategy type
+          <select id="sl-exit">
+            <option value="fixed_limit" ${draft.exit_mode === 'fixed_limit' ? 'selected' : ''}>Fixed limit (sell high, buy low)</option>
+            <option value="trailing_stop" ${draft.exit_mode === 'trailing_stop' ? 'selected' : ''}>Trailing stop (ride the trend)</option>
+            <option value="hybrid" ${draft.exit_mode === 'hybrid' ? 'selected' : ''}>Hybrid (take the swing, or trail a breakout)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="preset-note" id="sl-preset-note"></div>
+
+      <!-- Explicit sell/buy target inputs — always visible so you can override the slider -->
+      <div class="target-inputs">
+        <label>Sell target
+          <input type="number" id="sl-sell-target" step="0.005" value="${existing?.sell_px ?? (anchor + 0.5).toFixed(3)}">
+        </label>
+        <label>Buy-back target
+          <input type="number" id="sl-buy-target" step="0.005" value="${existing?.buy_px ?? (anchor - 0.5).toFixed(3)}">
+        </label>
+      </div>
+
+      <!-- Profit target slider — TAKE-HOME (net after fees). Bot back-calcs the gap. -->
+      <div class="profit-slider-block" id="sl-fixed-block">
+        <div class="profit-slider-header">
+          <span class="slider-label">Or drag: <b>net</b> take-home per swing (after fees, all <span id="sl-qty-echo">${startingQty}</span> contracts)</span>
+          <span class="slider-value" id="sl-profit-val">$${existingTotalProfit}</span>
+        </div>
+        <input type="range" id="sl-profit" min="10" max="2000" step="10" value="${existingTotalProfit}" class="profit-slider">
+        <div class="profit-slider-ticks">
+          <span>$10</span><span>$500</span><span>$1,000</span><span>$2,000</span>
+        </div>
+        <div class="cost-floor-note" id="sl-cost-floor"></div>
+      </div>
+
+      <!-- Trailing-only add-on: trail distance below the high water -->
+      <div class="profit-slider-block" id="sl-trail-block" hidden>
+        <div class="profit-slider-header">
+          <span class="slider-label">Trail distance (pullback before selling)</span>
+          <span class="slider-value" id="sl-td-val">$0.100</span>
+        </div>
+        <input type="range" id="sl-td-slider" min="0.010" max="1.000" step="0.005" value="${existing?.trail_distance || 0.100}" class="profit-slider">
+        <div class="profit-slider-ticks">
+          <span>$0.01</span><span>$0.25</span><span>$0.50</span><span>$1.00</span>
+        </div>
+        <div class="preview-note">
+          Trailing stop uses the sell target above as the ARM price — once silver hits it, the trail engages and rides upside. Sells when price pulls back this much from the peak.
+        </div>
+      </div>
+
+      <!-- Hybrid-only add-on: activation price + delay window -->
+      <div class="profit-slider-block" id="sl-hybrid-block" hidden>
+        <div class="target-inputs">
+          <label>Trail activation price
+            <input type="number" id="sl-trail-activation" step="0.005" value="${existing?.trail_activation_px ?? (anchor + 0.75).toFixed(3)}">
+          </label>
+          <label>Delay window (seconds)
+            <input type="number" id="sl-hybrid-delay" step="1" min="1" max="60" value="${existing?.hybrid_delay_secs ?? 5}">
+          </label>
+        </div>
+        <div class="preview-note">
+          Once silver crosses the <b>sell target</b>, we wait this many seconds to see if it pushes through the <b>trail activation price</b>.
+          If it does → trailing stop engages and rides the breakout. If it doesn't → we take the swing at market when the delay expires.
+        </div>
+      </div>
+
+      <div class="sleeve-preview" id="sl-preview">
+        <!-- filled by updatePreview() -->
+      </div>
+
+      <div id="sleeve-error" class="issues" hidden></div>
+      <div class="modal-footer">
+        <button data-close>cancel</button>
+        <button class="primary" id="sleeve-save-btn">save</button>
+      </div>
+    </div>
+  `;
+  m.hidden = false;
+
+  const presetEl = m.querySelector('#sl-preset');
+  const presetNoteEl = m.querySelector('#sl-preset-note');
+  const nameEl = m.querySelector('#sl-name');
+  const profitEl = m.querySelector('#sl-profit');
+  const profitValEl = m.querySelector('#sl-profit-val');
+  const previewEl = m.querySelector('#sl-preview');
+  const qtyEl = m.querySelector('#sl-qty');
+  const qtyEchoEl = m.querySelector('#sl-qty-echo');
+  const exitEl = m.querySelector('#sl-exit');
+  const fixedBlock = m.querySelector('#sl-fixed-block');
+  const trailBlock = m.querySelector('#sl-trail-block');
+  const hybridBlock = m.querySelector('#sl-hybrid-block');
+  const tdSliderEl = m.querySelector('#sl-td-slider');
+  const tdValEl = m.querySelector('#sl-td-val');
+  const sellTargetEl = m.querySelector('#sl-sell-target');
+  const buyTargetEl = m.querySelector('#sl-buy-target');
+  const trailActivationEl = m.querySelector('#sl-trail-activation');
+  const hybridDelayEl = m.querySelector('#sl-hybrid-delay');
+  const resetAnchorBtn = m.querySelector('#sl-reset-anchor');
+
+  let currentAnchor = anchor;  // mutable so "use market instead" can update it
+
+  function applyPreset(name) {
+    const p = PRESETS[name];
+    if (!p) return;
+    // Only overwrite fields the user hasn't intentionally changed by picking Custom
+    exitEl.value = p.exit_mode;
+    const qty = Math.max(1, Number(qtyEl.value) || 1);
+    const targetProfit = p.profitDollarsPerContract * qty;
+    profitEl.value = Math.min(2000, Math.max(10, targetProfit));
+    tdSliderEl.value = p.trailDistance;
+    presetNoteEl.textContent = p.note;
+    // Recompute targets from the profit slider around the current anchor
+    syncTargetsFromSlider();
+    applyModeVisibility();
+  }
+
+  function syncTargetsFromSlider() {
+    // Spec §5A: slider = target NET after fees. Back-calculate the gross gap:
+    //   gross_needed = target_net + roundtrip_fees
+    //   spread_per_contract = gross_needed / (qty × contract_size)
+    // That's the price gap the bot must actually capture to hand you the net.
+    const qty = Math.max(1, Number(qtyEl.value) || 1);
+    const feesTotal = feeRt * qty;
+    // Cost-gated MINIMUM (spec §5A): can't set a net target that's lower than
+    // fees alone — you'd need to capture more than the target just to pay them.
+    // Clamp slider min to fees+$1 so any target guarantees at least $1 net.
+    const costFloor = Math.ceil(feesTotal + 1);
+    if (Number(profitEl.min) !== costFloor) profitEl.min = costFloor;
+    if (Number(profitEl.value) < costFloor) profitEl.value = costFloor;
+    const costFloorEl = m.querySelector('#sl-cost-floor');
+    if (costFloorEl) costFloorEl.innerHTML = `Minimum: <b>$${costFloor}</b> — round-trip fees on ${qty} contract${qty === 1 ? '' : 's'} are $${feesTotal.toFixed(2)}. Lower nets would be eaten by fees.`;
+    const targetNet = Number(profitEl.value);
+    const grossNeeded = targetNet + feesTotal;
+    const spread = grossNeeded / (qty * contractSize);
+    sellTargetEl.value = (currentAnchor + spread / 2).toFixed(3);
+    buyTargetEl.value = (currentAnchor - spread / 2).toFixed(3);
+  }
+
+  function updateFillPct(el) {
+    if (!el) return;
+    const min = Number(el.min), max = Number(el.max), val = Number(el.value);
+    const pct = ((val - min) / (max - min)) * 100;
+    el.style.background = `linear-gradient(to right, var(--accent) 0%, var(--accent) ${pct}%, var(--panel-3) ${pct}%, var(--panel-3) 100%)`;
+  }
+
+  function updatePreview() {
+    const qty = Math.max(1, Number(qtyEl.value) || 1);
+    if (qtyEchoEl) qtyEchoEl.textContent = qty;
+    const feesPerSwing = feeRt * qty;
+    const mode = exitEl.value;
+    const sellPx = Number(sellTargetEl.value) || 0;
+    const buyPx = Number(buyTargetEl.value) || 0;
+    const grossPerSwing = (sellPx - buyPx) * contractSize * qty;
+    const netPerSwing = grossPerSwing - feesPerSwing;
+
+    profitValEl.textContent = `$${profitEl.value}`;
+    updateFillPct(profitEl);
+    updateFillPct(tdSliderEl);
+    tdValEl.textContent = `$${fmtNum(Number(tdSliderEl.value), 3)}`;
+
+    if (mode === 'trailing_stop') {
+      const trailDistance = Number(tdSliderEl.value) || 0.1;
+      const estGross = Math.max(0, (sellPx - trailDistance - buyPx) * contractSize * qty);
+      const estNet = estGross - feesPerSwing;
+      previewEl.innerHTML = `
+        <div class="preview-row">
+          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtNum(buyPx, 3)}</span></div>
+          <div><span class="preview-label">Now</span><span class="preview-num">$${fmtNum(mark, 3)}</span></div>
+          <div><span class="preview-label">Arms at</span><span class="preview-num sell">$${fmtNum(sellPx, 3)}</span></div>
+        </div>
+        <div class="preview-econ">
+          <span>Trail distance: <b>$${fmtNum(trailDistance, 3)}</b></span>
+          <span>Est min sell: <b>$${fmtNum(sellPx - trailDistance, 3)}</b></span>
+          <span>Est gross (min): <b>$${estGross.toFixed(2)}</b></span>
+          <span>Fees: <b>−$${feesPerSwing.toFixed(2)}</b></span>
+          <span>Est net (min): <b class="${estNet > 0 ? 'pos' : 'neg'}">${estNet >= 0 ? '+' : ''}$${estNet.toFixed(2)}</b></span>
+        </div>
+        <div class="preview-note">Trailing rides upside — profit is variable. Preview shows worst case (trail fires at arm price).</div>
+      `;
+    } else if (mode === 'hybrid') {
+      const activation = Number(trailActivationEl?.value) || sellPx;
+      const delay = Number(hybridDelayEl?.value) || 5;
+      const trailDistance = Number(tdSliderEl.value) || 0.1;
+      // Path A: delay expires without breakout — market-sell at sell_px area.
+      const perContract = qty > 0 ? grossPerSwing / qty : 0;
+      // Path B: activation crossed — trail engages. Worst case: trail fires
+      // at activation minus trail distance.
+      const estGrossTrailWorst = Math.max(0, (activation - trailDistance - buyPx) * contractSize * qty);
+      const estNetTrailWorst = estGrossTrailWorst - feesPerSwing;
+      previewEl.innerHTML = `
+        <div class="preview-row">
+          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtNum(buyPx, 3)}</span></div>
+          <div><span class="preview-label">Sell target</span><span class="preview-num sell">$${fmtNum(sellPx, 3)}</span></div>
+          <div><span class="preview-label">Activation</span><span class="preview-num">$${fmtNum(activation, 3)}</span></div>
+        </div>
+        <div class="preview-econ">
+          <span>Delay: <b>${delay}s</b></span>
+          <span>Trail distance: <b>$${fmtNum(trailDistance, 3)}</b></span>
+        </div>
+        <div class="preview-econ">
+          <span><b>Path A</b> (no breakout): sell at target → net <b class="${netPerSwing > 0 ? 'pos' : 'neg'}">${netPerSwing >= 0 ? '+' : ''}$${netPerSwing.toFixed(2)}</b></span>
+          <span><b>Path B</b> (breakout, worst): trail sells at $${fmtNum(activation - trailDistance, 3)} → net <b class="${estNetTrailWorst > 0 ? 'pos' : 'neg'}">${estNetTrailWorst >= 0 ? '+' : ''}$${estNetTrailWorst.toFixed(2)}</b></span>
+        </div>
+        <div class="preview-note">Activation must be above the sell target. Path B is a floor — real breakouts can ride much higher before the trail fires.</div>
+      `;
+    } else {
+      const perContract = qty > 0 ? grossPerSwing / qty : 0;
+      previewEl.innerHTML = `
+        <div class="preview-row">
+          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtNum(buyPx, 3)}</span></div>
+          <div><span class="preview-label">Now</span><span class="preview-num">$${fmtNum(mark, 3)}</span></div>
+          <div><span class="preview-label">Sell at</span><span class="preview-num sell">$${fmtNum(sellPx, 3)}</span></div>
+        </div>
+        <div class="preview-econ">
+          <span>Swing width: <b>$${fmtNum(sellPx - buyPx, 3)}</b></span>
+          <span>Per contract: <b>$${perContract.toFixed(2)}</b></span>
+          <span>Gross/swing: <b>$${grossPerSwing.toFixed(2)}</b></span>
+          <span>Fees: <b>−$${feesPerSwing.toFixed(2)}</b></span>
+          <span>Net/swing: <b class="${netPerSwing > 0 ? 'pos' : 'neg'}">${netPerSwing >= 0 ? '+' : ''}$${netPerSwing.toFixed(2)}</b></span>
+        </div>
+      `;
+    }
+  }
+
+  const applyModeVisibility = () => {
+    const mode = exitEl.value;
+    // Trail distance slider is used by BOTH trailing_stop and hybrid modes.
+    trailBlock.hidden = !(mode === 'trailing_stop' || mode === 'hybrid');
+    hybridBlock.hidden = mode !== 'hybrid';
+    updatePreview();
+  };
+
+  // Wire events
+  presetEl.addEventListener('change', () => { nameEl.value = presetEl.value; applyPreset(presetEl.value); });
+  nameEl.addEventListener('input', () => {
+    // If user types over the name, they're overriding — mark preset as Custom
+    if (presetEl.value !== 'Custom' && nameEl.value !== presetEl.value) presetEl.value = 'Custom';
+  });
+  profitEl.addEventListener('input', () => { syncTargetsFromSlider(); updatePreview(); });
+  qtyEl.addEventListener('input', () => { syncTargetsFromSlider(); updatePreview(); });
+  exitEl.addEventListener('change', applyModeVisibility);
+  tdSliderEl.addEventListener('input', updatePreview);
+  sellTargetEl.addEventListener('input', updatePreview);
+  buyTargetEl.addEventListener('input', updatePreview);
+  if (trailActivationEl) trailActivationEl.addEventListener('input', updatePreview);
+  if (hybridDelayEl) hybridDelayEl.addEventListener('input', updatePreview);
+  if (resetAnchorBtn) resetAnchorBtn.onclick = () => { currentAnchor = mark; syncTargetsFromSlider(); updatePreview(); };
+
+  // Initial state
+  if (!existing) applyPreset(presetEl.value);
+  else { presetNoteEl.textContent = PRESETS[draft.name]?.note || ''; syncTargetsFromSlider(); }
+  applyModeVisibility();
+
+  m.querySelector('#sleeve-save-btn').onclick = async () => {
+    const errEl = m.querySelector('#sleeve-error');
+    errEl.hidden = true;
+    const sellPx = Number(sellTargetEl.value);
+    const buyPx = Number(buyTargetEl.value);
+    const trailDistance = Number(tdSliderEl.value);
+    const trailActivation = Number(trailActivationEl?.value);
+    const hybridDelay = Number(hybridDelayEl?.value);
+    const usesTrail = exitEl.value === 'trailing_stop' || exitEl.value === 'hybrid';
+    const patch = {
+      id: draft.id,
+      name: nameEl.value || draft.id,
+      qty: parseInt(qtyEl.value, 10),
+      exit_mode: exitEl.value,
+      sell_px: sellPx,
+      buy_px: buyPx,
+      trail_trigger: sellPx,
+      trail_distance: usesTrail ? trailDistance : Math.max(0.02, (sellPx - buyPx) / 4),
+      trail_activation_px: exitEl.value === 'hybrid' ? trailActivation : (sellPx + 0.5),
+      hybrid_delay_secs: exitEl.value === 'hybrid' ? hybridDelay : 5.0,
+      reanchor_threshold: draft.reanchor_threshold,
+    };
+    if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
+    if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
+    if (usesTrail && !(trailDistance > 0)) { errEl.hidden = false; errEl.innerHTML = 'Trail distance must be > 0'; return; }
+    if (exitEl.value === 'hybrid') {
+      if (!(trailActivation > sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Trail activation must be above the sell target'; return; }
+      if (!(hybridDelay >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Delay must be at least 1 second'; return; }
+    }
+
+    const next = existing
+      ? sleeves.map(s => s.id === draft.id ? patch : s)
+      : [...sleeves, patch];
+    const res = await putJson('/api/sleeves', { tenant, symbol, sleeves: next });
+    if (res._unauthorized) { showLogin(); return; }
+    if (res.ok) { m.hidden = true; refreshOnce(); }
+    else {
+      errEl.hidden = false;
+      errEl.innerHTML = escapeHtml(res.error || 'save failed') +
+        (res.issues ? '<ul>' + res.issues.map(i => `<li>${escapeHtml(i.field)}: ${escapeHtml(i.message)}</li>`).join('') + '</ul>' : '');
+    }
+  };
+}
+
+async function deleteSleeve(tenant, symbol, sleeveId) {
+  if (!confirm(`Delete strategy ${sleeveId}? Any live order it holds will be cancelled next tick.`)) return;
+  const block = currentStore[tenant]?.[symbol] || {};
+  const sleeves = (block.config?.sleeves || []).filter(s => s.id !== sleeveId);
+  const res = await putJson('/api/sleeves', { tenant, symbol, sleeves });
+  if (res._unauthorized) { showLogin(); return; }
+  if (res.ok) { refreshOnce(); showToast('strategy deleted', 'info'); }
+  else showToast(res.error || 'delete failed', 'error');
+}
+
+// ---- manual trade -------------------------------------------------------
+
+function openTradeModal(tenant, symbol, side) {
+  tradeContext = { tenant, symbol, side };
+  const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
+  const cfg = currentStore[tenant]?.[symbol]?.config || {};
+  const mark = Number(snap.last_mark) || 0;
+  const pos = Number(snap.position_qty) || 0;
+  const core = Number(cfg.core_qty) || 0;
+  const availMargin = Number(snap.available_margin) || 0;
+  const marginPer = Number(cfg.margin_per_contract) || 275;
+
+  const maxSell = Math.max(0, pos - core);            // core floor guard (0 = full pos)
+  const marginCap = Math.floor(availMargin / marginPer);
+  const maxBuy = Math.max(1, Math.min(100, marginCap)); // capped by margin, 100 hard limit
+
+  tradeModalTitle.textContent = `${side === 'BUY' ? 'Buy' : 'Sell'} contracts at market — ${symbol}`;
+  const holdLine = core > 0
+    ? `You hold <b style="color:var(--text)">${pos} contracts</b> · core floor is <b style="color:var(--text)">${core}</b> (never sold)`
+    : `You hold <b style="color:var(--text)">${pos} contracts</b> · no floor — every contract is tradeable`;
+  tradeModalBody.innerHTML = `
+    <div style="line-height:1.7; color: var(--muted); font-size: 14px;">
+      <div>${holdLine}</div>
+      <div>Silver market now: <b style="color:var(--text)">$${fmtNum(mark, 3)}</b> — bid $${fmtNum(snap.best_bid, 3)} / ask $${fmtNum(snap.best_ask, 3)}</div>
+    </div>
+  `;
+
+  const max = side === 'SELL' ? maxSell : maxBuy;
+  tradeQty.max = max;
+  tradeQty.value = Math.max(1, Math.min(1, max) || 1);
+  tradeQty.disabled = max < 1;
+  if (max < 1) {
+    tradeConfirm.disabled = true;
+    tradeError.hidden = false;
+    tradeError.innerHTML = side === 'SELL'
+      ? `<b>Nothing to sell.</b> You hold 0 contracts.`
+      : `<b>Not enough margin.</b> Deposit more or reduce open positions.`;
+  }
+
+  // Quick-select chips: 1, 2, half, max
+  const quickEl = document.getElementById('trade-qty-quick');
+  quickEl.innerHTML = '';
+  const chips = uniqueSortedQtys([1, 2, Math.max(1, Math.floor(max / 2)), max]).filter(q => q >= 1 && q <= max);
+  for (const q of chips) {
+    const label = q === max && q > 1 ? `all (${q})` : String(q);
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'qty-chip';
+    chip.textContent = label;
+    chip.onclick = () => { tradeQty.value = q; updateTradePreview(); markActiveChip(quickEl, q); };
+    quickEl.appendChild(chip);
+  }
+  markActiveChip(quickEl, Number(tradeQty.value));
+
+  // Max note
+  const maxNote = document.getElementById('trade-max-note');
+  if (side === 'SELL') {
+    if (maxSell > 0) {
+      maxNote.textContent = core > 0
+        ? `up to ${maxSell} (protects core floor of ${core})`
+        : `up to ${maxSell} (your full position)`;
+    } else {
+      maxNote.textContent = core > 0
+        ? `nothing to sell — position ${pos} = core ${core}`
+        : `nothing to sell — position is 0`;
+    }
+  } else {
+    maxNote.textContent = `up to ${maxBuy} (limited by ~$${availMargin.toLocaleString('en-US', { maximumFractionDigits: 0 })} available margin)`;
+  }
+
+  tradeError.hidden = true;
+  updateTradePreview();
+  tradeModal.hidden = false;
+  setTimeout(() => { tradeQty.focus(); tradeQty.select(); }, 50);
+}
+
+function uniqueSortedQtys(arr) {
+  return [...new Set(arr.filter(n => Number.isFinite(n) && n > 0).map(n => Math.floor(n)))].sort((a, b) => a - b);
+}
+
+function markActiveChip(container, qty) {
+  container.querySelectorAll('.qty-chip').forEach(c => {
+    const val = parseInt(c.textContent, 10);
+    c.classList.toggle('active', val === qty);
+  });
+}
+
+function updateTradePreview() {
+  if (!tradeContext) return;
+  const { tenant, symbol, side } = tradeContext;
+  const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
+  const cfg = currentStore[tenant]?.[symbol]?.config || {};
+  const mark = Number(snap.last_mark) || 0;
+  const pos = Number(snap.position_qty) || 0;
+  const core = Number(cfg.core_qty) || 0;
+  const contractSize = Number(cfg.contract_size) || 50;
+  const fee = Number(cfg.fee_per_contract_roundtrip) / 2 || 2.34;
+  const qty = Number(tradeQty.value) || 0;
+
+  const newPos = side === 'BUY' ? pos + qty : pos - qty;
+  const notional = mark * contractSize * qty;
+  const feeCost = fee * qty;
+
+  const wouldBreach = side === 'SELL' && newPos < core;
+  const wouldGoNegative = side === 'SELL' && newPos < 0;
+  tradeError.hidden = !(wouldBreach || wouldGoNegative);
+  tradeConfirm.disabled = wouldBreach || wouldGoNegative || qty < 1;
+  if (wouldGoNegative) {
+    tradeError.innerHTML = `<b>Refused:</b> you only hold ${pos} contracts — can't sell ${qty}.`;
+  } else if (wouldBreach) {
+    tradeError.innerHTML = `<b>Refused:</b> selling ${qty} would take you to ${newPos} contracts, below your core floor of ${core}. Lower your core floor to 0 for free trading, or sell fewer.`;
+  }
+
+  tradePreview.innerHTML = `
+    <div>Position after: <b style="color:var(--text)">${pos} → ${newPos}</b> contracts</div>
+    <div>Notional at current price: $${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</div>
+    <div>Estimated fee: $${feeCost.toFixed(2)}</div>
+  `;
+}
+
+async function submitTrade() {
+  if (!tradeContext) return;
+  const { tenant, symbol, side } = tradeContext;
+  const qty = Number(tradeQty.value);
+  const res = await postJson('/api/manual-trade', {
+    tenant, symbol, side, qty, confirm: 'YES',
+  });
+  if (res.ok) {
+    tradeModal.hidden = true;
+    refreshOnce();
+  } else {
+    tradeError.hidden = false;
+    tradeError.innerHTML = `<b>Failed:</b> ${escapeHtml(res.error || 'unknown')}`;
+  }
+}
+
+tradeQty.addEventListener('input', () => {
+  updateTradePreview();
+  markActiveChip(document.getElementById('trade-qty-quick'), Number(tradeQty.value));
+});
+tradeConfirm.addEventListener('click', submitTrade);
+
 // ---- delegated events ---------------------------------------------------
 
+// Escape closes any open modal. Also clicking the dark backdrop outside
+// the panel closes it — matches web-app expectations.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const openModals = document.querySelectorAll('.modal:not([hidden])');
+  openModals.forEach(m => { m.hidden = true; });
+});
 document.addEventListener('click', (e) => {
+  // Backdrop click: if the click hit the .modal container itself (not a
+  // descendant like the panel or a button inside it), close.
+  if (e.target.classList && e.target.classList.contains('modal')) {
+    e.target.hidden = true;
+    return;
+  }
   const btn = e.target.closest('button');
   if (!btn) return;
   if (btn.dataset.close !== undefined) {
@@ -715,11 +2231,91 @@ document.addEventListener('click', (e) => {
     return;
   }
   const action = btn.dataset.action;
-  const { tenant, symbol, name } = btn.dataset;
+  const { tenant, symbol, name, target, side } = btn.dataset;
   if (action === 'edit') openConfigEditor(tenant, symbol);
   else if (action === 'explain') openStrategyExplainer(tenant, symbol, name);
   else if (action === 'backtest') openBacktest(tenant, symbol);
+  else if (action === 'trade') openTradeModal(tenant, symbol, side);
+  else if (action === 'toggle-details') {
+    const el = document.getElementById(target);
+    if (el) {
+      el.hidden = !el.hidden;
+      btn.textContent = el.hidden ? 'More details' : 'Hide details';
+    }
+  }
+  else if (action === 'add-sleeve') openSleeveEditor(tenant, symbol, null);
+  else if (action === 'add-sleeve-from-lot') openSleeveEditor(tenant, symbol, null, {
+    entry_price: parseFloat(btn.dataset.lotEntry),
+    qty: parseInt(btn.dataset.lotQty, 10),
+  });
+  else if (action === 'edit-sleeve') openSleeveEditor(tenant, symbol, btn.dataset.sleeveId);
+  else if (action === 'delete-sleeve') deleteSleeve(tenant, symbol, btn.dataset.sleeveId);
+  else if (action === 'resume') resumeStrategy(tenant, symbol);
+  else if (action === 'cancel-order') cancelOrder(tenant, symbol, btn.dataset.sleeveId || null);
+  else if (action === 'sell-now') marketSell(tenant, symbol, parseInt(btn.dataset.qty, 10));
+  else if (action === 'disable-primary') disablePrimaryStrategy(tenant, symbol);
 });
+
+async function disablePrimaryStrategy(tenant, symbol) {
+  if (!confirm('Turn off the Primary strategy? Its swing_qty goes to 0. Only sleeves you explicitly add will run. Re-enable by editing Settings.')) return;
+  const cfg = { ...(currentStore[tenant]?.[symbol]?.config || {}) };
+  cfg.swing_qty = 0;
+  const res = await putJson('/api/config', { tenant, symbol, config: cfg });
+  if (res._unauthorized) { showLogin(); return; }
+  if (res.ok) { showToast('primary strategy turned off', 'info'); refreshOnce(); }
+  else showToast(res.error || res.issues?.[0]?.message || 'save failed', 'error');
+}
+
+async function cancelOrder(tenant, symbol, sleeveId) {
+  const res = await postJson('/api/cancel-order', { tenant, symbol, sleeve_id: sleeveId });
+  if (res._unauthorized) { showLogin(); return; }
+  if (res.ok) { showToast('order cancel queued', 'info'); refreshOnce(); }
+  else showToast(res.error || 'cancel failed', 'error');
+}
+
+async function marketSell(tenant, symbol, qty) {
+  const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
+  const pos = Number(snap.position_qty) || 0;
+  if (qty < 1 || qty > pos) { showToast(`can't sell ${qty} — you hold ${pos}`, 'error'); return; }
+  const res = await postJson('/api/manual-trade', {
+    tenant, symbol, side: 'SELL', qty, confirm: 'YES',
+  });
+  if (res._unauthorized) { showLogin(); return; }
+  if (res.ok) { showToast(`market sell ${qty} queued`, 'info'); refreshOnce(); }
+  else showToast(res.error || 'sell failed', 'error');
+}
+
+async function resetPaperTrading() {
+  const tenant = Object.keys(currentStore)[0] || 'adam';
+  const symbols = Object.keys(currentStore[tenant] || {}).filter(s => !s.startsWith('__'));
+  if (!symbols.length) { showToast('no symbol to reset', 'error'); return; }
+  const msg = `Wipe paper trading state for ${symbols.join(', ')}? Balance goes back to $100k, position → 0, all lots + strategies reset. Live account is untouched.`;
+  if (!confirm(msg)) return;
+  for (const symbol of symbols) {
+    await postJson('/api/reset-paper', { tenant, symbol, confirm: 'YES', starting_balance: 100000 });
+  }
+  showToast('paper reset queued — bot picks it up within 5s', 'info');
+  setTimeout(refreshOnce, 3000);
+}
+
+async function resumeStrategy(tenant, symbol) {
+  const res = await postJson('/api/resume', { tenant, symbol });
+  if (res._unauthorized) { showLogin(); return; }
+  if (res.ok) refreshOnce();
+  else showToast(res.error || 'resume failed', 'error');
+}
+
+function showToast(msg, kind = 'info') {
+  const el = document.createElement('div');
+  el.className = `toast toast-${kind}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.classList.add('visible'), 10);
+  setTimeout(() => {
+    el.classList.remove('visible');
+    setTimeout(() => el.remove(), 300);
+  }, 3500);
+}
 
 killBtn.addEventListener('click', () => {
   const mode = killBtn.dataset.mode || 'activate';
@@ -743,6 +2339,7 @@ loginForm.addEventListener('submit', async (e) => {
   }
 });
 logoutBtn.addEventListener('click', logout);
+resetPaperBtn.addEventListener('click', resetPaperTrading);
 
 // ---- boot ---------------------------------------------------------------
 

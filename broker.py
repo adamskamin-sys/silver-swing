@@ -102,6 +102,29 @@ class CoinbaseBroker:
         err = resp.get("error_response") or resp.get("failure_reason") or resp
         raise RuntimeError(f"place_limit failed: {err}")
 
+    def place_market(self, side: str, qty: int) -> str:
+        """Submit a market order. Fills at whatever the book has right now.
+
+        For futures/CFM, base_size is contract count. Same idempotency contract
+        as place_limit — fresh client_order_id per call, don't blindly retry.
+        """
+        s = side.upper()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        method = self.client.market_order_buy if s == "BUY" else self.client.market_order_sell
+        kwargs = {
+            "client_order_id": str(uuid.uuid4()),
+            "product_id": self.cfg.product_id,
+            "base_size": str(int(qty)),
+        }
+        resp = _dump(method(**kwargs))
+        if resp.get("success"):
+            oid = (resp.get("success_response") or {}).get("order_id")
+            if oid:
+                return oid
+        err = resp.get("error_response") or resp.get("failure_reason") or resp
+        raise RuntimeError(f"place_market failed: {err}")
+
     def order_status(self, order_id: str) -> dict:
         """Return {'status': mapped, 'filled_qty': int, 'raw_status': ..., 'average_filled_price': ...}."""
         order = _dump(self.client.get_order(order_id)).get("order") or {}

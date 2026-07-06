@@ -36,11 +36,12 @@ def test_valid_config_passes():
 # ---- core_qty ---------------------------------------------------------------
 
 
-def test_core_qty_zero_rejected():
+def test_core_qty_zero_allowed():
+    """core_qty=0 disables the floor guard — free trading, no protected core."""
     cfg = valid_config(); cfg["core_qty"] = 0
     r = validate_config(cfg)
-    assert not r.ok
-    assert "core_qty" in issue_fields(r)
+    assert r.ok
+    assert "core_qty" not in issue_fields(r)
 
 
 def test_core_qty_negative_rejected():
@@ -180,7 +181,7 @@ def test_negative_fee_rejected():
 def test_multiple_issues_collected():
     """Field-level errors accumulate — the UI shows all of them at once, not one-at-a-time."""
     cfg = valid_config()
-    cfg["core_qty"] = 0
+    cfg["core_qty"] = -1
     cfg["buy_px"] = 100.0
     cfg["exit_mode"] = "nonsense"
     r = validate_config(cfg)
@@ -191,7 +192,7 @@ def test_multiple_issues_collected():
 
 
 def test_result_serializes_cleanly():
-    cfg = valid_config(); cfg["core_qty"] = 0
+    cfg = valid_config(); cfg["core_qty"] = -1
     r = validate_config(cfg)
     d = r.to_dict()
     assert "ok" in d and "issues" in d

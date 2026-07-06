@@ -49,6 +49,19 @@ class PaperPosition:
 
 
 @dataclass
+class Lot:
+    """One buy = one lot. Kept in FIFO order so we can compute per-lot P/L
+    (what you paid for THIS contract) instead of just the aggregate avg entry.
+    Sells reduce lots from the oldest first."""
+    id: str
+    qty: int
+    entry_price: float
+    entry_ts: float
+    source: str = "unknown"  # "manual" | "strategy" | "mirror" | "unknown"
+    strategy_id: Optional[str] = None  # which sleeve owns this lot, if any
+
+
+@dataclass
 class PaperConfig:
     product_id: str
     contract_size: float
@@ -70,9 +83,21 @@ class PaperBroker:
         self.open_orders: dict[str, PaperOrder] = {}
         self.history: list[PaperOrder] = []
         self.position = PaperPosition(cfg.product_id)
+        self.lots: list[Lot] = []
+        self._pending_source: str = "unknown"  # set by callers (SwingTrader / manual) before place_*
+        self._pending_strategy_id: Optional[str] = None
         self.high_water_mark = cfg.starting_balance
         self.max_drawdown = 0.0
         self._last_mark = 0.0
+        # Session high/low of the price mark. Reset at UTC midnight so the
+        # dashboard can label the range as "today's". Live feed can also supply
+        # exchange-computed high_24h/low_24h; when it does, we use those in
+        # snapshot() and keep the session tracker as backup.
+        self._day_high: Optional[float] = None
+        self._day_low: Optional[float] = None
+        self._day_reset_utc_date: Optional[str] = None
+        self._external_high_24h: Optional[float] = None
+        self._external_low_24h: Optional[float] = None
         self._halted = False
         self._halt_reason: Optional[str] = None
 
@@ -93,6 +118,36 @@ class PaperBroker:
             limit_price=float(price),
             placed_at=time.time(),
         )
+        return oid
+
+    def place_market(self, side: str, qty: int) -> str:
+        """Simulate a market order — fills immediately at the current bid/ask.
+
+        BUY hits the ask (worst-case for buyer). SELL hits the bid. If no
+        bid/ask has been seen yet (feed hasn't started), uses last_mark.
+        """
+        if self._halted:
+            raise RuntimeError(f"paper broker halted: {self._halt_reason}")
+        s = side.upper()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        # Fill price: buyer hits the ask, seller hits the bid. Approximate with
+        # last_mark ± half-spread if we don't have a real book. Slippage applies.
+        fill_price = self._last_mark or 0.0
+        oid = f"paper-mkt-{uuid.uuid4()}"
+        o = PaperOrder(
+            order_id=oid, product_id=self.cfg.product_id,
+            side=s, qty=int(qty), limit_price=fill_price,
+            placed_at=time.time(),
+        )
+        if s == "BUY" and self.cfg.slippage_ticks > 0:
+            fill_price += self.cfg.slippage_ticks * self.cfg.tick_size
+        elif s == "SELL" and self.cfg.slippage_ticks > 0:
+            fill_price -= self.cfg.slippage_ticks * self.cfg.tick_size
+        self._process_fill(o, fill_price)
+        self.history.append(o)
+        self._check_margin_call()
+        self._update_drawdown()
         return oid
 
     def order_status(self, order_id: str) -> dict:
@@ -126,7 +181,19 @@ class PaperBroker:
         if self._halted:
             return []
         # Track the mid so unrealized P&L stays fresh even when nothing fills
-        self._last_mark = (best_bid + best_ask) / 2
+        mid = (best_bid + best_ask) / 2
+        self._last_mark = mid
+        # Session high/low, reset at UTC midnight. Cheap to compute; useful for
+        # the dashboard's day-range display when the feed doesn't ship 24h stats.
+        import datetime as _dt
+        today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        if self._day_reset_utc_date != today:
+            self._day_reset_utc_date = today
+            self._day_high = mid
+            self._day_low = mid
+        else:
+            if self._day_high is None or mid > self._day_high: self._day_high = mid
+            if self._day_low is None or mid < self._day_low: self._day_low = mid
 
         filled_now: list[PaperOrder] = []
         for oid in list(self.open_orders.keys()):
@@ -177,12 +244,14 @@ class PaperBroker:
         self._update_drawdown()
 
     def _add_long(self, qty: int, price: float) -> None:
-        """BUY qty at price: either open/add to LONG, or close/reverse a SHORT."""
+        """BUY qty at price: either open/add to LONG, or close/reverse a SHORT.
+        Every long-adding BUY creates a lot so we can report per-contract P/L."""
         p = self.position
         if p.qty >= 0:
             new_qty = p.qty + qty
             p.avg_entry = price if p.qty == 0 else (p.qty * p.avg_entry + qty * price) / new_qty
             p.qty = new_qty
+            self._add_lot(qty, price)
         else:
             covered = min(qty, -p.qty)
             self.realized_pnl += (p.avg_entry - price) * self.cfg.contract_size * covered
@@ -192,13 +261,16 @@ class PaperBroker:
             elif p.qty > 0:
                 # flipped from short to long — remainder is a fresh long at the fill price
                 p.avg_entry = price
+                self._add_lot(p.qty, price)
 
     def _reduce_long(self, qty: int, price: float) -> None:
-        """SELL qty at price: either close/reduce LONG, or open/add to SHORT."""
+        """SELL qty at price: either close/reduce LONG, or open/add to SHORT.
+        Lots are consumed FIFO; per-lot realized P/L accumulates into total realized."""
         p = self.position
         if p.qty > 0:
             covered = min(qty, p.qty)
             self.realized_pnl += (price - p.avg_entry) * self.cfg.contract_size * covered
+            self._consume_lots(covered, price)
             p.qty -= qty
             if p.qty == 0:
                 p.avg_entry = 0.0
@@ -209,6 +281,49 @@ class PaperBroker:
             new_qty = p.qty - qty
             p.avg_entry = price if p.qty == 0 else (abs(p.qty) * p.avg_entry + qty * price) / abs(new_qty)
             p.qty = new_qty
+
+    def _add_lot(self, qty: int, price: float) -> None:
+        self.lots.append(Lot(
+            id=f"lot-{uuid.uuid4()}",
+            qty=int(qty),
+            entry_price=float(price),
+            entry_ts=time.time(),
+            source=self._pending_source,
+            strategy_id=self._pending_strategy_id,
+        ))
+
+    def _consume_lots(self, qty: int, exit_price: float) -> None:
+        """Consume `qty` contracts from open lots. Priority order:
+          1. If a strategy_id is set on the pending source, consume THAT
+             strategy's own tagged lots first (FIFO within its own inventory).
+             Keeps each sleeve's cost basis tied to what IT actually bought.
+          2. Then fall back to global FIFO (oldest lot first).
+        Splits a lot if qty doesn't fully close it. Silent no-op if lots empty."""
+        remaining = qty
+        tag = self._pending_strategy_id
+        if tag is not None:
+            # Preferred: consume this strategy's own tagged lots FIFO
+            i = 0
+            while remaining > 0 and i < len(self.lots):
+                lot = self.lots[i]
+                if lot.strategy_id != tag:
+                    i += 1
+                    continue
+                if lot.qty <= remaining:
+                    remaining -= lot.qty
+                    self.lots.pop(i)
+                else:
+                    lot.qty -= remaining
+                    remaining = 0
+        # Fallback: global FIFO for anything left
+        while remaining > 0 and self.lots:
+            lot = self.lots[0]
+            if lot.qty <= remaining:
+                remaining -= lot.qty
+                self.lots.pop(0)
+            else:
+                lot.qty -= remaining
+                remaining = 0
 
     def unrealized_pnl(self) -> float:
         if self.position.qty == 0 or self._last_mark == 0:
@@ -246,6 +361,26 @@ class PaperBroker:
         for oid in list(self.open_orders.keys()):
             self.cancel(oid)
 
+    def reset(self, starting_balance: Optional[float] = None) -> None:
+        """Wipe all paper state in place — balance, position, lots, orders,
+        realized P/L, drawdown, halt status. The bot's SwingTrader can keep
+        using the same broker instance; from its perspective it's a fresh
+        account. Real Coinbase state is not touched."""
+        self.balance = float(starting_balance) if starting_balance is not None else self.cfg.starting_balance
+        self.realized_pnl = 0.0
+        self.fees_paid = 0.0
+        self.open_orders = {}
+        self.history = []
+        self.position = PaperPosition(self.cfg.product_id)
+        self.lots = []
+        self._pending_source = "unknown"
+        self._pending_strategy_id = None
+        self.high_water_mark = self.balance
+        self.max_drawdown = 0.0
+        self._last_mark = 0.0
+        self._halted = False
+        self._halt_reason = None
+
     def _find_in_history(self, order_id: str) -> Optional[PaperOrder]:
         for o in self.history:
             if o.order_id == order_id:
@@ -265,7 +400,9 @@ class PaperBroker:
             "position_qty": self.position.qty,
             "position_avg_entry": self.position.avg_entry,
             "margin_used": self.margin_used(),
+            "margin_per_contract": self.cfg.margin_per_contract,
             "available_margin": self.equity() - self.margin_used(),
+            "liquidation_price": self._liquidation_price(),
             "high_water_mark": self.high_water_mark,
             "max_drawdown": self.max_drawdown,
             "open_orders": len(self.open_orders),
@@ -273,4 +410,61 @@ class PaperBroker:
             "halted": self._halted,
             "halt_reason": self._halt_reason,
             "last_mark": self._last_mark,
+            "day_high": self._external_high_24h if self._external_high_24h is not None else self._day_high,
+            "day_low": self._external_low_24h if self._external_low_24h is not None else self._day_low,
+            "lots": self.lots_snapshot(),
         }
+
+    def set_external_day_range(self, high_24h: Optional[float], low_24h: Optional[float]) -> None:
+        """Optional: feed exchange-computed 24h high/low so the snapshot uses
+        those instead of the session-only fallback."""
+        self._external_high_24h = high_24h
+        self._external_low_24h = low_24h
+
+    def _liquidation_price(self) -> Optional[float]:
+        """Price at which equity would exactly equal required margin (i.e. the
+        margin call trips). None when flat, since there's no directional risk.
+        Also None when the account has so much cushion that liquidation would
+        be at a negative price for a long (impossible in reality) — the UI
+        reads None as "no practical liquidation risk".
+
+        For a LONG position: liq = avg_entry - (balance + realized - margin_used) / (contract_size * qty)
+        For a SHORT position: liq = avg_entry + (balance + realized - margin_used) / (contract_size * |qty|)
+        The (balance + realized - margin_used) term is the cushion above required
+        margin; divided by contract_size × qty it's how many dollars of adverse
+        move the account can absorb per contract."""
+        p = self.position
+        if p.qty == 0:
+            return None
+        cushion = self.balance + self.realized_pnl - self.margin_used()
+        distance = cushion / (self.cfg.contract_size * abs(p.qty))
+        if p.qty > 0:
+            liq = p.avg_entry - distance
+            return liq if liq > 0 else None  # negative price = safe from liq
+        return p.avg_entry + distance
+
+    def lots_snapshot(self) -> list[dict]:
+        """One entry per open lot, enriched with live P/L at last mark."""
+        mark = self._last_mark
+        out = []
+        for lot in self.lots:
+            unrealized = 0.0
+            if mark and lot.qty > 0:
+                unrealized = (mark - lot.entry_price) * self.cfg.contract_size * lot.qty
+            out.append({
+                "id": lot.id,
+                "qty": lot.qty,
+                "entry_price": lot.entry_price,
+                "entry_ts": lot.entry_ts,
+                "source": lot.source,
+                "strategy_id": lot.strategy_id,
+                "mark": mark,
+                "unrealized_pnl": unrealized,
+            })
+        return out
+
+    def set_pending_source(self, source: str, strategy_id: Optional[str] = None) -> None:
+        """Tag the NEXT fill so its resulting lot knows where it came from.
+        Callers should set this immediately before place_limit / place_market."""
+        self._pending_source = source
+        self._pending_strategy_id = strategy_id

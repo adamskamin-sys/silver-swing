@@ -93,12 +93,26 @@ class LiveTickerFeed:
                     return
                 if price <= 0 and bid <= 0 and ask <= 0:
                     return
+                # Coinbase also ships 24h high/low in the ticker payload —
+                # forward it so the dashboard can show the day range next to
+                # the mark. Field names have varied so accept a few spellings.
+                def _f(*keys):
+                    for k in keys:
+                        v = t.get(k)
+                        if v is None: continue
+                        try: return float(v)
+                        except (ValueError, TypeError): continue
+                    return None
+                high_24 = _f("high_24_h", "high_24h", "high24h")
+                low_24 = _f("low_24_h", "low_24h", "low24h")
                 with self._lock:
                     self._latest = {
                         "product_id": self.product_id,
                         "price": price,
                         "best_bid": bid,
                         "best_ask": ask,
+                        "high_24h": high_24,
+                        "low_24h": low_24,
                         "ts": msg.get("timestamp") or t.get("timestamp"),
                     }
 

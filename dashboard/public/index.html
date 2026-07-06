@@ -11,7 +11,8 @@
     <div class="brand"><h1>silver-swing</h1></div>
     <div id="header-meta">
       <span id="last-updated"></span>
-      <button id="kill-switch-btn" class="danger" hidden>PAUSE ALL</button>
+      <button id="reset-paper-btn" class="ghost" hidden>Reset paper</button>
+      <button id="kill-switch-btn" hidden>Pause bot</button>
       <button id="logout-btn" hidden>logout</button>
     </div>
   </header>
@@ -82,6 +83,35 @@
       <div class="modal-footer">
         <button data-close>back</button>
         <button id="strategy-select" class="primary">select this strategy</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- manual trade confirm modal -->
+  <div id="trade-modal" class="modal" hidden>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <h2 id="trade-modal-title">Place market order</h2>
+        <button class="modal-close" data-close>✕</button>
+      </div>
+      <div id="trade-modal-body"></div>
+
+      <div class="trade-qty-block">
+        <div class="trade-qty-label">
+          <span>Contracts</span>
+          <span id="trade-max-note"></span>
+        </div>
+        <div class="trade-qty-row">
+          <input type="number" id="trade-qty" min="1" step="1" value="1">
+          <div class="trade-qty-quick" id="trade-qty-quick"></div>
+        </div>
+      </div>
+
+      <div id="trade-preview" class="trade-preview"></div>
+      <div id="trade-error" class="issues" hidden></div>
+      <div class="modal-footer">
+        <button data-close>cancel</button>
+        <button id="trade-confirm" class="primary">confirm</button>
       </div>
     </div>
   </div>

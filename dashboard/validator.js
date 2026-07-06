@@ -59,13 +59,13 @@ export function validateConfig(cfg = {}) {
     });
   }
 
-  if (core_qty !== null && core_qty <= 0)
-    issues.push({ field: 'core_qty', message: 'core_qty must be > 0 (that\'s the whole floor)' });
-  if (swing_qty !== null && swing_qty < 1)
-    issues.push({ field: 'swing_qty', message: 'swing_qty must be >= 1' });
+  if (core_qty !== null && core_qty < 0)
+    issues.push({ field: 'core_qty', message: 'core_qty must be >= 0 (0 disables the floor)' });
+  if (swing_qty !== null && swing_qty < 0)
+    issues.push({ field: 'swing_qty', message: 'swing_qty must be >= 0 (0 disables the primary strategy)' });
   if (max_swing_qty !== null && max_swing_qty < 1)
     issues.push({ field: 'max_swing_qty', message: 'max_swing_qty must be >= 1' });
-  if (swing_qty !== null && max_swing_qty !== null && swing_qty > max_swing_qty)
+  if (swing_qty !== null && max_swing_qty !== null && swing_qty > 0 && swing_qty > max_swing_qty)
     issues.push({ field: 'swing_qty', message: `swing_qty (${swing_qty}) must be <= max_swing_qty (${max_swing_qty})` });
   if (buy_px !== null && sell_px !== null && buy_px >= sell_px)
     issues.push({ field: 'buy_px', message: `buy_px (${buy_px}) must be < sell_px (${sell_px}); otherwise the swing loses money` });

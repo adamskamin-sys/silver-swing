@@ -7,7 +7,7 @@ validator server-side. Structurally insane values are rejected BEFORE they
 reach the store — never on read.
 
 Invariants enforced:
-  - core_qty > 0                        (the whole point of the floor)
+  - core_qty >= 0                       (0 = no floor / free trading)
   - swing_qty >= 1
   - swing_qty <= max_swing_qty
   - max_swing_qty >= swing_qty
@@ -105,13 +105,13 @@ def validate_config(cfg: dict) -> ValidationResult:
         ))
 
     # Guard: only run cross-field checks if the fields themselves parsed
-    if core_qty is not None and core_qty <= 0:
-        issues.append(ValidationIssue("core_qty", "core_qty must be > 0 (that's the whole floor)"))
-    if swing_qty is not None and swing_qty < 1:
-        issues.append(ValidationIssue("swing_qty", "swing_qty must be >= 1"))
+    if core_qty is not None and core_qty < 0:
+        issues.append(ValidationIssue("core_qty", "core_qty must be >= 0 (0 disables the floor)"))
+    if swing_qty is not None and swing_qty < 0:
+        issues.append(ValidationIssue("swing_qty", "swing_qty must be >= 0 (0 disables the primary strategy)"))
     if max_swing_qty is not None and max_swing_qty < 1:
         issues.append(ValidationIssue("max_swing_qty", "max_swing_qty must be >= 1"))
-    if swing_qty is not None and max_swing_qty is not None and swing_qty > max_swing_qty:
+    if swing_qty is not None and max_swing_qty is not None and swing_qty > 0 and swing_qty > max_swing_qty:
         issues.append(ValidationIssue(
             "swing_qty", f"swing_qty ({swing_qty}) must be <= max_swing_qty ({max_swing_qty})",
         ))
@@ -175,8 +175,8 @@ def clamp_to_bounds(cfg: dict) -> dict:
     should still be validated. Never widens abort_below/abort_above (that would
     reduce safety); only tightens obviously-broken values."""
     out = dict(cfg)
-    if out.get("core_qty", 1) <= 0:
-        out["core_qty"] = 1
+    if out.get("core_qty", 0) < 0:
+        out["core_qty"] = 0
     if out.get("swing_qty", 1) < 1:
         out["swing_qty"] = 1
     if out.get("max_swing_qty", 1) < out.get("swing_qty", 1):

@@ -69,7 +69,10 @@ class JsonFileStateStore:
         return json.loads(self.path.read_text())
 
     def _save(self, data: dict) -> None:
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        # Use a PID-suffixed tmp so we don't collide with the Node dashboard's
+        # tmp file when both write concurrently (otherwise whichever renames
+        # first wins and the other gets ENOENT).
+        tmp = self.path.with_suffix(self.path.suffix + f".tmp-{os.getpid()}")
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2, sort_keys=True)
             f.flush()
@@ -101,6 +104,59 @@ class JsonFileStateStore:
 
     def put_snapshot(self, tenant_id: str, symbol: str, snapshot: dict) -> None:
         self._put_scope(tenant_id, symbol, "snapshot", snapshot)
+
+    def get_intent(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        """Dashboard-writes/bot-reads pending manual order intent."""
+        return self._get_scope(tenant_id, symbol, "intent")
+
+    def put_intent(self, tenant_id: str, symbol: str, intent: dict) -> None:
+        self._put_scope(tenant_id, symbol, "intent", intent)
+
+    def clear_intent(self, tenant_id: str, symbol: str) -> None:
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if "intent" in block:
+            del block["intent"]
+            self._save(data)
+
+    def get_resume_intent(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        """Dashboard-writes/bot-reads request to clear a HALT and re-arm."""
+        return self._get_scope(tenant_id, symbol, "resume_intent")
+
+    def put_resume_intent(self, tenant_id: str, symbol: str, intent: dict) -> None:
+        self._put_scope(tenant_id, symbol, "resume_intent", intent)
+
+    def clear_resume_intent(self, tenant_id: str, symbol: str) -> None:
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if "resume_intent" in block:
+            del block["resume_intent"]
+            self._save(data)
+
+    def get_reset_intent(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        """Dashboard-writes/bot-reads request to wipe paper trading state."""
+        return self._get_scope(tenant_id, symbol, "reset_intent")
+
+    def put_reset_intent(self, tenant_id: str, symbol: str, intent: dict) -> None:
+        self._put_scope(tenant_id, symbol, "reset_intent", intent)
+
+    def clear_reset_intent(self, tenant_id: str, symbol: str) -> None:
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if "reset_intent" in block:
+            del block["reset_intent"]
+            self._save(data)
+
+    def get_cancel_intent(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        """Dashboard-writes/bot-reads request to cancel a strategy's live order."""
+        return self._get_scope(tenant_id, symbol, "cancel_intent")
+
+    def clear_cancel_intent(self, tenant_id: str, symbol: str) -> None:
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if "cancel_intent" in block:
+            del block["cancel_intent"]
+            self._save(data)
 
     def list_symbols(self, tenant_id: str) -> list[str]:
         return sorted((self._load().get(tenant_id) or {}).keys())

@@ -128,14 +128,18 @@ def test_reconcile_clears_stale_order_id(tmp_path):
 
 
 def test_arm_sell_blocked_by_floor(tmp_path):
-    """If a sell would breach the core, HALT instead."""
+    """If a sell would breach the core, SKIP arming (no HALT).
+    Transient condition — user might buy more contracts and the strategy
+    should recover naturally on a subsequent tick. HALT is reserved for
+    real invariant breaks (margin call, invalid config, reconcile mismatch)."""
     broker = make_paper_broker()
     preload_position(broker, 10, 58.44)  # exactly at core; sell would breach
-    # core_qty=10, swing_qty=2 by default → 10 - 2 = 8 < core 10 → HALT
+    # core_qty=10, swing_qty=2 by default → 10 - 2 = 8 < core 10 → skip
     trader, _, log, _, _ = make_trader(tmp_path, broker=broker)
     trader.reconcile()
     trader.step(63.5)
-    assert trader.s.state == State.HALTED
+    assert trader.s.state == State.ARMED_SELL  # stayed armed, waiting
+    assert trader.s.live_order_id is None       # but no order placed
 
 
 # ---- kill switch ------------------------------------------------------------
@@ -220,8 +224,14 @@ def test_full_cycle_realizes_pnl_and_counts(tmp_path):
 
     assert trader.s.state == State.ARMED_SELL
     assert trader.s.cycles == 1
-    # Realized P&L per strategy math: (65 - 63) × 50 × 2 - $4.68 × 2 = 200 - 9.36 = $190.64
-    assert trader.s.realized_pnl == pytest.approx(200.0 - 9.36)
+    # New model realizes on the SELL fill using the position's avg entry price
+    # (spec §2A, sell-realizes-immediately). Preload sets 12 contracts @ $58.44.
+    #   Sell 2 @ $65 vs $58.44 basis: gross = (65 - 58.44) × 50 × 2 = $656
+    #   Sell-side fees = ($4.68 / 2) × 2 = $4.68 → realized $651.32 after sell
+    # Scale-up gate then trips (free profit $651 covers $412.50 buffer for a
+    # 3rd contract), bumping swing_qty 2 → 3 before the buy arms.
+    #   Buy 3 @ $63: buy-side fees = ($4.68 / 2) × 3 = $7.02 → realized $644.30
+    assert trader.s.realized_pnl == pytest.approx(644.30)
     events = list(log.events())
     assert any(e["event_type"] == "cycle_completed" for e in events)
 
