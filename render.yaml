@@ -1,14 +1,18 @@
-# Render blueprint: dashboard + two bot workers (paper AND live).
-# Deploy with a "Blueprint" from your GitHub repo — Render creates all three
-# services in one shot and wires them to the shared persistent disk.
+# Render blueprint: dashboard + two bot workers + shared Redis (Key Value).
+# All three services read/write the SAME Redis instance so state is truly shared.
 #
 # BEFORE FIRST DEPLOY:
-#   1. Upload your Coinbase API JSON as a Secret File on Render named
+#   1. Upload your Coinbase API JSON as a Secret File on each worker named
 #      `coinbase.json` (Render mounts it at /etc/secrets/coinbase.json).
 #   2. Set DASHBOARD_PASSWORD in the dashboard service's env vars.
-#   3. Both workers read/write to the same disk so the dashboard sees both.
 
 services:
+  # ---- Shared Key Value (Redis) — single source of truth for state ---------
+  - type: keyvalue
+    name: silver-swing-state
+    plan: free
+    ipAllowList: []  # empty = allow all Render services in this workspace
+
   # ---- Dashboard (web, public URL) ------------------------------------------
   - type: web
     name: silver-swing-dashboard
@@ -20,21 +24,15 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20
-      - key: DASHBOARD_PORT
-        value: 3000
-      # Session secret: click "Generate" in Render UI to autofill a random value.
       - key: DASHBOARD_SESSION_SECRET
         generateValue: true
-      # Login password — set this manually in the Render UI to your chosen password.
       - key: DASHBOARD_PASSWORD
         sync: false
-      # The dashboard reads state from the SAME disk both bots write to.
-      - key: SWING_DATA_DIR
-        value: /var/data
-    disk:
-      name: shared-state
-      mountPath: /var/data
-      sizeGB: 1
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: silver-swing-state
+          property: connectionString
 
   # ---- PAPER bot worker (safe: no real orders) ------------------------------
   - type: worker
@@ -52,22 +50,20 @@ services:
         value: adam-paper
       - key: SWING_SYMBOL
         value: SLR-27AUG26-CDE
-      - key: SWING_DATA_DIR
-        value: /var/data
       - key: SWING_PAPER_BALANCE
         value: "100000"
-      # Read-only Coinbase key (for market data): mounted from Secret File
       - key: COINBASE_API_KEY_JSON_PATH
         value: /etc/secrets/coinbase.json
-    disk:
-      name: shared-state
-      mountPath: /var/data
-      sizeGB: 1
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: silver-swing-state
+          property: connectionString
 
   # ---- LIVE bot worker (REAL ORDERS — starts in dry-run) --------------------
-  # First deploy will use SWING_LIVE_DRY_RUN=1: full wiring, real feed, but
-  # orders are LOGGED not submitted. Confirm the pipeline is clean, then flip
-  # to SWING_LIVE_CONFIRM=I_UNDERSTAND (and remove SWING_LIVE_DRY_RUN) in the
+  # First deploy uses SWING_LIVE_DRY_RUN=1: full wiring, real feed, orders are
+  # LOGGED not submitted. Confirm the pipeline is clean, then flip to
+  # SWING_LIVE_CONFIRM=I_UNDERSTAND (and remove SWING_LIVE_DRY_RUN) in the
   # Render UI to go actually live.
   - type: worker
     name: silver-swing-bot-live
@@ -84,15 +80,12 @@ services:
         value: adam-live
       - key: SWING_SYMBOL
         value: SLR-27AUG26-CDE
-      - key: SWING_DATA_DIR
-        value: /var/data
-      # START IN DRY-RUN. Do not remove until you've verified the pipeline.
       - key: SWING_LIVE_DRY_RUN
         value: "1"
-      # Real Coinbase key with TRADE scope — same Secret File as above.
       - key: COINBASE_API_KEY_JSON_PATH
         value: /etc/secrets/coinbase.json
-    disk:
-      name: shared-state
-      mountPath: /var/data
-      sizeGB: 1
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: silver-swing-state
+          property: connectionString

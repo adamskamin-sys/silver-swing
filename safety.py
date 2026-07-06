@@ -27,6 +27,7 @@ Explicitly OUT OF SCOPE for this MVP (each is its own follow-up):
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +65,44 @@ class TradeLog:
     def tail(self, n: int) -> list[dict]:
         """Last N events. Full re-read; fine for the small MVP scale."""
         return list(self.events())[-n:]
+
+
+class RedisTradeLog:
+    """Redis-backed trade log. LPUSH new events onto a list, LTRIM to bound.
+    Reads take the last N via LRANGE."""
+
+    def __init__(self, url: str, key: str = "silver-swing:trades", max_len: int = 10000):
+        import redis
+        self._r = redis.Redis.from_url(url, decode_responses=True)
+        self._key = key
+        self._max_len = max_len
+
+    def record(self, event_type: str, **payload) -> dict:
+        entry = {"ts": time.time(), "event_type": event_type, **payload}
+        line = json.dumps(entry, sort_keys=True, default=str)
+        pipe = self._r.pipeline()
+        pipe.lpush(self._key, line)
+        pipe.ltrim(self._key, 0, self._max_len - 1)
+        pipe.execute()
+        return entry
+
+    def events(self) -> Iterator[dict]:
+        # oldest → newest, matching file version
+        raw = self._r.lrange(self._key, 0, -1)
+        for line in reversed(raw):
+            yield json.loads(line)
+
+    def tail(self, n: int) -> list[dict]:
+        raw = self._r.lrange(self._key, 0, n - 1)
+        return [json.loads(line) for line in reversed(raw)]
+
+
+def make_trade_log(data_dir: str):
+    """Pick file or Redis trade log based on REDIS_URL env var."""
+    url = os.getenv("REDIS_URL")
+    if url:
+        return RedisTradeLog(url)
+    return TradeLog(f"{data_dir}/trades.jsonl")
 
 
 # ============================================================================

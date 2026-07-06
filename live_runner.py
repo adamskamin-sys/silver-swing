@@ -159,15 +159,16 @@ def run() -> int:
     from alerting import default_notifier
     from broker import BrokerConfig, CoinbaseBroker
     from feed import LiveTickerFeed
-    from safety import KillSwitch, TradeLog
-    from state_store import JsonFileStateStore
+    from safety import KillSwitch, make_trade_log
+    from state_store import make_store
     from swing_leg import SwingTrader
 
     mode = "DRY-RUN" if dry_run else "LIVE (real orders)"
     _log(f"live_runner: mode={mode}, symbol={SYMBOL}, tenant={TENANT}")
 
-    store = JsonFileStateStore(f"{DATA_DIR}/store.json")
-    log = TradeLog(f"{DATA_DIR}/trades.jsonl")
+    store = make_store(DATA_DIR)
+    log = make_trade_log(DATA_DIR)
+    _log(f"store backend: {type(store).__name__}, trade log: {type(log).__name__}")
     ks = KillSwitch(store, TENANT)
     notifier = default_notifier()
 

@@ -163,3 +163,76 @@ class JsonFileStateStore:
 
     def list_tenants(self) -> list[str]:
         return sorted(self._load().keys())
+
+
+class RedisJsonStore:
+    """Redis-backed store that holds the entire state blob under one key.
+
+    Mirrors JsonFileStateStore semantics exactly: every operation is a
+    read-modify-write of the whole JSON tree. Fine for our scale (single blob
+    stays well under 1MB). Cross-process concurrent writes have the same
+    last-writer-wins semantics as the file backend.
+
+    Use for multi-service deploys where several processes need to see the same
+    state (e.g. Render workers + dashboard).
+    """
+
+    def __init__(self, url: str, key: str = "silver-swing:store"):
+        import redis  # local import so tests without redis don't fail on import
+        self._r = redis.Redis.from_url(url, decode_responses=True)
+        self._key = key
+
+    def _load(self) -> dict:
+        raw = self._r.get(self._key)
+        return json.loads(raw) if raw else {}
+
+    def _save(self, data: dict) -> None:
+        self._r.set(self._key, json.dumps(data, sort_keys=True))
+
+    def _get_scope(self, tenant_id, symbol, scope):
+        return self._load().get(tenant_id, {}).get(symbol, {}).get(scope)
+
+    def _put_scope(self, tenant_id, symbol, scope, value):
+        data = self._load()
+        data.setdefault(tenant_id, {}).setdefault(symbol, {})[scope] = value
+        self._save(data)
+
+    def get_config(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "config")
+    def put_config(self, tenant_id, symbol, config): self._put_scope(tenant_id, symbol, "config", config)
+    def get_state(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "state")
+    def put_state(self, tenant_id, symbol, state): self._put_scope(tenant_id, symbol, "state", state)
+    def get_snapshot(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "snapshot")
+    def put_snapshot(self, tenant_id, symbol, snapshot): self._put_scope(tenant_id, symbol, "snapshot", snapshot)
+    def get_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "intent")
+    def put_intent(self, tenant_id, symbol, intent): self._put_scope(tenant_id, symbol, "intent", intent)
+
+    def _clear_scope(self, tenant_id, symbol, scope):
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if scope in block:
+            del block[scope]
+            self._save(data)
+
+    def clear_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "intent")
+    def get_resume_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "resume_intent")
+    def put_resume_intent(self, tenant_id, symbol, intent): self._put_scope(tenant_id, symbol, "resume_intent", intent)
+    def clear_resume_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "resume_intent")
+    def get_reset_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "reset_intent")
+    def put_reset_intent(self, tenant_id, symbol, intent): self._put_scope(tenant_id, symbol, "reset_intent", intent)
+    def clear_reset_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "reset_intent")
+    def get_cancel_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "cancel_intent")
+    def clear_cancel_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "cancel_intent")
+
+    def list_symbols(self, tenant_id):
+        return sorted((self._load().get(tenant_id) or {}).keys())
+
+    def list_tenants(self):
+        return sorted(self._load().keys())
+
+
+def make_store(data_dir: str):
+    """Pick JsonFileStateStore or RedisJsonStore based on REDIS_URL env var."""
+    url = os.getenv("REDIS_URL")
+    if url:
+        return RedisJsonStore(url)
+    return JsonFileStateStore(f"{data_dir}/store.json")

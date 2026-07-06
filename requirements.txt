@@ -16,3 +16,4 @@ python-dotenv==1.2.2
 requests==2.34.2
 urllib3==2.7.0
 websockets==13.1
+redis==5.2.1

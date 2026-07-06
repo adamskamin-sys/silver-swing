@@ -94,14 +94,15 @@ def run_paper_mode() -> int:
     Safe: no path to Coinbase's order endpoint."""
     from feed import LiveTickerFeed
     from paper_broker import PaperBroker, PaperConfig
-    from safety import KillSwitch, TradeLog
-    from state_store import JsonFileStateStore
+    from safety import KillSwitch, make_trade_log
+    from state_store import make_store
     from swing_leg import SwingTrader
 
     _log(f"paper mode: symbol={SYMBOL}, tenant={TENANT}")
 
-    store = JsonFileStateStore(f"{DATA_DIR}/store.json")
-    log = TradeLog(f"{DATA_DIR}/trades.jsonl")
+    store = make_store(DATA_DIR)
+    log = make_trade_log(DATA_DIR)
+    _log(f"store backend: {type(store).__name__}, trade log: {type(log).__name__}")
     ks = KillSwitch(store, TENANT)
     _seed_config_if_missing(store, TENANT, SYMBOL)
 

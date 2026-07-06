@@ -24,6 +24,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { createClient } from 'redis';
 import { validateConfig } from './validator.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,9 +42,23 @@ const SESSION_SECRET = process.env.DASHBOARD_SESSION_SECRET
   || process.env.SESSION_SECRET
   || 'dev-only-do-not-ship-this';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
+const REDIS_URL = process.env.REDIS_URL || null;
+const REDIS_STORE_KEY = 'silver-swing:store';
+const REDIS_TRADES_KEY = 'silver-swing:trades';
 
 if (!DASHBOARD_PASSWORD) {
   console.warn('WARNING: DASHBOARD_PASSWORD not set. Login is disabled — dev mode only.');
+}
+
+// Shared Redis client (lazy). Same instance reused across requests.
+let _redis = null;
+async function getRedis() {
+  if (!REDIS_URL) return null;
+  if (_redis) return _redis;
+  _redis = createClient({ url: REDIS_URL });
+  _redis.on('error', (err) => console.error('redis error:', err));
+  await _redis.connect();
+  return _redis;
 }
 
 // ---- app --------------------------------------------------------------------
@@ -428,6 +443,11 @@ export function makeApp({
 // ---- helpers ----------------------------------------------------------------
 
 async function readStore(storePath) {
+  const r = await getRedis();
+  if (r) {
+    const raw = await r.get(REDIS_STORE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  }
   try {
     const raw = await fs.readFile(storePath, 'utf-8');
     return JSON.parse(raw);
@@ -438,6 +458,11 @@ async function readStore(storePath) {
 }
 
 async function writeStoreAtomic(storePath, data) {
+  const r = await getRedis();
+  if (r) {
+    await r.set(REDIS_STORE_KEY, JSON.stringify(data));
+    return;
+  }
   // Mirror the Python JsonFileStateStore atomicity: write tmp, rename.
   // Use a PID- and timestamp-suffixed tmp so we don't collide with the Python
   // bot's tmp file when both processes write concurrently. Without this,
@@ -478,6 +503,14 @@ function runPythonBacktest(payload) {
 }
 
 async function tailJsonl(logPath, n) {
+  const r = await getRedis();
+  if (r) {
+    // Python-side pushes via LPUSH (newest at head), we return oldest→newest.
+    const raw = await r.lRange(REDIS_TRADES_KEY, 0, n - 1);
+    return raw.slice().reverse().map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+  }
   try {
     const raw = await fs.readFile(logPath, 'utf-8');
     const lines = raw.split('\n').filter(Boolean);
@@ -497,8 +530,8 @@ if (process.argv[1] && process.argv[1].endsWith('server.js')) {
   const app = makeApp();
   app.listen(PORT, () => {
     console.log(`silver-swing dashboard on http://localhost:${PORT}`);
-    console.log(`  store: ${STORE_PATH}`);
-    console.log(`  trade log: ${TRADE_LOG_PATH}`);
+    console.log(`  store: ${REDIS_URL ? `redis:${REDIS_STORE_KEY}` : STORE_PATH}`);
+    console.log(`  trade log: ${REDIS_URL ? `redis:${REDIS_TRADES_KEY}` : TRADE_LOG_PATH}`);
     console.log(`  auth: ${DASHBOARD_PASSWORD ? 'ENABLED' : 'disabled (dev only)'}`);
   });
 }
