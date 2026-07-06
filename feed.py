@@ -41,11 +41,21 @@ class LiveTickerFeed:
         product_id: str,
         key_file: Optional[str] = None,
         ws_client=None,
+        subscribe_l2: bool = False,
+        subscribe_trades: bool = False,
+        on_l2_snapshot=None,
+        on_l2_update=None,
+        on_trade=None,
     ):
         self.product_id = product_id
         self._latest: Optional[dict] = None
         self._lock = threading.Lock()
         self._started = False
+        self._subscribe_l2 = subscribe_l2
+        self._subscribe_trades = subscribe_trades
+        self._on_l2_snapshot = on_l2_snapshot
+        self._on_l2_update = on_l2_update
+        self._on_trade = on_trade
 
         if ws_client is not None:
             # Injected client (tests, or a pre-configured shared instance)
@@ -75,9 +85,16 @@ class LiveTickerFeed:
             return
         if not isinstance(msg, dict):
             return
-        if msg.get("channel") != "ticker":
-            return
+        channel = msg.get("channel")
         events = msg.get("events") or []
+        if channel == "l2_data" and self._subscribe_l2:
+            self._parse_l2(events)
+            return
+        if channel == "market_trades" and self._subscribe_trades:
+            self._parse_trades(events)
+            return
+        if channel != "ticker":
+            return
         for event in events:
             tickers = event.get("tickers") or []
             for t in tickers:
@@ -116,6 +133,61 @@ class LiveTickerFeed:
                         "ts": msg.get("timestamp") or t.get("timestamp"),
                     }
 
+    # ---- l2 + trades parsers (only invoked when subscribed) -------------
+
+    def _parse_l2(self, events: list) -> None:
+        """Coinbase l2_data events. First message is a snapshot; subsequent are
+        deltas. Format:
+          {"type": "snapshot", "product_id": ..., "updates": [{"side", "price_level", "new_quantity"}]}
+          {"type": "update", "product_id": ..., "updates": [same]}
+        """
+        for ev in events:
+            if ev.get("product_id") != self.product_id:
+                continue
+            typ = ev.get("type")
+            updates = ev.get("updates") or []
+            if typ == "snapshot":
+                bids, asks = [], []
+                for u in updates:
+                    try:
+                        px = float(u.get("price_level"))
+                        sz = float(u.get("new_quantity"))
+                    except (TypeError, ValueError):
+                        continue
+                    side = str(u.get("side") or "").lower()
+                    if side.startswith("b"):
+                        bids.append((px, sz))
+                    elif side.startswith(("o", "a", "s")):  # offer/ask/sell
+                        asks.append((px, sz))
+                if self._on_l2_snapshot:
+                    self._on_l2_snapshot(bids, asks)
+            elif typ == "update" and self._on_l2_update:
+                for u in updates:
+                    try:
+                        px = float(u.get("price_level"))
+                        sz = float(u.get("new_quantity"))
+                    except (TypeError, ValueError):
+                        continue
+                    self._on_l2_update(str(u.get("side") or ""), px, sz)
+
+    def _parse_trades(self, events: list) -> None:
+        """Coinbase market_trades events:
+          {"trades": [{"trade_id","product_id","price","size","side","time"}]}
+        """
+        if not self._on_trade:
+            return
+        for ev in events:
+            for t in ev.get("trades") or []:
+                if t.get("product_id") != self.product_id:
+                    continue
+                try:
+                    price = float(t.get("price"))
+                    size = float(t.get("size"))
+                except (TypeError, ValueError):
+                    continue
+                side = str(t.get("side") or "").lower() or None
+                self._on_trade(price, size, side, None)
+
     # ---- lifecycle -------------------------------------------------------
 
     def start(self) -> None:
@@ -123,6 +195,17 @@ class LiveTickerFeed:
             return
         self._ws.open()
         self._ws.ticker(product_ids=[self.product_id])
+        if self._subscribe_l2:
+            # SDK method name is `level2` in coinbase-advanced-py
+            try:
+                self._ws.level2(product_ids=[self.product_id])
+            except Exception:
+                pass
+        if self._subscribe_trades:
+            try:
+                self._ws.market_trades(product_ids=[self.product_id])
+            except Exception:
+                pass
         self._started = True
 
     def stop(self) -> None:
@@ -132,6 +215,16 @@ class LiveTickerFeed:
             self._ws.ticker_unsubscribe(product_ids=[self.product_id])
         except Exception:
             pass
+        if self._subscribe_l2:
+            try:
+                self._ws.level2_unsubscribe(product_ids=[self.product_id])
+            except Exception:
+                pass
+        if self._subscribe_trades:
+            try:
+                self._ws.market_trades_unsubscribe(product_ids=[self.product_id])
+            except Exception:
+                pass
         try:
             self._ws.close()
         except Exception:

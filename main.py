@@ -126,10 +126,29 @@ def run_paper_mode() -> int:
     else:
         _log("paper starts flat (mirror disabled — set SWING_PAPER_MIRROR_LIVE=1 to enable)")
 
-    trader = SwingTrader(paper, store, TENANT, SYMBOL, trade_log=log, kill_switch=ks)
+    from microstructure import MicrostructureFilter
+    ms = MicrostructureFilter()
+    if ms.any_enabled():
+        enabled = [k for k, on in {
+            "spread_band": ms.enable_spread, "autocorr": ms.enable_autocorr,
+            "obi": ms.enable_obi, "vpin": ms.enable_vpin, "kyle_lambda": ms.enable_lambda,
+        }.items() if on]
+        _log(f"microstructure signals ON: {', '.join(enabled)}")
+    else:
+        ms = None
+
+    trader = SwingTrader(paper, store, TENANT, SYMBOL, trade_log=log,
+                         kill_switch=ks, microstructure=ms)
 
     _log(f"connecting to WS feed (waiting up to {FEED_READY_TIMEOUT}s for first tick)...")
-    feed = LiveTickerFeed(SYMBOL)
+    feed = LiveTickerFeed(
+        SYMBOL,
+        subscribe_l2=(ms.needs_l2() if ms else False),
+        subscribe_trades=(ms.needs_trades() if ms else False),
+        on_l2_snapshot=(ms.on_l2_snapshot if ms else None),
+        on_l2_update=(ms.on_l2_update if ms else None),
+        on_trade=(ms.on_trade if ms else None),
+    )
     stopping = False
 
     def stop(*_):
@@ -158,6 +177,8 @@ def run_paper_mode() -> int:
                 time.sleep(0.1)
                 continue
             paper.tick(t["best_bid"], t["best_ask"])
+            if ms is not None:
+                ms.on_ticker(t["best_bid"], t["best_ask"], t["price"])
             # Forward exchange-provided 24h high/low if the feed shipped them.
             set_range = getattr(paper, "set_external_day_range", None)
             if callable(set_range):
@@ -171,6 +192,8 @@ def run_paper_mode() -> int:
                 snap["best_bid"] = t["best_bid"]
                 snap["best_ask"] = t["best_ask"]
                 snap["generated_at"] = now
+                if ms is not None:
+                    snap["microstructure"] = ms.snapshot()
                 store.put_snapshot(TENANT, SYMBOL, snap)
                 last_snapshot = now
             time.sleep(LOOP_INTERVAL_SECS)

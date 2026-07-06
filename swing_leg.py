@@ -119,6 +119,7 @@ class SwingTrader:
         trade_log: Optional[TradeLog] = None,
         kill_switch: Optional[KillSwitch] = None,
         notifier: Optional[Notifier] = None,
+        microstructure=None,
     ):
         self.b = broker
         self.store = store
@@ -127,6 +128,7 @@ class SwingTrader:
         self.log = trade_log
         self.ks = kill_switch
         self.notifier = notifier
+        self.ms = microstructure  # MicrostructureFilter or None
 
         self.cfg = self._load_config()
         self.s = self._load_state()
@@ -497,11 +499,6 @@ class SwingTrader:
         strat = self._exit_strategy()
         if self.s.state == State.ARMED_SELL:
             if not self._floor_ok(pos, self.s.swing_qty):
-                # Transient: not enough contracts to arm the sell right now.
-                # Skip this tick and wait for more contracts — no HALT.
-                # HALT is reserved for genuine failures (margin call, bad config,
-                # explicit governor trip). Missing contracts is recoverable by
-                # buying more, which the user can do at any time.
                 self._record(
                     "arm_sell_skipped",
                     reason="insufficient contracts",
@@ -513,7 +510,10 @@ class SwingTrader:
             directive = strat.sell_action(self.s, self.cfg, current_price)
             if directive is None:
                 return  # trailing waiting for trigger / trail crossover
-            self._arm("SELL", directive.qty, directive.limit_price)
+            qty, px = self._ms_adjust("SELL", directive.qty, directive.limit_price, current_price)
+            if qty is None:
+                return  # filter said pause
+            self._arm("SELL", qty, px)
         elif self.s.state == State.ARMED_BUY:
             self._maybe_scale_up()
             directive = strat.buy_action(
@@ -522,7 +522,29 @@ class SwingTrader:
             )
             if directive is None:
                 return
-            self._arm("BUY", directive.qty, directive.limit_price)
+            qty, px = self._ms_adjust("BUY", directive.qty, directive.limit_price, current_price)
+            if qty is None:
+                return
+            self._arm("BUY", qty, px)
+
+    def _ms_adjust(self, side: str, qty: int, px: float, mark: float):
+        """Consult the microstructure filter. Returns (qty, px) or (None, None) to pause."""
+        if not self.ms:
+            return qty, px
+        reason = self.ms.should_pause_arm(side)
+        if reason:
+            self._record("ms_pause", side=side, reason=reason)
+            return None, None
+        # Adaptive spread band overrides configured limit if enabled
+        if side == "BUY":
+            px = self.ms.adjusted_buy_px(px, mark)
+        else:
+            px = self.ms.adjusted_sell_px(px, mark)
+        # Kyle-lambda size taper
+        scale = self.ms.size_scale()
+        if scale < 1.0:
+            qty = max(1, int(qty * scale))
+        return qty, px
 
     def _maybe_scale_up(self) -> None:
         if self.s.swing_qty >= self.cfg.max_swing_qty:
