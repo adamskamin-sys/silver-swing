@@ -216,6 +216,31 @@ class CoinbaseBroker:
         """Real-time futures account balance summary — empirical inputs for §4 gates."""
         return _dump(self.client.get_futures_balance_summary()).get("balance_summary") or {}
 
+    def stablecoin_balance(self) -> float:
+        """USDC held in spot accounts. Coinbase's Total balance display in the
+        app includes this; get_futures_balance_summary does not — that's why
+        the dashboard's TOTAL VALUE reads lower than Coinbase's total when
+        the user is holding stables.
+
+        Returns 0.0 on any failure so the caller (snapshot) can proceed without
+        the extra number rather than crashing the whole snapshot."""
+        try:
+            resp = _dump(self.client.get_accounts())
+            accts = resp.get("accounts") or []
+            total = 0.0
+            for a in accts:
+                cur = (a.get("currency") or "").upper()
+                if cur != "USDC":
+                    continue
+                bal = a.get("available_balance") or {}
+                try:
+                    total += float(bal.get("value") or 0)
+                except (TypeError, ValueError):
+                    continue
+            return total
+        except Exception:
+            return 0.0
+
     def snapshot(self) -> dict:
         """Unified snapshot in the same shape as PaperBroker.snapshot() so the
         dashboard can render either without branching. Best-effort — any subcall
@@ -248,21 +273,27 @@ class CoinbaseBroker:
 
         cfm_balance = _num("cfm_usd_balance", "value")
         cbi_balance = _num("cbi_usd_balance", "value")
+        # USDC in spot accounts. Coinbase's "Total balance" in the app rolls
+        # this in; the futures balance summary doesn't. Pulling it separately
+        # closes the mismatch the dashboard used to show.
+        usdc_balance = self.stablecoin_balance()
+        unrealized = _num("unrealized_pnl", "value")
         return {
             "mode": "live",
             "product_id": self.cfg.product_id,
             "position_qty": pos_qty,
             "position_avg_entry": avg_entry,
             "last_mark": mark,
-            "balance": cbi_balance + cfm_balance,
+            "balance": cbi_balance + cfm_balance + usdc_balance,
             "cfm_usd_balance": cfm_balance,
             "cbi_usd_balance": cbi_balance,
-            "unrealized_pnl": _num("unrealized_pnl", "value"),
+            "usdc_balance": usdc_balance,
+            "unrealized_pnl": unrealized,
             "realized_pnl": _num("daily_realized_pnl", "value"),
             "initial_margin": _num("initial_margin", "value"),
             "maintenance_margin": _num("liquidation_threshold", "value"),
             "available_margin": _num("available_margin", "value"),
             "futures_buying_power": _num("futures_buying_power", "value"),
             "liquidation_buffer": _num("liquidation_buffer_amount", "value"),
-            "equity": cbi_balance + cfm_balance + _num("unrealized_pnl", "value"),
+            "equity": cbi_balance + cfm_balance + usdc_balance + unrealized,
         }
