@@ -1150,24 +1150,26 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
         <button class="small primary" data-action="add-sleeve" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">+ add strategy</button>
       </div>
       ${priceBar}
-      <table class="sleeves-table">
-        <thead>
-          <tr>
-            <th>Strategy</th>
-            <th>Contracts</th>
-            <th>Params</th>
-            <th>Status</th>
-            <th>Cycles</th>
-            <th>Unrealized</th>
-            <th>Realized</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          ${primaryRow}
-          ${sleeveRows}
-        </tbody>
-      </table>
+      <div class="sleeves-table-wrap">
+        <table class="sleeves-table">
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Contracts</th>
+              <th>Params</th>
+              <th>Status</th>
+              <th>Cycles</th>
+              <th>Unrealized</th>
+              <th>Realized</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${primaryRow}
+            ${sleeveRows}
+          </tbody>
+        </table>
+      </div>
     </section>
   `;
 }
@@ -2481,6 +2483,13 @@ function openScannerDetail(row) {
   scannerDetailContext = row;
   scannerChartWindow = { days: 7, granularity: 'FIVE_MINUTE' };
   scannerDetailTitle.textContent = row.product_id;
+  // Default the mode chooser to whatever tab the user's on if it's meaningful,
+  // else fall back to paper (safer default for accidental clicks).
+  const defaultMode = (activeMode === 'live') ? 'live' : 'paper';
+  document.querySelectorAll('input[name="scanner-buy-mode"]').forEach(r => {
+    r.checked = (r.value === defaultMode);
+    r.onchange = () => updateScannerBuyButton();
+  });
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
@@ -2515,18 +2524,19 @@ function openScannerDetail(row) {
 function updateScannerBuyButton() {
   if (!scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
-  const tenant = tenantForActiveMode();
+  const mode = selectedScannerBuyMode();
+  const tenant = tenantForMode(mode);
   const tracks = tenant && currentStore[tenant] && currentStore[tenant][symbol];
   if (tenant && tracks) {
-    scannerBuyBtn.textContent = `buy on ${activeMode}`;
+    scannerBuyBtn.textContent = `buy on ${mode}`;
     scannerBuyBtn.disabled = false;
     scannerDetailWarning.hidden = true;
   } else if (tenant) {
-    scannerBuyBtn.textContent = `buy on ${activeMode}`;
+    scannerBuyBtn.textContent = `buy on ${mode}`;
     scannerBuyBtn.disabled = true;
     scannerDetailWarning.hidden = false;
     scannerDetailWarning.innerHTML = `
-      <b>${escapeHtml(symbol)}</b> isn't a tracked instrument on your <b>${escapeHtml(activeMode || 'paper')}</b> account.
+      <b>${escapeHtml(symbol)}</b> isn't a tracked instrument on your <b>${escapeHtml(mode)}</b> account.
       To trade it here, add it as a tracked symbol first (the bot needs a
       running strategy on this product to route the order through). Silver
       (SLR-27AUG26-CDE) is the currently tracked instrument.
@@ -2534,14 +2544,19 @@ function updateScannerBuyButton() {
   } else {
     scannerBuyBtn.disabled = true;
     scannerDetailWarning.hidden = false;
-    scannerDetailWarning.innerHTML = `No <b>${escapeHtml(activeMode || 'paper')}</b> account configured.`;
+    scannerDetailWarning.innerHTML = `No <b>${escapeHtml(mode)}</b> account configured.`;
   }
 }
 
-function tenantForActiveMode() {
-  const mode = activeMode === 'scanner' ? 'paper' : (activeMode || 'paper');
+function selectedScannerBuyMode() {
+  const checked = document.querySelector('input[name="scanner-buy-mode"]:checked');
+  return checked ? checked.value : 'paper';
+}
+
+function tenantForMode(mode) {
+  const target = (mode === 'live' || mode === 'paper') ? mode : 'paper';
   for (const t of Object.keys(currentStore || {})) {
-    if (modeOfTenant(t) === mode) return t;
+    if (modeOfTenant(t) === target) return t;
   }
   return null;
 }
@@ -2549,8 +2564,15 @@ function tenantForActiveMode() {
 scannerBuyBtn.addEventListener('click', () => {
   if (scannerBuyBtn.disabled || !scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
-  const tenant = tenantForActiveMode();
+  const mode = selectedScannerBuyMode();
+  const tenant = tenantForMode(mode);
   if (!tenant) return;
+  // For live: extra confirm since this is real money. Paper is fine to trade
+  // straight into the existing trade modal (which already shows a preview).
+  if (mode === 'live') {
+    const ok = confirm(`Buy real ${symbol} contracts on LIVE (real money)? You'll get a preview to review before it submits.`);
+    if (!ok) return;
+  }
   scannerDetailModal.hidden = true;
   openTradeModal(tenant, symbol, 'BUY');
 });

@@ -745,6 +745,13 @@ header { padding: 20px 32px; }
 .sleeves-table {
   width: 100%; border-collapse: collapse; font-size: 13px;
 }
+/* On narrow viewports the strategy row's action buttons (Cancel order /
+   Sell N now / Edit / Stop) push off the right edge of the card. Wrap the
+   table in a horizontal scroll container so nothing hides. */
+.sleeves-section .sleeves-table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 .sleeves-table thead th {
   text-align: left; padding: 8px 12px;
   color: var(--dim); font-weight: 500; font-size: 11px;
@@ -1139,6 +1146,14 @@ header { padding: 20px 32px; }
 .scanner-detail-range { font-size: 13px; color: var(--muted); }
 .scanner-detail-vol { font-size: 13px; color: var(--muted); }
 .scanner-detail-vol b { color: var(--text); }
+.scanner-detail-modechooser { display: flex; gap: 14px; align-items: center;
+  padding: 10px 0; margin-bottom: 8px; font-size: 13px;
+  border-bottom: 1px solid var(--border); }
+.scanner-detail-modechooser .mode-label { color: var(--muted);
+  text-transform: uppercase; letter-spacing: 1px; font-size: 11px; }
+.scanner-detail-modechooser label { display: inline-flex; align-items: center;
+  gap: 4px; cursor: pointer; color: var(--text); }
+.scanner-detail-modechooser input[type="radio"] { accent-color: #8f7ae0; }
 .scanner-detail-timeframes { display: flex; gap: 6px; margin-bottom: 8px; }
 .timeframe-btn { padding: 4px 12px; font-size: 12px; background: var(--panel-3);
   color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
