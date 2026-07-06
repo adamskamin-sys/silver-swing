@@ -80,6 +80,11 @@ class BacktestResult:
     fills: int
     halted: bool
     halt_reason: Optional[str]
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    price_start: Optional[float] = None
+    price_end: Optional[float] = None
+    candle_count: int = 0
     equity_curve: list[EquityPoint] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -142,6 +147,8 @@ def run_backtest(
 
     start = paper_config.starting_balance
     final = broker.equity()
+    price_min = min((c.low for c in candles), default=None)
+    price_max = max((c.high for c in candles), default=None)
     return BacktestResult(
         starting_balance=start,
         final_equity=final,
@@ -156,6 +163,11 @@ def run_backtest(
         fills=sum(1 for o in broker.history if o.status == "FILLED"),
         halted=broker._halted,
         halt_reason=broker._halt_reason,
+        price_min=price_min,
+        price_max=price_max,
+        price_start=candles[0].open if candles else None,
+        price_end=candles[-1].close if candles else None,
+        candle_count=len(candles),
         equity_curve=curve,
     )
 

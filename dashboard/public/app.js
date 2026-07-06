@@ -1726,27 +1726,67 @@ function renderBacktestSummary(r) {
 
 function renderLeaderboard(results) {
   if (!results?.length) return '<div class="dim">no results</div>';
-  const rows = results.map(r => `
-    <tr>
-      <td>${escapeHtml(r.strategy)}</td>
+  // Rank by total_return (highest first). Errored runs go last.
+  const ranked = results.slice().sort((a, b) => {
+    const ea = a.error != null;
+    const eb = b.error != null;
+    if (ea && !eb) return 1;
+    if (eb && !ea) return -1;
+    return (Number(b.total_return) || 0) - (Number(a.total_return) || 0);
+  });
+
+  // Price range info (all strategies see the same window, so any result has it)
+  const first = ranked.find(r => r.price_min != null) || {};
+  const priceInfo = first.price_min != null ? `
+    <div class="backtest-price-range">
+      window price range: <b>$${fmtNum(first.price_min, 3)}</b>
+       – <b>$${fmtNum(first.price_max, 3)}</b>
+       · candles: ${first.candle_count}
+       · start $${fmtNum(first.price_start, 3)} → end $${fmtNum(first.price_end, 3)}
+    </div>
+  ` : '';
+
+  const rows = ranked.map((r, i) => {
+    const winnerCls = i === 0 && !r.error ? 'winner' : '';
+    const err = r.error ? `<td colspan="6" class="neg">error: ${escapeHtml(r.error)}</td>` : `
       <td class="${classForValue(r.total_return)}">${fmtMoney(r.total_return)}</td>
       <td>${fmtNum(r.total_return_pct, 2)}%</td>
       <td class="neg">${fmtMoney(r.max_drawdown)}</td>
       <td>${r.cycles}</td>
       <td>${r.fills}</td>
       <td>${r.halted ? '⚠' : '✓'}</td>
-    </tr>
-  `).join('');
+    `;
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`;
+    return `
+      <tr class="${winnerCls}">
+        <td class="rank-cell">${medal}</td>
+        <td class="strategy-cell">${escapeHtml(r.strategy)}${i === 0 && !r.error ? ' <span class="best-tag">BEST</span>' : ''}</td>
+        ${err}
+      </tr>
+    `;
+  }).join('');
+
+  const zeroFills = ranked.every(r => (r.fills || 0) === 0 && !r.error);
+  const zeroNote = zeroFills ? `
+    <div class="backtest-empty-note">
+      No strategy fired in this window. Price stayed inside your bounds — try a
+      wider window, tighter <code>buy_px</code> / <code>sell_px</code>, or a
+      finer granularity (hourly instead of daily) for more resolution.
+    </div>
+  ` : '';
+
   return `
+    ${priceInfo}
     <table class="leaderboard">
       <thead>
         <tr>
-          <th>strategy</th><th>return</th><th>return %</th><th>max dd</th>
-          <th>cycles</th><th>fills</th><th>ok</th>
+          <th>rank</th><th>strategy</th><th>return</th><th>return %</th>
+          <th>max dd</th><th>cycles</th><th>fills</th><th>ok</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
     </table>
+    ${zeroNote}
     <div class="overfit-warning" style="margin-top:16px">
       Ranked on this specific window. Whichever strategy wins here won THIS
       slice of history. Try 3+ windows spanning different regimes before

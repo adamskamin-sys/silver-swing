@@ -154,6 +154,11 @@ def _result_to_dict(r):
         "fills": r.fills,
         "halted": r.halted,
         "halt_reason": r.halt_reason,
+        "price_min": r.price_min,
+        "price_max": r.price_max,
+        "price_start": r.price_start,
+        "price_end": r.price_end,
+        "candle_count": r.candle_count,
     }
 
 

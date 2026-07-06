@@ -1126,3 +1126,28 @@ header { padding: 20px 32px; }
   font-size: 10px; color: var(--muted); font-weight: normal; }
 #scanner-table tr:hover { background: var(--panel-3); }
 .mode-tab.mode-scanner.active { border-color: #8f7ae0; color: #d5cef5; }
+
+/* ---- backtest leaderboard ranking -------------------------------------- */
+.leaderboard tr.winner { background: rgba(75, 184, 144, 0.08); }
+.leaderboard tr.winner td { border-top: 1px solid rgba(75, 184, 144, 0.3); border-bottom: 1px solid rgba(75, 184, 144, 0.3); }
+.rank-cell { font-size: 18px; text-align: center; width: 60px; }
+.strategy-cell { font-weight: 500; }
+.best-tag {
+  display: inline-block; margin-left: 6px; padding: 2px 8px;
+  background: rgba(75, 184, 144, 0.2); color: #4bb890;
+  border-radius: 3px; font-size: 10px; letter-spacing: 1px; font-weight: 600;
+}
+.backtest-price-range {
+  margin-bottom: 12px; padding: 10px 12px;
+  background: var(--panel-3); border-left: 3px solid var(--accent);
+  border-radius: 4px; font-family: var(--mono); font-size: 12px;
+}
+.backtest-empty-note {
+  margin-top: 12px; padding: 12px;
+  background: rgba(212, 160, 76, 0.1); border-left: 3px solid #d4a04c;
+  border-radius: 4px; font-size: 13px; line-height: 1.5;
+}
+.backtest-empty-note code {
+  background: var(--panel-3); padding: 1px 5px; border-radius: 3px;
+  font-family: var(--mono); font-size: 12px;
+}
