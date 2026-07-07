@@ -148,6 +148,36 @@ function fmtNum(n, decimals = 2) {
   return Number.isNaN(v) ? '—' : v.toFixed(decimals);
 }
 
+// Pick a sensible decimal precision for a product's price. Micro-priced perps
+// (PEPE at $0.00001) need 6-8 decimals; silver at $60 only needs 3. Prefers
+// the product's tick_size when present in config; otherwise infers from the
+// magnitude so we never truncate meaningful digits. Silver hardcoded to 3
+// (matches the Coinbase display for CDE futures).
+function pricePrecisionFor(price, config) {
+  const tick = Number(config?.tick_size) || 0;
+  if (tick > 0) {
+    // Count decimals implied by the tick size (0.005 → 3, 0.00001 → 5).
+    const parts = tick.toString().split('.');
+    if (parts.length > 1) return Math.min(8, parts[1].length);
+    return 0;
+  }
+  const p = Math.abs(Number(price) || 0);
+  if (p === 0) return 3;
+  if (p >= 1000) return 2;
+  if (p >= 10) return 3;
+  if (p >= 1) return 4;
+  if (p >= 0.01) return 5;
+  if (p >= 0.0001) return 6;
+  return 8;
+}
+
+// Shorthand: format a price using the config's tick precision or magnitude.
+// Config is optional — when missing, falls back to magnitude inference so
+// this can be dropped in anywhere without threading config through helpers.
+function fmtPrice(price, config) {
+  return fmtNum(price, pricePrecisionFor(price, config));
+}
+
 function fmtHeartbeat(ts) {
   if (!ts) return 'never';
   const age = Date.now() / 1000 - ts;
@@ -369,7 +399,7 @@ function renderPositionLane(state, config, snapshot) {
       </div>
       <div class="position-lane-row" style="margin-top:4px;color:var(--muted);font-size:11px;">
         <span>total held: ${posQty}</span>
-        <span>avg entry: ${fmtNum(snapshot?.position_avg_entry, 3)}</span>
+        <span>avg entry: ${fmtPrice(\1)}</span>
       </div>
     </div>
   `;
@@ -483,6 +513,7 @@ function renderCard(tenant, symbol, { config, state, snapshot }) {
 
     <div class="card-body">
       ${renderTargetsRow(c, snap)}
+      ${renderContractInfo(symbol, c, snap)}
       ${renderPositionBar(s, c, snap)}
       ${renderLotsTable(snap, c, tenant, symbol, s)}
       ${renderRiskStrip(snap)}
@@ -573,15 +604,15 @@ function renderLotsTable(snapshot, config, tenant, symbol, state) {
         <div class="positions-summary">
           <div class="summary-cell">
             <span class="summary-label">Avg entry</span>
-            <span class="summary-value">$${fmtNum(avg, 3)}</span>
+            <span class="summary-value">$${fmtPrice(\1)}</span>
           </div>
           <div class="summary-cell">
             <span class="summary-label">Current mark</span>
-            <span class="summary-value">$${fmtNum(mark, 3)}</span>
+            <span class="summary-value">$${fmtPrice(\1)}</span>
           </div>
           <div class="summary-cell">
             <span class="summary-label">vs avg entry</span>
-            <span class="summary-value ${classForValue(dist)}">${dist >= 0 ? '+' : ''}$${fmtNum(dist, 3)} / contract</span>
+            <span class="summary-value ${classForValue(dist)}">${dist >= 0 ? '+' : ''}$${fmtPrice(\1)} / contract</span>
           </div>
         </div>
         <div class="positions-empty">Aggregate view — per-lot history begins with your next fill.</div>
@@ -607,8 +638,8 @@ function renderLotsTable(snapshot, config, tenant, symbol, state) {
     return `
       <tr class="lot-row">
         <td class="lot-qty"><b>${qty}</b></td>
-        <td class="lot-entry">$${fmtNum(entry, 3)}</td>
-        <td class="lot-mark">$${fmtNum(mark, 3)}</td>
+        <td class="lot-entry">$${fmtPrice(\1)}</td>
+        <td class="lot-mark">$${fmtPrice(\1)}</td>
         <td class="lot-pnl ${classForValue(unreal)}">
           <div>${unreal >= 0 ? '+' : ''}${fmtMoney(unreal)}</div>
           <div class="lot-pnl-sub">${perContract >= 0 ? '+' : ''}${fmtMoney(perContract)} / ea</div>
@@ -664,15 +695,15 @@ function renderLotsTable(snapshot, config, tenant, symbol, state) {
       <div class="positions-summary">
         <div class="summary-cell">
           <span class="summary-label">Avg entry</span>
-          <span class="summary-value">$${fmtNum(avgEntry, 3)}</span>
+          <span class="summary-value">$${fmtPrice(\1)}</span>
         </div>
         <div class="summary-cell">
           <span class="summary-label">Current mark</span>
-          <span class="summary-value">$${fmtNum(mark, 3)}</span>
+          <span class="summary-value">$${fmtPrice(\1)}</span>
         </div>
         <div class="summary-cell">
           <span class="summary-label">vs avg entry</span>
-          <span class="summary-value ${classForValue(distFromAvg)}">${distFromAvg >= 0 ? '+' : ''}$${fmtNum(distFromAvg, 3)} / contract</span>
+          <span class="summary-value ${classForValue(distFromAvg)}">${distFromAvg >= 0 ? '+' : ''}$${fmtPrice(\1)} / contract</span>
         </div>
       </div>
       <table class="positions-table">
@@ -799,8 +830,8 @@ function renderRiskStrip(snapshot) {
     liqCell = `
       <div class="risk-cell">
         <span class="risk-label">Liquidation price</span>
-        <span class="risk-value ${cls}">$${fmtNum(liq, 3)}</span>
-        <span class="risk-sub">$${fmtNum(Math.abs(dist), 3)} away · ${distPct.toFixed(1)}% cushion</span>
+        <span class="risk-value ${cls}">$${fmtPrice(\1)}</span>
+        <span class="risk-sub">$${fmtPrice(\1)} away · ${distPct.toFixed(1)}% cushion</span>
       </div>
     `;
   }
@@ -945,9 +976,9 @@ function fmtTrailingParams(exitMode, live, staticCfg) {
       return `
         <div class="params-block trail-armed">
           <div class="params-mode"><span class="dot dot-live"></span>Trailing <em>(armed)</em></div>
-          <div class="params-line"><span class="params-label">Stop</span><b>$${fmtNum(stop, 3)}</b></div>
-          <div class="params-line"><span class="params-label">HWM</span>$${fmtNum(live.hwm, 3)}</div>
-          <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+          <div class="params-line"><span class="params-label">Stop</span><b>$${fmtPrice(\1)}</b></div>
+          <div class="params-line"><span class="params-label">HWM</span>$${fmtPrice(\1)}</div>
+          <div class="params-line"><span class="params-label">Buy back</span>$${fmtPrice(\1)}</div>
           ${fmtLockedLine(lockedArmed, 'Locked in profit')}
           <div class="params-line params-sub">Rises with price · sells at market on pullback</div>
         </div>`;
@@ -955,10 +986,10 @@ function fmtTrailingParams(exitMode, live, staticCfg) {
     return `
       <div class="params-block">
         <div class="params-mode">Trailing stop</div>
-        <div class="params-line"><span class="params-label">Trigger</span>$${fmtNum(staticCfg.trigger, 3)}</div>
-        <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
-        <div class="params-line"><span class="params-label">Distance</span>$${fmtNum(staticCfg.distance, 3)}</div>
-        ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If armed now</span><b class="dim-b">$${fmtNum(projectedStop, 3)}</b></div>` : ''}
+        <div class="params-line"><span class="params-label">Trigger</span>$${fmtPrice(\1)}</div>
+        <div class="params-line"><span class="params-label">Buy back</span>$${fmtPrice(\1)}</div>
+        <div class="params-line"><span class="params-label">Distance</span>$${fmtPrice(\1)}</div>
+        ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If armed now</span><b class="dim-b">$${fmtPrice(\1)}</b></div>` : ''}
         ${fmtLockedLine(lockedProjected, 'If armed: locked')}
         <div class="params-line params-sub">Waits for trigger, then trails</div>
       </div>`;
@@ -970,9 +1001,9 @@ function fmtTrailingParams(exitMode, live, staticCfg) {
       return `
         <div class="params-block trail-armed">
           <div class="params-mode"><span class="dot dot-live"></span>Hybrid → Trailing <em>(breakout)</em></div>
-          <div class="params-line"><span class="params-label">Stop</span><b>$${fmtNum(stop, 3)}</b></div>
-          <div class="params-line"><span class="params-label">HWM</span>$${fmtNum(live.hwm, 3)}</div>
-          <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+          <div class="params-line"><span class="params-label">Stop</span><b>$${fmtPrice(\1)}</b></div>
+          <div class="params-line"><span class="params-label">HWM</span>$${fmtPrice(\1)}</div>
+          <div class="params-line"><span class="params-label">Buy back</span>$${fmtPrice(\1)}</div>
           ${fmtLockedLine(lockedArmed, 'Locked in profit')}
           <div class="params-line params-sub">Rode past activation · trailing on breakout</div>
         </div>`;
@@ -984,11 +1015,11 @@ function fmtTrailingParams(exitMode, live, staticCfg) {
       return `
         <div class="params-block trail-armed">
           <div class="params-mode"><span class="dot dot-live"></span>Hybrid <em>(watching)</em></div>
-          <div class="params-line"><span class="params-label">Target hit</span>$${fmtNum(staticCfg.sellPx, 3)}</div>
-          <div class="params-line"><span class="params-label">Watch until</span><b>$${fmtNum(staticCfg.activationPx, 3)}</b></div>
+          <div class="params-line"><span class="params-label">Target hit</span>$${fmtPrice(\1)}</div>
+          <div class="params-line"><span class="params-label">Watch until</span><b>$${fmtPrice(\1)}</b></div>
           <div class="params-line"><span class="params-label">Remaining</span>${remaining.toFixed(1)}s</div>
-          <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
-          ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If trail now</span><b class="dim-b">$${fmtNum(projectedStop, 3)}</b></div>` : ''}
+          <div class="params-line"><span class="params-label">Buy back</span>$${fmtPrice(\1)}</div>
+          ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If trail now</span><b class="dim-b">$${fmtPrice(\1)}</b></div>` : ''}
           ${fmtLockedLine(lockedProjected, 'If trail: locked')}
           <div class="params-line params-sub">Cross activation → trail · else sell at market</div>
         </div>`;
@@ -997,20 +1028,20 @@ function fmtTrailingParams(exitMode, live, staticCfg) {
     return `
       <div class="params-block">
         <div class="params-mode">Hybrid</div>
-        <div class="params-line"><span class="params-label">Sell target</span>$${fmtNum(staticCfg.sellPx, 3)}</div>
-        <div class="params-line"><span class="params-label">Buy back</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
-        <div class="params-line"><span class="params-label">Activation</span>$${fmtNum(staticCfg.activationPx, 3)}</div>
+        <div class="params-line"><span class="params-label">Sell target</span>$${fmtPrice(\1)}</div>
+        <div class="params-line"><span class="params-label">Buy back</span>$${fmtPrice(\1)}</div>
+        <div class="params-line"><span class="params-label">Activation</span>$${fmtPrice(\1)}</div>
         <div class="params-line"><span class="params-label">Delay</span>${fmtNum(staticCfg.hybridDelay || 5, 0)}s</div>
-        <div class="params-line"><span class="params-label">Trail dist</span>$${fmtNum(staticCfg.distance, 3)}</div>
-        ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If trail now</span><b class="dim-b">$${fmtNum(projectedStop, 3)}</b></div>` : ''}
+        <div class="params-line"><span class="params-label">Trail dist</span>$${fmtPrice(\1)}</div>
+        ${projectedStop !== null ? `<div class="params-line params-projected"><span class="params-label">If trail now</span><b class="dim-b">$${fmtPrice(\1)}</b></div>` : ''}
         ${fmtLockedLine(lockedProjected, 'If trail: locked')}
       </div>`;
   }
   return `
     <div class="params-block">
       <div class="params-mode">Fixed limit</div>
-      <div class="params-line"><span class="params-label">Sell</span>$${fmtNum(staticCfg.sellPx, 3)}</div>
-      <div class="params-line"><span class="params-label">Buy</span>$${fmtNum(staticCfg.buyPx, 3)}</div>
+      <div class="params-line"><span class="params-label">Sell</span>$${fmtPrice(\1)}</div>
+      <div class="params-line"><span class="params-label">Buy</span>$${fmtPrice(\1)}</div>
     </div>`;
 }
 
@@ -1207,11 +1238,11 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
         <span class="section-price-label">${escapeHtml(symbolLabel(symbol))}</span>
       </div>
       <div class="section-price-mark-wrap">
-        <span class="section-price-mark">$${fmtNum(mkt, 3)}</span>
+        <span class="section-price-mark">$${fmtPrice(\1)}</span>
       </div>
       <div class="section-price-side right">
         ${Number.isFinite(bid) && Number.isFinite(ask)
-          ? `<span class="section-price-book">bid $${fmtNum(bid, 3)} &nbsp;·&nbsp; ask $${fmtNum(ask, 3)}</span>`
+          ? `<span class="section-price-book">bid $${fmtPrice(\1)} &nbsp;·&nbsp; ask $${fmtPrice(\1)}</span>`
           : ''}
       </div>
     </div>` : '';
@@ -1256,6 +1287,47 @@ function lotAge(ts) {
   return `${(age / 86400).toFixed(1)}d`;
 }
 
+// Contract-info strip: the spec sheet for a tracked product. Coinbase shows
+// this on their derivatives page (contract size, tick, margin, expiry) — we
+// mirror it here so users don't have to leave the dashboard to look it up.
+// Reads from the config block (persisted per-symbol) with sensible fallbacks.
+function renderContractInfo(symbol, config, snapshot) {
+  const contractSize = Number(config?.contract_size) || 50;
+  const tickSize = Number(config?.tick_size) || 0;
+  const tickValue = tickSize > 0 ? tickSize * contractSize : null;
+  const margin = Number(config?.margin_per_contract) || 0;
+  const fee = Number(config?.fee_per_contract_roundtrip) || 0;
+  const expiry = config?.contract_expiry || snapshot?.contract_expiry || null;
+  const family = symbolFamilyOf(symbol);
+  const cell = (label, val) => `
+    <div class="contract-info-cell">
+      <div class="contract-info-label">${escapeHtml(label)}</div>
+      <div class="contract-info-value">${val}</div>
+    </div>`;
+  let expiryHtml = '—';
+  if (expiry) {
+    try {
+      const d = new Date(expiry);
+      const days = Math.round((d - Date.now()) / 86400000);
+      expiryHtml = `${d.toISOString().slice(0, 10)} <span class="dim">(${days}d)</span>`;
+    } catch { expiryHtml = escapeHtml(String(expiry)); }
+  }
+  return `
+    <div class="contract-info-strip">
+      <div class="contract-info-title">Contract specs</div>
+      <div class="contract-info-grid">
+        ${cell('Product', escapeHtml(symbol))}
+        ${cell('Family', escapeHtml(family))}
+        ${cell('Contract size', contractSize.toLocaleString('en-US') + ' /ct')}
+        ${cell('Tick size', tickSize > 0 ? '$' + fmtPrice(tickSize, config) : '—')}
+        ${cell('Tick value', tickValue !== null ? '$' + tickValue.toFixed(2) : '—')}
+        ${cell('Margin / contract', margin > 0 ? '$' + margin.toLocaleString('en-US', {maximumFractionDigits: 2}) : '—')}
+        ${cell('Fee / round-trip', fee > 0 ? '$' + fee.toFixed(2) : '—')}
+        ${cell('Expiration', expiryHtml)}
+      </div>
+    </div>`;
+}
+
 function renderTargetsRow(config, snapshot) {
   // Symbol-level market data only. Per-strategy targets (buy/sell prices)
   // now live INSIDE each strategy row so sleeves with different params
@@ -1266,15 +1338,15 @@ function renderTargetsRow(config, snapshot) {
   const dayLow = Number(snapshot?.day_low);
   const rangeHtml = (isFinite(dayHigh) && isFinite(dayLow) && dayHigh > 0 && dayLow > 0)
     ? `<div class="mark-range">
-         <span class="mark-range-item"><span class="mark-range-label">Day high</span><span class="mark-range-val pos">$${fmtNum(dayHigh, 3)}</span></span>
-         <span class="mark-range-item"><span class="mark-range-label">Day low</span><span class="mark-range-val neg">$${fmtNum(dayLow, 3)}</span></span>
+         <span class="mark-range-item"><span class="mark-range-label">Day high</span><span class="mark-range-val pos">$${fmtPrice(\1)}</span></span>
+         <span class="mark-range-item"><span class="mark-range-label">Day low</span><span class="mark-range-val neg">$${fmtPrice(\1)}</span></span>
        </div>` : '';
   const label = symbolLabel(snapshot?.product_id || '') + ' market';
   return `
     <div class="mark-row">
       <div class="mark-label">${escapeHtml(label)}</div>
-      <div class="mark-value">$${fmtNum(mark, 3)}</div>
-      <div class="mark-sub">bid $${fmtNum(snapshot.best_bid, 3)} · ask $${fmtNum(snapshot.best_ask, 3)}</div>
+      <div class="mark-value">$${fmtPrice(\1)}</div>
+      <div class="mark-sub">bid $${fmtPrice(\1)} · ask $${fmtPrice(\1)}</div>
       ${rangeHtml}
     </div>
   `;
@@ -1886,18 +1958,18 @@ function renderLeaderboard(results, appliedCfg) {
   const first = ranked.find(r => r.price_min != null) || {};
   const priceInfo = first.price_min != null ? `
     <div class="backtest-price-range">
-      window price range: <b>$${fmtNum(first.price_min, 3)}</b>
-       – <b>$${fmtNum(first.price_max, 3)}</b>
+      window price range: <b>$${fmtPrice(\1)}</b>
+       – <b>$${fmtPrice(\1)}</b>
        · candles: ${first.candle_count}
-       · start $${fmtNum(first.price_start, 3)} → end $${fmtNum(first.price_end, 3)}
+       · start $${fmtPrice(\1)} → end $${fmtPrice(\1)}
     </div>
   ` : '';
   const fitInfo = (appliedCfg && appliedCfg.auto_fit) ? `
     <div class="backtest-auto-fit">
       Auto-fit thresholds to this window:
-      <b>buy $${fmtNum(appliedCfg.buy_px, 3)}</b> ·
-      <b>sell $${fmtNum(appliedCfg.sell_px, 3)}</b> ·
-      abort below $${fmtNum(appliedCfg.abort_below, 3)} / above $${fmtNum(appliedCfg.abort_above, 3)}.
+      <b>buy $${fmtPrice(\1)}</b> ·
+      <b>sell $${fmtPrice(\1)}</b> ·
+      abort below $${fmtPrice(\1)} / above $${fmtPrice(\1)}.
       Ranking below reflects strategy MECHANICS, not whether a specific price target was hit.
     </div>
   ` : '';
@@ -2152,18 +2224,18 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
             <button type="button" class="anchor-choice ${anchor === anchorAlt ? 'active' : ''}" id="sl-anchor-alt"
                     data-anchor="${anchorAlt}">
               <span class="anchor-choice-label">${anchorAltLabel}</span>
-              <span class="anchor-choice-value">$${fmtNum(anchorAlt, 3)}</span>
+              <span class="anchor-choice-value">$${fmtPrice(\1)}</span>
             </button>
           ` : ''}
           <button type="button" class="anchor-choice ${anchor === mark ? 'active' : ''}" id="sl-anchor-market"
                   data-anchor="${mark}">
             <span class="anchor-choice-label">Current market</span>
-            <span class="anchor-choice-value">$${fmtNum(mark, 3)}</span>
+            <span class="anchor-choice-value">$${fmtPrice(\1)}</span>
           </button>
         </div>
         ${anchorStale ? `
           <div class="sleeve-anchor-sub">
-            <span class="stale-warn">Selected anchor is $${fmtNum(anchorToMarketDist, 3)} away from current market — targets below may be off-market</span>
+            <span class="stale-warn">Selected anchor is $${fmtPrice(\1)} away from current market — targets below may be off-market</span>
           </div>` : ''}
       </div>
       <div class="sleeve-form">
@@ -2431,7 +2503,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     profitValEl.textContent = `$${profitEl.value}`;
     updateFillPct(profitEl);
     updateFillPct(tdSliderEl);
-    tdValEl.textContent = `$${fmtNum(Number(tdSliderEl.value), 3)}`;
+    tdValEl.textContent = `$${fmtPrice(\1)}`;
 
     if (mode === 'trailing_stop') {
       const trailDistance = Number(tdSliderEl.value) || 0.1;
@@ -2439,13 +2511,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       const estNet = estGross - feesPerSwing;
       previewEl.innerHTML = `
         <div class="preview-row">
-          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtNum(buyPx, 3)}</span></div>
-          <div><span class="preview-label">Now</span><span class="preview-num">$${fmtNum(mark, 3)}</span></div>
-          <div><span class="preview-label">Arms at</span><span class="preview-num sell">$${fmtNum(sellPx, 3)}</span></div>
+          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtPrice(\1)}</span></div>
+          <div><span class="preview-label">Now</span><span class="preview-num">$${fmtPrice(\1)}</span></div>
+          <div><span class="preview-label">Arms at</span><span class="preview-num sell">$${fmtPrice(\1)}</span></div>
         </div>
         <div class="preview-econ">
-          <span>Trail distance: <b>$${fmtNum(trailDistance, 3)}</b></span>
-          <span>Est min sell: <b>$${fmtNum(sellPx - trailDistance, 3)}</b></span>
+          <span>Trail distance: <b>$${fmtPrice(\1)}</b></span>
+          <span>Est min sell: <b>$${fmtPrice(\1)}</b></span>
           <span>Est gross (min): <b>$${estGross.toFixed(2)}</b></span>
           <span>Fees: <b>−$${feesPerSwing.toFixed(2)}</b></span>
           <span>Est net (min): <b class="${estNet > 0 ? 'pos' : 'neg'}">${estNet >= 0 ? '+' : ''}$${estNet.toFixed(2)}</b></span>
@@ -2464,17 +2536,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       const estNetTrailWorst = estGrossTrailWorst - feesPerSwing;
       previewEl.innerHTML = `
         <div class="preview-row">
-          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtNum(buyPx, 3)}</span></div>
-          <div><span class="preview-label">Sell target</span><span class="preview-num sell">$${fmtNum(sellPx, 3)}</span></div>
-          <div><span class="preview-label">Activation</span><span class="preview-num">$${fmtNum(activation, 3)}</span></div>
+          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtPrice(\1)}</span></div>
+          <div><span class="preview-label">Sell target</span><span class="preview-num sell">$${fmtPrice(\1)}</span></div>
+          <div><span class="preview-label">Activation</span><span class="preview-num">$${fmtPrice(\1)}</span></div>
         </div>
         <div class="preview-econ">
           <span>Delay: <b>${delay}s</b></span>
-          <span>Trail distance: <b>$${fmtNum(trailDistance, 3)}</b></span>
+          <span>Trail distance: <b>$${fmtPrice(\1)}</b></span>
         </div>
         <div class="preview-econ">
           <span><b>Path A</b> (no breakout): sell at target → net <b class="${netPerSwing > 0 ? 'pos' : 'neg'}">${netPerSwing >= 0 ? '+' : ''}$${netPerSwing.toFixed(2)}</b></span>
-          <span><b>Path B</b> (breakout, worst): trail sells at $${fmtNum(activation - trailDistance, 3)} → net <b class="${estNetTrailWorst > 0 ? 'pos' : 'neg'}">${estNetTrailWorst >= 0 ? '+' : ''}$${estNetTrailWorst.toFixed(2)}</b></span>
+          <span><b>Path B</b> (breakout, worst): trail sells at $${fmtPrice(\1)} → net <b class="${estNetTrailWorst > 0 ? 'pos' : 'neg'}">${estNetTrailWorst >= 0 ? '+' : ''}$${estNetTrailWorst.toFixed(2)}</b></span>
         </div>
         <div class="preview-note">Activation must be above the sell target. Path B is a floor — real breakouts can ride much higher before the trail fires.</div>
       `;
@@ -2482,12 +2554,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       const perContract = qty > 0 ? grossPerSwing / qty : 0;
       previewEl.innerHTML = `
         <div class="preview-row">
-          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtNum(buyPx, 3)}</span></div>
-          <div><span class="preview-label">Now</span><span class="preview-num">$${fmtNum(mark, 3)}</span></div>
-          <div><span class="preview-label">Sell at</span><span class="preview-num sell">$${fmtNum(sellPx, 3)}</span></div>
+          <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtPrice(\1)}</span></div>
+          <div><span class="preview-label">Now</span><span class="preview-num">$${fmtPrice(\1)}</span></div>
+          <div><span class="preview-label">Sell at</span><span class="preview-num sell">$${fmtPrice(\1)}</span></div>
         </div>
         <div class="preview-econ">
-          <span>Swing width: <b>$${fmtNum(sellPx - buyPx, 3)}</b></span>
+          <span>Swing width: <b>$${fmtPrice(\1)}</b></span>
           <span>Per contract: <b>$${perContract.toFixed(2)}</b></span>
           <span>Gross/swing: <b>$${grossPerSwing.toFixed(2)}</b></span>
           <span>Fees: <b>−$${feesPerSwing.toFixed(2)}</b></span>
@@ -2684,7 +2756,7 @@ function openTradeModal(tenant, symbol, side) {
   tradeModalBody.innerHTML = `
     <div style="line-height:1.7; color: var(--muted); font-size: 14px;">
       <div>${holdLine}</div>
-      <div>${escapeHtml(symbolLabel(symbol))} market now: <b style="color:var(--text)">$${fmtNum(mark, 3)}</b> — bid $${fmtNum(snap.best_bid, 3)} / ask $${fmtNum(snap.best_ask, 3)}</div>
+      <div>${escapeHtml(symbolLabel(symbol))} market now: <b style="color:var(--text)">$${fmtPrice(\1)}</b> — bid $${fmtPrice(\1)} / ask $${fmtPrice(\1)}</div>
     </div>
   `;
 

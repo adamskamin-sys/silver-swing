@@ -110,6 +110,34 @@ def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
         store.put_config(tenant, symbol, _default_paper_config())
 
 
+def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:
+    """Fetch the live Coinbase spec for this product and merge tick_size,
+    contract_size, contract_expiry, and margin rates into the config. Runs on
+    every _Track init so the dashboard can display the ACTUAL precision (e.g.
+    0.00001 for a memecoin perp instead of a magnitude-inferred guess) and
+    the Contract Info panel shows exact numbers from the exchange, not stale
+    defaults. Failures are logged and swallowed — the bot must still boot if
+    Coinbase is unreachable for a moment."""
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        cfg = dict(store.get_config(tenant, symbol) or {})
+        broker = CoinbaseBroker(BrokerConfig(product_id=symbol))
+        spec = broker.contract_spec()
+        dirty = False
+        for k in ("contract_size", "tick_size", "contract_expiry",
+                  "intraday_margin_rate", "overnight_margin_rate"):
+            v = spec.get(k)
+            if v is not None and cfg.get(k) != v:
+                cfg[k] = v
+                dirty = True
+        if dirty:
+            store.put_config(tenant, symbol, cfg)
+            _log(f"[{tenant}/{symbol}] spec refreshed: tick={spec.get('tick_size')}, "
+                 f"size={spec.get('contract_size')}, expiry={spec.get('contract_expiry')}")
+    except Exception as e:
+        _log(f"[{tenant}/{symbol}] spec refresh skipped: {type(e).__name__}: {e}")
+
+
 def _fixup_lab_config(store, tenant: str, symbol: str) -> None:
     """One-time migration for Lab configs that were seeded before this fix
     landed — they inherited the primary paper defaults (core_qty=10) so a
@@ -184,6 +212,7 @@ class _Track:
         from swing_leg import SwingTrader
 
         _seed_config_if_missing(store, tenant, symbol)
+        _refresh_contract_spec_into_config(store, tenant, symbol)
         self.tenant = tenant
         self.symbol = symbol
         self.store = store

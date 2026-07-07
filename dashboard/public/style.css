@@ -380,6 +380,37 @@ input:focus, select:focus {
 .target-value.buy { color: var(--accent); }
 .target-hint { font-size: var(--fs-xs); color: var(--dim); margin-top: var(--s1); }
 
+/* CONTRACT INFO STRIP — Coinbase-style spec sheet under the price/targets row.
+   All the numbers a trader wants at a glance without opening Settings. */
+.contract-info-strip {
+  margin-top: var(--s5);
+  padding: var(--s5);
+  background: var(--panel-2);
+  border-radius: var(--r-md);
+}
+.contract-info-title {
+  font-size: var(--fs-xs); color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
+  margin-bottom: var(--s3);
+}
+.contract-info-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--s4);
+}
+.contract-info-cell {
+  display: flex; flex-direction: column; gap: var(--s1);
+}
+.contract-info-label {
+  font-size: 10px; color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
+}
+.contract-info-value {
+  font-family: var(--mono); font-size: var(--fs-body); color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.contract-info-value .dim { color: var(--dim); font-family: var(--sans); font-size: var(--fs-sm); }
+
 /* ACTIONS */
 .card-actions {
   display: flex; gap: var(--s2); padding: var(--s4) var(--s6) var(--s5);
