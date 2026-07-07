@@ -41,6 +41,10 @@ _CANDLES_RES = "silver-swing:candles:res:"
 _CANDLES_CACHE = "silver-swing:candles:cache:"
 _CANDLES_CACHE_TTL_SECS = 60
 
+_SCANNER_ORDER_QUEUE = "silver-swing:scanner_order:queue"
+_SCANNER_ORDER_REQ = "silver-swing:scanner_order:req:"
+_SCANNER_ORDER_RES = "silver-swing:scanner_order:res:"
+
 _RESULT_TTL_SECS = 300
 
 
@@ -60,16 +64,19 @@ def _run_loop(redis_url: str, stop_event: threading.Event) -> None:
                 r.ping()
                 _log("connected to Redis, watching backtest + candles queues")
                 backoff = 1.0
-            # BRPOP over both queues in priority order (backtest first — user is
-            # actively waiting on those; candle fetches are usually cache hits).
-            item = r.brpop([_BT_QUEUE, _CANDLES_QUEUE], timeout=2)
+            # BRPOP over all queues in priority: scanner orders (user is placing
+            # real money orders, respond fast), backtests (actively waiting),
+            # candles (usually cache hits).
+            item = r.brpop([_SCANNER_ORDER_QUEUE, _BT_QUEUE, _CANDLES_QUEUE], timeout=2)
             if item is None:
                 continue
             queue_key, job_id = item
             if queue_key == _BT_QUEUE:
                 _handle_backtest_job(r, job_id)
-            else:
+            elif queue_key == _CANDLES_QUEUE:
                 _handle_candles_job(r, job_id)
+            else:
+                _handle_scanner_order_job(r, job_id)
         except Exception as e:
             _log(f"loop error ({type(e).__name__}: {e}) — reconnecting in {backoff:.1f}s")
             r = None
@@ -171,6 +178,79 @@ def _handle_candles_job(r, job_id: str) -> None:
         }), ex=_RESULT_TTL_SECS)
         r.delete(req_key)
         _log(f"candles {job_id}: failed {type(e).__name__}: {e}")
+
+
+def _handle_scanner_order_job(r, job_id: str) -> None:
+    """One-shot market order for an arbitrary Coinbase futures product,
+    executed straight from the scanner. Doesn't require a tracked strategy —
+    the whole point is to let the user act on scanner picks without a
+    pre-configured sleeve. LIVE places a real Coinbase order. PAPER simulates
+    a fill and records it to a scanner-order log for review.
+    """
+    req_key = f"{_SCANNER_ORDER_REQ}{job_id}"
+    res_key = f"{_SCANNER_ORDER_RES}{job_id}"
+    raw = r.get(req_key)
+    if not raw:
+        _log(f"scanner_order {job_id}: request key missing — dropping")
+        return
+    try:
+        req = json.loads(raw)
+        product_id = str(req["product_id"])
+        side = str(req["side"]).upper()
+        qty = int(req["qty"])
+        mode = str(req.get("mode") or "paper").lower()
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        if qty < 1:
+            raise ValueError(f"qty must be >= 1, got {qty}")
+        if mode not in ("paper", "live"):
+            raise ValueError(f"mode must be paper or live, got {mode!r}")
+    except Exception as e:
+        r.set(res_key, json.dumps({"ok": False, "error": f"bad request: {e}"}), ex=_RESULT_TTL_SECS)
+        r.delete(req_key)
+        return
+
+    started = time.time()
+    _log(f"scanner_order {job_id}: {mode} {side} {qty} {product_id}")
+    try:
+        if mode == "live":
+            from broker import BrokerConfig, CoinbaseBroker
+            broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
+            order_id = broker.place_market(side, qty)
+            result = {
+                "ok": True,
+                "mode": "live",
+                "product_id": product_id,
+                "side": side,
+                "qty": qty,
+                "order_id": order_id,
+                "message": f"placed real {side} {qty} {product_id} — order {order_id}",
+            }
+        else:
+            # Paper "scanner order" is not managed by any strategy — it just
+            # logs what would have happened so the user can see fills without
+            # setting up a tracked symbol first. This is the honest tradeoff:
+            # a real paper simulation would need to track the position over
+            # time via a fresh WS feed, which is out of scope for MVP.
+            result = {
+                "ok": True,
+                "mode": "paper",
+                "product_id": product_id,
+                "side": side,
+                "qty": qty,
+                "message": (
+                    f"[PAPER SIMULATED] would {side} {qty} {product_id} at market. "
+                    "For persistent paper tracking, add this as a tracked symbol first."
+                ),
+            }
+    except Exception as e:
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    elapsed = time.time() - started
+    result["_elapsed_secs"] = round(elapsed, 2)
+    r.set(res_key, json.dumps(result), ex=_RESULT_TTL_SECS)
+    r.delete(req_key)
+    _log(f"scanner_order {job_id}: done in {elapsed:.1f}s ok={result.get('ok')}")
 
 
 def start(redis_url: str) -> threading.Event:

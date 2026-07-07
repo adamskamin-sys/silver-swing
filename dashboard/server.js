@@ -447,6 +447,32 @@ export function makeApp({
     }
   });
 
+  // One-shot buy/sell of any Coinbase futures product straight from the
+  // scanner — doesn't require a tracked strategy. Same Redis queue pattern:
+  // dashboard queues, paper worker executes via CoinbaseBroker (LIVE) or
+  // simulates + logs (PAPER).
+  app.post('/api/scanner-order', requireAuth, async (req, res) => {
+    const { product_id, side, qty, mode, confirm } = req.body || {};
+    if (!product_id) return res.status(400).json({ ok: false, error: 'product_id required' });
+    if (confirm !== 'YES') return res.status(400).json({ ok: false, error: 'confirm must be "YES"' });
+    const s = String(side || '').toUpperCase();
+    if (!['BUY', 'SELL'].includes(s)) return res.status(400).json({ ok: false, error: 'side must be BUY or SELL' });
+    const q = Number(qty);
+    if (!Number.isFinite(q) || q < 1 || q > 100 || q !== Math.floor(q)) {
+      return res.status(400).json({ ok: false, error: 'qty must be a whole number 1-100' });
+    }
+    const m = String(mode || 'paper').toLowerCase();
+    if (!['paper', 'live'].includes(m)) return res.status(400).json({ ok: false, error: 'mode must be paper or live' });
+    const r = await getRedis();
+    if (!r) return res.status(503).json({ ok: false, error: 'redis not configured' });
+    try {
+      const result = await scannerOrderViaRedis(r, { product_id, side: s, qty: q, mode: m });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // Candles for the scanner's chart modal. Same Redis queue pattern as
   // backtest — dashboard queues, paper worker fetches from Coinbase, result
   // is cached ~60s so a re-open doesn't re-hit the API.
@@ -573,6 +599,23 @@ async function fetchCandlesViaRedis(redis, payload) {
     reqTtl: CANDLES_KEY_TTL_SECS,
     maxWaitMs: CANDLES_MAX_WAIT_MS,
     timeoutMsg: 'candles fetch timed out after 30s. Paper worker may be down.',
+  }, payload);
+}
+
+const SCANNER_ORDER_QUEUE_KEY = 'silver-swing:scanner_order:queue';
+const SCANNER_ORDER_REQ_PREFIX = 'silver-swing:scanner_order:req:';
+const SCANNER_ORDER_RES_PREFIX = 'silver-swing:scanner_order:res:';
+const SCANNER_ORDER_MAX_WAIT_MS = 30_000;
+const SCANNER_ORDER_TTL_SECS = 120;
+
+async function scannerOrderViaRedis(redis, payload) {
+  return jobViaRedis(redis, {
+    queueKey: SCANNER_ORDER_QUEUE_KEY,
+    reqPrefix: SCANNER_ORDER_REQ_PREFIX,
+    resPrefix: SCANNER_ORDER_RES_PREFIX,
+    reqTtl: SCANNER_ORDER_TTL_SECS,
+    maxWaitMs: SCANNER_ORDER_MAX_WAIT_MS,
+    timeoutMsg: 'scanner order timed out after 30s. Paper worker may be down — check Render logs.',
   }, payload);
 }
 

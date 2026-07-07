@@ -2517,6 +2517,11 @@ function openScannerDetail(row) {
     r.checked = (r.value === defaultMode);
     r.onchange = () => updateScannerBuyButton();
   });
+  const qtyInput = document.getElementById('scanner-buy-qty');
+  if (qtyInput) {
+    qtyInput.value = 1;
+    qtyInput.oninput = () => updateScannerBuyButton();
+  }
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
@@ -2552,26 +2557,25 @@ function updateScannerBuyButton() {
   if (!scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
   const mode = selectedScannerBuyMode();
-  const tenant = tenantForMode(mode);
-  const tracks = tenant && currentStore[tenant] && currentStore[tenant][symbol];
-  if (tenant && tracks) {
-    scannerBuyBtn.textContent = `buy on ${mode}`;
-    scannerBuyBtn.disabled = false;
-    scannerDetailWarning.hidden = true;
-  } else if (tenant) {
-    scannerBuyBtn.textContent = `buy on ${mode}`;
-    scannerBuyBtn.disabled = true;
+  const qtyInput = document.getElementById('scanner-buy-qty');
+  const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
+  scannerBuyBtn.textContent = `buy ${qty} ${symbol} on ${mode}`;
+  scannerBuyBtn.disabled = false;
+  if (mode === 'live') {
     scannerDetailWarning.hidden = false;
     scannerDetailWarning.innerHTML = `
-      <b>${escapeHtml(symbol)}</b> isn't a tracked instrument on your <b>${escapeHtml(mode)}</b> account.
-      To trade it here, add it as a tracked symbol first (the bot needs a
-      running strategy on this product to route the order through). Silver
-      (SLR-27AUG26-CDE) is the currently tracked instrument.
+      <b>Live</b> = real money. This places a market BUY of 1 contract on
+      Coinbase for <b>${escapeHtml(symbol)}</b> at the current ask. No strategy
+      will manage it after — you'll need to close it manually on Coinbase or add
+      a strategy for this symbol later.
     `;
   } else {
-    scannerBuyBtn.disabled = true;
     scannerDetailWarning.hidden = false;
-    scannerDetailWarning.innerHTML = `No <b>${escapeHtml(mode)}</b> account configured.`;
+    scannerDetailWarning.innerHTML = `
+      <b>Paper</b> mode logs a simulated fill. It doesn't persist a position
+      unless <b>${escapeHtml(symbol)}</b> is added as a tracked symbol first
+      (needs a running strategy to accumulate P&L over time).
+    `;
   }
 }
 
@@ -2588,20 +2592,37 @@ function tenantForMode(mode) {
   return null;
 }
 
-scannerBuyBtn.addEventListener('click', () => {
+scannerBuyBtn.addEventListener('click', async () => {
   if (scannerBuyBtn.disabled || !scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
   const mode = selectedScannerBuyMode();
-  const tenant = tenantForMode(mode);
-  if (!tenant) return;
-  // For live: extra confirm since this is real money. Paper is fine to trade
-  // straight into the existing trade modal (which already shows a preview).
+  const qtyInput = document.getElementById('scanner-buy-qty');
+  const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
   if (mode === 'live') {
-    const ok = confirm(`Buy real ${symbol} contracts on LIVE (real money)? You'll get a preview to review before it submits.`);
+    const ok = confirm(`REAL MONEY: place a market BUY of ${qty} ${symbol} contract${qty > 1 ? 's' : ''} on Coinbase right now?`);
     if (!ok) return;
   }
-  scannerDetailModal.hidden = true;
-  openTradeModal(tenant, symbol, 'BUY');
+  const originalLabel = scannerBuyBtn.textContent;
+  scannerBuyBtn.disabled = true;
+  scannerBuyBtn.textContent = 'placing…';
+  try {
+    const res = await postJson('/api/scanner-order', {
+      product_id: symbol, side: 'BUY', qty, mode, confirm: 'YES',
+    });
+    if (res._unauthorized) { showLogin(); return; }
+    if (res.ok) {
+      showToast(res.message || `${mode} ${symbol} order placed`, 'info');
+      scannerDetailModal.hidden = true;
+    } else {
+      showToast(res.error || 'scanner order failed', 'error');
+      scannerBuyBtn.disabled = false;
+      scannerBuyBtn.textContent = originalLabel;
+    }
+  } catch (err) {
+    showToast(String(err.message || err), 'error');
+    scannerBuyBtn.disabled = false;
+    scannerBuyBtn.textContent = originalLabel;
+  }
 });
 
 async function loadScannerChart() {
