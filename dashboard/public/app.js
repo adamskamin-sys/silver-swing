@@ -1972,6 +1972,15 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       trailDistance: 0.10,
       note: 'Fixed limit with room to breathe. Elder wanted setups to have time to develop — medium targets, patient exits.',
     },
+    '$10 net swing': {
+      // Same math as the primary Settings preset. Nets ~$10 per completed
+      // cycle across the sleeve's contracts after fees. Sell/buy anchored to
+      // current mark with a ~$0.10 offset each side ($0.20 total spread).
+      exit_mode: 'fixed_limit',
+      profitDollarsPerContract: 5,    // $5/contract × qty = qty × $5 net (~$10 at qty=2)
+      trailDistance: 0.10,
+      note: '2-contract $10-net swing math applied to this sleeve. Tight $0.20 spread anchored to current mark — nets ~$5/contract per cycle after fees.',
+    },
     'Custom': {
       exit_mode: 'fixed_limit',
       profitDollarsPerContract: 50,
