@@ -1,23 +1,24 @@
 :root {
-  /* Coinbase Advanced palette — dark tokens matching their trade UI:
-     #0a0b0d background, subtle panel tints, their signature blue (#1652f0)
-     for interactive, their green/red for gains/losses. */
-  --bg: #0a0b0d;
-  --panel: #16171d;
-  --panel-2: #1c1e26;
-  --panel-3: #25272f;
-  --border: #2a2d36;
-  --border-soft: #1f2129;
-  --text: #ffffff;
-  --muted: #7f838e;
-  --dim: #4e5259;
-  --good: #05b169;
-  --bad: #cf202f;
-  --warn: #f5a623;
-  --accent: #1652f0;
-  --accent-2: #7c3aed;
+  /* Off-Premise Chicago palette — exact hex codes pulled from
+     offpremisechicago.com CSS. Dark forest greens, cream text, warm
+     terracotta accents. Green/red for gains/losses stay bright so
+     numbers remain scannable against the dark green background. */
+  --bg: #0a2e2b;              /* deep forest green — page bg */
+  --panel: #0d3b38;           /* slightly lighter green — cards */
+  --panel-2: #152f2b;         /* darker variation — inset panels */
+  --panel-3: #08211f;         /* deepest — table headers */
+  --border: #1a4340;
+  --border-soft: #123430;
+  --text: #f9f5f0;            /* cream / off-white */
+  --muted: #c4a599;           /* warm neutral — labels, subtext */
+  --dim: #7a5f52;             /* deeper warm neutral — tertiary */
+  --good: #05b169;            /* bright green — gains (contrasts w/ dark green bg) */
+  --bad: #c0392b;             /* brick red from their palette — losses */
+  --warn: #d49a7a;            /* tan from their gradient */
+  --accent: #e8a882;          /* warm terracotta — their primary accent */
+  --accent-2: #c4886b;        /* deeper terracotta — secondary */
   --core-shade: rgba(5, 177, 105, 0.10);
-  --swing-shade: rgba(22, 82, 240, 0.12);
+  --swing-shade: rgba(232, 168, 130, 0.12);
 
   /* Spacing scale — 4pt base, everything is a multiple. Kills the current
      mix of 6/10/12/14/16/20/24 that gave the UI a jittery rhythm. */
