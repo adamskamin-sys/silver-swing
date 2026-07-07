@@ -1046,7 +1046,7 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
   const resumeBtn = (t, sym) =>
     `<button class="small primary" data-action="resume" data-tenant="${escapeHtml(t)}" data-symbol="${escapeHtml(sym)}">Resume</button>`;
   const cancelBtn = (t, sym, sid, enabled) =>
-    `<button class="small ghost" ${enabled ? '' : 'disabled'} data-action="cancel-order" data-tenant="${escapeHtml(t)}" data-symbol="${escapeHtml(sym)}"${sid ? ` data-sleeve-id="${escapeHtml(sid)}"` : ''} title="${enabled ? 'Cancel this strategy\'s pending order' : 'No pending order to cancel'}">Cancel order</button>`;
+    `<button class="small ghost" ${enabled ? '' : 'disabled'} data-action="cancel-order" data-tenant="${escapeHtml(t)}" data-symbol="${escapeHtml(sym)}"${sid ? ` data-sleeve-id="${escapeHtml(sid)}"` : ''} title="${enabled ? 'Pause this strategy — cancels the pending order and halts the state machine so it does not immediately re-arm. Click Resume to bring it back.' : 'Strategy has no pending order'}">Pause strategy</button>`;
   const sellNowBtn = (t, sym, qty, enabled) => {
     // Only render the button when a sell is actually possible. If the strategy
     // is waiting to buy or has no contracts, the button would be a no-op — don't
@@ -2073,14 +2073,38 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       trailDistance: 0.10,
       note: 'Fixed limit with room to breathe. Elder wanted setups to have time to develop — medium targets, patient exits.',
     },
-    '$10 net swing': {
-      // Same math as the primary Settings preset. Nets ~$10 per completed
-      // cycle across the sleeve's contracts after fees. Sell/buy anchored to
-      // current mark with a ~$0.10 offset each side ($0.20 total spread).
+    '$5 net swing': {
+      // FIXED target: always nets $5 total per cycle regardless of qty. Spread
+      // auto-adjusts based on contract count. profitDollarsFixed overrides the
+      // per-contract math in applyPreset — see comment there.
       exit_mode: 'fixed_limit',
-      profitDollarsPerContract: 5,    // $5/contract × qty = qty × $5 net (~$10 at qty=2)
+      profitDollarsFixed: 5,
       trailDistance: 0.10,
-      note: '2-contract $10-net swing math applied to this sleeve. Tight $0.20 spread anchored to current mark — nets ~$5/contract per cycle after fees.',
+      note: '$5 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $5 after fees.',
+    },
+    '$10 net swing': {
+      exit_mode: 'fixed_limit',
+      profitDollarsFixed: 10,
+      trailDistance: 0.10,
+      note: '$10 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $10 after fees.',
+    },
+    '$25 net swing': {
+      exit_mode: 'fixed_limit',
+      profitDollarsFixed: 25,
+      trailDistance: 0.15,
+      note: '$25 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $25 after fees.',
+    },
+    '$50 net swing': {
+      exit_mode: 'fixed_limit',
+      profitDollarsFixed: 50,
+      trailDistance: 0.20,
+      note: '$50 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $50 after fees.',
+    },
+    '$100 net swing': {
+      exit_mode: 'fixed_limit',
+      profitDollarsFixed: 100,
+      trailDistance: 0.25,
+      note: '$100 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $100 after fees.',
     },
     'Custom': {
       exit_mode: 'fixed_limit',
@@ -2336,14 +2360,22 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
   function applyPreset(name) {
     const p = PRESETS[name];
     if (!p) return;
-    // Only overwrite fields the user hasn't intentionally changed by picking Custom
     exitEl.value = p.exit_mode;
     const qty = Math.max(1, Number(qtyEl.value) || 1);
-    const targetProfit = p.profitDollarsPerContract * qty;
-    profitEl.value = Math.min(2000, Math.max(10, targetProfit));
+    // Two preset flavors:
+    //  - profitDollarsFixed:  net-per-cycle stays constant regardless of qty
+    //    (spread auto-adjusts so "$10 net swing" ALWAYS nets $10)
+    //  - profitDollarsPerContract:  scales with qty ($5/contract × 3 = $15)
+    //    Used by named-trader presets where per-contract is the canonical unit.
+    // Cost floor still applies: can't set net below fees + $1.
+    const feesTotal = feeRt * qty;
+    const costFloor = Math.ceil(feesTotal + 1);
+    const targetProfit = p.profitDollarsFixed != null
+      ? p.profitDollarsFixed
+      : p.profitDollarsPerContract * qty;
+    profitEl.value = Math.min(2000, Math.max(costFloor, targetProfit));
     tdSliderEl.value = p.trailDistance;
     presetNoteEl.textContent = p.note;
-    // Recompute targets from the profit slider around the current anchor
     syncTargetsFromSlider();
     applyModeVisibility();
   }
@@ -3180,12 +3212,16 @@ async function disablePrimaryStrategy(tenant, symbol) {
 async function cancelOrder(tenant, symbol, sleeveId) {
   if (isLiveTenant(tenant)) {
     const ok = await confirmLive({
-      title: `Cancel live order — ${symbol}`,
-      body: 'Cancels the strategy\'s pending order on Coinbase. Your contracts stay in the position — this only cancels the pending buy/sell offer sitting at the exchange. Next tick the strategy may re-arm with a fresh order.',
+      title: `Pause strategy — ${symbol}`,
+      body: 'Cancels the pending order on Coinbase AND halts the strategy so it stops re-arming. Your contracts stay in the position — nothing sells or buys until you click Resume.',
     });
     if (!ok) return;
   }
-  const res = await postJson('/api/cancel-order', { tenant, symbol, sleeve_id: sleeveId });
+  // halt:true → the bot cancels the pending order AND sets the state to
+  // HALTED so the strategy stops re-arming on the next tick. Otherwise the
+  // strategy would immediately place a new limit order — which was the
+  // original bug that made this button feel broken.
+  const res = await postJson('/api/cancel-order', { tenant, symbol, sleeve_id: sleeveId, halt: true });
   if (res._unauthorized) { showLogin(); return; }
   if (res.ok) { showToast('order cancel queued', 'info'); refreshOnce(); }
   else showToast(res.error || 'cancel failed', 'error');

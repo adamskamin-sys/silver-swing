@@ -313,7 +313,7 @@ export function makeApp({
 
   // --- cancel a strategy's live order (primary or sleeve) -----------------
   app.post('/api/cancel-order', requireAuth, async (req, res) => {
-    const { tenant, symbol, sleeve_id } = req.body || {};
+    const { tenant, symbol, sleeve_id, halt } = req.body || {};
     if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
     try {
       const store = await readStore(storePath);
@@ -322,6 +322,7 @@ export function makeApp({
       store[tenant][symbol].cancel_intent = {
         requested_ts: Date.now() / 1000,
         sleeve_id: sleeve_id || null,  // null = primary
+        halt: !!halt,                  // true → also halt the state machine
       };
       await writeStoreAtomic(storePath, store);
       res.json({ ok: true, queued: true });

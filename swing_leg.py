@@ -378,9 +378,15 @@ class SwingTrader:
 
     def _maybe_execute_cancel_intent(self) -> None:
         """Dashboard queued a cancel for a specific strategy's live order.
-        sleeve_id=None targets the primary. The strategy stays in its current
-        state — next tick, if the arm conditions still hold, it'll re-arm.
-        For a persistent stop, use Pause bot (kill switch) instead."""
+        sleeve_id=None targets the primary.
+
+        If intent['halt'] is True, we ALSO set the state machine to HALTED so
+        the strategy stops re-arming on the next tick. Without halt, cancelling
+        a resting limit order was pointless: the sleeve's next step() saw no
+        live_order_id and immediately placed a new one, so the user's Cancel
+        click felt like a no-op. halt=True is what "Pause strategy" on the
+        dashboard actually means.
+        """
         get_ci = getattr(self.store, "get_cancel_intent", None)
         if not callable(get_ci):
             return
@@ -389,24 +395,35 @@ class SwingTrader:
             return
         try:
             target = intent.get("sleeve_id")
+            halt = bool(intent.get("halt"))
             if target is None:
                 # Primary strategy cancel
                 if self.s.live_order_id:
                     try: self.b.cancel(self.s.live_order_id)
                     except Exception as e:
                         self._record("cancel_failed", order_id=self.s.live_order_id, error=str(e))
-                    self._record("primary_order_cancelled", order_id=self.s.live_order_id, requested_by="dashboard")
+                    self._record("primary_order_cancelled", order_id=self.s.live_order_id, requested_by="dashboard", halted=halt)
                     self.s.live_order_id = None
                     self.s.filled_qty = 0
+                if halt:
+                    self.s.state = State.HALTED
+                    self.s.halt_reason = "paused via dashboard"
+                    self._record("primary_paused", requested_by="dashboard")
             else:
                 ss = self.s.sleeves.get(target)
-                if ss and ss.live_order_id:
-                    try: self.b.cancel(ss.live_order_id)
-                    except Exception as e:
-                        self._record("cancel_failed", sleeve_id=target, order_id=ss.live_order_id, error=str(e))
-                    self._record("sleeve_order_cancelled", sleeve_id=target, order_id=ss.live_order_id, requested_by="dashboard")
-                    ss.live_order_id = None
-                    ss.filled_qty = 0
+                if ss:
+                    if ss.live_order_id:
+                        try: self.b.cancel(ss.live_order_id)
+                        except Exception as e:
+                            self._record("cancel_failed", sleeve_id=target, order_id=ss.live_order_id, error=str(e))
+                        self._record("sleeve_order_cancelled", sleeve_id=target, order_id=ss.live_order_id, requested_by="dashboard", halted=halt)
+                        ss.live_order_id = None
+                        ss.filled_qty = 0
+                    if halt:
+                        ss.state = SleeveStateEnum.HALTED
+                        ss.halt_reason = "paused via dashboard"
+                        self._record("sleeve_paused", sleeve_id=target, requested_by="dashboard")
+            self._save_state()
         finally:
             self.store.clear_cancel_intent(self.tenant_id, self.symbol)
 
@@ -468,6 +485,7 @@ class SwingTrader:
                 ss.state = SleeveStateEnum.ARMED_SELL
                 ss.live_order_id = None
                 ss.filled_qty = 0
+                ss.halt_reason = None
                 self._record("sleeve_resume", sleeve_id=sid)
         self.store.clear_resume_intent(self.tenant_id, self.symbol)
         self._save_state()
@@ -1199,6 +1217,7 @@ class SwingTrader:
             except Exception: pass
             ss.live_order_id = None
         ss.state = SleeveStateEnum.HALTED
+        ss.halt_reason = reason or "halted"
         self._record("sleeve_halted", sleeve_id=sc.id, sleeve_name=sc.name, reason=reason)
 
     def _on_fill(self, fill_price: Optional[float] = None) -> None:

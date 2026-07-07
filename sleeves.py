@@ -129,6 +129,10 @@ class SleeveState:
     # inherited paper gain still shows up in the account-level unrealized at
     # the top of the card, just not double-counted per sleeve.
     own_avg_entry: Optional[float] = None
+    # Human-readable reason the sleeve is HALTED. Surfaced on the strategy
+    # row so the user knows WHY it stopped (paused via dashboard vs stop-loss
+    # fired vs abort band vs core-floor breach). Empty when running.
+    halt_reason: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
@@ -146,6 +150,7 @@ class SleeveState:
             hybrid_sell_triggered_ts=d.get("hybrid_sell_triggered_ts"),
             current_qty=int(d.get("current_qty") or 0),
             own_avg_entry=d.get("own_avg_entry"),
+            halt_reason=d.get("halt_reason"),
         )
 
     def to_dict(self) -> dict:
