@@ -2255,6 +2255,21 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       trailDistance: 0.25,
       note: '$100 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $100 after fees.',
     },
+    '$10 net swing + aggressive trail': {
+      // Hybrid: take the $10 target if silver just touches, but ride
+      // breakouts with a wide trail. Parameters tuned to silver ATR:
+      //   trail_distance = 2.5 × ATR (0.20) — big enough for breakout runway
+      //   activation_offset = +0.20 above sell_px — engages trail only on
+      //     real momentum (silver has to push 20¢ past target), not on a
+      //     single-tick touch
+      //   hybrid_delay = 10s — patient window to distinguish spike from run
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.20,
+      trailActivationOffset: 0.20,
+      hybridDelay: 10,
+      note: 'Takes the $10 target if silver just touches; if it pushes 20¢ past target, engages a $0.20 trailing stop and rides the breakout. Best when you expect trending days.',
+    },
     'Custom': {
       exit_mode: 'fixed_limit',
       profitDollarsPerContract: 50,
@@ -2535,6 +2550,16 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       presetNoteEl.textContent = p.note;
     }
     syncTargetsFromSlider();
+    // Now that sell/buy targets are computed, populate the hybrid fields.
+    if (p.exit_mode === 'hybrid') {
+      if (p.trailActivationOffset != null && trailActivationEl && sellTargetEl) {
+        const sellPx = Number(sellTargetEl.value) || 0;
+        trailActivationEl.value = (sellPx + p.trailActivationOffset).toFixed(3);
+      }
+      if (p.hybridDelay != null && hybridDelayEl) {
+        hybridDelayEl.value = p.hybridDelay;
+      }
+    }
     applyModeVisibility();
   }
 
