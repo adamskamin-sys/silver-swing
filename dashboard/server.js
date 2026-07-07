@@ -368,6 +368,15 @@ export function makeApp({
         if (!Number.isFinite(delay) || delay < 1)
           issues.push({ field: `${s.id}.hybrid_delay_secs`, message: 'hybrid_delay_secs must be >= 1' });
       }
+      // Per-sleeve accumulation validation. Only enforced when enabled.
+      if (s.accumulate_enabled) {
+        const maxQ = Number(s.max_qty);
+        if (!Number.isFinite(maxQ) || maxQ < q || maxQ !== Math.floor(maxQ))
+          issues.push({ field: `${s.id}.max_qty`, message: `max_qty must be an integer >= current qty (${q})` });
+        const buf = Number(s.scale_up_buffer_mult);
+        if (!Number.isFinite(buf) || buf < 1.0)
+          issues.push({ field: `${s.id}.scale_up_buffer_mult`, message: 'scale_up_buffer_mult must be >= 1.0' });
+      }
     }
     if (issues.length) return res.status(400).json({ ok: false, issues });
 

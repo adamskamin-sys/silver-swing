@@ -2115,6 +2115,30 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
         <!-- filled by updatePreview() -->
       </div>
 
+      <!-- Per-sleeve accumulation. Independent of the primary's scale-up so
+           each sleeve compounds its own realized P&L into more contracts. -->
+      <div class="accumulate-block">
+        <label class="accumulate-toggle">
+          <input type="checkbox" id="sl-accumulate" ${draft.accumulate_enabled ? 'checked' : ''}>
+          <b>Accumulate profits into more contracts</b>
+        </label>
+        <div class="accumulate-fields" id="sl-accumulate-fields" ${draft.accumulate_enabled ? '' : 'hidden'}>
+          <div class="target-inputs">
+            <label>Max contracts
+              <input type="number" id="sl-max-qty" min="1" step="1" value="${draft.max_qty || (draft.qty || 1) * 5}">
+            </label>
+            <label>Add-one buffer ×
+              <input type="number" id="sl-scale-buf" min="1" step="0.1" value="${draft.scale_up_buffer_mult || 1.5}">
+            </label>
+          </div>
+          <div class="preview-note">
+            When banked profit ≥ <b>margin/contract × buffer</b> (default $275 × 1.5 = $412),
+            this sleeve grows by 1 contract. Repeats until max is reached. Set buffer to
+            1.0 to add sooner ($275), 2.0 for a safer $550 cushion.
+          </div>
+        </div>
+      </div>
+
       <div id="sleeve-error" class="issues" hidden></div>
       <div class="modal-footer">
         <button data-close>cancel</button>
@@ -2143,6 +2167,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
   const trailActivationEl = m.querySelector('#sl-trail-activation');
   const hybridDelayEl = m.querySelector('#sl-hybrid-delay');
   const resetAnchorBtn = m.querySelector('#sl-reset-anchor');
+  const accumulateToggle = m.querySelector('#sl-accumulate');
+  const accumulateFields = m.querySelector('#sl-accumulate-fields');
+  if (accumulateToggle && accumulateFields) {
+    accumulateToggle.addEventListener('change', () => {
+      accumulateFields.hidden = !accumulateToggle.checked;
+    });
+  }
 
   let currentAnchor = anchor;  // mutable so "use market instead" can update it
 
@@ -2307,6 +2338,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     const trailActivation = Number(trailActivationEl?.value);
     const hybridDelay = Number(hybridDelayEl?.value);
     const usesTrail = exitEl.value === 'trailing_stop' || exitEl.value === 'hybrid';
+    const accumulateEl = m.querySelector('#sl-accumulate');
+    const maxQtyEl = m.querySelector('#sl-max-qty');
+    const scaleBufEl = m.querySelector('#sl-scale-buf');
+    const accumulateEnabled = !!(accumulateEl && accumulateEl.checked);
     const patch = {
       id: draft.id,
       name: nameEl.value || draft.id,
@@ -2319,6 +2354,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       trail_activation_px: exitEl.value === 'hybrid' ? trailActivation : (sellPx + 0.5),
       hybrid_delay_secs: exitEl.value === 'hybrid' ? hybridDelay : 5.0,
       reanchor_threshold: draft.reanchor_threshold,
+      accumulate_enabled: accumulateEnabled,
+      max_qty: accumulateEnabled ? parseInt(maxQtyEl?.value || 0, 10) : 0,
+      scale_up_buffer_mult: accumulateEnabled ? Number(scaleBufEl?.value || 1.5) : 1.5,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
@@ -2784,16 +2822,31 @@ async function marketSell(tenant, symbol, qty) {
 }
 
 async function resetPaperTrading() {
-  const tenant = Object.keys(currentStore)[0] || 'adam';
-  const symbols = Object.keys(currentStore[tenant] || {}).filter(s => !s.startsWith('__'));
-  if (!symbols.length) { showToast('no symbol to reset', 'error'); return; }
-  const msg = `Wipe paper trading state for ${symbols.join(', ')}? Balance goes back to $100k, position → 0, all lots + strategies reset. Live account is untouched.`;
-  if (!confirm(msg)) return;
-  for (const symbol of symbols) {
-    await postJson('/api/reset-paper', { tenant, symbol, confirm: 'YES', starting_balance: 100000 });
+  // Find the PAPER tenant explicitly. Alphabetical Object.keys(currentStore)[0]
+  // would grab 'adam-live' before 'adam-paper' and the server would (rightly)
+  // refuse to reset a live tenant — but silently, from the user's perspective.
+  const paperTenant = Object.keys(currentStore).find(t => modeOfTenant(t) === 'paper');
+  if (!paperTenant) {
+    showToast('no paper tenant found', 'error');
+    return;
   }
-  showToast('paper reset queued — bot picks it up within 5s', 'info');
-  setTimeout(refreshOnce, 3000);
+  const symbols = Object.keys(currentStore[paperTenant] || {}).filter(s => !s.startsWith('__'));
+  if (!symbols.length) { showToast('no symbol to reset', 'error'); return; }
+  const msg = `Wipe paper trading state for ${paperTenant}/${symbols.join(', ')}? Balance goes back to $100k, position → 0, all lots + strategies reset. Live account is untouched.`;
+  if (!confirm(msg)) return;
+  let anyFailed = false;
+  for (const symbol of symbols) {
+    const res = await postJson('/api/reset-paper', { tenant: paperTenant, symbol, confirm: 'YES', starting_balance: 100000 });
+    if (res._unauthorized) { showLogin(); return; }
+    if (!res.ok) {
+      anyFailed = true;
+      showToast(res.error || `reset failed for ${symbol}`, 'error');
+    }
+  }
+  if (!anyFailed) {
+    showToast('paper reset queued — bot picks it up within 5s', 'info');
+    setTimeout(refreshOnce, 3000);
+  }
 }
 
 async function resumeStrategy(tenant, symbol) {
@@ -2817,7 +2870,13 @@ function showToast(msg, kind = 'info') {
 
 killBtn.addEventListener('click', () => {
   const mode = killBtn.dataset.mode || 'activate';
-  const tenant = Object.keys(currentStore)[0] || 'adam';
+  // Pause the tenant that matches the currently-viewed tab. Falling back to
+  // the alphabetically-first tenant would silently kill the wrong side when
+  // both adam-live and adam-paper exist (live sorts first).
+  const targetMode = (activeMode === 'live' || activeMode === 'paper') ? activeMode : 'paper';
+  const tenant = Object.keys(currentStore).find(t => modeOfTenant(t) === targetMode)
+    || Object.keys(currentStore)[0]
+    || 'adam';
   openKillModal(tenant, mode);
 });
 killConfirm.addEventListener('click', confirmKill);

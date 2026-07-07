@@ -577,6 +577,51 @@ class SwingTrader:
             )
             self._save_state()
 
+    def _maybe_scale_up_sleeve(self, sc, ss) -> None:
+        """Per-sleeve accumulation. Same logic as _maybe_scale_up but scoped
+        to this sleeve's own realized_pnl and its own max_qty ceiling. That
+        way each sleeve compounds independently — a winning sleeve grows,
+        a losing sleeve stays at its starting size.
+
+        Bumps sc.qty in memory AND writes the new qty back to the store so a
+        restart preserves the accumulated size.
+        """
+        if not getattr(sc, "accumulate_enabled", False):
+            return
+        max_qty = int(getattr(sc, "max_qty", 0) or 0)
+        if max_qty <= sc.qty:
+            return
+        need = self.cfg.margin_per_contract * float(getattr(sc, "scale_up_buffer_mult", 1.5) or 1.5)
+        if ss.realized_pnl < need:
+            return
+        # Enough banked to add one contract. Bump in memory, persist to store,
+        # and decrement the sleeve's own realized so the same profit can't be
+        # counted twice next cycle. Matches the primary's semantics.
+        sc.qty += 1
+        ss.realized_pnl -= need
+        self._persist_sleeve_qty(sc.id, sc.qty)
+        self._record(
+            "sleeve_scaled_up",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            new_qty=sc.qty, max_qty=max_qty,
+            consumed=need,
+        )
+
+    def _persist_sleeve_qty(self, sleeve_id: str, new_qty: int) -> None:
+        """Write the grown qty back to the sleeves config so the next boot
+        starts at the accumulated size, not the original config qty."""
+        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+        sleeves = list(cfg.get("sleeves") or [])
+        changed = False
+        for s in sleeves:
+            if s.get("id") == sleeve_id:
+                s["qty"] = int(new_qty)
+                changed = True
+                break
+        if changed:
+            cfg["sleeves"] = sleeves
+            self.store.put_config(self.tenant_id, self.symbol, cfg)
+
     # ---- stop-loss -------------------------------------------------------
 
     def _compute_stop_loss_qty(self, position_qty: int) -> int:
@@ -1026,6 +1071,9 @@ class SwingTrader:
                 gross=gross, fees=half_fee,
                 realized_pnl_total=ss.realized_pnl,
             )
+            # Per-sleeve accumulation. Grow this sleeve's qty (up to max_qty)
+            # off its OWN banked profit — each sleeve compounds independently.
+            self._maybe_scale_up_sleeve(sc, ss)
         else:
             # Buy-back re-arms the sleeve. Deduct the buy-side fee (round-trip
             # fees are split across both legs so this leg pays its share).

@@ -41,6 +41,14 @@ class SleeveConfig:
     # market-sell at the end of the delay window (took the swing at target).
     trail_activation_px: float = 65.5
     hybrid_delay_secs: float = 5.0
+    # Per-sleeve accumulation. When enabled, the sleeve grows its own qty
+    # (up to max_qty) after each completed cycle if banked profit covers
+    # margin_per_contract × scale_up_buffer_mult. Mirrors the primary's
+    # scale-up mechanism but scoped to this sleeve's own realized_pnl —
+    # so each strategy compounds independently.
+    accumulate_enabled: bool = False
+    max_qty: int = 0                          # 0 or <= qty disables
+    scale_up_buffer_mult: float = 1.5
 
     @classmethod
     def from_dict(cls, d: dict) -> "SleeveConfig":
@@ -56,6 +64,9 @@ class SleeveConfig:
             reanchor_threshold=float(d.get("reanchor_threshold") or 2.0),
             trail_activation_px=float(d.get("trail_activation_px") or 65.5),
             hybrid_delay_secs=float(d.get("hybrid_delay_secs") or 5.0),
+            accumulate_enabled=bool(d.get("accumulate_enabled") or False),
+            max_qty=int(d.get("max_qty") or 0),
+            scale_up_buffer_mult=float(d.get("scale_up_buffer_mult") or 1.5),
         )
 
 
@@ -71,6 +82,10 @@ class SleeveState:
     cycles: int = 0
     trail_armed: bool = False
     trail_high_water_price: float = 0.0
+    # Per-sleeve accumulation. current_qty grows from cfg.qty toward cfg.max_qty
+    # as realized_pnl covers margin_per_contract × scale_up_buffer_mult. Starts
+    # at 0 which the SwingTrader interprets as "not yet initialized — use cfg.qty".
+    current_qty: int = 0
     # Hybrid mode: timestamp when sell_px was first crossed. None = not yet
     # triggered; a value = we're inside the delay window watching for either
     # trail_activation_px (→ engage trail) or delay expiry (→ market sell).
@@ -95,6 +110,7 @@ class SleeveState:
             trail_armed=bool(d.get("trail_armed") or False),
             trail_high_water_price=float(d.get("trail_high_water_price") or 0.0),
             hybrid_sell_triggered_ts=d.get("hybrid_sell_triggered_ts"),
+            current_qty=int(d.get("current_qty") or 0),
         )
 
     def to_dict(self) -> dict:
