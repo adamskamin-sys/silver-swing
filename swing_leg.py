@@ -608,6 +608,39 @@ class SwingTrader:
             qty = max(1, int(qty * scale))
         return qty, px
 
+    def _sleeve_ms_adjust(self, sc, ss, side: str, qty: int, px: float, mark: float):
+        """Sleeve-scoped microstructure gate. Only consults the filter when
+        the sleeve has microstructure_gate_enabled = true. Same 5 signals as
+        the primary (Effective Spread, Autocorr, OBI, VPIN, Kyle-λ), same
+        decisions:
+          - pause the arm if any signal says stand aside
+          - shift limit price via spread band if enabled
+          - taper qty via Kyle-λ scale
+        Returns (qty, px) — with qty=None to signal 'skip this arm'."""
+        if not getattr(sc, "microstructure_gate_enabled", False):
+            return qty, px
+        if not self.ms:
+            return qty, px
+        reason = self.ms.should_pause_arm(side)
+        if reason:
+            self._record("sleeve_ms_pause",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         side=side, reason=reason)
+            return None, px
+        if side == "BUY":
+            px = self.ms.adjusted_buy_px(px, mark)
+        else:
+            px = self.ms.adjusted_sell_px(px, mark)
+        scale = self.ms.size_scale()
+        if scale < 1.0:
+            new_qty = max(1, int(qty * scale))
+            if new_qty < qty:
+                self._record("sleeve_ms_size_taper",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             original_qty=qty, tapered_qty=new_qty, scale=scale)
+                qty = new_qty
+        return qty, px
+
     def _maybe_scale_up(self) -> None:
         if self.s.swing_qty >= self.cfg.max_swing_qty:
             return
@@ -1147,7 +1180,10 @@ class SwingTrader:
                 elif sc.exit_mode == "hybrid":
                     self._sleeve_hybrid_step(sc, ss, last_price)
                 else:
-                    self._sleeve_arm(sc, ss, "SELL", sc.qty, sc.sell_px)
+                    ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "SELL", sc.qty, sc.sell_px, last_price)
+                    if ms_qty is None:
+                        return  # microstructure gate said pause
+                    self._sleeve_arm(sc, ss, "SELL", ms_qty, ms_px)
             else:  # ARMED_BUY
                 # Auto-reanchor: if silver has run more than reanchor_threshold
                 # above buy_px while we've been waiting, the buy target is stale
@@ -1163,7 +1199,10 @@ class SwingTrader:
                     new_sell_px = round(last_price + spread / 2, 3)
                     self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
                     return  # next tick uses the new targets
-                self._sleeve_arm(sc, ss, "BUY", sc.qty, sc.buy_px)
+                ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, sc.buy_px, last_price)
+                if ms_qty is None:
+                    return  # microstructure gate said pause
+                self._sleeve_arm(sc, ss, "BUY", ms_qty, ms_px)
             return
 
         # Poll the live order.
