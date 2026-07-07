@@ -322,6 +322,29 @@ class SwingTrader:
             set_src = getattr(self.b, "set_pending_source", None)
             if callable(set_src):
                 set_src("manual")
+
+            order_type = str(intent.get("order_type") or "market").lower()
+            limit_price = intent.get("limit_price")
+
+            if order_type == "limit" and limit_price is not None:
+                try:
+                    px = float(limit_price)
+                except (TypeError, ValueError):
+                    self._record("intent_rejected", reason="bad limit_price", intent=intent)
+                    return
+                if px <= 0:
+                    self._record("intent_rejected", reason="limit_price <= 0", intent=intent)
+                    return
+                oid = self.b.place_limit(side, qty, px)
+                self._record("manual_limit_order", side=side, qty=qty, order_id=oid,
+                             price=px, source="dashboard")
+                self._notify(
+                    f"manual {side} {qty} LIMIT placed: {self.symbol}",
+                    f"limit={px}, order_id={oid}",
+                    Priority.INFO,
+                )
+                return
+
             place_market = getattr(self.b, "place_market", None)
             if callable(place_market):
                 oid = self.b.place_market(side, qty)

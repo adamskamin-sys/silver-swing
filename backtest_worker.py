@@ -199,32 +199,48 @@ def _handle_scanner_order_job(r, job_id: str) -> None:
         side = str(req["side"]).upper()
         qty = int(req["qty"])
         mode = str(req.get("mode") or "paper").lower()
+        order_type = str(req.get("order_type") or "market").lower()
+        limit_price = req.get("limit_price")
         if side not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         if qty < 1:
             raise ValueError(f"qty must be >= 1, got {qty}")
         if mode not in ("paper", "live"):
             raise ValueError(f"mode must be paper or live, got {mode!r}")
+        if order_type not in ("market", "limit"):
+            raise ValueError(f"order_type must be market or limit, got {order_type!r}")
+        if order_type == "limit":
+            lp = float(limit_price) if limit_price is not None else 0.0
+            if lp <= 0:
+                raise ValueError("limit_price must be > 0 for limit orders")
+            limit_price = lp
     except Exception as e:
         r.set(res_key, json.dumps({"ok": False, "error": f"bad request: {e}"}), ex=_RESULT_TTL_SECS)
         r.delete(req_key)
         return
 
     started = time.time()
-    _log(f"scanner_order {job_id}: {mode} {side} {qty} {product_id}")
+    _log(f"scanner_order {job_id}: {mode} {order_type} {side} {qty} {product_id}")
     try:
         if mode == "live":
             from broker import BrokerConfig, CoinbaseBroker
             broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
-            order_id = broker.place_market(side, qty)
+            if order_type == "limit":
+                order_id = broker.place_limit(side, qty, float(limit_price))
+                msg = f"placed real LIMIT {side} {qty} {product_id} @ {limit_price} — order {order_id}"
+            else:
+                order_id = broker.place_market(side, qty)
+                msg = f"placed real MARKET {side} {qty} {product_id} — order {order_id}"
             result = {
                 "ok": True,
                 "mode": "live",
                 "product_id": product_id,
                 "side": side,
                 "qty": qty,
+                "order_type": order_type,
+                "limit_price": limit_price,
                 "order_id": order_id,
-                "message": f"placed real {side} {qty} {product_id} — order {order_id}",
+                "message": msg,
             }
         else:
             # Paper "scanner order" is not managed by any strategy — it just
@@ -232,14 +248,18 @@ def _handle_scanner_order_job(r, job_id: str) -> None:
             # setting up a tracked symbol first. This is the honest tradeoff:
             # a real paper simulation would need to track the position over
             # time via a fresh WS feed, which is out of scope for MVP.
+            detail = (f"at LIMIT ${limit_price:.4f}" if order_type == "limit"
+                      else "at market")
             result = {
                 "ok": True,
                 "mode": "paper",
                 "product_id": product_id,
                 "side": side,
                 "qty": qty,
+                "order_type": order_type,
+                "limit_price": limit_price,
                 "message": (
-                    f"[PAPER SIMULATED] would {side} {qty} {product_id} at market. "
+                    f"[PAPER SIMULATED] would {side} {qty} {product_id} {detail}. "
                     "For persistent paper tracking, add this as a tracked symbol first."
                 ),
             }

@@ -1101,11 +1101,14 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     // Newly-created sleeves and ARMED_BUY sleeves show $0 here because they
     // haven't earned any move that belongs to them yet. Inherited paper gains
     // on pre-existing lots stay at the top-level unrealized on the position row,
-    // so they're not double-counted per strategy.
+    // so they're not double-counted per strategy. Fallback: if the sleeve is
+    // ARMED_SELL with contracts but own_avg_entry is missing (legacy state
+    // from before this field was tracked), use the sleeve's buy_px — a limit
+    // buy fills exactly at buy_px so it's the closest we can reconstruct.
     const sleeveUnits = allocation.bySleeve[s.id] || [];
-    const ownEntry = ss.own_avg_entry;
-    const unreal = (ownEntry != null && sleeveQty > 0 && sState === 'ARMED_SELL')
-      ? (mark - Number(ownEntry)) * contractSize * sleeveQty
+    const ownEntry = ss.own_avg_entry != null ? Number(ss.own_avg_entry) : Number(s.buy_px);
+    const unreal = (ownEntry > 0 && sleeveQty > 0 && sState === 'ARMED_SELL')
+      ? (mark - ownEntry) * contractSize * sleeveQty
       : 0;
 
     const sleeveAvgEntry = sleeveUnits.length > 0
@@ -2540,6 +2543,20 @@ function openTradeModal(tenant, symbol, side) {
   const availMargin = Number(snap.available_margin) || 0;
   const marginPer = Number(cfg.margin_per_contract) || 275;
 
+  // Reset order type to Market on every open, and seed the limit price field
+  // with a reasonable default (best bid/ask for the side, or the mark).
+  const marketRadio = document.querySelector('input[name="trade-order-type"][value="market"]');
+  if (marketRadio) marketRadio.checked = true;
+  const limitRow = document.getElementById('trade-limit-row');
+  if (limitRow) limitRow.hidden = true;
+  const limitInput = document.getElementById('trade-limit-price');
+  if (limitInput) {
+    const defaultPx = side === 'BUY'
+      ? Number(snap.best_bid) || mark
+      : Number(snap.best_ask) || mark;
+    limitInput.value = defaultPx ? defaultPx.toFixed(3) : '';
+  }
+
   const maxSell = Math.max(0, pos - core);            // core floor guard (0 = full pos)
   const marginCap = Math.floor(availMargin / marginPer);
   const maxBuy = Math.max(1, Math.min(100, marginCap)); // capped by margin, 100 hard limit
@@ -2627,24 +2644,52 @@ function updateTradePreview() {
   const fee = Number(cfg.fee_per_contract_roundtrip) / 2 || 2.34;
   const qty = Number(tradeQty.value) || 0;
 
+  const orderType = document.querySelector('input[name="trade-order-type"]:checked')?.value || 'market';
+  const limitInput = document.getElementById('trade-limit-price');
+  const limitPrice = Number(limitInput?.value) || 0;
+
+  // Notional uses the LIMIT price when placing a limit order, otherwise the mark.
+  // A limit order at your set price is exactly what you'd pay — the mark is
+  // only relevant for market orders that fill immediately.
+  const priceForNotional = orderType === 'limit' && limitPrice > 0 ? limitPrice : mark;
   const newPos = side === 'BUY' ? pos + qty : pos - qty;
-  const notional = mark * contractSize * qty;
+  const notional = priceForNotional * contractSize * qty;
   const feeCost = fee * qty;
 
   const wouldBreach = side === 'SELL' && newPos < core;
   const wouldGoNegative = side === 'SELL' && newPos < 0;
-  tradeError.hidden = !(wouldBreach || wouldGoNegative);
-  tradeConfirm.disabled = wouldBreach || wouldGoNegative || qty < 1;
+  const badLimit = orderType === 'limit' && !(limitPrice > 0);
+  tradeError.hidden = !(wouldBreach || wouldGoNegative || badLimit);
+  tradeConfirm.disabled = wouldBreach || wouldGoNegative || qty < 1 || badLimit;
   if (wouldGoNegative) {
     tradeError.innerHTML = `<b>Refused:</b> you only hold ${pos} contracts — can't sell ${qty}.`;
   } else if (wouldBreach) {
     tradeError.innerHTML = `<b>Refused:</b> selling ${qty} would take you to ${newPos} contracts, below your core floor of ${core}. Lower your core floor to 0 for free trading, or sell fewer.`;
+  } else if (badLimit) {
+    tradeError.innerHTML = `<b>Enter a limit price above 0.</b>`;
   }
+
+  // Hint on the limit input: how far from the current mark this price sits.
+  const hintEl = document.getElementById('trade-limit-hint');
+  if (hintEl) {
+    if (orderType === 'limit' && limitPrice > 0 && mark > 0) {
+      const diff = limitPrice - mark;
+      const sign = diff >= 0 ? '+' : '−';
+      hintEl.textContent = `${sign}$${Math.abs(diff).toFixed(3)} vs mark $${mark.toFixed(3)}`;
+    } else {
+      hintEl.textContent = '';
+    }
+  }
+
+  const priceLabel = orderType === 'limit'
+    ? `at your limit of $${limitPrice.toFixed(3)}`
+    : `at current mark $${mark.toFixed(3)}`;
 
   tradePreview.innerHTML = `
     <div>Position after: <b style="color:var(--text)">${pos} → ${newPos}</b> contracts</div>
-    <div>Notional at current price: $${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</div>
+    <div>Total ${priceLabel}: <b style="color:var(--text)">$${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b></div>
     <div>Estimated fee: $${feeCost.toFixed(2)}</div>
+    ${orderType === 'limit' ? '<div style="color:var(--muted)">Order sits open until price reaches your limit or you cancel it.</div>' : ''}
   `;
 }
 
@@ -2652,16 +2697,30 @@ async function submitTrade() {
   if (!tradeContext) return;
   const { tenant, symbol, side } = tradeContext;
   const qty = Number(tradeQty.value);
+  const orderType = document.querySelector('input[name="trade-order-type"]:checked')?.value || 'market';
+  const limitPrice = Number(document.getElementById('trade-limit-price')?.value) || 0;
+  if (orderType === 'limit' && !(limitPrice > 0)) {
+    tradeError.hidden = false;
+    tradeError.innerHTML = '<b>Enter a limit price above 0.</b>';
+    return;
+  }
   if (isLiveTenant(tenant)) {
+    const priceLine = orderType === 'limit'
+      ? `at LIMIT $${limitPrice.toFixed(3)}`
+      : `at MARKET`;
     const ok = await confirmLive({
       title: `${side} ${qty} ${symbol} — real money`,
-      body: `<b>${side} ${qty}</b> contract${qty === 1 ? '' : 's'} of <b>${escapeHtml(symbol)}</b> at MARKET on Coinbase.<br><br>` +
-            `Fills immediately at current ${side === 'BUY' ? 'ask' : 'bid'}. This is not paper — real cash moves out of your account.`,
+      body: `<b>${side} ${qty}</b> contract${qty === 1 ? '' : 's'} of <b>${escapeHtml(symbol)}</b> ${priceLine} on Coinbase.<br><br>` +
+            (orderType === 'limit'
+              ? `Sits open until filled or cancelled. This is not paper — real cash moves out of your account when it fills.`
+              : `Fills immediately at current ${side === 'BUY' ? 'ask' : 'bid'}. This is not paper — real cash moves out of your account.`),
     });
     if (!ok) return;
   }
   const res = await postJson('/api/manual-trade', {
-    tenant, symbol, side, qty, confirm: 'YES',
+    tenant, symbol, side, qty, order_type: orderType,
+    limit_price: orderType === 'limit' ? limitPrice : null,
+    confirm: 'YES',
   });
   if (res.ok) {
     tradeModal.hidden = true;
@@ -2677,6 +2736,18 @@ tradeQty.addEventListener('input', () => {
   markActiveChip(document.getElementById('trade-qty-quick'), Number(tradeQty.value));
 });
 tradeConfirm.addEventListener('click', submitTrade);
+
+// Order-type toggle + limit price live-update the preview and show/hide the
+// limit row. Wired once on load — the modal keeps the same DOM across opens.
+document.querySelectorAll('input[name="trade-order-type"]').forEach(el => {
+  el.addEventListener('change', () => {
+    const isLimit = document.querySelector('input[name="trade-order-type"]:checked')?.value === 'limit';
+    const row = document.getElementById('trade-limit-row');
+    if (row) row.hidden = !isLimit;
+    updateTradePreview();
+  });
+});
+document.getElementById('trade-limit-price')?.addEventListener('input', updateTradePreview);
 
 // ---- scanner detail: chart + purchase ----------------------------------
 
@@ -2750,17 +2821,42 @@ function updateScannerBuyButton() {
   if (!scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
   const mode = selectedScannerBuyMode();
+  const orderType = selectedScannerOrderType();
   const qtyInput = document.getElementById('scanner-buy-qty');
   const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
-  scannerBuyBtn.textContent = `buy ${qty} ${symbol} on ${mode}`;
-  scannerBuyBtn.disabled = false;
+  const limitPrice = Number(document.getElementById('scanner-limit-price')?.value) || 0;
+  const priceForPreview = orderType === 'limit' && limitPrice > 0
+    ? limitPrice
+    : Number(scannerDetailContext.price) || 0;
+
+  // Contract size defaults to 50 (silver/mini futures); would ideally read
+  // from the symbol's spec — good enough for a preview line.
+  const contractSize = 50;
+  const notional = priceForPreview * contractSize * qty;
+  const feeEst = 2.34 * qty;
+  const priceLabel = orderType === 'limit'
+    ? (limitPrice > 0 ? `at your limit $${limitPrice.toFixed(3)}` : 'at your limit (enter price)')
+    : `at market ~$${(Number(scannerDetailContext.price) || 0).toFixed(3)}`;
+
+  const previewEl = document.getElementById('scanner-buy-preview');
+  if (previewEl) {
+    previewEl.innerHTML = `
+      <div>Buying <b style="color:var(--text)">${qty}</b> contract${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
+      <div>Total: <b style="color:var(--text)">$${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b> · fee ~$${feeEst.toFixed(2)}</div>
+    `;
+  }
+
+  scannerBuyBtn.textContent = orderType === 'limit'
+    ? `place ${mode} LIMIT for ${qty} ${symbol}`
+    : `place ${mode} MARKET for ${qty} ${symbol}`;
+  scannerBuyBtn.disabled = orderType === 'limit' && !(limitPrice > 0);
+
   if (mode === 'live') {
     scannerDetailWarning.hidden = false;
     scannerDetailWarning.innerHTML = `
-      <b>Live</b> = real money. This places a market BUY of 1 contract on
-      Coinbase for <b>${escapeHtml(symbol)}</b> at the current ask. No strategy
-      will manage it after — you'll need to close it manually on Coinbase or add
-      a strategy for this symbol later.
+      <b>Live</b> = real money. Real cash moves ${orderType === 'limit' ? 'when the limit fills' : 'immediately'} on Coinbase.
+      No strategy will manage this position after — you'll need to close it manually on Coinbase or add a strategy for
+      <b>${escapeHtml(symbol)}</b> later.
     `;
   } else {
     scannerDetailWarning.hidden = false;
@@ -2770,6 +2866,11 @@ function updateScannerBuyButton() {
       (needs a running strategy to accumulate P&L over time).
     `;
   }
+}
+
+function selectedScannerOrderType() {
+  const checked = document.querySelector('input[name="scanner-order-type"]:checked');
+  return checked ? checked.value : 'market';
 }
 
 function selectedScannerBuyMode() {
@@ -2789,10 +2890,19 @@ scannerBuyBtn.addEventListener('click', async () => {
   if (scannerBuyBtn.disabled || !scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
   const mode = selectedScannerBuyMode();
+  const orderType = selectedScannerOrderType();
   const qtyInput = document.getElementById('scanner-buy-qty');
   const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
+  const limitPrice = Number(document.getElementById('scanner-limit-price')?.value) || 0;
+  if (orderType === 'limit' && !(limitPrice > 0)) {
+    showToast('enter a limit price above 0', 'error');
+    return;
+  }
   if (mode === 'live') {
-    const ok = confirm(`REAL MONEY: place a market BUY of ${qty} ${symbol} contract${qty > 1 ? 's' : ''} on Coinbase right now?`);
+    const detail = orderType === 'limit'
+      ? `LIMIT at $${limitPrice.toFixed(3)}`
+      : 'MARKET at current ask';
+    const ok = confirm(`REAL MONEY: place a ${detail} BUY of ${qty} ${symbol} contract${qty > 1 ? 's' : ''} on Coinbase?`);
     if (!ok) return;
   }
   const originalLabel = scannerBuyBtn.textContent;
@@ -2800,7 +2910,10 @@ scannerBuyBtn.addEventListener('click', async () => {
   scannerBuyBtn.textContent = 'placing…';
   try {
     const res = await postJson('/api/scanner-order', {
-      product_id: symbol, side: 'BUY', qty, mode, confirm: 'YES',
+      product_id: symbol, side: 'BUY', qty, mode,
+      order_type: orderType,
+      limit_price: orderType === 'limit' ? limitPrice : null,
+      confirm: 'YES',
     });
     if (res._unauthorized) { showLogin(); return; }
     if (res.ok) {
@@ -2817,6 +2930,22 @@ scannerBuyBtn.addEventListener('click', async () => {
     scannerBuyBtn.textContent = originalLabel;
   }
 });
+
+// Scanner order-type radios: toggle limit-price visibility and refresh preview.
+document.querySelectorAll('input[name="scanner-order-type"]').forEach(el => {
+  el.addEventListener('change', () => {
+    const isLimit = selectedScannerOrderType() === 'limit';
+    const row = document.getElementById('scanner-limit-row');
+    if (row) row.hidden = !isLimit;
+    // Seed limit-price field on first switch so the user has a sensible starting value.
+    const limitInput = document.getElementById('scanner-limit-price');
+    if (isLimit && limitInput && !limitInput.value && scannerDetailContext?.price) {
+      limitInput.value = Number(scannerDetailContext.price).toFixed(3);
+    }
+    updateScannerBuyButton();
+  });
+});
+document.getElementById('scanner-limit-price')?.addEventListener('input', updateScannerBuyButton);
 
 async function loadScannerChart() {
   if (!scannerDetailContext) return;

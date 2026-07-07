@@ -577,6 +577,32 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 }
 .trade-preview b { color: var(--text); font-weight: 600; }
 
+.trade-order-type {
+  margin-top: 20px; padding: 14px 16px;
+  background: var(--panel-2); border-radius: 8px;
+}
+.trade-order-type-label {
+  font-size: 13px; color: var(--muted); margin-bottom: 8px;
+}
+.trade-order-type-choices {
+  display: flex; gap: 20px; font-size: 14px; color: var(--text);
+}
+.trade-order-type-choices label {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+}
+.trade-limit-row {
+  margin-top: 12px;
+  display: flex; gap: 16px; align-items: center;
+  font-size: 13px; color: var(--muted);
+}
+.trade-limit-row label { display: inline-flex; gap: 6px; align-items: center; }
+.trade-limit-row input {
+  width: 120px; padding: 8px 10px; font-family: var(--mono); font-size: 14px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text);
+}
+.trade-limit-hint { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+
 /* ==================================================================== */
 /* POSITIONS SECTION — per-lot table                                       */
 /* ==================================================================== */

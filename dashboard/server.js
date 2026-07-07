@@ -202,9 +202,9 @@ export function makeApp({
     }
   });
 
-  // --- manual market order intent (dashboard queues, bot executes) ---
+  // --- manual market/limit order intent (dashboard queues, bot executes) ---
   app.post('/api/manual-trade', requireAuth, async (req, res) => {
-    const { tenant, symbol, side, qty, confirm } = req.body || {};
+    const { tenant, symbol, side, qty, confirm, order_type, limit_price } = req.body || {};
     if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
     if (confirm !== 'YES') return res.status(400).json({ ok: false, error: 'confirm must be "YES"' });
     const s = String(side || '').toUpperCase();
@@ -212,6 +212,17 @@ export function makeApp({
     const q = Number(qty);
     if (!Number.isFinite(q) || q < 1 || q > 100 || q !== Math.floor(q)) {
       return res.status(400).json({ ok: false, error: 'qty must be a whole number 1–100' });
+    }
+    const ot = String(order_type || 'market').toLowerCase();
+    if (!['market', 'limit'].includes(ot)) {
+      return res.status(400).json({ ok: false, error: 'order_type must be market or limit' });
+    }
+    let lp = null;
+    if (ot === 'limit') {
+      lp = Number(limit_price);
+      if (!Number.isFinite(lp) || lp <= 0) {
+        return res.status(400).json({ ok: false, error: 'limit_price must be > 0 for limit orders' });
+      }
     }
     try {
       const store = await readStore(storePath);
@@ -234,6 +245,8 @@ export function makeApp({
       const snap = store[tenant][symbol].snapshot || {};
       store[tenant][symbol].intent = {
         side: s, qty: q,
+        order_type: ot,
+        limit_price: lp,
         mark: Number(snap.last_mark) || null,
         submitted_ts: Date.now() / 1000,
         submitted_by: 'dashboard',
@@ -477,7 +490,7 @@ export function makeApp({
   // dashboard queues, paper worker executes via CoinbaseBroker (LIVE) or
   // simulates + logs (PAPER).
   app.post('/api/scanner-order', requireAuth, async (req, res) => {
-    const { product_id, side, qty, mode, confirm } = req.body || {};
+    const { product_id, side, qty, mode, confirm, order_type, limit_price } = req.body || {};
     if (!product_id) return res.status(400).json({ ok: false, error: 'product_id required' });
     if (confirm !== 'YES') return res.status(400).json({ ok: false, error: 'confirm must be "YES"' });
     const s = String(side || '').toUpperCase();
@@ -488,10 +501,24 @@ export function makeApp({
     }
     const m = String(mode || 'paper').toLowerCase();
     if (!['paper', 'live'].includes(m)) return res.status(400).json({ ok: false, error: 'mode must be paper or live' });
+    const ot = String(order_type || 'market').toLowerCase();
+    if (!['market', 'limit'].includes(ot)) {
+      return res.status(400).json({ ok: false, error: 'order_type must be market or limit' });
+    }
+    let lp = null;
+    if (ot === 'limit') {
+      lp = Number(limit_price);
+      if (!Number.isFinite(lp) || lp <= 0) {
+        return res.status(400).json({ ok: false, error: 'limit_price must be > 0 for limit orders' });
+      }
+    }
     const r = await getRedis();
     if (!r) return res.status(503).json({ ok: false, error: 'redis not configured' });
     try {
-      const result = await scannerOrderViaRedis(r, { product_id, side: s, qty: q, mode: m });
+      const result = await scannerOrderViaRedis(r, {
+        product_id, side: s, qty: q, mode: m,
+        order_type: ot, limit_price: lp,
+      });
       res.json(result);
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
