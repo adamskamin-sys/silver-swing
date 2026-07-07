@@ -234,6 +234,40 @@ function modeOfTenant(tenant) {
   return null;
 }
 
+function isLiveTenant(tenant) {
+  return modeOfTenant(tenant) === 'live';
+}
+
+// Red-bordered "LIVE — REAL MONEY" confirmation. Returns a Promise resolving
+// true (proceed) or false (cancel). Requires ticking a checkbox before the
+// confirm button enables — an extra deliberate step so a rage-click can't
+// blow past the safety net.
+function confirmLive({ title = 'Confirm live action', body = 'This will place a real order on Coinbase.' } = {}) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('live-confirm-modal');
+    const titleEl = document.getElementById('live-confirm-title');
+    const bodyEl = document.getElementById('live-confirm-body');
+    const checkEl = document.getElementById('live-confirm-check');
+    const okBtn = document.getElementById('live-confirm-ok');
+    const cancelBtn = document.getElementById('live-confirm-cancel');
+    titleEl.textContent = title;
+    bodyEl.innerHTML = body;
+    checkEl.checked = false;
+    okBtn.disabled = true;
+    modal.hidden = false;
+    const onCheck = () => { okBtn.disabled = !checkEl.checked; };
+    const cleanup = () => {
+      checkEl.removeEventListener('change', onCheck);
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+      modal.hidden = true;
+    };
+    checkEl.addEventListener('change', onCheck);
+    okBtn.onclick = () => { cleanup(); resolve(true); };
+    cancelBtn.onclick = () => { cleanup(); resolve(false); };
+  });
+}
+
 function renderModeTabs(store) {
   const counts = { paper: 0, live: 0 };
   for (const [tenant, symbols] of Object.entries(store)) {
@@ -1609,6 +1643,13 @@ function round3(n) { return Math.round(n * 1000) / 1000; }
 
 async function saveConfig() {
   if (!configEditContext) return;
+  if (isLiveTenant(configEditContext.tenant)) {
+    const ok = await confirmLive({
+      title: `Save live config — ${configEditContext.symbol}`,
+      body: 'You are editing the <b>LIVE</b> tenant\'s config. Changes take effect on the bot\'s next tick and drive real market orders (sell targets, buy-backs, stop-loss, size). Double-check every number before saving.',
+    });
+    if (!ok) return;
+  }
   const cfg = {};
   for (const section of CONFIG_SECTIONS) {
     for (const [key, , type] of section.fields) {
@@ -2369,6 +2410,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     const next = existing
       ? sleeves.map(s => s.id === draft.id ? patch : s)
       : [...sleeves, patch];
+    if (isLiveTenant(tenant)) {
+      const ok = await confirmLive({
+        title: `${existing ? 'Save' : 'Add'} live strategy — ${symbol}`,
+        body: `<b>${existing ? 'Update' : 'Add'} strategy</b> "${escapeHtml(patch.name)}" on <b>${escapeHtml(symbol)}</b> (LIVE).<br><br>` +
+              `<b>Contracts:</b> ${patch.qty}<br>` +
+              `<b>Sell:</b> $${patch.sell_px.toFixed(3)} &nbsp;&nbsp; <b>Buy back:</b> $${patch.buy_px.toFixed(3)}<br>` +
+              `<b>Exit mode:</b> ${patch.exit_mode}<br><br>` +
+              'Once saved, the bot will place real orders on the next tick.',
+      });
+      if (!ok) return;
+    }
     const res = await putJson('/api/sleeves', { tenant, symbol, sleeves: next });
     if (res._unauthorized) { showLogin(); return; }
     if (res.ok) { m.hidden = true; refreshOnce(); }
@@ -2381,7 +2433,16 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
 }
 
 async function deleteSleeve(tenant, symbol, sleeveId) {
-  if (!confirm(`Delete strategy ${sleeveId}? Any live order it holds will be cancelled next tick.`)) return;
+  if (isLiveTenant(tenant)) {
+    const ok = await confirmLive({
+      title: `Delete live strategy ${sleeveId}`,
+      body: `Removes strategy <b>${escapeHtml(sleeveId)}</b> from rotation on <b>${escapeHtml(symbol)}</b>.<br><br>` +
+            'Its pending order (if any) will be cancelled on the next tick. Contracts it held stay in your position — they just have no strategy managing them anymore.',
+    });
+    if (!ok) return;
+  } else {
+    if (!confirm(`Delete strategy ${sleeveId}? Any live order it holds will be cancelled next tick.`)) return;
+  }
   const block = currentStore[tenant]?.[symbol] || {};
   const sleeves = (block.config?.sleeves || []).filter(s => s.id !== sleeveId);
   const res = await putJson('/api/sleeves', { tenant, symbol, sleeves });
@@ -2514,6 +2575,14 @@ async function submitTrade() {
   if (!tradeContext) return;
   const { tenant, symbol, side } = tradeContext;
   const qty = Number(tradeQty.value);
+  if (isLiveTenant(tenant)) {
+    const ok = await confirmLive({
+      title: `${side} ${qty} ${symbol} — real money`,
+      body: `<b>${side} ${qty}</b> contract${qty === 1 ? '' : 's'} of <b>${escapeHtml(symbol)}</b> at MARKET on Coinbase.<br><br>` +
+            `Fills immediately at current ${side === 'BUY' ? 'ask' : 'bid'}. This is not paper — real cash moves out of your account.`,
+    });
+    if (!ok) return;
+  }
   const res = await postJson('/api/manual-trade', {
     tenant, symbol, side, qty, confirm: 'YES',
   });
@@ -2803,6 +2872,13 @@ async function disablePrimaryStrategy(tenant, symbol) {
 }
 
 async function cancelOrder(tenant, symbol, sleeveId) {
+  if (isLiveTenant(tenant)) {
+    const ok = await confirmLive({
+      title: `Cancel live order — ${symbol}`,
+      body: 'Cancels the strategy\'s pending order on Coinbase. Your contracts stay in the position — this only cancels the pending buy/sell offer sitting at the exchange. Next tick the strategy may re-arm with a fresh order.',
+    });
+    if (!ok) return;
+  }
   const res = await postJson('/api/cancel-order', { tenant, symbol, sleeve_id: sleeveId });
   if (res._unauthorized) { showLogin(); return; }
   if (res.ok) { showToast('order cancel queued', 'info'); refreshOnce(); }
@@ -2813,6 +2889,14 @@ async function marketSell(tenant, symbol, qty) {
   const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
   const pos = Number(snap.position_qty) || 0;
   if (qty < 1 || qty > pos) { showToast(`can't sell ${qty} — you hold ${pos}`, 'error'); return; }
+  if (isLiveTenant(tenant)) {
+    const ok = await confirmLive({
+      title: `Sell ${qty} ${symbol} at market — real money`,
+      body: `<b>Market SELL ${qty}</b> contract${qty === 1 ? '' : 's'} of <b>${escapeHtml(symbol)}</b> on Coinbase.<br><br>` +
+            `Fills at the current bid. Closes ${qty} of your ${pos} held contracts. Cash lands in your futures wallet.`,
+    });
+    if (!ok) return;
+  }
   const res = await postJson('/api/manual-trade', {
     tenant, symbol, side: 'SELL', qty, confirm: 'YES',
   });

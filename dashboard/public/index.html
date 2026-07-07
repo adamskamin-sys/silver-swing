@@ -129,6 +129,26 @@
     </div>
   </div>
 
+  <!-- live-mode confirm modal — red-bordered, requires explicit YES for any
+       real-money action so accidental clicks can't move actual funds -->
+  <div id="live-confirm-modal" class="modal live-confirm-modal" hidden>
+    <div class="modal-panel">
+      <div class="live-confirm-banner">⚠️ LIVE MODE — REAL MONEY</div>
+      <h2 id="live-confirm-title">Confirm live action</h2>
+      <div id="live-confirm-body"></div>
+      <div class="live-confirm-checkbox">
+        <label>
+          <input type="checkbox" id="live-confirm-check">
+          I understand this affects real money on Coinbase.
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button id="live-confirm-cancel">cancel</button>
+        <button id="live-confirm-ok" class="danger" disabled>confirm & proceed</button>
+      </div>
+    </div>
+  </div>
+
   <!-- scanner detail modal (chart + purchase) -->
   <div id="scanner-detail-modal" class="modal" hidden>
     <div class="modal-panel wide">
