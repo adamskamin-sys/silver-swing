@@ -103,11 +103,101 @@ def _is_lab_tenant(tenant: str) -> bool:
 def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
     if store.get_config(tenant, symbol):
         _fixup_lab_config(store, tenant, symbol)
+        if _is_lab_tenant(tenant):
+            _seed_lab_comparison_sleeves(store, tenant, symbol)
         return
     if _is_lab_tenant(tenant):
         store.put_config(tenant, symbol, _default_lab_config())
+        _seed_lab_comparison_sleeves(store, tenant, symbol)
     else:
         store.put_config(tenant, symbol, _default_paper_config())
+
+
+def _seed_lab_comparison_sleeves(store, tenant: str, symbol: str) -> None:
+    """One-time bootstrap: seed the Lab tenant with 5 sleeves running Models
+    A–E side-by-side, 2 contracts each. Clears any pre-existing sleeves so
+    the comparison always starts fresh with just A–E.
+
+    Skips re-seeding if the sleeves list already contains any of the
+    'Model X' sleeves — prevents wiping user's mid-run comparison on every
+    bot restart. To force a re-seed, delete the existing sleeves first via
+    the dashboard.
+
+    Anchor pricing uses the last snapshot mark if available, else falls
+    back to 61.5 (roughly current silver at build time). Prices adjust on
+    the sleeve's first arm anyway — they're just starting points.
+    """
+    cfg = dict(store.get_config(tenant, symbol) or {})
+    existing = cfg.get("sleeves") or []
+    already_seeded = any(str(s.get("name", "")).startswith("Model ") for s in existing)
+    if already_seeded:
+        return
+    snap = store.get_snapshot(tenant, symbol) or {}
+    mark = float(snap.get("last_mark") or 61.5)
+    # Common defaults for all 5 sleeves
+    spread = 0.20  # buy/sell centered on mark with $0.20 spread → nets ~$10 at qty=2
+    base = {
+        "qty": 2,
+        "reanchor_threshold": 2.0,
+        "buy_px": round(mark - spread / 2, 3),
+        "sell_px": round(mark + spread / 2, 3),
+        "trail_trigger": round(mark + spread / 2, 3),
+        "trail_distance": 0.15,
+        "trail_activation_px": round(mark + spread / 2 + 0.10, 3),
+        "hybrid_delay_secs": 5,
+        "max_qty": 5,
+        "scale_up_buffer_mult": 1.5,
+        "stop_loss_px": round(mark - spread / 2 - 1.50, 3),
+        "stop_loss_qty_mode": "all",
+        "stop_loss_qty_custom": 0,
+    }
+    models = [
+        {**base, "id": "model_a", "name": "Model A — Baseline",
+         "exit_mode": "fixed_limit", "stop_loss_enabled": True},
+        {**base, "id": "model_b", "name": "Model B — Defensive Plus",
+         "exit_mode": "hybrid",
+         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
+         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
+         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
+         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
+         "reentry_min_wait_secs": 30,
+         "reanchor_threshold": 0.75,
+         "accumulate_enabled": True},
+        {**base, "id": "model_c", "name": "Model C — Microstructure",
+         "exit_mode": "hybrid",
+         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
+         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
+         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
+         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
+         "reentry_min_wait_secs": 30,
+         "reanchor_threshold": 0.75,
+         "accumulate_enabled": True,
+         "microstructure_gate_enabled": True},
+        {**base, "id": "model_d", "name": "Model D — News-Aware",
+         "exit_mode": "hybrid",
+         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
+         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
+         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
+         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
+         "reentry_min_wait_secs": 30,
+         "reanchor_threshold": 0.75,
+         "accumulate_enabled": True,
+         "news_blackout_enabled": True, "news_blackout_tier": 2},
+        {**base, "id": "model_e", "name": "Model E — Kitchen Sink",
+         "exit_mode": "hybrid",
+         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
+         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
+         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
+         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
+         "reentry_min_wait_secs": 30,
+         "reanchor_threshold": 0.75,
+         "accumulate_enabled": True,
+         "microstructure_gate_enabled": True,
+         "news_blackout_enabled": True, "news_blackout_tier": 2},
+    ]
+    cfg["sleeves"] = models
+    store.put_config(tenant, symbol, cfg)
+    _log(f"[{tenant}/{symbol}] seeded Lab with 5 comparison sleeves (Models A–E, 2 contracts each)")
 
 
 def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:

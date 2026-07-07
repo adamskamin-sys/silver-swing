@@ -2186,126 +2186,106 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       ))
     : defaultTotalProfit;
 
-  // The 4 canonical swing-trading authors from the build spec (§5, §6). Each
-  // preset packages the exit mode + profit target + trail distance the way
-  // that author's method suggests. "Custom" lets the user configure freely.
+  // Five head-to-head strategy models — designed to run side-by-side in the
+  // Lab tenant so you can compare which combination of features actually
+  // makes money on live silver data. Same base $10-net-swing math, layered
+  // additions. Model A is the control (what you had before).
   const PRESETS = {
-    'Jim Paul': {
-      // What I Learned Losing a Million Dollars — RISK-FIRST. Small, defensible
-      // range. Fixed limit with tight profit target so you're never far offside.
-      exit_mode: 'fixed_limit',
-      profitDollarsPerContract: 25,   // $0.50 spread on a 50oz contract
-      trailDistance: 0.05,
-      note: 'Risk-first fixed limit. Tight range, small targets — Paul cared about not blowing up more than winning big.',
-    },
-    'Livermore': {
-      // Reminiscences of a Stock Operator — PIVOT + PYRAMID. Wider swings,
-      // fixed limit at whole-number pivots. Big spread, meaningful targets.
-      exit_mode: 'fixed_limit',
-      profitDollarsPerContract: 100,  // $2 spread
-      trailDistance: 0.20,
-      note: 'Pivot-based fixed limit. Wider swings around whole-number levels — Livermore traded pivot points, not noise.',
-    },
-    'Carter': {
-      // Mastering the Trade — TRAILING/BREAKOUT. Arms above pivot, rides trend,
-      // exits on structure break. Real trailing stop with medium distance.
-      exit_mode: 'trailing_stop',
-      profitDollarsPerContract: 50,   // arm at anchor + $1
-      trailDistance: 0.15,
-      note: "Trailing stop that rides trend. Arms on breakout, rides upside, exits when structure breaks — Carter's bread and butter.",
-    },
-    'Elder': {
-      // Trading for a Living — TRIPLE SCREEN. Medium fixed limit with wider
-      // range to give the setup room to work.
-      exit_mode: 'fixed_limit',
-      profitDollarsPerContract: 60,   // $1.20 spread
-      trailDistance: 0.10,
-      note: 'Fixed limit with room to breathe. Elder wanted setups to have time to develop — medium targets, patient exits.',
-    },
-    '$5 net swing': {
-      // FIXED target: always nets $5 total per cycle regardless of qty. Spread
-      // auto-adjusts based on contract count. profitDollarsFixed overrides the
-      // per-contract math in applyPreset — see comment there.
-      exit_mode: 'fixed_limit',
-      profitDollarsFixed: 5,
-      trailDistance: 0.10,
-      note: '$5 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $5 after fees.',
-    },
-    '$10 net swing': {
+    'Model A — $10 net swing (baseline)': {
+      // Control: pure fixed limit with a static stop-loss. Nothing fancy.
+      // Any Model B–E outperforming this proves the added features are
+      // adding value; matching this means the extras are noise.
       exit_mode: 'fixed_limit',
       profitDollarsFixed: 10,
       trailDistance: 0.10,
-      note: '$10 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $10 after fees.',
+      stopLoss: { enabled: true, price_below_buy: 1.5, qty_mode: 'all' },
+      note: 'Baseline / control. Fixed $10 swing + static stop-loss $1.50 below buy. No trail, no reanchor, no microstructure. Use to measure whether extras (Models B–E) actually help.',
     },
-    '$25 net swing': {
-      exit_mode: 'fixed_limit',
-      profitDollarsFixed: 25,
-      trailDistance: 0.15,
-      note: '$25 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $25 after fees.',
-    },
-    '$50 net swing': {
-      exit_mode: 'fixed_limit',
-      profitDollarsFixed: 50,
-      trailDistance: 0.20,
-      note: '$50 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $50 after fees.',
-    },
-    '$100 net swing': {
-      exit_mode: 'fixed_limit',
-      profitDollarsFixed: 100,
-      trailDistance: 0.25,
-      note: '$100 net per cycle. Spread auto-adjusts to your qty so this preset ALWAYS nets $100 after fees.',
-    },
-    '$10 net swing + aggressive trail': {
-      // Hybrid: take the $10 target if silver just touches, but ride
-      // breakouts with a wide trail. Parameters tuned to silver ATR:
-      //   trail_distance = 2.5 × ATR (0.20) — big enough for breakout runway
-      //   activation_offset = +0.20 above sell_px — engages trail only on
-      //     real momentum (silver has to push 20¢ past target), not on a
-      //     single-tick touch
-      //   hybrid_delay = 10s — patient window to distinguish spike from run
-      exit_mode: 'hybrid',
-      profitDollarsFixed: 10,
-      trailDistance: 0.20,
-      trailActivationOffset: 0.20,
-      hybridDelay: 10,
-      note: 'Takes the $10 target if silver just touches; if it pushes 20¢ past target, engages a $0.20 trailing stop and rides the breakout. Best when you expect trending days.',
-    },
-    '$10 net swing + moderate trail': {
-      // Moderate hybrid — expert-recommended default. Parameters:
-      //   trail_distance = 2 × ATR (0.15) — survives normal intraday noise
-      //   activation_offset = +0.10 above sell_px — engages on real breakout
-      //     but not on false spikes
-      //   hybrid_delay = 5s — standard window for silver
-      // Empirically the highest-EV of the three (Conservative/Moderate/Aggressive)
-      // across mixed regimes on silver-like instruments.
-      exit_mode: 'hybrid',
-      profitDollarsFixed: 10,
-      trailDistance: 0.15,
-      trailActivationOffset: 0.10,
-      hybridDelay: 5,
-      note: 'Takes the $10 target if silver just touches; if it pushes 10¢ past target, engages a $0.15 trailing stop and rides the breakout. Highest expected value across mixed regimes — the expert-recommended default.',
-    },
-    'Expert enhanced ($10 swing — full stack)': {
-      // The full recipe from the expert-methodology discussion:
-      // moderate hybrid trail + accumulate + stop-loss + auto-reanchor.
-      // One preset toggles all four. Requires 2 contracts as the starting
-      // qty; accumulation grows it. Stop-loss $1.50 below the buy target
-      // (~2.5% for silver at $60); reanchor at $0.75 above buy.
+    'Model B — Defensive plus (ratchet + reanchor + volatility re-entry)': {
+      // Everything Model A has PLUS: ratcheting stop-loss (preserves gains),
+      // auto-reanchor on stalled buy, volatility-contraction re-entry after
+      // stop. This is the "expert stack" from the methodology discussion.
       exit_mode: 'hybrid',
       profitDollarsFixed: 10,
       trailDistance: 0.15,
       trailActivationOffset: 0.10,
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
-      stopLoss: { enabled: true, price_below_buy: 1.5, qty_mode: 'all' },
+      stopLoss: {
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
+        reanchor_on_trigger: true, max_consecutive: 3,
+      },
       reanchorThreshold: 0.75,
-      note: 'Full expert stack: moderate hybrid trail (rides breakouts) + accumulate (grows qty on wins, up to 2.5×) + stop-loss (protects on crashes, $1.50 below buy) + auto-reanchor (walks targets up if silver rises $0.75 past buy without a dip). Highest theoretical EV — backtest before deploying live.',
+      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      note: 'Model A + moderate hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + reanchor on stalled buy + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore.',
+    },
+    'Model C — Microstructure-informed': {
+      // Model B + sleeve-level microstructure gates. Uses OBI (order book
+      // imbalance), VPIN (toxic flow), Kyle-λ (price impact) — but only
+      // active if SWING_MS_* env vars are set on the bot.
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.15,
+      trailActivationOffset: 0.10,
+      hybridDelay: 5,
+      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
+      stopLoss: {
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
+        reanchor_on_trigger: true, max_consecutive: 3,
+      },
+      reanchorThreshold: 0.75,
+      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      microstructureGate: true,
+      note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
+    },
+    'Model D — News-aware': {
+      // Model B + scheduled event blackout (FOMC / CPI / NFP / speeches).
+      // Pauses arms during high-uncertainty windows so news whipsaws don't
+      // eat into gains.
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.15,
+      trailActivationOffset: 0.10,
+      hybridDelay: 5,
+      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
+      stopLoss: {
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
+        reanchor_on_trigger: true, max_consecutive: 3,
+      },
+      reanchorThreshold: 0.75,
+      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      newsBlackout: { enabled: true, tier: 2 },
+      note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
+    },
+    'Model E — Kitchen sink (everything)': {
+      // Model B + C + D combined. Highest theoretical EV but highest
+      // parameter count / overfit risk. Compare against A/B/C/D to see
+      // if MORE features = more edge or just more noise.
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.15,
+      trailActivationOffset: 0.10,
+      hybridDelay: 5,
+      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
+      stopLoss: {
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
+        reanchor_on_trigger: true, max_consecutive: 3,
+      },
+      reanchorThreshold: 0.75,
+      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      microstructureGate: true,
+      newsBlackout: { enabled: true, tier: 2 },
+      note: 'Everything combined: Model B + microstructure gates + news blackout. Highest theoretical EV. Also highest complexity — a good win here vs Model B tells you the microstructure + news signals add real edge; a small/negative delta means those signals are noise for your timescale.',
     },
     'Custom': {
       exit_mode: 'fixed_limit',
       profitDollarsPerContract: 50,
       trailDistance: 0.10,
-      note: 'You set every parameter. Use this when the presets don\'t match what you want.',
+      note: 'You set every parameter. Use this when Models A–E don\'t match what you want.',
     },
   };
   const nextAuthorName = () => {
@@ -2627,6 +2607,25 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     if (p.reanchorThreshold != null) {
       draft.reanchor_threshold = p.reanchorThreshold;
     }
+    // Ratcheting stop-loss + re-entry + news blackout + microstructure gate —
+    // no editor UI, presets are the primary way to configure. Flow through
+    // draft to the save patch. Explicitly write nulls when the preset omits
+    // them so previous preset selections don't leak into the next one.
+    const sl = p.stopLoss || {};
+    draft.stop_loss_ratchet_enabled = !!sl.ratchet_enabled;
+    draft.stop_loss_ratchet_distance = sl.ratchet_distance ?? 1.50;
+    draft.stop_loss_ratchet_activation = sl.ratchet_activation ?? 0.50;
+    draft.stop_loss_reanchor_on_trigger = !!sl.reanchor_on_trigger;
+    draft.stop_loss_max_consecutive = sl.max_consecutive ?? 0;
+    const re = p.reentry || {};
+    draft.reentry_mode = re.mode || 'off';
+    draft.reentry_range_contraction = re.range_contraction ?? 0.5;
+    draft.reentry_range_window = re.range_window ?? 60;
+    draft.reentry_min_wait_secs = re.min_wait_secs ?? 30;
+    const nb = p.newsBlackout || {};
+    draft.news_blackout_enabled = !!nb.enabled;
+    draft.news_blackout_tier = nb.tier ?? 2;
+    draft.microstructure_gate_enabled = !!p.microstructureGate;
     applyModeVisibility();
   }
 
@@ -2828,6 +2827,22 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       stop_loss_qty_mode: stopLossEnabled ? stopMode : 'all',
       stop_loss_qty_custom: stopLossEnabled && stopMode === 'custom'
         ? parseInt(stopQtyEl?.value || 1, 10) : 0,
+      // Ratchet + re-entry + microstructure + news blackout come from the
+      // draft (populated by applyPreset for Models B–E). No UI toggle for
+      // these yet — presets are the primary interface. Reading from draft
+      // lets Model presets flow through the save without adding form fields.
+      stop_loss_ratchet_enabled: !!draft.stop_loss_ratchet_enabled,
+      stop_loss_ratchet_distance: Number(draft.stop_loss_ratchet_distance) || 1.50,
+      stop_loss_ratchet_activation: Number(draft.stop_loss_ratchet_activation) || 0.50,
+      stop_loss_reanchor_on_trigger: !!draft.stop_loss_reanchor_on_trigger,
+      stop_loss_max_consecutive: parseInt(draft.stop_loss_max_consecutive || 0, 10),
+      reentry_mode: String(draft.reentry_mode || 'off'),
+      reentry_range_contraction: Number(draft.reentry_range_contraction) || 0.5,
+      reentry_range_window: parseInt(draft.reentry_range_window || 60, 10),
+      reentry_min_wait_secs: Number(draft.reentry_min_wait_secs) || 30,
+      news_blackout_enabled: !!draft.news_blackout_enabled,
+      news_blackout_tier: parseInt(draft.news_blackout_tier || 2, 10),
+      microstructure_gate_enabled: !!draft.microstructure_gate_enabled,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }

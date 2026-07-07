@@ -671,13 +671,36 @@ class SwingTrader:
             return min(max(0, int(getattr(sc, "stop_loss_qty_custom", 0) or 0)), sellable_ceiling)
         return sellable_ceiling  # "all"
 
+    def _sleeve_effective_stop(self, sc, ss) -> float:
+        """Compute the effective stop-loss price. If ratchet is enabled AND
+        the position has cleared the activation profit threshold, returns
+        max(fixed_stop, HWM - ratchet_distance). Otherwise returns the fixed
+        stop. Always monotonic-up: once ratcheted higher, never drops."""
+        fixed_stop = float(sc.stop_loss_px or 0.0)
+        if not sc.stop_loss_ratchet_enabled:
+            return fixed_stop
+        if ss.stop_loss_hwm is None or ss.own_avg_entry is None:
+            return fixed_stop
+        # Ratchet only arms once unrealized/contract is above activation.
+        unrealized_per_contract = ss.stop_loss_hwm - float(ss.own_avg_entry)
+        if unrealized_per_contract < sc.stop_loss_ratchet_activation:
+            return fixed_stop
+        ratchet_stop = float(ss.stop_loss_hwm) - float(sc.stop_loss_ratchet_distance)
+        return max(fixed_stop, ratchet_stop)
+
     def _maybe_trigger_sleeve_stop_loss(self, sc, ss, last_price: float) -> bool:
-        """Per-sleeve stop-loss. Halts only this sleeve; other sleeves and the
-        primary keep running. Returns True when it fired."""
+        """Per-sleeve stop-loss. Fires either from fixed floor OR from a
+        ratcheted stop that walks up with the HWM to preserve gains. On
+        trigger: sells at market, then either reanchors (walks buy/sell to
+        bracket current price so sleeve keeps trading) or halts.
+
+        Also increments consecutive_stops; if that reaches
+        stop_loss_max_consecutive, halts anyway as a safety brake against
+        reanchor+stop chains during a bleeding market."""
         if not getattr(sc, "stop_loss_enabled", False):
             return False
-        trigger = float(getattr(sc, "stop_loss_px", 0.0) or 0.0)
-        if trigger <= 0 or last_price > trigger:
+        effective_stop = self._sleeve_effective_stop(sc, ss)
+        if effective_stop <= 0 or last_price > effective_stop:
             return False
         try:
             pos = int(self.b.position_qty() or 0)
@@ -687,14 +710,15 @@ class SwingTrader:
             return False
         if pos <= 0:
             self._sleeve_halt(sc, ss,
-                              f"stop-loss at {last_price} (≤ {trigger}) but position is 0")
+                              f"stop-loss at {last_price} (≤ {effective_stop}) but position is 0")
             return True
         to_sell = self._compute_sleeve_stop_loss_qty(sc, pos)
         if to_sell <= 0:
             self._sleeve_halt(sc, ss,
-                              f"stop-loss at {last_price} (≤ {trigger}) but core floor "
+                              f"stop-loss at {last_price} (≤ {effective_stop}) but core floor "
                               f"{self.cfg.core_qty} blocks the sell (pos={pos})")
             return True
+        was_ratcheted = effective_stop > float(sc.stop_loss_px or 0.0)
         try:
             source = getattr(self.b, "set_pending_source", None)
             if callable(source):
@@ -703,17 +727,140 @@ class SwingTrader:
             self._record(
                 "sleeve_stop_loss_triggered",
                 sleeve_id=sc.id, sleeve_name=sc.name,
-                price=last_price, trigger=trigger, sold=to_sell,
-                mode=sc.stop_loss_qty_mode, order_id=oid,
+                price=last_price, trigger=effective_stop,
+                ratcheted=was_ratcheted, hwm=ss.stop_loss_hwm,
+                sold=to_sell, mode=sc.stop_loss_qty_mode, order_id=oid,
                 position_before=pos, position_after=pos - to_sell,
             )
         except Exception as e:
             self._record("sleeve_stop_loss_sell_failed",
                          sleeve_id=sc.id, error=str(e),
-                         price=last_price, trigger=trigger)
+                         price=last_price, trigger=effective_stop)
+
+        # Post-trigger housekeeping.
+        ss.consecutive_stops = int(ss.consecutive_stops or 0) + 1
+        ss.stop_loss_hwm = None  # reset — no longer holding, HWM restarts on next buy
+        ss.own_avg_entry = None  # position now flat
+
+        # Safety brake: after N consecutive stops without a winner in between,
+        # halt regardless of reanchor/re-entry flags. Requires manual review.
+        max_consec = int(sc.stop_loss_max_consecutive or 0)
+        if max_consec > 0 and ss.consecutive_stops >= max_consec:
+            self._sleeve_halt(sc, ss,
+                              f"stop-loss: {ss.consecutive_stops} consecutive stops — halted for review")
+            return True
+
+        # Choose post-trigger behavior:
+        # 1. If reanchor_on_trigger: walk buy/sell to bracket current price,
+        #    stay ARMED_BUY so sleeve resumes trading at new level.
+        # 2. Else if reentry_mode == 'volatility': keep sleeve alive in a
+        #    "waiting for volatility contraction" state (reentry_pending).
+        # 3. Else: halt as before (fixed stop-loss with no auto-recovery).
+        if sc.stop_loss_reanchor_on_trigger:
+            spread = max(0.005, sc.sell_px - sc.buy_px)
+            new_buy = round(last_price - spread / 2, 3)
+            new_sell = round(last_price + spread / 2, 3)
+            self._reanchor_sleeve(sc, ss, new_buy, new_sell, last_price)
+            ss.state = SleeveStateEnum.ARMED_BUY
+            return True
+        if sc.reentry_mode == "volatility":
+            import time as _t
+            ss.reentry_pending = True
+            ss.reentry_stop_ts = _t.time()
+            ss.pre_stop_range = self._sleeve_recent_range(sc)
+            ss.state = SleeveStateEnum.ARMED_BUY
+            self._record("sleeve_reentry_pending",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         pre_stop_range=ss.pre_stop_range,
+                         waiting_for_contraction=sc.reentry_range_contraction)
+            return True
         self._sleeve_halt(sc, ss,
-                          f"stop-loss: sold {to_sell} @ market at {last_price} (trigger {trigger})")
+                          f"stop-loss: sold {to_sell} @ market at {last_price} (trigger {effective_stop})")
         return True
+
+    # ---- rolling price range for volatility detection ---------------------
+
+    def _sleeve_recent_range(self, sc) -> float:
+        """Peak-to-trough range of the last N ticks in this sleeve's price
+        history. Used both as the pre-stop baseline (captured at trigger
+        time) and post-stop to detect when volatility has contracted enough
+        to re-enter. Returns 0 if we don't have enough history yet."""
+        window = int(sc.reentry_range_window or 60)
+        history = self._sleeve_price_history.get(sc.id)
+        if not history:
+            return 0.0
+        recent = list(history)[-window:]
+        if len(recent) < 5:
+            return 0.0
+        return max(recent) - min(recent)
+
+    def _sleeve_track_price(self, sc, last_price: float) -> None:
+        """Append last_price to the sleeve's rolling window. Kept short so
+        memory is bounded — window * 4 keeps enough history for pre-stop
+        vs post-stop range comparison."""
+        from collections import deque as _deque
+        if sc.id not in self._sleeve_price_history:
+            self._sleeve_price_history[sc.id] = _deque(maxlen=int(sc.reentry_range_window or 60) * 4)
+        self._sleeve_price_history[sc.id].append(float(last_price))
+
+    def _maybe_trigger_sleeve_reentry(self, sc, ss, last_price: float) -> bool:
+        """Volatility-contraction re-entry after a stop. When current range
+        has contracted below pre_stop_range × contraction, place a market
+        buy to re-enter at the (lower) new price level. Also reanchors the
+        sleeve's buy/sell targets around the new market. Returns True if
+        it re-entered."""
+        if not ss.reentry_pending:
+            return False
+        if sc.reentry_mode != "volatility":
+            # Config changed under us — clear the pending flag and let normal
+            # arm logic take over.
+            ss.reentry_pending = False
+            return False
+        import time as _t
+        elapsed = _t.time() - (ss.reentry_stop_ts or 0)
+        if elapsed < float(sc.reentry_min_wait_secs or 30.0):
+            return False
+        current_range = self._sleeve_recent_range(sc)
+        pre_range = float(ss.pre_stop_range or 0.0)
+        # If we have no pre-stop baseline (edge case: reentry_pending set
+        # without proper capture), fall back to time-only trigger after 5×
+        # the min wait so the sleeve doesn't get stuck.
+        if pre_range <= 0:
+            if elapsed < float(sc.reentry_min_wait_secs or 30.0) * 5:
+                return False
+        else:
+            contraction_target = pre_range * float(sc.reentry_range_contraction or 0.5)
+            if current_range > contraction_target:
+                return False  # volatility hasn't contracted enough yet
+
+        # Reanchor to current price so the buy fires at market immediately.
+        spread = max(0.005, sc.sell_px - sc.buy_px)
+        new_buy = round(last_price - spread / 2, 3)
+        new_sell = round(last_price + spread / 2, 3)
+        self._reanchor_sleeve(sc, ss, new_buy, new_sell, last_price)
+        ss.reentry_pending = False
+        ss.reentry_stop_ts = None
+        self._record("sleeve_reentry_fired",
+                     sleeve_id=sc.id, sleeve_name=sc.name,
+                     elapsed_secs=elapsed, current_range=current_range,
+                     pre_stop_range=pre_range,
+                     new_buy=new_buy, new_sell=new_sell)
+        # Return False so normal arm logic runs on this same tick — the
+        # ARMED_BUY state machine will place the buy at new_buy_px.
+        return False
+
+    # ---- news blackout check ---------------------------------------------
+
+    def _sleeve_in_blackout(self, sc, ss) -> bool:
+        """True if the sleeve is currently inside a news-event blackout
+        window and should pause new arms. Tier 2+ = pause; tier 3 = also
+        exit any open position (handled separately)."""
+        if not sc.news_blackout_enabled:
+            return False
+        if ss.blackout_until_ts is None:
+            return False
+        import time as _t
+        return _t.time() < float(ss.blackout_until_ts)
 
     def _persist_sleeve_qty(self, sleeve_id: str, new_qty: int) -> None:
         """Write the grown qty back to the sleeves config so the next boot
@@ -922,10 +1069,31 @@ class SwingTrader:
         if ss.state == SleeveStateEnum.HALTED:
             return
 
-        # Per-sleeve stop-loss fires BEFORE the abort governor. Sells the
-        # configured qty at market then halts just this sleeve — other
-        # sleeves keep running.
+        # Track price for volatility signal & update HWM for ratcheting stop.
+        self._sleeve_track_price(sc, last_price)
+        if ss.state == SleeveStateEnum.ARMED_SELL:
+            try:
+                pos_now = int(self.b.position_qty() or 0)
+            except Exception:
+                pos_now = 0
+            if pos_now >= sc.qty:
+                if ss.stop_loss_hwm is None or last_price > ss.stop_loss_hwm:
+                    ss.stop_loss_hwm = last_price
+
+        # Per-sleeve stop-loss fires BEFORE the abort governor. May sell +
+        # reanchor (keep trading at new level) or sell + set reentry_pending
+        # (wait for volatility contraction) or sell + halt (fixed behavior).
         if self._maybe_trigger_sleeve_stop_loss(sc, ss, last_price):
+            return
+
+        # Volatility-contraction re-entry: after a stop set reentry_pending,
+        # this fires the reanchor when the market has calmed enough.
+        self._maybe_trigger_sleeve_reentry(sc, ss, last_price)
+
+        # News blackout: pause new arms during scheduled high-uncertainty
+        # windows (FOMC, CPI, NFP). Existing positions ride through unless
+        # tier 3 (which halts, handled elsewhere).
+        if self._sleeve_in_blackout(sc, ss):
             return
 
         # Abort governor uses the symbol-level bands.
@@ -1227,6 +1395,11 @@ class SwingTrader:
             ss.trail_armed = False
             ss.trail_high_water_price = 0.0
             ss.hybrid_sell_triggered_ts = None
+            # Winning cycle completed → reset the consecutive-stop counter
+            # (breaks any streak that was accumulating). Also clear the
+            # ratcheting HWM — next cycle starts fresh at the new basis.
+            ss.consecutive_stops = 0
+            ss.stop_loss_hwm = None
             self._record(
                 "sleeve_cycle_completed",
                 sleeve_id=sc.id, sleeve_name=sc.name,

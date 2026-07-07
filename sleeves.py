@@ -60,6 +60,57 @@ class SleeveConfig:
     stop_loss_qty_mode: str = "all"           # "all" | "original" | "custom"
     stop_loss_qty_custom: int = 0
 
+    # Ratcheting stop-loss (chandelier-style). Once unrealized/contract crosses
+    # ratchet_activation, the effective stop is max(stop_loss_px, HWM − ratchet_distance).
+    # Locks in gains as silver rises; never moves down. Independently toggled
+    # from the fixed stop_loss above.
+    stop_loss_ratchet_enabled: bool = False
+    stop_loss_ratchet_distance: float = 1.50  # $ below HWM
+    stop_loss_ratchet_activation: float = 0.50  # $/contract unrealized before ratchet arms
+
+    # Reanchor buy_px + sell_px to bracket current mark after the stop fires.
+    # Without this, the sleeve halts and requires manual Resume; with it, the
+    # sleeve keeps trading at the new price level (silver at $60 → buy $59.90,
+    # sell $60.10 instead of leaving the old $61.336 / $61.539 stranded).
+    stop_loss_reanchor_on_trigger: bool = False
+
+    # Safety cap: after N consecutive stop-out cycles without a winning
+    # round-trip in between, halt the sleeve for manual review. Protects
+    # against reanchor+stop chains during multi-day bleeds. 0 = unlimited.
+    stop_loss_max_consecutive: int = 0
+
+    # Signal-based re-entry after a stop-out (Van Tharp SafeZone / volatility
+    # contraction). Modes:
+    #   off        — no re-entry (sleeve halts, waits for manual Resume)
+    #   reanchor   — instant reanchor (matches stop_loss_reanchor_on_trigger)
+    #   volatility — wait for range to contract below contraction × pre-stop
+    #                range, then buy at market. Prevents chasing a still-
+    #                falling market.
+    reentry_mode: str = "off"                      # off | reanchor | volatility
+    reentry_range_contraction: float = 0.5         # current range < X × pre-stop range
+    reentry_range_window: int = 60                 # ticks in rolling range calc
+    reentry_min_wait_secs: float = 30.0            # earliest re-entry after stop
+
+    # Scale-in on re-entry (Livermore-style progressive entry):
+    #   stage 1: half qty at re-entry signal
+    #   stage 2: other half after price moves 0.5 × pre-stop-range in expected
+    #            direction (i.e., market confirms recovery)
+    reentry_scale_in: bool = False
+    reentry_second_half_move_pct: float = 0.5      # of pre-stop range
+
+    # News event blackout — pause new arms during scheduled high-uncertainty
+    # events. Tier levels: 0=off, 1=tighten only, 2=pause new arms hold
+    # existing, 3=full exit any position. Bot compares 'now' against
+    # blackout_windows (list of {start_ts, end_ts, tier} entries) written
+    # by the news calendar module.
+    news_blackout_enabled: bool = False
+    news_blackout_tier: int = 2  # default: pause new arms, hold existing
+
+    # Microstructure gates on sleeve arms. When true, sleeve consults the
+    # existing microstructure filter (OBI, VPIN, Kyle-λ) before arming. Uses
+    # whichever SWING_MS_* env vars are set on the bot.
+    microstructure_gate_enabled: bool = False
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -87,6 +138,20 @@ class SleeveConfig:
             stop_loss_px=float(d.get("stop_loss_px") or 0.0),
             stop_loss_qty_mode=str(d.get("stop_loss_qty_mode") or "all"),
             stop_loss_qty_custom=int(d.get("stop_loss_qty_custom") or 0),
+            stop_loss_ratchet_enabled=bool(d.get("stop_loss_ratchet_enabled") or False),
+            stop_loss_ratchet_distance=float(d.get("stop_loss_ratchet_distance") or 1.50),
+            stop_loss_ratchet_activation=float(d.get("stop_loss_ratchet_activation") or 0.50),
+            stop_loss_reanchor_on_trigger=bool(d.get("stop_loss_reanchor_on_trigger") or False),
+            stop_loss_max_consecutive=int(d.get("stop_loss_max_consecutive") or 0),
+            reentry_mode=str(d.get("reentry_mode") or "off"),
+            reentry_range_contraction=float(d.get("reentry_range_contraction") or 0.5),
+            reentry_range_window=int(d.get("reentry_range_window") or 60),
+            reentry_min_wait_secs=float(d.get("reentry_min_wait_secs") or 30.0),
+            reentry_scale_in=bool(d.get("reentry_scale_in") or False),
+            reentry_second_half_move_pct=float(d.get("reentry_second_half_move_pct") or 0.5),
+            news_blackout_enabled=bool(d.get("news_blackout_enabled") or False),
+            news_blackout_tier=int(d.get("news_blackout_tier") or 2),
+            microstructure_gate_enabled=bool(d.get("microstructure_gate_enabled") or False),
         )
 
 
@@ -127,6 +192,32 @@ class SleeveState:
     # fired vs abort band vs core-floor breach). Empty when running.
     halt_reason: Optional[str] = None
 
+    # Ratcheting stop-loss HWM — highest price seen while holding contracts.
+    # Reset when the sleeve fully exits (position → 0). Never moves down.
+    stop_loss_hwm: Optional[float] = None
+    # Number of stop-out cycles in a row without a completed winning cycle in
+    # between. Reset to 0 on a successful SELL fill at target.
+    consecutive_stops: int = 0
+
+    # Post-stop re-entry state — only used when reentry_mode = 'volatility'.
+    # reentry_pending = True while watching for volatility contraction after
+    # a stop fired. reentry_stop_ts records when the stop fired (used with
+    # reentry_min_wait_secs to prevent instant re-entry). pre_stop_range is
+    # the observed price range in the window BEFORE the stop, used as the
+    # baseline to detect contraction (current_range < pre_stop_range × X).
+    reentry_pending: bool = False
+    reentry_stop_ts: Optional[float] = None
+    pre_stop_range: float = 0.0
+    # Scale-in staging: 0 = not scaling, 1 = half in (bought half of qty),
+    # 2 = fully in. Only used when reentry_scale_in enabled.
+    reentry_scale_in_stage: int = 0
+    reentry_stage_1_price: Optional[float] = None  # for measuring the second-half trigger
+
+    # News blackout state — timestamp until which this sleeve is paused.
+    # None or 0 = not in blackout. If set, sleeve doesn't arm new orders
+    # until now > blackout_until_ts.
+    blackout_until_ts: Optional[float] = None
+
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
         return cls(
@@ -144,6 +235,14 @@ class SleeveState:
             current_qty=int(d.get("current_qty") or 0),
             own_avg_entry=d.get("own_avg_entry"),
             halt_reason=d.get("halt_reason"),
+            stop_loss_hwm=d.get("stop_loss_hwm"),
+            consecutive_stops=int(d.get("consecutive_stops") or 0),
+            reentry_pending=bool(d.get("reentry_pending") or False),
+            reentry_stop_ts=d.get("reentry_stop_ts"),
+            pre_stop_range=float(d.get("pre_stop_range") or 0.0),
+            reentry_scale_in_stage=int(d.get("reentry_scale_in_stage") or 0),
+            reentry_stage_1_price=d.get("reentry_stage_1_price"),
+            blackout_until_ts=d.get("blackout_until_ts"),
         )
 
     def to_dict(self) -> dict:
