@@ -2285,6 +2285,22 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       hybridDelay: 5,
       note: 'Takes the $10 target if silver just touches; if it pushes 10¢ past target, engages a $0.15 trailing stop and rides the breakout. Highest expected value across mixed regimes — the expert-recommended default.',
     },
+    'Expert enhanced ($10 swing — full stack)': {
+      // The full recipe from the expert-methodology discussion:
+      // moderate hybrid trail + accumulate + stop-loss + auto-reanchor.
+      // One preset toggles all four. Requires 2 contracts as the starting
+      // qty; accumulation grows it. Stop-loss $1.50 below the buy target
+      // (~2.5% for silver at $60); reanchor at $0.75 above buy.
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.15,
+      trailActivationOffset: 0.10,
+      hybridDelay: 5,
+      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
+      stopLoss: { enabled: true, price_below_buy: 1.5, qty_mode: 'all' },
+      reanchorThreshold: 0.75,
+      note: 'Full expert stack: moderate hybrid trail (rides breakouts) + accumulate (grows qty on wins, up to 2.5×) + stop-loss (protects on crashes, $1.50 below buy) + auto-reanchor (walks targets up if silver rises $0.75 past buy without a dip). Highest theoretical EV — backtest before deploying live.',
+    },
     'Custom': {
       exit_mode: 'fixed_limit',
       profitDollarsPerContract: 50,
@@ -2574,6 +2590,42 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       if (p.hybridDelay != null && hybridDelayEl) {
         hybridDelayEl.value = p.hybridDelay;
       }
+    }
+    // Accumulate toggle + fields — presets can enable pyramiding.
+    if (p.accumulate) {
+      const accEl = m.querySelector('#sl-accumulate');
+      const maxQtyEl = m.querySelector('#sl-max-qty');
+      const bufEl = m.querySelector('#sl-scale-buf');
+      const accFields = m.querySelector('#sl-accumulate-fields');
+      if (accEl) accEl.checked = !!p.accumulate.enabled;
+      if (accFields) accFields.hidden = !p.accumulate.enabled;
+      if (maxQtyEl && p.accumulate.max_qty_mult) {
+        maxQtyEl.value = Math.max(1, Math.round(qty * p.accumulate.max_qty_mult));
+      }
+      if (bufEl && p.accumulate.buffer_mult) {
+        bufEl.value = p.accumulate.buffer_mult;
+      }
+    }
+    // Stop-loss toggle + fields — presets can enable crash protection.
+    if (p.stopLoss) {
+      const slEl = m.querySelector('#sl-stoploss');
+      const slPxEl = m.querySelector('#sl-stop-px');
+      const slModeEl = m.querySelector('#sl-stop-mode');
+      const slFields = m.querySelector('#sl-stoploss-fields');
+      if (slEl) slEl.checked = !!p.stopLoss.enabled;
+      if (slFields) slFields.hidden = !p.stopLoss.enabled;
+      if (slPxEl && p.stopLoss.price_below_buy != null && buyTargetEl) {
+        const buyPx = Number(buyTargetEl.value) || 0;
+        slPxEl.value = Math.max(0, buyPx - p.stopLoss.price_below_buy).toFixed(2);
+      }
+      if (slModeEl && p.stopLoss.qty_mode) {
+        slModeEl.value = p.stopLoss.qty_mode;
+      }
+    }
+    // Reanchor threshold — no UI in the sleeve editor, but the save handler
+    // reads draft.reanchor_threshold. Mutate draft so it flows through.
+    if (p.reanchorThreshold != null) {
+      draft.reanchor_threshold = p.reanchorThreshold;
     }
     applyModeVisibility();
   }
