@@ -33,6 +33,12 @@ SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
 DATA_DIR = os.getenv("SWING_DATA_DIR", "data")
 LOOP_INTERVAL_SECS = float(os.getenv("SWING_LOOP_INTERVAL", "1.0"))
 FEED_READY_TIMEOUT = float(os.getenv("SWING_FEED_TIMEOUT", "15.0"))
+# Paper bot also serves the Lab tenant (dedicated $100k learning sandbox with
+# theory-based preset strategies — mean_reversion, momentum, Bollinger, etc.).
+# Disable by setting SWING_LAB_ENABLED=0 if you want to run the primary paper
+# tenant alone. Lab tenant name is auto-derived: "adam-paper" → "adam-lab".
+LAB_ENABLED = os.getenv("SWING_LAB_ENABLED", "1") == "1"
+LAB_BALANCE = float(os.getenv("SWING_LAB_BALANCE", "100000.0"))
 # When SWING_SYMBOL_FAMILY is set (e.g. "SLR", "AVE", "ETH"), the bot resolves
 # it to the current front-month contract for that family on startup. That way
 # a Coinbase auto-roll doesn't require an env var edit — the next redeploy
@@ -149,7 +155,12 @@ class _Track:
         else:
             _log(f"[{symbol}] paper starts flat")
 
-        self.ms = MicrostructureFilter() if symbol == SYMBOL else None
+        # Microstructure signals only run for the primary tenant's primary
+        # symbol so the lab tenant stays a clean testbed for theory strategies
+        # without the primary's HFT signal gating leaking in. Adding a Lab-only
+        # microstructure toggle is a follow-up if we want it.
+        is_primary_track = (symbol == SYMBOL and tenant == TENANT)
+        self.ms = MicrostructureFilter() if is_primary_track else None
         if self.ms and not self.ms.any_enabled():
             self.ms = None
 
@@ -223,23 +234,49 @@ def _discover_tracked_symbols(store, tenant: str, primary_symbol: str) -> list[s
     return [primary_symbol] + sorted(extras)
 
 
+def _derive_lab_tenant(paper_tenant: str) -> str:
+    """Convert a paper tenant name to its lab counterpart. adam-paper → adam-lab.
+    Anything else gets '-lab' appended so the naming stays predictable."""
+    if paper_tenant.endswith("-paper"):
+        return paper_tenant[: -len("-paper")] + "-lab"
+    return f"{paper_tenant}-lab"
+
+
+def _tenant_balance(tenant: str) -> float:
+    """Balance a tenant starts new tracks with. Lab uses $100k; other tenants
+    use SWING_PAPER_BALANCE."""
+    lab_tenant = _derive_lab_tenant(TENANT)
+    if tenant == lab_tenant:
+        return LAB_BALANCE
+    return float(os.getenv("SWING_PAPER_BALANCE", "100000.0"))
+
+
 def run_paper_mode() -> int:
-    """Live feed → PaperBroker → SwingTrader, per tracked symbol. Real market
-    prices, simulated fills. Safe: no path to Coinbase's order endpoint."""
+    """Live feed → PaperBroker → SwingTrader, per (tenant, symbol) tracked.
+    Real market prices, simulated fills. Safe: no path to Coinbase's order
+    endpoint. Serves the primary paper tenant plus the Lab tenant (auto-derived
+    from primary) so users can experiment with theory-based strategies in an
+    isolated $100k sandbox."""
     from safety import KillSwitch, make_trade_log
     from state_store import make_store
 
     global SYMBOL
     SYMBOL = _resolve_symbol(SYMBOL)
-    _log(f"paper mode: primary={SYMBOL}, tenant={TENANT}"
+
+    tenants: list[str] = [TENANT]
+    if LAB_ENABLED:
+        lab_tenant = _derive_lab_tenant(TENANT)
+        if lab_tenant != TENANT:
+            tenants.append(lab_tenant)
+    _log(f"paper mode: primary={SYMBOL}, tenants={tenants}"
          f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
 
     store = make_store(DATA_DIR)
     log = make_trade_log(DATA_DIR)
     _log(f"store backend: {type(store).__name__}, trade log: {type(log).__name__}")
-    ks = KillSwitch(store, TENANT)
 
-    starting_balance = float(os.getenv("SWING_PAPER_BALANCE", "100000.0"))
+    # One KillSwitch per tenant — pausing the lab shouldn't pause primary.
+    kill_switches: dict[str, "KillSwitch"] = {t: KillSwitch(store, t) for t in tenants}
 
     # Start backtest worker if Redis is wired. Dashboard pushes jobs onto a
     # queue; this thread runs them here (where Python + Coinbase creds live)
@@ -248,10 +285,10 @@ def run_paper_mode() -> int:
         import backtest_worker
         backtest_worker.start(os.getenv("REDIS_URL"))
 
-    initial_symbols = _discover_tracked_symbols(store, TENANT, SYMBOL)
-    _log(f"tracking {len(initial_symbols)} symbol(s) at boot: {initial_symbols}")
-
-    tracks: dict[str, _Track] = {}
+    # tracks keyed by (tenant, symbol) so multi-tenant + multi-symbol is a flat
+    # iteration in the main loop. Each track owns its own broker + trader +
+    # feed — no cross-tenant state sharing.
+    tracks: dict[tuple[str, str], _Track] = {}
     stopping = False
 
     def stop(*_):
@@ -262,28 +299,33 @@ def run_paper_mode() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    # Open a track for each initial symbol.
-    for sym in initial_symbols:
-        track = _Track(store, log, ks, TENANT, sym, starting_balance)
-        if track.start(FEED_READY_TIMEOUT):
-            tracks[sym] = track
-        else:
-            track.close()
+    # Seed initial tracks: for the primary tenant, use SYMBOL as the primary;
+    # for the lab tenant, use SYMBOL too so there's always at least one card
+    # visible in the lab on first boot. Both then pick up extras from the store.
+    for tenant in tenants:
+        balance = _tenant_balance(tenant)
+        initial_symbols = _discover_tracked_symbols(store, tenant, SYMBOL)
+        _log(f"[{tenant}] tracking {len(initial_symbols)} symbol(s) at boot: {initial_symbols}")
+        for sym in initial_symbols:
+            track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
+            if track.start(FEED_READY_TIMEOUT):
+                tracks[(tenant, sym)] = track
+            else:
+                track.close()
 
     if not tracks:
         _log("no tracks came up — check the WS or product_ids")
         return 1
 
-    # Mirror-live is opt-in and only ever applies to the primary symbol (real
-    # positions only exist there in the initial deploy scenario). Only fires
-    # when we start FLAT, i.e. no persisted paper state.
-    primary_track = tracks.get(SYMBOL)
+    # Mirror-live opt-in still only applies to the PRIMARY tenant's primary
+    # symbol — the lab is intentionally sandboxed away from real positions.
+    primary_track = tracks.get((TENANT, SYMBOL))
     if (primary_track and primary_track.broker.position.qty == 0
             and os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1"):
         _mirror_live_position_into_paper(primary_track.broker, SYMBOL)
 
-    log.record("bot_started", mode="paper", tenant=TENANT,
-               symbols=list(tracks.keys()), starting_balance=starting_balance)
+    log.record("bot_started", mode="paper", tenants=tenants,
+               tracks=[f"{t}:{s}" for (t, s) in tracks.keys()])
 
     try:
         snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
@@ -297,18 +339,21 @@ def run_paper_mode() -> int:
         while not stopping:
             now = time.time()
 
-            # Hot-add newly-tracked symbols (dashboard-driven). Cheap re-scan
-            # on an interval — new symbols come from user clicks on the
-            # scanner "Track this symbol" button.
+            # Hot-add newly-tracked symbols across ALL tenants — dashboard-added
+            # symbols come online without a restart. Runs across tenants so a
+            # user's "Track this symbol" click in the Lab tab picks up too.
             if now - last_discover >= symbol_discover_interval:
-                current = set(_discover_tracked_symbols(store, TENANT, SYMBOL))
-                for sym in current - set(tracks):
-                    _log(f"hot-adding new tracked symbol: {sym}")
-                    track = _Track(store, log, ks, TENANT, sym, starting_balance)
-                    if track.start(FEED_READY_TIMEOUT):
-                        tracks[sym] = track
-                    else:
-                        track.close()
+                for tenant in tenants:
+                    current = set(_discover_tracked_symbols(store, tenant, SYMBOL))
+                    existing = {s for (t, s) in tracks if t == tenant}
+                    balance = _tenant_balance(tenant)
+                    for sym in current - existing:
+                        _log(f"[{tenant}] hot-adding new tracked symbol: {sym}")
+                        track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
+                        if track.start(FEED_READY_TIMEOUT):
+                            tracks[(tenant, sym)] = track
+                        else:
+                            track.close()
                 last_discover = now
 
             for track in list(tracks.values()):
@@ -333,9 +378,9 @@ def run_paper_mode() -> int:
     finally:
         for track in tracks.values():
             track.close()
-        log.record("bot_stopped", mode="paper", symbols=list(tracks.keys()))
-        for sym, track in tracks.items():
-            _log(f"[{sym}] final: {track.broker.snapshot()}")
+        log.record("bot_stopped", mode="paper", tracks=[f"{t}:{s}" for (t, s) in tracks.keys()])
+        for (tenant, sym), track in tracks.items():
+            _log(f"[{tenant}/{sym}] final: {track.broker.snapshot()}")
     return 0
 
 

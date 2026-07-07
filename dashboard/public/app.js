@@ -179,6 +179,34 @@ function assetClassOf(symbol) {
   return 'other';
 }
 
+// Human-readable label for a product_id. SLR-27AUG26-CDE → "SILVER (SLR)",
+// AVE-20DEC30-CDE → "AVALANCHE (AVE)", BTC-PERP-INTX → "BITCOIN (BTC)". The
+// display in the price bar was previously hardcoded to "SILVER (SLR)" so ANY
+// tracked symbol would falsely read as silver — including AVE at $91, which is
+// how this bug was found. Falls back to the raw family code if we don't have
+// a friendly name yet.
+const SYMBOL_FAMILY_NAMES = {
+  SLR: 'SILVER', SIL: 'SILVER',
+  GC: 'GOLD', GOLD: 'GOLD',
+  PA: 'PALLADIUM', PL: 'PLATINUM',
+  HG: 'COPPER', COPPER: 'COPPER',
+  CL: 'CRUDE OIL', NG: 'NATURAL GAS', BZ: 'BRENT',
+  BTC: 'BITCOIN', ETH: 'ETHEREUM', SOL: 'SOLANA', LTC: 'LITECOIN',
+  XRP: 'RIPPLE', BCH: 'BITCOIN CASH', AVE: 'AVALANCHE', DOGE: 'DOGECOIN',
+  LINK: 'CHAINLINK', UNI: 'UNISWAP', MATIC: 'POLYGON',
+  ES: 'S&P 500', NQ: 'NASDAQ', YM: 'DOW', RTY: 'RUSSELL',
+};
+function symbolFamilyOf(symbol) {
+  if (!symbol) return '';
+  if (symbol.includes('-PERP-')) return symbol.split('-PERP-')[0];
+  return symbol.split('-')[0] || '';
+}
+function symbolLabel(symbol) {
+  const fam = symbolFamilyOf(symbol);
+  const friendly = SYMBOL_FAMILY_NAMES[fam.toUpperCase()];
+  return friendly ? `${friendly} (${fam})` : fam || symbol;
+}
+
 function iconForAssetClass(c) {
   return { metals: '⚪', energy: '⛽', crypto: '₿', equity: '📈', other: '📊' }[c] || '📊';
 }
@@ -1172,7 +1200,7 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
   const priceBar = mkt > 0 ? `
     <div class="section-price-bar">
       <div class="section-price-side">
-        <span class="section-price-label">SILVER (SLR)</span>
+        <span class="section-price-label">${escapeHtml(symbolLabel(symbol))}</span>
       </div>
       <div class="section-price-mark-wrap">
         <span class="section-price-mark">$${fmtNum(mkt, 3)}</span>
@@ -1237,9 +1265,10 @@ function renderTargetsRow(config, snapshot) {
          <span class="mark-range-item"><span class="mark-range-label">Day high</span><span class="mark-range-val pos">$${fmtNum(dayHigh, 3)}</span></span>
          <span class="mark-range-item"><span class="mark-range-label">Day low</span><span class="mark-range-val neg">$${fmtNum(dayLow, 3)}</span></span>
        </div>` : '';
+  const label = symbolLabel(snapshot?.product_id || '') + ' market';
   return `
     <div class="mark-row">
-      <div class="mark-label">Silver market</div>
+      <div class="mark-label">${escapeHtml(label)}</div>
       <div class="mark-value">$${fmtNum(mark, 3)}</div>
       <div class="mark-sub">bid $${fmtNum(snapshot.best_bid, 3)} · ask $${fmtNum(snapshot.best_ask, 3)}</div>
       ${rangeHtml}
@@ -2568,7 +2597,7 @@ function openTradeModal(tenant, symbol, side) {
   tradeModalBody.innerHTML = `
     <div style="line-height:1.7; color: var(--muted); font-size: 14px;">
       <div>${holdLine}</div>
-      <div>Silver market now: <b style="color:var(--text)">$${fmtNum(mark, 3)}</b> — bid $${fmtNum(snap.best_bid, 3)} / ask $${fmtNum(snap.best_ask, 3)}</div>
+      <div>${escapeHtml(symbolLabel(symbol))} market now: <b style="color:var(--text)">$${fmtNum(mark, 3)}</b> — bid $${fmtNum(snap.best_bid, 3)} / ask $${fmtNum(snap.best_ask, 3)}</div>
     </div>
   `;
 
