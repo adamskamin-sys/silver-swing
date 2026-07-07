@@ -361,7 +361,18 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 #sleeve-modal .modal-panel {
   max-width: 1000px;
   min-width: 780px;
+  max-height: 95vh;
+  padding: 20px 24px;
 }
+/* Compact the sleeve editor's internal sections so the accumulate block +
+   preview both fit above the fold on a standard laptop viewport. */
+#sleeve-modal .sleeve-anchor { padding: 10px 14px; margin-bottom: 10px; }
+#sleeve-modal .sleeve-form { gap: 10px; margin: 8px 0; }
+#sleeve-modal .preset-note { margin: 6px 0 10px; }
+#sleeve-modal .target-inputs { margin: 8px 0; }
+#sleeve-modal .profit-slider-block { padding: 12px 14px; margin: 10px 0; }
+#sleeve-modal .accumulate-block { margin-top: 10px; padding: 10px 14px; }
+#sleeve-modal .sleeve-preview { padding: 10px 14px; margin: 10px 0; }
 
 .modal-header {
   display: flex; justify-content: space-between; align-items: center;

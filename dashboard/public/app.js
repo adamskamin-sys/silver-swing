@@ -2067,7 +2067,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
             <div class="sleeve-anchor-label">${anchorLabel}</div>
             <div class="sleeve-anchor-value">$${fmtNum(anchor, 3)}</div>
           </div>
-          ${anchorStale ? `<button type="button" class="small ghost" id="sl-reset-anchor">use market instead ($${fmtNum(mark, 3)})</button>` : ''}
+          <button type="button" class="small ghost" id="sl-reset-anchor">use current market ($${fmtNum(mark, 3)})</button>
         </div>
         <div class="sleeve-anchor-sub">
           Market is at $${fmtNum(mark, 3)}${anchorStale ? ` — <span class="stale-warn">anchor is $${fmtNum(anchorToMarketDist, 3)} away, targets below may be off-market</span>` : ''}
@@ -2363,7 +2363,18 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
   buyTargetEl.addEventListener('input', updatePreview);
   if (trailActivationEl) trailActivationEl.addEventListener('input', updatePreview);
   if (hybridDelayEl) hybridDelayEl.addEventListener('input', updatePreview);
-  if (resetAnchorBtn) resetAnchorBtn.onclick = () => { currentAnchor = mark; syncTargetsFromSlider(); updatePreview(); };
+  if (resetAnchorBtn) resetAnchorBtn.onclick = () => {
+    currentAnchor = mark;
+    // Update the visible anchor block to reflect the switch. Otherwise the
+    // top of the modal still reads "Anchored to strategy's original entry"
+    // even though the math has moved.
+    const anchorValEl = m.querySelector('.sleeve-anchor-value');
+    const anchorLabelEl = m.querySelector('.sleeve-anchor-label');
+    if (anchorValEl) anchorValEl.textContent = '$' + fmtNum(mark, 3);
+    if (anchorLabelEl) anchorLabelEl.textContent = 'Anchored to current market';
+    syncTargetsFromSlider();
+    updatePreview();
+  };
 
   // Initial state
   if (!existing) applyPreset(presetEl.value);
