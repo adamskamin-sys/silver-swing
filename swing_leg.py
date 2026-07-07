@@ -280,6 +280,11 @@ class SwingTrader:
     # ---- floor guard -----------------------------------------------------
 
     def _floor_ok(self, position: int, sell_qty: int) -> bool:
+        # core_qty <= 0 means no protected core to defend — shorts allowed.
+        # Lab tenant defaults to core=0 so every sleeve can open its first
+        # cycle by shorting, without needing a seeded long position.
+        if self.cfg.core_qty <= 0:
+            return True
         return position - sell_qty >= self.cfg.core_qty
 
     # ---- kill switch -----------------------------------------------------
@@ -1169,10 +1174,11 @@ class SwingTrader:
         if not ss.live_order_id:
             if ss.state == SleeveStateEnum.ARMED_SELL:
                 # Floor guard: sum of all pending sells (primary + sleeves) + this sleeve
-                # must not take the position below core_qty.
+                # must not take the position below core_qty. Skipped when core_qty <= 0
+                # (Lab tenant / paper account with no core to defend) so sleeves can short.
                 pos = self.b.position_qty()
                 pending = self._pending_sell_qty_excluding(sc.id)
-                if pos - pending - sc.qty < self.cfg.core_qty:
+                if not self._floor_ok(pos - pending, sc.qty):
                     # Transient — try again next tick when more contracts free up.
                     self._record(
                         "sleeve_arm_skipped",
