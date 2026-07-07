@@ -85,6 +85,17 @@ class SwingConfig:
     reanchor_threshold: float = 2.0         # if trailing exit fills > this above sell_px, re-anchor
     tick_size: float = 0.005                # per-instrument (needed for trail-stop fill price)
 
+    # Stop-loss: fires BEFORE abort_below. abort_below just halts (position
+    # keeps bleeding); stop-loss sells first, then halts. Modes for the sell
+    # quantity are exposed so the user can pick between "flatten to core"
+    # (safest during a crash) and "sell only the original swing size, let
+    # accumulated contracts ride" (bet on rebound). Set stop_loss_enabled=False
+    # to disable entirely — abort_below still catches the crash as fallback.
+    stop_loss_enabled: bool = False
+    stop_loss_px: float = 0.0
+    stop_loss_qty_mode: str = "all"         # "all" | "original" | "custom"
+    stop_loss_qty_custom: int = 0           # only read when mode == "custom"
+
 
 @dataclass
 class SwingState:
@@ -566,6 +577,82 @@ class SwingTrader:
             )
             self._save_state()
 
+    # ---- stop-loss -------------------------------------------------------
+
+    def _compute_stop_loss_qty(self, position_qty: int) -> int:
+        """How many contracts to sell on stop-loss trigger. Always respects
+        the core floor — never sells contracts that would take the position
+        below core_qty. Returns 0 when there's nothing sellable."""
+        core = int(self.cfg.core_qty or 0)
+        sellable_ceiling = max(0, position_qty - core)
+        if sellable_ceiling == 0:
+            return 0
+        mode = (self.cfg.stop_loss_qty_mode or "all").lower()
+        if mode == "all":
+            return sellable_ceiling
+        if mode == "original":
+            # Fall back to swing_qty from config (the STARTING size, not the
+            # possibly-scaled-up state.swing_qty). This is what "just the
+            # original strategy contracts, let accumulated ride" means.
+            return min(int(self.cfg.swing_qty or 0), sellable_ceiling)
+        if mode == "custom":
+            return min(max(0, int(self.cfg.stop_loss_qty_custom or 0)), sellable_ceiling)
+        # Unknown mode = safest default (flatten). Beats silently ignoring the
+        # protection the user turned on.
+        return sellable_ceiling
+
+    def _maybe_trigger_stop_loss(self, last_price: float) -> bool:
+        """If stop-loss is enabled and price fell to/below the trigger, sell
+        the configured qty at market and halt. Returns True when it fired
+        (caller should stop stepping)."""
+        if not getattr(self.cfg, "stop_loss_enabled", False):
+            return False
+        trigger = float(getattr(self.cfg, "stop_loss_px", 0.0) or 0.0)
+        if trigger <= 0 or last_price > trigger:
+            return False
+        try:
+            pos = int(self.b.position_qty() or 0)
+        except Exception as e:
+            self._record("stop_loss_read_position_failed", error=str(e))
+            return False
+        if pos <= 0:
+            # Nothing to sell — just halt so we stop opening new positions
+            # once the crash has already flattened us via some other path.
+            self._halt(f"stop-loss triggered at {last_price} (price ≤ {trigger}) but position is 0")
+            return True
+        to_sell = self._compute_stop_loss_qty(pos)
+        if to_sell <= 0:
+            self._halt(
+                f"stop-loss triggered at {last_price} (price ≤ {trigger}) but "
+                f"core floor {self.cfg.core_qty} blocks the sell (pos={pos})"
+            )
+            return True
+        try:
+            source = getattr(self.b, "set_pending_source", None)
+            if callable(source):
+                source("stop_loss")
+            oid = self.b.place_market("SELL", to_sell)
+            self._record(
+                "stop_loss_triggered",
+                price=last_price, trigger=trigger, sold=to_sell,
+                mode=self.cfg.stop_loss_qty_mode, order_id=oid,
+                position_before=pos, position_after=pos - to_sell,
+            )
+            if self.notifier is not None:
+                try:
+                    from alerting import Priority
+                    self.notifier.send(
+                        "stop_loss_triggered",
+                        f"symbol={self.symbol} price={last_price} sold={to_sell} @ market",
+                        Priority.HIGH,
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            self._record("stop_loss_sell_failed", error=str(e), price=last_price, trigger=trigger)
+        self._halt(f"stop-loss: sold {to_sell} @ market at {last_price} (trigger {trigger})")
+        return True
+
     # ---- main loop -------------------------------------------------------
 
     def step(self, last_price: float) -> None:
@@ -596,6 +683,11 @@ class SwingTrader:
         # Refresh config from store — dashboard edits take effect next cycle.
         cfg = self._load_config()
         self.cfg = cfg
+
+        # Stop-loss fires BEFORE abort_below so we sell first, then halt.
+        # abort_below on its own would halt while the position keeps bleeding.
+        if self._maybe_trigger_stop_loss(last_price):
+            return
 
         if self.s.state == State.ARMED_SELL and last_price >= self.cfg.abort_above:
             return self._halt(

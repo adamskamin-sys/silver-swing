@@ -1409,6 +1409,22 @@ const CONFIG_SECTIONS = [
     ],
   },
   {
+    title: 'Stop-loss (protects during a crash)',
+    fields: [
+      ['stop_loss_enabled', 'Enable stop-loss', 'checkbox', {}],
+      ['stop_loss_px', 'Trigger price — sell when price falls to ($)', 'number', { step: 0.01 }],
+      ['stop_loss_qty_mode', 'Sell how many', 'select', {
+        options: ['all', 'original', 'custom'],
+        labels: {
+          all: 'all (flatten everything above core)',
+          original: 'only the original swing size (let accumulated ride)',
+          custom: 'custom number',
+        },
+      }],
+      ['stop_loss_qty_custom', 'Custom qty (only if mode=custom)', 'number', { step: 1, min: 1 }],
+    ],
+  },
+  {
     title: 'Costs & margin  (advanced)',
     advanced: true,
     fields: [
@@ -1510,10 +1526,17 @@ function openConfigEditor(tenant, symbol) {
         input.name = key;
         for (const o of opts.options) {
           const opt = document.createElement('option');
-          opt.value = o; opt.textContent = o;
+          opt.value = o;
+          opt.textContent = (opts.labels && opts.labels[o]) || o;
           if (String(cfg[key] || '') === o) opt.selected = true;
           input.appendChild(opt);
         }
+      } else if (type === 'checkbox') {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        input.name = key;
+        input.checked = !!cfg[key];
+        wrap.classList.add('checkbox-row');
       } else {
         input = document.createElement('input');
         input.type = type;
@@ -1591,6 +1614,10 @@ async function saveConfig() {
     for (const [key, , type] of section.fields) {
       const input = configForm.querySelector(`[name="${key}"]`);
       if (!input) continue;
+      if (type === 'checkbox') {
+        cfg[key] = !!input.checked;
+        continue;
+      }
       let val = input.value;
       if (val === '' || val === null || val === undefined) continue;
       if (type === 'number') val = Number(val);

@@ -340,3 +340,98 @@ def test_safety_reconcile_works_against_paper_broker(tmp_path):
     assert result.ok
     bad = safety_reconcile(broker, believed_position=99)
     assert not bad.ok
+
+
+# ---- stop-loss --------------------------------------------------------------
+
+def _config_with_stop_loss(mode, custom=0, trigger=60.0, core=10):
+    cfg = default_config_dict()
+    cfg["core_qty"] = core
+    cfg["stop_loss_enabled"] = True
+    cfg["stop_loss_px"] = trigger
+    cfg["stop_loss_qty_mode"] = mode
+    cfg["stop_loss_qty_custom"] = custom
+    return cfg
+
+
+def test_stop_loss_all_sells_everything_above_core(tmp_path):
+    """Mode=all: liquidate down to the core floor, then halt."""
+    trader, broker, _, _, _ = make_trader(
+        tmp_path, config=_config_with_stop_loss("all", core=10),
+    )
+    trader.reconcile()
+    # Simulate a crash: price falls below the trigger
+    broker.tick(59.99, 59.99)
+    trader.step(59.99)
+    assert trader.s.state == State.HALTED
+    assert "stop-loss" in (trader.s.halt_reason or "").lower()
+    # 12 held − 10 core = 2 sellable, all sold
+    assert broker.position.qty == 10
+
+
+def test_stop_loss_original_sells_only_starting_swing_size(tmp_path):
+    """Mode=original: sell cfg.swing_qty (2 in default), leave accumulated ride.
+    Set up: hold 15 contracts with core 10, so 5 above core; only 2 should be sold."""
+    cfg = _config_with_stop_loss("original", core=10)
+    cfg["swing_qty"] = 2  # the starting swing size
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    # Fresh broker: preload 15 held so we have room to leave 3 accumulated riding
+    broker2 = make_paper_broker()
+    preload_position(broker2, 15, 58.44)
+    trader.b = broker2
+    trader.reconcile()
+    broker2.tick(59.99, 59.99)
+    trader.step(59.99)
+    assert trader.s.state == State.HALTED
+    # 15 − 2 (original swing) = 13 remaining
+    assert broker2.position.qty == 13
+
+
+def test_stop_loss_custom_sells_configured_qty(tmp_path):
+    """Mode=custom: sell exactly the custom qty, respecting the core floor."""
+    cfg = _config_with_stop_loss("custom", custom=3, core=8)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(59.99, 59.99)
+    trader.step(59.99)
+    assert trader.s.state == State.HALTED
+    # 12 − 3 = 9 remaining (custom respected, and 9 > core 8 so floor didn't cap it)
+    assert broker.position.qty == 9
+
+
+def test_stop_loss_respects_core_floor(tmp_path):
+    """Custom qty larger than pos − core: capped so we never breach core."""
+    cfg = _config_with_stop_loss("custom", custom=100, core=10)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(59.99, 59.99)
+    trader.step(59.99)
+    assert trader.s.state == State.HALTED
+    assert broker.position.qty == 10  # never below core
+
+
+def test_stop_loss_disabled_does_nothing(tmp_path):
+    """With enabled=False, the trigger price is irrelevant."""
+    cfg = default_config_dict()
+    cfg["stop_loss_enabled"] = False
+    cfg["stop_loss_px"] = 63.0  # above current — would trigger if enabled
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(59.99, 59.99)
+    trader.step(59.99)
+    # abort_below in the default config is 60.0; 59.99 < 60 would normally halt
+    # but only if state == ARMED_BUY. Position is 12 above core 10 so state
+    # after reconcile is ARMED_SELL — abort_below doesn't apply here.
+    # Key assertion: no forced sell happened
+    assert broker.position.qty == 12
+
+
+def test_stop_loss_only_fires_at_or_below_trigger(tmp_path):
+    """Price still above trigger → no fire."""
+    cfg = _config_with_stop_loss("all", trigger=60.0, core=10)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(60.50, 60.50)  # above 60
+    trader.step(60.50)
+    assert trader.s.state != State.HALTED or "stop-loss" not in (trader.s.halt_reason or "").lower()
+    assert broker.position.qty == 12

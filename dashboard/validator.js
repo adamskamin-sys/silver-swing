@@ -101,5 +101,25 @@ export function validateConfig(cfg = {}) {
   if (reanchor_threshold !== null && reanchor_threshold < 0)
     issues.push({ field: 'reanchor_threshold', message: 'reanchor_threshold cannot be negative' });
 
+  // Stop-loss (optional). Only enforced when enabled — else fields are ignored.
+  if (cfg.stop_loss_enabled) {
+    const sl_px = num(cfg, 'stop_loss_px', issues, true);
+    if (sl_px !== null && sl_px <= 0)
+      issues.push({ field: 'stop_loss_px', message: 'stop_loss_px must be > 0' });
+    if (sl_px !== null && buy_px !== null && sl_px >= buy_px)
+      issues.push({
+        field: 'stop_loss_px',
+        message: `stop_loss_px (${sl_px}) should be < buy_px (${buy_px}); otherwise it fires as soon as you're armed`,
+      });
+    const sl_mode = String(cfg.stop_loss_qty_mode || 'all').toLowerCase();
+    if (!['all', 'original', 'custom'].includes(sl_mode))
+      issues.push({ field: 'stop_loss_qty_mode', message: `stop_loss_qty_mode must be one of all|original|custom, got ${JSON.stringify(sl_mode)}` });
+    if (sl_mode === 'custom') {
+      const sl_qty = int(cfg, 'stop_loss_qty_custom', issues, true);
+      if (sl_qty !== null && sl_qty < 1)
+        issues.push({ field: 'stop_loss_qty_custom', message: 'stop_loss_qty_custom must be >= 1 when mode is custom' });
+    }
+  }
+
   return { ok: issues.length === 0, issues };
 }

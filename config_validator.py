@@ -166,6 +166,36 @@ def validate_config(cfg: dict) -> ValidationResult:
     if reanchor_threshold is not None and reanchor_threshold < 0:
         issues.append(ValidationIssue("reanchor_threshold", "reanchor_threshold cannot be negative"))
 
+    # Stop-loss (optional). Only enforced when enabled — otherwise the fields
+    # are ignored and the config still validates.
+    sl_enabled = bool(cfg.get("stop_loss_enabled"))
+    if sl_enabled:
+        sl_px = _get_num(cfg, "stop_loss_px", issues, required=True)
+        if sl_px is not None and sl_px <= 0:
+            issues.append(ValidationIssue("stop_loss_px", "stop_loss_px must be > 0"))
+        # stop-loss should sit BELOW the entry range or the trigger fires
+        # immediately every tick and defeats the strategy. Warn but don't
+        # block if it's above buy_px — user might be trying a tight trailing
+        # protection intentionally.
+        if sl_px is not None and buy_px is not None and sl_px >= buy_px:
+            issues.append(ValidationIssue(
+                "stop_loss_px",
+                f"stop_loss_px ({sl_px}) should be < buy_px ({buy_px}); otherwise it fires as soon as you're armed",
+            ))
+        sl_mode = str(cfg.get("stop_loss_qty_mode") or "all").lower()
+        if sl_mode not in {"all", "original", "custom"}:
+            issues.append(ValidationIssue(
+                "stop_loss_qty_mode",
+                f"stop_loss_qty_mode must be one of all|original|custom, got {sl_mode!r}",
+            ))
+        if sl_mode == "custom":
+            sl_qty = _get_int(cfg, "stop_loss_qty_custom", issues, required=True)
+            if sl_qty is not None and sl_qty < 1:
+                issues.append(ValidationIssue(
+                    "stop_loss_qty_custom",
+                    "stop_loss_qty_custom must be >= 1 when mode is custom",
+                ))
+
     return ValidationResult(ok=len(issues) == 0, issues=issues)
 
 
