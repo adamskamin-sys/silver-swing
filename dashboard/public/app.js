@@ -508,19 +508,22 @@ function renderCard(tenant, symbol, { config, state, snapshot }) {
       </div>
     </div>
 
-    <div class="card-body">
-      ${renderTargetsRow(c, snap)}
-      ${renderContractInfo(symbol, c, snap)}
-      ${renderPositionBar(s, c, snap)}
-      ${renderLotsTable(snap, c, tenant, symbol, s)}
-      ${renderRiskStrip(snap)}
-      ${renderMicrostructurePanel(snap)}
-      ${renderSleevesSection(tenant, symbol, c, s, snap)}
+    <div class="card-body card-body-split">
+      <div class="card-main">
+        ${renderTargetsRow(c, snap)}
+        ${renderSleevesSection(tenant, symbol, c, s, snap)}
+        ${renderLotsTable(snap, c, tenant, symbol, s)}
+        ${renderRiskStrip(snap)}
+        ${renderMicrostructurePanel(snap)}
+      </div>
+      <aside class="card-sidebar">
+        ${renderTradeSidebar(tenant, symbol, s, c, snap)}
+        ${renderContractInfo(symbol, c, snap)}
+        ${renderPositionBar(s, c, snap)}
+      </aside>
     </div>
 
     <div class="card-actions">
-      <button class="primary" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="BUY">Buy at market</button>
-      <button class="danger" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="SELL">Sell at market</button>
       <button data-action="backtest" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">Backtest</button>
       <button data-action="explain" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-name="${escapeHtml(c.exit_mode || 'fixed_limit')}">Strategy</button>
       <button class="ghost" data-action="edit" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}">Settings</button>
@@ -1292,6 +1295,35 @@ function lotAge(ts) {
   if (age < 3600) return `${(age / 60).toFixed(0)}m`;
   if (age < 86400) return `${(age / 3600).toFixed(1)}h`;
   return `${(age / 86400).toFixed(1)}d`;
+}
+
+// Coinbase-Advanced-style trade sidebar: Buy/Sell tab strip → market/limit
+// toggle → qty + preview → confirm. Sits in the right column of the card so
+// manual trades are always one click away without opening a modal.
+function renderTradeSidebar(tenant, symbol, state, config, snap) {
+  const mark = Number(snap?.last_mark) || 0;
+  const bid = Number(snap?.best_bid);
+  const ask = Number(snap?.best_ask);
+  const pos = Number(snap?.position_qty) || 0;
+  return `
+    <div class="trade-sidebar">
+      <div class="trade-sidebar-header">
+        <div class="trade-sidebar-title">Trade</div>
+        <div class="trade-sidebar-price">
+          <span class="trade-sidebar-mark">$${fmtPrice(mark, config)}</span>
+          ${Number.isFinite(bid) && Number.isFinite(ask) ? `<span class="trade-sidebar-book">bid $${fmtPrice(bid, config)} · ask $${fmtPrice(ask, config)}</span>` : ''}
+        </div>
+      </div>
+      <div class="trade-sidebar-tabs">
+        <button class="trade-sidebar-tab primary" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="BUY">Buy</button>
+        <button class="trade-sidebar-tab danger" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="SELL"${pos < 1 ? ' disabled' : ''}>Sell</button>
+      </div>
+      <div class="trade-sidebar-hint">
+        ${pos === 0
+          ? 'You hold 0 contracts. Buy to open a position, then add strategies to manage it.'
+          : `You hold <b>${pos}</b> contract${pos === 1 ? '' : 's'}. Click Buy/Sell to open the order form (market or limit).`}
+      </div>
+    </div>`;
 }
 
 // Contract-info strip: the spec sheet for a tracked product. Coinbase shows

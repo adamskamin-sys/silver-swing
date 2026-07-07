@@ -1,22 +1,23 @@
 :root {
-  /* Palette — quieter, more Coinbase-ish. Less contrast in secondary text,
-     accent used sparingly. */
-  --bg: #0b0d10;
-  --panel: #14171c;
-  --panel-2: #1a1e24;
-  --panel-3: #232830;
-  --border: #23292f;
-  --border-soft: #1c2026;
+  /* Coinbase Advanced palette — dark tokens matching their trade UI:
+     #0a0b0d background, subtle panel tints, their signature blue (#1652f0)
+     for interactive, their green/red for gains/losses. */
+  --bg: #0a0b0d;
+  --panel: #16171d;
+  --panel-2: #1c1e26;
+  --panel-3: #25272f;
+  --border: #2a2d36;
+  --border-soft: #1f2129;
   --text: #ffffff;
-  --muted: #8b93a1;
-  --dim: #5a6270;
+  --muted: #7f838e;
+  --dim: #4e5259;
   --good: #05b169;
-  --bad: #f04438;
-  --warn: #f59e0b;
-  --accent: #4a86ff;
+  --bad: #cf202f;
+  --warn: #f5a623;
+  --accent: #1652f0;
   --accent-2: #7c3aed;
   --core-shade: rgba(5, 177, 105, 0.10);
-  --swing-shade: rgba(74, 134, 255, 0.14);
+  --swing-shade: rgba(22, 82, 240, 0.12);
 
   /* Spacing scale — 4pt base, everything is a multiple. Kills the current
      mix of 6/10/12/14/16/20/24 that gave the UI a jittery rhythm. */
@@ -289,8 +290,61 @@ input:focus, select:focus {
 }
 .hero-value-sub .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
-/* BODY — details in progressive disclosure */
+/* BODY — Coinbase-Advanced-style split: main content left, sidebar right.
+   Sidebar collapses under the main on narrow viewports so nothing scrolls. */
 .card-body { padding: var(--s5) var(--s6) var(--s6); }
+.card-body-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: var(--s5);
+}
+.card-main { min-width: 0; }
+.card-sidebar { min-width: 0; display: flex; flex-direction: column; gap: var(--s3); }
+@media (max-width: 1100px) {
+  .card-body-split { grid-template-columns: 1fr; }
+}
+
+/* Trade sidebar — Coinbase Advanced's buy/sell panel in miniature. */
+.trade-sidebar {
+  background: var(--panel-2);
+  border-radius: var(--r-md);
+  padding: var(--s4);
+}
+.trade-sidebar-header { margin-bottom: var(--s3); }
+.trade-sidebar-title {
+  font-size: var(--fs-xs); color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
+  margin-bottom: var(--s1);
+}
+.trade-sidebar-price { display: flex; flex-direction: column; gap: var(--s1); }
+.trade-sidebar-mark {
+  font-family: var(--mono); font-size: 22px; font-weight: 600;
+  color: var(--text); font-variant-numeric: tabular-nums;
+  letter-spacing: -0.3px;
+}
+.trade-sidebar-book {
+  font-family: var(--mono); font-size: var(--fs-xs);
+  color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.trade-sidebar-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s2); }
+.trade-sidebar-tab {
+  padding: var(--s3) var(--s4);
+  font-weight: 600;
+  font-size: var(--fs-body);
+}
+.trade-sidebar-tab.primary { background: var(--good); color: white; border-color: var(--good); }
+.trade-sidebar-tab.primary:hover { filter: brightness(1.05); background: var(--good); }
+.trade-sidebar-tab.danger { background: var(--bad); color: white; border-color: var(--bad); }
+.trade-sidebar-tab.danger:hover { filter: brightness(1.05); background: var(--bad); }
+.trade-sidebar-tab:disabled {
+  opacity: 0.4; cursor: not-allowed;
+  background: var(--panel-3); border-color: var(--panel-3); color: var(--dim);
+}
+.trade-sidebar-hint {
+  margin-top: var(--s3);
+  font-size: var(--fs-xs); color: var(--muted); line-height: 1.5;
+}
+.trade-sidebar-hint b { color: var(--text); }
 .card-row {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--s5); margin-bottom: var(--s5);
