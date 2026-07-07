@@ -52,6 +52,19 @@ def _dump(obj):
     return {}
 
 
+# Local-only order id prefixes. State can carry these across broker swaps
+# (dry-run session → live session, paper session → live restart). Forwarding
+# them to Coinbase is guaranteed 400 INVALID_ARGUMENT; treat them as stale and
+# skip the round-trip.
+_STALE_LOCAL_PREFIXES = ("dry-run-", "paper-")
+
+
+def _is_stale_local_order_id(order_id) -> bool:
+    if not order_id:
+        return False
+    return any(str(order_id).startswith(p) for p in _STALE_LOCAL_PREFIXES)
+
+
 @dataclass
 class BrokerConfig:
     product_id: str                    # e.g., "SLR-27AUG26-CDE"
@@ -127,6 +140,18 @@ class CoinbaseBroker:
 
     def order_status(self, order_id: str) -> dict:
         """Return {'status': mapped, 'filled_qty': int, 'raw_status': ..., 'average_filled_price': ...}."""
+        # Stale ids left over from paper / dry-run sessions can end up in
+        # state.live_order_id (Redis persists across broker swaps). Forwarding
+        # them to Coinbase throws INVALID_ARGUMENT and crashes the worker at
+        # reconcile. Treat them as CANCELLED so reconcile clears the state and
+        # the strategy re-arms with a real order.
+        if _is_stale_local_order_id(order_id):
+            return {
+                "status": "CANCELLED",
+                "filled_qty": 0,
+                "raw_status": "STALE_LOCAL_ID",
+                "average_filled_price": None,
+            }
         order = _dump(self.client.get_order(order_id)).get("order") or {}
         raw = order.get("status") or "UNKNOWN"
         try:
@@ -142,6 +167,10 @@ class CoinbaseBroker:
 
     def cancel(self, order_id: str) -> None:
         """Cancel one live order by its exchange order_id."""
+        # Same stale-id guard as order_status — cancelling a fake dry-run id
+        # against Coinbase would 400 too. No-op it and let the caller move on.
+        if _is_stale_local_order_id(order_id):
+            return
         resp = _dump(self.client.cancel_orders(order_ids=[order_id]))
         results = resp.get("results") or []
         if not results:
