@@ -251,21 +251,44 @@ class CoinbaseBroker:
         the dashboard's TOTAL VALUE reads lower than Coinbase's total when
         the user is holding stables.
 
-        Returns 0.0 on any failure so the caller (snapshot) can proceed without
-        the extra number rather than crashing the whole snapshot."""
+        Coinbase's get_accounts is paginated (default 49 per page). Users
+        with multiple wallets (SOL, dust crypto, USD, USDC, etc.) often have
+        USDC beyond the first page, so we iterate the cursor until has_next
+        is False. Also sums 'hold' so pending USDC isn't dropped.
+
+        Returns 0.0 on any failure so the caller (snapshot) can proceed
+        without crashing the whole snapshot.
+        """
         try:
-            resp = _dump(self.client.get_accounts())
-            accts = resp.get("accounts") or []
             total = 0.0
-            for a in accts:
-                cur = (a.get("currency") or "").upper()
-                if cur != "USDC":
-                    continue
-                bal = a.get("available_balance") or {}
-                try:
-                    total += float(bal.get("value") or 0)
-                except (TypeError, ValueError):
-                    continue
+            cursor = None
+            # Hard page cap so a broken cursor loop can't wedge the snapshot
+            # forever. 20 pages × 250 = 5000 accounts, well beyond any user.
+            for _ in range(20):
+                kwargs = {"limit": 250}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = _dump(self.client.get_accounts(**kwargs))
+                accts = resp.get("accounts") or []
+                for a in accts:
+                    cur = (a.get("currency") or "").upper()
+                    if cur != "USDC":
+                        continue
+                    avail = a.get("available_balance") or {}
+                    hold = a.get("hold") or {}
+                    try:
+                        total += float(avail.get("value") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        total += float(hold.get("value") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                if not resp.get("has_next"):
+                    break
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
             return total
         except Exception:
             return 0.0
