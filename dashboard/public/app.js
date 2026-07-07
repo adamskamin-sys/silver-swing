@@ -2373,9 +2373,18 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     const targetProfit = p.profitDollarsFixed != null
       ? p.profitDollarsFixed
       : p.profitDollarsPerContract * qty;
-    profitEl.value = Math.min(2000, Math.max(costFloor, targetProfit));
+    const appliedTarget = Math.min(2000, Math.max(costFloor, targetProfit));
+    profitEl.value = appliedTarget;
     tdSliderEl.value = p.trailDistance;
-    presetNoteEl.textContent = p.note;
+    // If the fixed target got bumped up by the cost floor (e.g. "$5 net swing"
+    // at qty=3 where fees alone exceed $5), surface that truthfully in the
+    // note — silent clamping was the previous bug where users thought they
+    // were nettting $5 but actually netting $16.
+    if (p.profitDollarsFixed != null && appliedTarget > p.profitDollarsFixed) {
+      presetNoteEl.innerHTML = p.note + ` <b style="color:var(--warn)">Note: at ${qty} contracts, fees alone are $${feesTotal.toFixed(2)}, so this preset targets $${appliedTarget} net (the floor) not $${p.profitDollarsFixed}.</b>`;
+    } else {
+      presetNoteEl.textContent = p.note;
+    }
     syncTargetsFromSlider();
     applyModeVisibility();
   }
@@ -2503,7 +2512,18 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     if (presetEl.value !== 'Custom' && nameEl.value !== presetEl.value) presetEl.value = 'Custom';
   });
   profitEl.addEventListener('input', () => { syncTargetsFromSlider(); updatePreview(); });
-  qtyEl.addEventListener('input', () => { syncTargetsFromSlider(); updatePreview(); });
+  qtyEl.addEventListener('input', () => {
+    // Re-apply the preset when qty changes so per-contract-scaled presets
+    // recompute their target (e.g., Paul preset at 1c = $25 net, at 3c = $75
+    // net). Fixed-target presets are safe under this too — they just re-clamp
+    // against the new cost floor.
+    if (presetEl.value && presetEl.value !== 'Custom') {
+      applyPreset(presetEl.value);
+    } else {
+      syncTargetsFromSlider();
+    }
+    updatePreview();
+  });
   exitEl.addEventListener('change', applyModeVisibility);
   tdSliderEl.addEventListener('input', updatePreview);
   sellTargetEl.addEventListener('input', updatePreview);
@@ -2872,7 +2892,7 @@ function openScannerDetail(row) {
   scannerDetailTitle.textContent = row.product_id;
   // Default the mode chooser to whatever tab the user's on if it's meaningful,
   // else fall back to paper (safer default for accidental clicks).
-  const defaultMode = (activeMode === 'live') ? 'live' : 'paper';
+  const defaultMode = ['live', 'lab', 'paper'].includes(activeMode) ? activeMode : 'paper';
   document.querySelectorAll('input[name="scanner-buy-mode"]').forEach(r => {
     r.checked = (r.value === defaultMode);
     r.onchange = () => updateScannerBuyButton();
@@ -2975,7 +2995,7 @@ function selectedScannerBuyMode() {
 }
 
 function tenantForMode(mode) {
-  const target = (mode === 'live' || mode === 'paper') ? mode : 'paper';
+  const target = ['live', 'paper', 'lab'].includes(mode) ? mode : 'paper';
   for (const t of Object.keys(currentStore || {})) {
     if (modeOfTenant(t) === target) return t;
   }
@@ -3248,21 +3268,24 @@ async function marketSell(tenant, symbol, qty) {
 }
 
 async function resetPaperTrading() {
-  // Find the PAPER tenant explicitly. Alphabetical Object.keys(currentStore)[0]
-  // would grab 'adam-live' before 'adam-paper' and the server would (rightly)
-  // refuse to reset a live tenant — but silently, from the user's perspective.
-  const paperTenant = Object.keys(currentStore).find(t => modeOfTenant(t) === 'paper');
-  if (!paperTenant) {
-    showToast('no paper tenant found', 'error');
+  // Reset targets the tenant that matches the CURRENT tab. Clicking 'Reset'
+  // while on the Lab tab wipes Lab, not Paper — silently wiping the wrong
+  // account was the previous bug. Live tenants are never reset from here
+  // (the server also refuses live-tenant resets as a second guard).
+  const targetMode = (activeMode === 'lab' || activeMode === 'paper') ? activeMode : 'paper';
+  const targetTenant = Object.keys(currentStore).find(t => modeOfTenant(t) === targetMode);
+  if (!targetTenant) {
+    showToast(`no ${targetMode} tenant found`, 'error');
     return;
   }
-  const symbols = Object.keys(currentStore[paperTenant] || {}).filter(s => !s.startsWith('__'));
+  const symbols = Object.keys(currentStore[targetTenant] || {}).filter(s => !s.startsWith('__'));
   if (!symbols.length) { showToast('no symbol to reset', 'error'); return; }
-  const msg = `Wipe paper trading state for ${paperTenant}/${symbols.join(', ')}? Balance goes back to $100k, position → 0, all lots + strategies reset. Live account is untouched.`;
+  const label = targetMode === 'lab' ? 'Lab' : 'Paper';
+  const msg = `Wipe ${label} trading state for ${targetTenant}/${symbols.join(', ')}? Balance goes back to $100k, position → 0, all lots + strategies reset. Live account is untouched.`;
   if (!confirm(msg)) return;
   let anyFailed = false;
   for (const symbol of symbols) {
-    const res = await postJson('/api/reset-paper', { tenant: paperTenant, symbol, confirm: 'YES', starting_balance: 100000 });
+    const res = await postJson('/api/reset-paper', { tenant: targetTenant, symbol, confirm: 'YES', starting_balance: 100000 });
     if (res._unauthorized) { showLogin(); return; }
     if (!res.ok) {
       anyFailed = true;
@@ -3270,7 +3293,7 @@ async function resetPaperTrading() {
     }
   }
   if (!anyFailed) {
-    showToast('paper reset queued — bot picks it up within 5s', 'info');
+    showToast(`${label} reset queued — bot picks it up within 5s`, 'info');
     setTimeout(refreshOnce, 3000);
   }
 }
@@ -3298,8 +3321,8 @@ killBtn.addEventListener('click', () => {
   const mode = killBtn.dataset.mode || 'activate';
   // Pause the tenant that matches the currently-viewed tab. Falling back to
   // the alphabetically-first tenant would silently kill the wrong side when
-  // both adam-live and adam-paper exist (live sorts first).
-  const targetMode = (activeMode === 'live' || activeMode === 'paper') ? activeMode : 'paper';
+  // multiple tenants exist (live sorts before paper alphabetically).
+  const targetMode = ['live', 'paper', 'lab'].includes(activeMode) ? activeMode : 'paper';
   const tenant = Object.keys(currentStore).find(t => modeOfTenant(t) === targetMode)
     || Object.keys(currentStore)[0]
     || 'adam';

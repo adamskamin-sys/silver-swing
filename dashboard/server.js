@@ -543,7 +543,7 @@ export function makeApp({
       return res.status(400).json({ ok: false, error: 'qty must be a whole number 1-100' });
     }
     const m = String(mode || 'paper').toLowerCase();
-    if (!['paper', 'live'].includes(m)) return res.status(400).json({ ok: false, error: 'mode must be paper or live' });
+    if (!['paper', 'live', 'lab'].includes(m)) return res.status(400).json({ ok: false, error: 'mode must be paper, lab, or live' });
     const ot = String(order_type || 'market').toLowerCase();
     if (!['market', 'limit'].includes(ot)) {
       return res.status(400).json({ ok: false, error: 'order_type must be market or limit' });

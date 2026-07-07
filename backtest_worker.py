@@ -205,8 +205,8 @@ def _handle_scanner_order_job(r, job_id: str) -> None:
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         if qty < 1:
             raise ValueError(f"qty must be >= 1, got {qty}")
-        if mode not in ("paper", "live"):
-            raise ValueError(f"mode must be paper or live, got {mode!r}")
+        if mode not in ("paper", "live", "lab"):
+            raise ValueError(f"mode must be paper, lab, or live, got {mode!r}")
         if order_type not in ("market", "limit"):
             raise ValueError(f"order_type must be market or limit, got {order_type!r}")
         if order_type == "limit":

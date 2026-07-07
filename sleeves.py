@@ -60,15 +60,11 @@ class SleeveConfig:
     stop_loss_qty_mode: str = "all"           # "all" | "original" | "custom"
     stop_loss_qty_custom: int = 0
 
-    # Mean reversion (exit_mode="mean_reversion") — Ornstein-Uhlenbeck style
-    # regime signal. Sleeve maintains a rolling window of prices, computes
-    # mean μ and stddev σ every tick, and arms buy at μ − k×σ, sell at μ + k×σ.
-    # Adapts to whatever regime silver is in without hand-tuned levels.
-    # Theory: Roll (1984), Ornstein-Uhlenbeck mean-reversion literature.
-    mr_window: int = 100                       # ticks in rolling window
-    mr_k: float = 2.0                          # bands at μ ± k×σ
-    mr_min_spread: float = 0.10                # never arm tighter than this
-    # Bollinger, momentum, Avellaneda-Stoikov, VPIN-gated go here in follow-ups.
+    # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
+    # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
+    # so declaring config fields would let a user pick an unwired preset that
+    # silently falls through to fixed_limit behavior. Add fields the same
+    # commit that wires the strategy.
 
     @classmethod
     def from_dict(cls, d: dict) -> "SleeveConfig":
@@ -91,9 +87,6 @@ class SleeveConfig:
             stop_loss_px=float(d.get("stop_loss_px") or 0.0),
             stop_loss_qty_mode=str(d.get("stop_loss_qty_mode") or "all"),
             stop_loss_qty_custom=int(d.get("stop_loss_qty_custom") or 0),
-            mr_window=int(d.get("mr_window") or 100),
-            mr_k=float(d.get("mr_k") or 2.0),
-            mr_min_spread=float(d.get("mr_min_spread") or 0.10),
         )
 
 

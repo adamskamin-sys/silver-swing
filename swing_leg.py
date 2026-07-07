@@ -144,12 +144,10 @@ class SwingTrader:
         self.cfg = self._load_config()
         self.s = self._load_state()
 
-        # Rolling price history per sleeve for theory-based strategies (mean
-        # reversion, Bollinger, etc.). Transient — rebuilt from live ticks on
-        # restart. Length is the maximum window any strategy needs; deque
-        # trims automatically.
-        from collections import deque as _deque
-        self._sleeve_price_history: dict[str, _deque] = {}
+        # Rolling price history dict reserved for future theory-based
+        # strategies (mean reversion, Bollinger). Empty for now; will be
+        # populated the same commit those exit_modes are wired in.
+        self._sleeve_price_history: dict = {}
 
     # ---- persistence / crash recovery ------------------------------------
 
