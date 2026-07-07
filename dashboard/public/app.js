@@ -1297,14 +1297,16 @@ function lotAge(ts) {
   return `${(age / 86400).toFixed(1)}d`;
 }
 
-// Coinbase-Advanced-style trade sidebar: Buy/Sell tab strip → market/limit
-// toggle → qty + preview → confirm. Sits in the right column of the card so
-// manual trades are always one click away without opening a modal.
+// Coinbase-Advanced-style trade sidebar: Buy/Sell tabs → Market/Limit toggle
+// → qty + optional limit price → preview → confirm. Everything visible at a
+// glance, no modal needed to see order type is an option.
 function renderTradeSidebar(tenant, symbol, state, config, snap) {
   const mark = Number(snap?.last_mark) || 0;
   const bid = Number(snap?.best_bid);
   const ask = Number(snap?.best_ask);
   const pos = Number(snap?.position_qty) || 0;
+  const escSym = escapeHtml(symbol);
+  const escTen = escapeHtml(tenant);
   return `
     <div class="trade-sidebar">
       <div class="trade-sidebar-header">
@@ -1315,13 +1317,19 @@ function renderTradeSidebar(tenant, symbol, state, config, snap) {
         </div>
       </div>
       <div class="trade-sidebar-tabs">
-        <button class="trade-sidebar-tab primary" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="BUY">Buy</button>
-        <button class="trade-sidebar-tab danger" data-action="trade" data-tenant="${escapeHtml(tenant)}" data-symbol="${escapeHtml(symbol)}" data-side="SELL"${pos < 1 ? ' disabled' : ''}>Sell</button>
+        <button class="trade-sidebar-tab primary" data-action="trade" data-tenant="${escTen}" data-symbol="${escSym}" data-side="BUY">Buy</button>
+        <button class="trade-sidebar-tab danger" data-action="trade" data-tenant="${escTen}" data-symbol="${escSym}" data-side="SELL"${pos < 1 ? ' disabled' : ''}>Sell</button>
+      </div>
+      <div class="trade-sidebar-types">
+        <span class="trade-sidebar-types-label">Order type:</span>
+        <span class="trade-sidebar-types-item"><b>Market</b> — fills now at best available</span>
+        <span class="trade-sidebar-types-item"><b>Limit</b> — sits at your price until it fills</span>
+        <span class="trade-sidebar-types-note">Click Buy or Sell to pick order type + qty + confirm.</span>
       </div>
       <div class="trade-sidebar-hint">
         ${pos === 0
-          ? 'You hold 0 contracts. Buy to open a position, then add strategies to manage it.'
-          : `You hold <b>${pos}</b> contract${pos === 1 ? '' : 's'}. Click Buy/Sell to open the order form (market or limit).`}
+          ? 'You hold <b>0</b> contracts. Buy to open a long. (Shorting via Sell is off by default — ask to enable.)'
+          : `You hold <b>${pos}</b> contract${pos === 1 ? '' : 's'} long.`}
       </div>
     </div>`;
 }
