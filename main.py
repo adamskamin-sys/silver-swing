@@ -116,66 +116,130 @@ def _mirror_live_position_into_paper(paper, product_id: str) -> bool:
         return False
 
 
+class _Track:
+    """One tracked symbol = one broker + trader + feed. Lifecycle is bounded:
+    open() creates + starts everything, close() reverses it. main_loop pumps
+    ticks through step() every iteration. All state (broker, trader, feed) is
+    owned by this object so adding/removing symbols at runtime is contained."""
+
+    def __init__(self, store, log, ks, tenant: str, symbol: str, starting_balance: float):
+        from feed import LiveTickerFeed
+        from microstructure import MicrostructureFilter
+        from paper_broker import PaperBroker, PaperConfig
+        from swing_leg import SwingTrader
+
+        _seed_config_if_missing(store, tenant, symbol)
+        self.tenant = tenant
+        self.symbol = symbol
+        self.store = store
+        self.log = log
+
+        self.broker = PaperBroker(PaperConfig(
+            product_id=symbol,
+            contract_size=50.0, tick_size=0.005,
+            fee_per_fill=2.34, margin_per_contract=275.0,
+            starting_balance=starting_balance,
+        ))
+        persisted = store.get_paper_state(tenant, symbol)
+        if persisted:
+            self.broker.restore_from_state_dict(persisted)
+            _log(f"[{symbol}] restored: qty={self.broker.position.qty}, "
+                 f"balance=${self.broker.balance:,.2f}, "
+                 f"realized=${self.broker.realized_pnl:+,.2f}")
+        else:
+            _log(f"[{symbol}] paper starts flat")
+
+        self.ms = MicrostructureFilter() if symbol == SYMBOL else None
+        if self.ms and not self.ms.any_enabled():
+            self.ms = None
+
+        self.trader = SwingTrader(self.broker, store, tenant, symbol,
+                                  trade_log=log, kill_switch=ks, microstructure=self.ms)
+        self.feed = LiveTickerFeed(
+            symbol,
+            subscribe_l2=(self.ms.needs_l2() if self.ms else False),
+            subscribe_trades=(self.ms.needs_trades() if self.ms else False),
+            on_l2_snapshot=(self.ms.on_l2_snapshot if self.ms else None),
+            on_l2_update=(self.ms.on_l2_update if self.ms else None),
+            on_trade=(self.ms.on_trade if self.ms else None),
+        )
+        self.last_snapshot_ts = 0.0
+        self.reconciled = False
+
+    def start(self, feed_ready_timeout: float) -> bool:
+        self.feed.start()
+        if not self.feed.wait_for_first_tick(timeout=feed_ready_timeout):
+            _log(f"[{self.symbol}] no ticks within {feed_ready_timeout}s — skipping")
+            self.feed.stop()
+            return False
+        self.trader.reconcile()
+        self.reconciled = True
+        return True
+
+    def step(self, now: float, snapshot_interval: float) -> None:
+        t = self.feed.latest_ticker()
+        if t is None:
+            return
+        self.broker.tick(t["best_bid"], t["best_ask"])
+        if self.ms is not None:
+            self.ms.on_ticker(t["best_bid"], t["best_ask"], t["price"])
+        set_range = getattr(self.broker, "set_external_day_range", None)
+        if callable(set_range):
+            set_range(t.get("high_24h"), t.get("low_24h"))
+        self.trader.step(t["price"])
+        if now - self.last_snapshot_ts >= snapshot_interval:
+            snap = self.broker.snapshot()
+            snap["mode"] = "paper"
+            snap["product_id"] = self.symbol
+            snap["best_bid"] = t["best_bid"]
+            snap["best_ask"] = t["best_ask"]
+            snap["generated_at"] = now
+            if self.ms is not None:
+                snap["microstructure"] = self.ms.snapshot()
+            self.store.put_snapshot(self.tenant, self.symbol, snap)
+            self.store.put_paper_state(self.tenant, self.symbol,
+                                       self.broker.to_state_dict())
+            self.last_snapshot_ts = now
+
+    def close(self) -> None:
+        try:
+            self.feed.stop()
+        except Exception:
+            pass
+
+
+def _discover_tracked_symbols(store, tenant: str, primary_symbol: str) -> list[str]:
+    """Any (tenant, symbol) with a config block is a tracked symbol. Primary
+    always leads. list_symbols may include entries the tenant created via
+    /api/track-symbol without setting SWING_SYMBOL for them."""
+    try:
+        found = store.list_symbols(tenant) or []
+    except Exception as e:
+        _log(f"discover_tracked_symbols failed: {type(e).__name__}: {e}")
+        found = []
+    # Primary first, others alphabetical after — order matters for consistent
+    # log output but no functional dependency.
+    extras = [s for s in found if s and s != primary_symbol]
+    return [primary_symbol] + sorted(extras)
+
+
 def run_paper_mode() -> int:
-    """Live feed → PaperBroker → SwingTrader. Real market prices, simulated fills.
-    Safe: no path to Coinbase's order endpoint."""
-    from feed import LiveTickerFeed
-    from paper_broker import PaperBroker, PaperConfig
+    """Live feed → PaperBroker → SwingTrader, per tracked symbol. Real market
+    prices, simulated fills. Safe: no path to Coinbase's order endpoint."""
     from safety import KillSwitch, make_trade_log
     from state_store import make_store
-    from swing_leg import SwingTrader
 
     global SYMBOL
     SYMBOL = _resolve_symbol(SYMBOL)
-    _log(f"paper mode: symbol={SYMBOL}, tenant={TENANT}"
+    _log(f"paper mode: primary={SYMBOL}, tenant={TENANT}"
          f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
 
     store = make_store(DATA_DIR)
     log = make_trade_log(DATA_DIR)
     _log(f"store backend: {type(store).__name__}, trade log: {type(log).__name__}")
     ks = KillSwitch(store, TENANT)
-    _seed_config_if_missing(store, TENANT, SYMBOL)
 
-    # Paper account balance from env or default
     starting_balance = float(os.getenv("SWING_PAPER_BALANCE", "100000.0"))
-    paper = PaperBroker(PaperConfig(
-        product_id=SYMBOL,
-        contract_size=50.0,
-        tick_size=0.005,
-        fee_per_fill=2.34,
-        margin_per_contract=275.0,
-        starting_balance=starting_balance,
-    ))
-    _log(f"paper broker seeded: balance=${starting_balance:,.2f}")
-
-    # Restore paper state from the store if it exists — otherwise every Render
-    # redeploy wipes positions and balance to the starting sandbox. Order
-    # matters: restore first (may set position, balance, etc.), then mirror
-    # only if there's no restored state AND mirror is opted-in.
-    persisted = store.get_paper_state(TENANT, SYMBOL)
-    if persisted:
-        paper.restore_from_state_dict(persisted)
-        _log(f"paper state restored: qty={paper.position.qty}, "
-             f"balance=${paper.balance:,.2f}, lots={len(paper.lots)}, "
-             f"realized=${paper.realized_pnl:+,.2f}")
-    elif os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1":
-        _mirror_live_position_into_paper(paper, SYMBOL)
-    else:
-        _log("paper starts flat (no persisted state; mirror disabled)")
-
-    from microstructure import MicrostructureFilter
-    ms = MicrostructureFilter()
-    if ms.any_enabled():
-        enabled = [k for k, on in {
-            "spread_band": ms.enable_spread, "autocorr": ms.enable_autocorr,
-            "obi": ms.enable_obi, "vpin": ms.enable_vpin, "kyle_lambda": ms.enable_lambda,
-        }.items() if on]
-        _log(f"microstructure signals ON: {', '.join(enabled)}")
-    else:
-        ms = None
-
-    trader = SwingTrader(paper, store, TENANT, SYMBOL, trade_log=log,
-                         kill_switch=ks, microstructure=ms)
 
     # Start backtest worker if Redis is wired. Dashboard pushes jobs onto a
     # queue; this thread runs them here (where Python + Coinbase creds live)
@@ -184,15 +248,10 @@ def run_paper_mode() -> int:
         import backtest_worker
         backtest_worker.start(os.getenv("REDIS_URL"))
 
-    _log(f"connecting to WS feed (waiting up to {FEED_READY_TIMEOUT}s for first tick)...")
-    feed = LiveTickerFeed(
-        SYMBOL,
-        subscribe_l2=(ms.needs_l2() if ms else False),
-        subscribe_trades=(ms.needs_trades() if ms else False),
-        on_l2_snapshot=(ms.on_l2_snapshot if ms else None),
-        on_l2_update=(ms.on_l2_update if ms else None),
-        on_trade=(ms.on_trade if ms else None),
-    )
+    initial_symbols = _discover_tracked_symbols(store, TENANT, SYMBOL)
+    _log(f"tracking {len(initial_symbols)} symbol(s) at boot: {initial_symbols}")
+
+    tracks: dict[str, _Track] = {}
     stopping = False
 
     def stop(*_):
@@ -203,50 +262,58 @@ def run_paper_mode() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    try:
-        feed.start()
-        if not feed.wait_for_first_tick(timeout=FEED_READY_TIMEOUT):
-            _log("no ticks received within timeout — check the WS or product_id")
-            return 1
-        _log("feed live — starting main loop")
-        log.record("bot_started", mode="paper", tenant=TENANT, symbol=SYMBOL,
-                   starting_balance=starting_balance)
-        trader.reconcile()
+    # Open a track for each initial symbol.
+    for sym in initial_symbols:
+        track = _Track(store, log, ks, TENANT, sym, starting_balance)
+        if track.start(FEED_READY_TIMEOUT):
+            tracks[sym] = track
+        else:
+            track.close()
 
+    if not tracks:
+        _log("no tracks came up — check the WS or product_ids")
+        return 1
+
+    # Mirror-live is opt-in and only ever applies to the primary symbol (real
+    # positions only exist there in the initial deploy scenario). Only fires
+    # when we start FLAT, i.e. no persisted paper state.
+    primary_track = tracks.get(SYMBOL)
+    if (primary_track and primary_track.broker.position.qty == 0
+            and os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1"):
+        _mirror_live_position_into_paper(primary_track.broker, SYMBOL)
+
+    log.record("bot_started", mode="paper", tenant=TENANT,
+               symbols=list(tracks.keys()), starting_balance=starting_balance)
+
+    try:
         snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
-        last_snapshot = 0.0
         scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "60.0"))
+        symbol_discover_interval = float(os.getenv("SWING_SYMBOL_DISCOVER_INTERVAL", "10.0"))
         last_scanner = 0.0
-        _coinbase_for_scanner = None  # lazy-init: shared REST client
+        last_discover = 0.0
+        _coinbase_for_scanner = None
         redis_url = os.getenv("REDIS_URL")
+
         while not stopping:
-            t = feed.latest_ticker()
-            if t is None:
-                time.sleep(0.1)
-                continue
-            paper.tick(t["best_bid"], t["best_ask"])
-            if ms is not None:
-                ms.on_ticker(t["best_bid"], t["best_ask"], t["price"])
-            # Forward exchange-provided 24h high/low if the feed shipped them.
-            set_range = getattr(paper, "set_external_day_range", None)
-            if callable(set_range):
-                set_range(t.get("high_24h"), t.get("low_24h"))
-            trader.step(t["price"])
             now = time.time()
-            if now - last_snapshot >= snapshot_interval:
-                snap = paper.snapshot()
-                snap["mode"] = "paper"
-                snap["product_id"] = SYMBOL
-                snap["best_bid"] = t["best_bid"]
-                snap["best_ask"] = t["best_ask"]
-                snap["generated_at"] = now
-                if ms is not None:
-                    snap["microstructure"] = ms.snapshot()
-                store.put_snapshot(TENANT, SYMBOL, snap)
-                # Persist the authoritative paper state alongside the derived
-                # snapshot so a Render redeploy doesn't wipe the sandbox.
-                store.put_paper_state(TENANT, SYMBOL, paper.to_state_dict())
-                last_snapshot = now
+
+            # Hot-add newly-tracked symbols (dashboard-driven). Cheap re-scan
+            # on an interval — new symbols come from user clicks on the
+            # scanner "Track this symbol" button.
+            if now - last_discover >= symbol_discover_interval:
+                current = set(_discover_tracked_symbols(store, TENANT, SYMBOL))
+                for sym in current - set(tracks):
+                    _log(f"hot-adding new tracked symbol: {sym}")
+                    track = _Track(store, log, ks, TENANT, sym, starting_balance)
+                    if track.start(FEED_READY_TIMEOUT):
+                        tracks[sym] = track
+                    else:
+                        track.close()
+                last_discover = now
+
+            for track in list(tracks.values()):
+                track.step(now, snapshot_interval)
+
             if redis_url and now - last_scanner >= scanner_interval:
                 try:
                     from scanner import fetch_and_rank, write_ranking_to_redis
@@ -260,12 +327,15 @@ def run_paper_mode() -> int:
                 except Exception as e:
                     _log(f"scanner refresh failed: {type(e).__name__}: {e}")
                 last_scanner = now
+
             time.sleep(LOOP_INTERVAL_SECS)
 
     finally:
-        feed.stop()
-        log.record("bot_stopped", mode="paper", final_snapshot=paper.snapshot())
-        _log(f"final paper snapshot: {paper.snapshot()}")
+        for track in tracks.values():
+            track.close()
+        log.record("bot_stopped", mode="paper", symbols=list(tracks.keys()))
+        for sym, track in tracks.items():
+            _log(f"[{sym}] final: {track.broker.snapshot()}")
     return 0
 
 

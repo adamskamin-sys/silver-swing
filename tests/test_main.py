@@ -44,3 +44,26 @@ def test_unknown_mode_exits_with_code_2(monkeypatch, capsys):
     rc = main()
     assert rc == 2
     assert "unknown SWING_MODE" in capsys.readouterr().out
+
+
+def test_discover_tracked_symbols_lists_primary_and_extras(tmp_path):
+    """Multi-symbol discovery: the primary is always first, extras come from
+    any (tenant, symbol) that already has a config block. Used by the paper
+    loop to decide which Tracks to spin up on boot and on hot-add."""
+    from main import _discover_tracked_symbols
+    store = JsonFileStateStore(tmp_path / "store.json")
+    store.put_config("adam", "SLR-27AUG26-CDE", {"sell_px": 65.0})
+    store.put_config("adam", "AVE-20DEC30-CDE", {"sell_px": 5.0})
+    store.put_config("adam", "ETH-27JUN26-CDE", {"sell_px": 2000.0})
+    result = _discover_tracked_symbols(store, "adam", "SLR-27AUG26-CDE")
+    assert result[0] == "SLR-27AUG26-CDE"  # primary always first
+    assert set(result) == {"SLR-27AUG26-CDE", "AVE-20DEC30-CDE", "ETH-27JUN26-CDE"}
+    # Extras alphabetical after primary
+    assert result[1:] == sorted(result[1:])
+
+
+def test_discover_tracked_symbols_primary_only_when_no_extras(tmp_path):
+    from main import _discover_tracked_symbols
+    store = JsonFileStateStore(tmp_path / "store.json")
+    result = _discover_tracked_symbols(store, "adam", "SLR-27AUG26-CDE")
+    assert result == ["SLR-27AUG26-CDE"]

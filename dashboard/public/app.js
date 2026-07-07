@@ -2931,6 +2931,42 @@ scannerBuyBtn.addEventListener('click', async () => {
   }
 });
 
+// Track a scanner-picked symbol so the paper bot starts a Track for it and
+// persists a real position when the user buys. Also usable stand-alone: if
+// the user just wants the symbol on their dashboard without buying, this puts
+// it in the tracked set and adds a card.
+const scannerTrackBtn = document.getElementById('scanner-track-btn');
+if (scannerTrackBtn) {
+  scannerTrackBtn.addEventListener('click', async () => {
+    if (!scannerDetailContext) return;
+    const symbol = scannerDetailContext.product_id;
+    const mode = selectedScannerBuyMode();
+    const tenant = tenantForMode(mode);
+    if (!tenant) { showToast(`no ${mode} tenant found`, 'error'); return; }
+    scannerTrackBtn.disabled = true;
+    const originalLabel = scannerTrackBtn.textContent;
+    scannerTrackBtn.textContent = 'tracking…';
+    try {
+      const res = await postJson('/api/track-symbol', { tenant, symbol });
+      if (res._unauthorized) { showLogin(); return; }
+      if (res.ok) {
+        showToast(res.already_tracked
+          ? `${symbol} already tracked`
+          : `now tracking ${symbol} — the bot will pick it up on next scan (~10s)`,
+          'info');
+        refreshOnce();
+      } else {
+        showToast(res.error || 'track failed', 'error');
+      }
+    } catch (err) {
+      showToast(String(err.message || err), 'error');
+    } finally {
+      scannerTrackBtn.disabled = false;
+      scannerTrackBtn.textContent = originalLabel;
+    }
+  });
+}
+
 // Scanner order-type radios: toggle limit-price visibility and refresh preview.
 document.querySelectorAll('input[name="scanner-order-type"]').forEach(el => {
   el.addEventListener('change', () => {

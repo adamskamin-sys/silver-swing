@@ -489,6 +489,48 @@ export function makeApp({
   // scanner — doesn't require a tracked strategy. Same Redis queue pattern:
   // dashboard queues, paper worker executes via CoinbaseBroker (LIVE) or
   // simulates + logs (PAPER).
+  // --- track a new symbol under a tenant. Seeds a default config so the bot's
+  // discovery pass finds it and hot-adds a Track. The bot re-scans on an
+  // interval (SWING_SYMBOL_DISCOVER_INTERVAL, default 10s) so newly-tracked
+  // symbols come online within a few seconds of clicking Track.
+  app.post('/api/track-symbol', requireAuth, async (req, res) => {
+    const { tenant, symbol } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    // Basic symbol shape check — Coinbase futures use PRODUCT-DDMMMYY-CDE.
+    // Cheap sanity gate; the bot will fail its feed subscription if wrong.
+    if (!/^[A-Z0-9]+-[0-9A-Z]+-[A-Z]+$/i.test(symbol)) {
+      return res.status(400).json({ ok: false, error: `symbol shape looks wrong: ${symbol}` });
+    }
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      if (store[tenant][symbol]) {
+        return res.json({ ok: true, already_tracked: true });
+      }
+      // Seed with core_qty=0 so a new derivative starts with free trading —
+      // the user can raise the floor later once they know how they want to
+      // manage it. Everything else uses the same empirical SLR defaults;
+      // dashboard exposes Settings to tune per-symbol.
+      store[tenant][symbol] = {
+        config: {
+          core_qty: 0, swing_qty: 0, max_swing_qty: 5,
+          sell_px: 0, buy_px: 0, contract_size: 50,
+          margin_per_contract: 275.0, scale_up_buffer_mult: 1.5,
+          fee_per_contract_roundtrip: 4.68,
+          abort_below: 0, abort_above: 1e9,
+          fee_sanity_multiplier: 2.0,
+          sleeves: [],
+          tracked_by: 'dashboard',
+          tracked_ts: Date.now() / 1000,
+        },
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, symbol });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.post('/api/scanner-order', requireAuth, async (req, res) => {
     const { product_id, side, qty, mode, confirm, order_type, limit_price } = req.body || {};
     if (!product_id) return res.status(400).json({ ok: false, error: 'product_id required' });
