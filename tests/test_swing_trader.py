@@ -544,6 +544,67 @@ def test_sleeve_own_avg_entry_set_on_own_buy_fill(tmp_path):
     assert ss.state == SleeveStateEnum.ARMED_SELL
 
 
+def _config_with_reanchor_sleeve(threshold=0.75, buy=63.0, sell=63.20, qty=2, core=0):
+    """Config with one sleeve that has a reanchor_threshold set. Primary is
+    disabled (swing_qty=0) so we can test the sleeve state machine cleanly."""
+    return {
+        "core_qty": core, "swing_qty": 0,
+        "sell_px": 65.0, "buy_px": 63.0,
+        "abort_below": 55.0, "abort_above": 75.0,
+        "contract_size": 50, "margin_per_contract": 275.0,
+        "fee_per_contract_roundtrip": 4.68, "fee_sanity_multiplier": 2.0,
+        "sleeves": [{
+            "id": "s1", "name": "walker", "qty": qty,
+            "exit_mode": "fixed_limit",
+            "sell_px": sell, "buy_px": buy,
+            "trail_trigger": sell, "trail_distance": 0.20,
+            "reanchor_threshold": threshold,
+        }],
+    }
+
+
+def test_sleeve_reanchors_when_price_runs_above_buy(tmp_path):
+    """Silver rallies past buy_px + reanchor_threshold while the sleeve is
+    ARMED_BUY. Sleeve should walk buy_px + sell_px UP to bracket the current
+    market instead of sitting on stale targets waiting for a dip."""
+    from sleeves import SleeveStateEnum
+    cfg = _config_with_reanchor_sleeve(threshold=0.50, buy=63.0, sell=63.20)
+    trader, broker, _, _, store = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    ss = trader.s.sleeves["s1"]
+    ss.state = SleeveStateEnum.ARMED_BUY  # sleeve just sold, waiting to rebuy
+    ss.live_order_id = None
+    # Silver rallies to 64.00 — that's $1.00 above buy_px 63.0, well past the
+    # 0.50 threshold. Reanchor should fire.
+    broker.tick(64.00, 64.00)
+    trader.step(64.00)
+    # In-memory config should have new prices centered on 64.0 with same $0.20 spread
+    cfg_updated = store.get_config(TENANT, SYMBOL)
+    sleeve_cfg = cfg_updated["sleeves"][0]
+    assert sleeve_cfg["buy_px"] == pytest.approx(63.90, abs=0.005)
+    assert sleeve_cfg["sell_px"] == pytest.approx(64.10, abs=0.005)
+
+
+def test_sleeve_does_not_reanchor_when_price_within_threshold(tmp_path):
+    """Silver hasn't moved far enough past buy_px — reanchor stays quiet.
+    Otherwise the strategy would chase every small tick and burn fees walking
+    up and down."""
+    from sleeves import SleeveStateEnum
+    cfg = _config_with_reanchor_sleeve(threshold=0.50, buy=63.0, sell=63.20)
+    trader, broker, _, _, store = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    ss = trader.s.sleeves["s1"]
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = None
+    # Silver only ticks to 63.30 — $0.30 above buy_px, under the $0.50 threshold.
+    broker.tick(63.30, 63.30)
+    trader.step(63.30)
+    cfg_after = store.get_config(TENANT, SYMBOL)
+    sleeve_cfg = cfg_after["sleeves"][0]
+    assert sleeve_cfg["buy_px"] == pytest.approx(63.0)
+    assert sleeve_cfg["sell_px"] == pytest.approx(63.20)
+
+
 def test_sleeve_own_avg_entry_cleared_on_sell_fill(tmp_path):
     """After a SELL fill, the sleeve holds nothing so own_avg_entry must clear
     back to None — otherwise the dashboard would keep showing a stale basis."""

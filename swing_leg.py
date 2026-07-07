@@ -730,6 +730,41 @@ class SwingTrader:
             cfg["sleeves"] = sleeves
             self.store.put_config(self.tenant_id, self.symbol, cfg)
 
+    def _reanchor_sleeve(self, sc: "SleeveConfig", ss: "SleeveState",
+                         new_buy_px: float, new_sell_px: float,
+                         current_price: float) -> None:
+        """Walk this sleeve's buy/sell targets to bracket the current market
+        instead of waiting forever for a dip that isn't coming. Updates BOTH
+        the in-memory SleeveConfig (so this tick uses the new prices) AND the
+        persisted config in the store (so next boot uses them too).
+
+        Also mutates the config for other tenants sharing the same underlying
+        store contract? No — get_config/put_config are scoped by (tenant, symbol),
+        so no cross-tenant leak.
+        """
+        old_buy, old_sell = sc.buy_px, sc.sell_px
+        sc.buy_px = float(new_buy_px)
+        sc.sell_px = float(new_sell_px)
+        sc.trail_trigger = float(new_sell_px)
+        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+        sleeves = list(cfg.get("sleeves") or [])
+        for s in sleeves:
+            if s.get("id") == sc.id:
+                s["buy_px"] = float(new_buy_px)
+                s["sell_px"] = float(new_sell_px)
+                s["trail_trigger"] = float(new_sell_px)
+                break
+        cfg["sleeves"] = sleeves
+        self.store.put_config(self.tenant_id, self.symbol, cfg)
+        self._record(
+            "sleeve_reanchored",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            current_price=current_price,
+            old_buy=old_buy, old_sell=old_sell,
+            new_buy=new_buy_px, new_sell=new_sell_px,
+            reason=f"price {current_price} moved > {sc.reanchor_threshold} above buy {old_buy}",
+        )
+
     # ---- stop-loss -------------------------------------------------------
 
     def _compute_stop_loss_qty(self, position_qty: int) -> int:
@@ -946,6 +981,20 @@ class SwingTrader:
                 else:
                     self._sleeve_arm(sc, ss, "SELL", sc.qty, sc.sell_px)
             else:  # ARMED_BUY
+                # Auto-reanchor: if silver has run more than reanchor_threshold
+                # above buy_px while we've been waiting, the buy target is stale
+                # — silver isn't going to dip back down to fill it. Walk both
+                # targets UP to bracket the current mark, preserving the spread.
+                # Only fires in ARMED_BUY (we hold 0 of this sleeve's contracts,
+                # so there's no cost basis to disturb). Reanchor once per event
+                # to avoid oscillation on a slowly-rising tape.
+                spread = sc.sell_px - sc.buy_px
+                if spread > 0 and sc.reanchor_threshold > 0 \
+                        and last_price - sc.buy_px > sc.reanchor_threshold:
+                    new_buy_px = round(last_price - spread / 2, 3)
+                    new_sell_px = round(last_price + spread / 2, 3)
+                    self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
+                    return  # next tick uses the new targets
                 self._sleeve_arm(sc, ss, "BUY", sc.qty, sc.buy_px)
             return
 

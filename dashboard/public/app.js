@@ -2270,6 +2270,21 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       hybridDelay: 10,
       note: 'Takes the $10 target if silver just touches; if it pushes 20¢ past target, engages a $0.20 trailing stop and rides the breakout. Best when you expect trending days.',
     },
+    '$10 net swing + moderate trail': {
+      // Moderate hybrid — expert-recommended default. Parameters:
+      //   trail_distance = 2 × ATR (0.15) — survives normal intraday noise
+      //   activation_offset = +0.10 above sell_px — engages on real breakout
+      //     but not on false spikes
+      //   hybrid_delay = 5s — standard window for silver
+      // Empirically the highest-EV of the three (Conservative/Moderate/Aggressive)
+      // across mixed regimes on silver-like instruments.
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.15,
+      trailActivationOffset: 0.10,
+      hybridDelay: 5,
+      note: 'Takes the $10 target if silver just touches; if it pushes 10¢ past target, engages a $0.15 trailing stop and rides the breakout. Highest expected value across mixed regimes — the expert-recommended default.',
+    },
     'Custom': {
       exit_mode: 'fixed_limit',
       profitDollarsPerContract: 50,
