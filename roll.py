@@ -122,3 +122,44 @@ def _contract_family(symbol: str) -> str:
         return symbol.split("-PERP-")[0] + "-PERP"
     parts = symbol.split("-")
     return parts[0] if parts else ""
+
+
+def resolve_front_month(
+    coinbase_broker,
+    family: str,
+    now: Optional[datetime] = None,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    """Return the current front-month product_id for a family (SLR → SLR-27AUG26-CDE).
+
+    Front-month = the dated CFM contract with the earliest expiry that hasn't
+    already expired. If the family has no live contracts (rare) returns
+    `fallback`. This is what the bot points at when SWING_SYMBOL_FAMILY is set,
+    so a rolled Coinbase account keeps trading without an env var change.
+    """
+    now = now or datetime.now(timezone.utc)
+    if not family:
+        return fallback
+    try:
+        resp = coinbase_broker.client.get_products(product_type="FUTURE", get_all_products=True)
+        resp_d = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        products = resp_d.get("products", []) or []
+    except Exception:
+        return fallback
+
+    family_upper = family.upper()
+    candidates: list[tuple[datetime, str]] = []
+    for p in products:
+        pid = p.get("product_id") or ""
+        if _contract_family(pid).upper() != family_upper:
+            continue
+        exp = _parse_expiry(
+            ((p.get("future_product_details") or {}).get("contract_expiry")) or ""
+        )
+        if exp is None or exp <= now:
+            continue
+        candidates.append((exp, pid))
+    if not candidates:
+        return fallback
+    candidates.sort()
+    return candidates[0][1]

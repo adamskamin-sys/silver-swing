@@ -33,6 +33,33 @@ SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
 DATA_DIR = os.getenv("SWING_DATA_DIR", "data")
 LOOP_INTERVAL_SECS = float(os.getenv("SWING_LOOP_INTERVAL", "1.0"))
 FEED_READY_TIMEOUT = float(os.getenv("SWING_FEED_TIMEOUT", "15.0"))
+# When SWING_SYMBOL_FAMILY is set (e.g. "SLR", "AVE", "ETH"), the bot resolves
+# it to the current front-month contract for that family on startup. That way
+# a Coinbase auto-roll doesn't require an env var edit — the next redeploy
+# picks up the new active contract automatically.
+SYMBOL_FAMILY = os.getenv("SWING_SYMBOL_FAMILY", "").strip() or None
+
+
+def _resolve_symbol(fallback: str) -> str:
+    """If SWING_SYMBOL_FAMILY is set, resolve to that family's current
+    front-month contract. Otherwise return the fixed SWING_SYMBOL."""
+    if not SYMBOL_FAMILY:
+        return fallback
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        from roll import resolve_front_month
+        # product_id required by BrokerConfig but the client is product-agnostic
+        client = CoinbaseBroker(BrokerConfig(product_id=fallback)).client
+        resolved = resolve_front_month(
+            type("_C", (), {"client": client})(),
+            SYMBOL_FAMILY, fallback=fallback,
+        )
+        if resolved and resolved != fallback:
+            _log(f"symbol family {SYMBOL_FAMILY!r} → resolved front-month {resolved} (fallback {fallback})")
+        return resolved or fallback
+    except Exception as e:
+        _log(f"symbol family resolution failed ({type(e).__name__}: {e}) — using fallback {fallback}")
+        return fallback
 
 
 def _default_paper_config():
@@ -98,7 +125,10 @@ def run_paper_mode() -> int:
     from state_store import make_store
     from swing_leg import SwingTrader
 
-    _log(f"paper mode: symbol={SYMBOL}, tenant={TENANT}")
+    global SYMBOL
+    SYMBOL = _resolve_symbol(SYMBOL)
+    _log(f"paper mode: symbol={SYMBOL}, tenant={TENANT}"
+         f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
 
     store = make_store(DATA_DIR)
     log = make_trade_log(DATA_DIR)

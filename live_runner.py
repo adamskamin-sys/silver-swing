@@ -37,10 +37,14 @@ from dotenv import load_dotenv
 
 TENANT = os.getenv("SWING_TENANT", "adam")
 SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
+SYMBOL_FAMILY = os.getenv("SWING_SYMBOL_FAMILY", "").strip() or None
 DATA_DIR = os.getenv("SWING_DATA_DIR", "data")
 LOOP_INTERVAL_SECS = float(os.getenv("SWING_LOOP_INTERVAL", "1.0"))
 FEED_READY_TIMEOUT = float(os.getenv("SWING_FEED_TIMEOUT", "15.0"))
 SNAPSHOT_INTERVAL = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
+# How often (seconds) to re-check the front-month contract when family mode
+# is active. Once/hour is plenty — expiries move on multi-week cadences.
+FAMILY_RECHECK_SECS = float(os.getenv("SWING_FAMILY_RECHECK_SECS", "3600.0"))
 
 
 def _log(msg: str) -> None:
@@ -177,7 +181,25 @@ def run() -> int:
     from swing_leg import SwingTrader
 
     mode = "DRY-RUN" if dry_run else "LIVE (real orders)"
-    _log(f"live_runner: mode={mode}, symbol={SYMBOL}, tenant={TENANT}")
+
+    # Family mode: resolve current front-month contract before anything else.
+    # Lets a Coinbase auto-roll survive a redeploy without touching env vars.
+    global SYMBOL
+    if SYMBOL_FAMILY:
+        try:
+            from roll import resolve_front_month
+            probe = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
+            resolved = resolve_front_month(probe, SYMBOL_FAMILY, fallback=SYMBOL)
+            if resolved and resolved != SYMBOL:
+                _log(f"family={SYMBOL_FAMILY!r} → resolved front-month {resolved} (was {SYMBOL})")
+                SYMBOL = resolved
+            else:
+                _log(f"family={SYMBOL_FAMILY!r} → still {SYMBOL}")
+        except Exception as e:
+            _log(f"family resolution failed ({type(e).__name__}: {e}) — using fallback {SYMBOL}")
+
+    _log(f"live_runner: mode={mode}, symbol={SYMBOL}, tenant={TENANT}"
+         f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
 
     store = make_store(DATA_DIR)
     log = make_trade_log(DATA_DIR)
@@ -235,6 +257,7 @@ def run() -> int:
         trader.reconcile()
 
         last_snapshot = 0.0
+        last_family_check = time.time()  # already resolved on startup
         while not stopping:
             t = feed.latest_ticker()
             if t is None:
@@ -242,6 +265,30 @@ def run() -> int:
                 continue
             trader.step(t["price"])
             now = time.time()
+            # Periodic front-month recheck. If Coinbase has rolled the family,
+            # halt with a clear reason so the next restart picks up the new
+            # symbol. We don't hot-swap the WS feed mid-session (real risk of
+            # state confusion between old and new orders) — restart is safer.
+            if SYMBOL_FAMILY and now - last_family_check >= FAMILY_RECHECK_SECS:
+                last_family_check = now
+                try:
+                    from roll import resolve_front_month
+                    latest = resolve_front_month(coinbase, SYMBOL_FAMILY, fallback=SYMBOL)
+                    if latest and latest != SYMBOL:
+                        msg = (f"front-month rolled: {SYMBOL} → {latest}. "
+                               "Restarting to pick up new contract.")
+                        _log(msg)
+                        log.record("front_month_rolled",
+                                   old_symbol=SYMBOL, new_symbol=latest, family=SYMBOL_FAMILY)
+                        try:
+                            from alerting import Priority
+                            notifier.send("front-month rolled", msg, Priority.HIGH)
+                        except Exception:
+                            pass
+                        stopping = True
+                        break
+                except Exception as e:
+                    _log(f"front-month recheck failed ({type(e).__name__}: {e})")
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()
