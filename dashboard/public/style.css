@@ -395,6 +395,47 @@ input:focus, select:focus {
   font-size: var(--fs-xs); color: var(--muted); line-height: 1.5;
 }
 .trade-sidebar-hint b { color: var(--text); }
+
+/* Lab comparison view — side-by-side Models A-E summary at the top of Lab tab. */
+.lab-comparison {
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-lg);
+  padding: var(--s5) var(--s6);
+  margin-bottom: var(--s5);
+}
+.lab-comparison-header { margin-bottom: var(--s4); }
+.lab-comparison-header .section-title { margin: 0 0 var(--s1); font-size: var(--fs-md); }
+.lab-comparison-header .dim { font-size: var(--fs-sm); color: var(--muted); }
+.lab-comparison-table {
+  width: 100%; border-collapse: collapse; font-size: var(--fs-sm);
+}
+.lab-comparison-table th {
+  text-align: left; padding: var(--s2) var(--s3);
+  color: var(--dim); font-weight: 500; font-size: var(--fs-xs);
+  text-transform: uppercase; letter-spacing: 0.6px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.lab-comparison-table td {
+  padding: var(--s3); border-bottom: 1px solid var(--border-soft);
+  vertical-align: middle;
+}
+.lab-comparison-table tr:last-child td { border-bottom: none; }
+.lab-comparison-table .mono {
+  font-family: var(--mono); font-variant-numeric: tabular-nums;
+}
+.lab-comparison-table .pos { color: var(--good); }
+.lab-comparison-table .neg { color: var(--bad); }
+.lab-comparison-table .dim { color: var(--dim); }
+.lab-comparison-table tr.halted { opacity: 0.55; }
+.lab-comparison-table tr.halted .halt-why {
+  font-size: var(--fs-xs); color: var(--bad); margin-top: var(--s1);
+}
+.lab-comparison-table td.winner {
+  font-weight: 700; color: var(--good);
+}
+.lab-comparison-table tr.winner-row { background: rgba(5, 177, 105, 0.06); }
+.model-name { min-width: 200px; }
 .card-row {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--s5); margin-bottom: var(--s5);

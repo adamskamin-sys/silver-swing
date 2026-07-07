@@ -423,6 +423,85 @@ function renderMarginBar(snapshot) {
 
 // ---- cards --------------------------------------------------------------
 
+// Lab comparison view: side-by-side table of Models A–E performance.
+// Reads sleeve state from the Lab tenant and lays out every metric that
+// matters for A/B/C/D/E head-to-head comparison. Purely additive — cards
+// still render below, this is just a summary strip.
+function renderLabComparison() {
+  const labTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'lab');
+  if (!labTenant) return '';
+  const symbols = Object.keys(currentStore[labTenant] || {}).filter(s => !s.startsWith('__'));
+  if (!symbols.length) return '';
+  // Aggregate Model sleeves across all Lab symbols (usually just one, but
+  // could be multiple if user tracked more instruments in Lab).
+  const rows = [];
+  for (const symbol of symbols) {
+    const block = currentStore[labTenant][symbol] || {};
+    const config = block.config || {};
+    const state = block.state || {};
+    const sleeves = config.sleeves || [];
+    const sleeveStates = state.sleeves || {};
+    for (const s of sleeves) {
+      const name = String(s.name || s.id || '');
+      if (!name.startsWith('Model ')) continue;  // only auto-seeded model sleeves
+      const ss = sleeveStates[s.id] || {};
+      const cycles = Number(ss.cycles) || 0;
+      const realized = Number(ss.realized_pnl) || 0;
+      const consecutiveStops = Number(ss.consecutive_stops) || 0;
+      const stateName = String(ss.state || 'ARMED_SELL');
+      const halted = stateName === 'HALTED';
+      // Avg $/cycle — realized divided by completed cycles. Meaningful once
+      // you have at least a few cycles under each model.
+      const avgPerCycle = cycles > 0 ? realized / cycles : 0;
+      rows.push({
+        name, symbol, cycles, realized, avgPerCycle,
+        state: stateName, halted, consecutive_stops: consecutiveStops,
+        halt_reason: ss.halt_reason || '',
+      });
+    }
+  }
+  if (!rows.length) return '';
+  rows.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const bestRealized = Math.max(...rows.map(r => r.realized));
+  const cell = (val, cls = '') => `<td class="${cls}">${val}</td>`;
+  const numCell = (val, isWinner = false) => {
+    const sign = val >= 0 ? '+' : '';
+    const cls = val >= 0 ? 'pos' : 'neg';
+    const winner = isWinner && val > 0 ? ' winner' : '';
+    return `<td class="mono ${cls}${winner}">${sign}${fmtMoney(val)}</td>`;
+  };
+  const rowsHtml = rows.map(r => {
+    const isWinner = r.realized === bestRealized && rows.length > 1;
+    return `
+    <tr class="${r.halted ? 'halted' : ''}${isWinner ? ' winner-row' : ''}">
+      <td class="model-name"><b>${escapeHtml(r.name)}</b>${r.halted ? `<div class="halt-why">${escapeHtml(r.halt_reason)}</div>` : ''}</td>
+      <td class="mono">${r.cycles}</td>
+      ${numCell(r.realized, isWinner)}
+      ${numCell(r.avgPerCycle)}
+      <td class="mono ${r.consecutive_stops >= 2 ? 'neg' : 'dim'}">${r.consecutive_stops}</td>
+      <td><span class="status-pill ${(r.state || '').toLowerCase()}">${escapeHtml(prettyState(r.state))}</span></td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="lab-comparison-header">
+      <h3 class="section-title">Model Comparison — head-to-head</h3>
+      <div class="dim">Auto-seeded sleeves running Models A–E side-by-side on the same market data. Winner in green.</div>
+    </div>
+    <table class="lab-comparison-table">
+      <thead>
+        <tr>
+          <th>Strategy</th>
+          <th>Cycles</th>
+          <th>Realized</th>
+          <th>Avg / cycle</th>
+          <th>Consec. stops</th>
+          <th>State</th>
+        </tr>
+      </thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>`;
+}
+
 function renderCard(tenant, symbol, { config, state, snapshot }) {
   const s = state || {};
   const c = config || {};
@@ -1579,6 +1658,19 @@ async function refreshOnce() {
   cardsEl.innerHTML = '';
   const tenants = Object.keys(currentStore).sort();
   let anyRendered = false;
+
+  // Lab tab: add a side-by-side comparison panel at the top showing
+  // Models A-E performance at a glance, before the individual cards.
+  if (activeMode === 'lab') {
+    const compHtml = renderLabComparison();
+    if (compHtml) {
+      const compEl = document.createElement('section');
+      compEl.className = 'lab-comparison';
+      compEl.innerHTML = compHtml;
+      cardsEl.appendChild(compEl);
+    }
+  }
+
   for (const tenant of tenants) {
     const m = modeOfTenant(tenant);
     if (activeMode && activeMode !== 'scanner' && m && m !== activeMode) continue;

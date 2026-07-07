@@ -887,13 +887,43 @@ class SwingTrader:
     def _sleeve_in_blackout(self, sc, ss) -> bool:
         """True if the sleeve is currently inside a news-event blackout
         window and should pause new arms. Tier 2+ = pause; tier 3 = also
-        exit any open position (handled separately)."""
+        exit any open position (handled separately).
+
+        Consults news_calendar.blackout_for() to check against the module-
+        level SCHEDULED_EVENTS list. Also honors any explicit
+        blackout_until_ts on the state (manual override or set by an
+        earlier event). Bot-side check runs every tick — cheap operation
+        since the calendar list is small and stays in memory.
+        """
         if not sc.news_blackout_enabled:
             return False
-        if ss.blackout_until_ts is None:
-            return False
         import time as _t
-        return _t.time() < float(ss.blackout_until_ts)
+        now = _t.time()
+        # Explicit state override (set by dashboard for manual pauses)
+        if ss.blackout_until_ts is not None and now < float(ss.blackout_until_ts):
+            return True
+        # Scheduled event check
+        try:
+            from news_calendar import blackout_for
+            active = blackout_for(now)
+        except Exception as e:
+            self._record("sleeve_blackout_check_failed",
+                         sleeve_id=sc.id, error=str(e))
+            return False
+        if not active:
+            return False
+        # Only respect events at or above this sleeve's configured tier.
+        # sc.news_blackout_tier = 2 means "only stand aside for tier 2 and
+        # tier 3 events (skip tier 1 tightening-only)."
+        if active["tier"] < int(sc.news_blackout_tier or 2):
+            return False
+        # Cache the end_ts so subsequent ticks in this window are fast.
+        ss.blackout_until_ts = active["end_ts"]
+        self._record("sleeve_blackout_active",
+                     sleeve_id=sc.id, sleeve_name=sc.name,
+                     event=active["name"], tier=active["tier"],
+                     end_ts=active["end_ts"])
+        return True
 
     def _persist_sleeve_qty(self, sleeve_id: str, new_qty: int) -> None:
         """Write the grown qty back to the sleeves config so the next boot
