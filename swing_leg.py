@@ -607,6 +607,68 @@ class SwingTrader:
             consumed=need,
         )
 
+    def _compute_sleeve_stop_loss_qty(self, sc, position_qty: int) -> int:
+        """Same rules as _compute_stop_loss_qty but scoped to a sleeve. Always
+        respects the core floor. 'original' means cfg.qty (the starting size,
+        not the current possibly-accumulated size)."""
+        core = int(self.cfg.core_qty or 0)
+        sellable_ceiling = max(0, position_qty - core)
+        if sellable_ceiling == 0:
+            return 0
+        mode = (getattr(sc, "stop_loss_qty_mode", "all") or "all").lower()
+        if mode == "original":
+            # Use the sleeve's current qty (accumulated size). "Original" here
+            # means "just this sleeve, not all your other holdings" — which is
+            # what makes intuitive sense at the sleeve level.
+            return min(int(sc.qty or 0), sellable_ceiling)
+        if mode == "custom":
+            return min(max(0, int(getattr(sc, "stop_loss_qty_custom", 0) or 0)), sellable_ceiling)
+        return sellable_ceiling  # "all"
+
+    def _maybe_trigger_sleeve_stop_loss(self, sc, ss, last_price: float) -> bool:
+        """Per-sleeve stop-loss. Halts only this sleeve; other sleeves and the
+        primary keep running. Returns True when it fired."""
+        if not getattr(sc, "stop_loss_enabled", False):
+            return False
+        trigger = float(getattr(sc, "stop_loss_px", 0.0) or 0.0)
+        if trigger <= 0 or last_price > trigger:
+            return False
+        try:
+            pos = int(self.b.position_qty() or 0)
+        except Exception as e:
+            self._record("sleeve_stop_loss_read_position_failed",
+                         sleeve_id=sc.id, error=str(e))
+            return False
+        if pos <= 0:
+            self._sleeve_halt(sc, ss,
+                              f"stop-loss at {last_price} (≤ {trigger}) but position is 0")
+            return True
+        to_sell = self._compute_sleeve_stop_loss_qty(sc, pos)
+        if to_sell <= 0:
+            self._sleeve_halt(sc, ss,
+                              f"stop-loss at {last_price} (≤ {trigger}) but core floor "
+                              f"{self.cfg.core_qty} blocks the sell (pos={pos})")
+            return True
+        try:
+            source = getattr(self.b, "set_pending_source", None)
+            if callable(source):
+                source(f"sleeve_stop_loss:{sc.id}")
+            oid = self.b.place_market("SELL", to_sell)
+            self._record(
+                "sleeve_stop_loss_triggered",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                price=last_price, trigger=trigger, sold=to_sell,
+                mode=sc.stop_loss_qty_mode, order_id=oid,
+                position_before=pos, position_after=pos - to_sell,
+            )
+        except Exception as e:
+            self._record("sleeve_stop_loss_sell_failed",
+                         sleeve_id=sc.id, error=str(e),
+                         price=last_price, trigger=trigger)
+        self._sleeve_halt(sc, ss,
+                          f"stop-loss: sold {to_sell} @ market at {last_price} (trigger {trigger})")
+        return True
+
     def _persist_sleeve_qty(self, sleeve_id: str, new_qty: int) -> None:
         """Write the grown qty back to the sleeves config so the next boot
         starts at the accumulated size, not the original config qty."""
@@ -777,6 +839,12 @@ class SwingTrader:
         """Independent state machine for one additional sleeve. Shares broker,
         position, and floor guard with siblings and with the primary strategy."""
         if ss.state == SleeveStateEnum.HALTED:
+            return
+
+        # Per-sleeve stop-loss fires BEFORE the abort governor. Sells the
+        # configured qty at market then halts just this sleeve — other
+        # sleeves keep running.
+        if self._maybe_trigger_sleeve_stop_loss(sc, ss, last_price):
             return
 
         # Abort governor uses the symbol-level bands.
@@ -1058,6 +1126,7 @@ class SwingTrader:
             ss.last_sell_qty = sc.qty
             ss.last_sell_fill_price = fill if fill else None
             ss.sell_entry_avg = None  # cleared until next arm recomputes
+            ss.own_avg_entry = None   # no longer holding own contracts
             ss.state = SleeveStateEnum.ARMED_BUY
             # Trail/hybrid sub-states reset here so the rebuy is a clean slate.
             ss.trail_armed = False
@@ -1078,12 +1147,20 @@ class SwingTrader:
             # Buy-back re-arms the sleeve. Deduct the buy-side fee (round-trip
             # fees are split across both legs so this leg pays its share).
             ss.realized_pnl -= half_fee
+            # Anchor the sleeve's own basis to the buy fill so subsequent
+            # unrealized display reflects THIS sleeve's independent trading —
+            # not the paper gain on lots it inherited from an existing position.
+            try:
+                ss.own_avg_entry = float(fill_price) if fill_price is not None else float(sc.buy_px)
+            except (TypeError, ValueError):
+                ss.own_avg_entry = float(sc.buy_px)
             ss.state = SleeveStateEnum.ARMED_SELL
             self._record(
                 "sleeve_rebuy_completed",
                 sleeve_id=sc.id, sleeve_name=sc.name,
                 fill_price=fill_price, fees=half_fee,
                 realized_pnl_total=ss.realized_pnl,
+                own_avg_entry=ss.own_avg_entry,
             )
 
     def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:

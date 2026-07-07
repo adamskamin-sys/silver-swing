@@ -91,6 +91,14 @@ def execute(req: dict) -> dict:
         store.put_config(tenant, symbol, cfg)
         log = TradeLog(store_path.replace(".json", ".jsonl"))
 
+        # Seed the paper broker with swing_qty contracts at the first candle's
+        # open price. Without this, the strategy starts ARMED_SELL but the paper
+        # book is empty, so every arm_sell gets skipped ("insufficient contracts")
+        # and the backtest returns all zeros. With a seed, the first sell fires
+        # against known basis and the cycle can rotate through the window.
+        seed_qty = int(cfg.get("swing_qty") or 0)
+        seed_price = float(candles[0].open) if candles else 0.0
+
         def factory(broker, exit_mode=None):
             if exit_mode:
                 cfg2 = dict(cfg)
@@ -98,6 +106,8 @@ def execute(req: dict) -> dict:
                 cfg2.setdefault("trail_trigger", cfg2["sell_px"])
                 cfg2.setdefault("trail_distance", 0.20)
                 store.put_config(tenant, symbol, cfg2)
+            if seed_qty > 0 and seed_price > 0:
+                _seed_paper_position(broker, seed_qty, seed_price)
             return SwingTrader(broker, store, tenant, symbol, trade_log=log)
 
         applied_cfg = {
@@ -147,14 +157,33 @@ def main() -> int:
 
 
 def _default_config():
+    # core_qty=0 because a backtest doesn't have a "protected core" to worry
+    # about — we're evaluating whether the strategy mechanics work in this
+    # window, not what a live position would tolerate. Leaving core_qty=10 (as
+    # in live config) would cause reconcile() to HALT immediately since the
+    # seeded position is only swing_qty, well below 10.
     return {
-        "core_qty": 10, "swing_qty": 2, "max_swing_qty": 5,
+        "core_qty": 0, "swing_qty": 2, "max_swing_qty": 5,
         "sell_px": 65.0, "buy_px": 63.0, "contract_size": 50,
         "margin_per_contract": 275.0, "scale_up_buffer_mult": 1.5,
         "fee_per_contract_roundtrip": 4.68,
         "abort_below": 60.0, "abort_above": 70.0,
         "fee_sanity_multiplier": 2.0, "exit_mode": "fixed_limit",
     }
+
+
+def _seed_paper_position(broker, qty: int, price: float) -> None:
+    """Give the broker `qty` open contracts at `price` so the ARMED_SELL state
+    machine has something to sell in the first candle. Mirrors what a real
+    live account looks like at t=0: already long, waiting for the target."""
+    from paper_broker import Lot, PaperPosition
+    import time as _t, uuid as _uuid
+    broker.position = PaperPosition(product_id=broker.cfg.product_id, qty=qty, avg_entry=price)
+    broker.lots = [Lot(
+        id=f"lot-seed-{_uuid.uuid4()}",
+        qty=qty, entry_price=price, entry_ts=_t.time(),
+        source="backtest_seed", strategy_id=None,
+    )]
 
 
 def _apply_auto_fit(cfg: dict, candles) -> None:

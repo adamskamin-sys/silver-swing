@@ -50,6 +50,16 @@ class SleeveConfig:
     max_qty: int = 0                          # 0 or <= qty disables
     scale_up_buffer_mult: float = 1.5
 
+    # Per-sleeve stop-loss. Fires independently: only this sleeve halts,
+    # rest of the strategies keep running. Qty modes match the primary's:
+    #   all      → flatten this sleeve's held contracts (respecting core)
+    #   original → sell only the sleeve's starting cfg.qty
+    #   custom   → user-specified qty
+    stop_loss_enabled: bool = False
+    stop_loss_px: float = 0.0
+    stop_loss_qty_mode: str = "all"           # "all" | "original" | "custom"
+    stop_loss_qty_custom: int = 0
+
     @classmethod
     def from_dict(cls, d: dict) -> "SleeveConfig":
         return cls(
@@ -67,6 +77,10 @@ class SleeveConfig:
             accumulate_enabled=bool(d.get("accumulate_enabled") or False),
             max_qty=int(d.get("max_qty") or 0),
             scale_up_buffer_mult=float(d.get("scale_up_buffer_mult") or 1.5),
+            stop_loss_enabled=bool(d.get("stop_loss_enabled") or False),
+            stop_loss_px=float(d.get("stop_loss_px") or 0.0),
+            stop_loss_qty_mode=str(d.get("stop_loss_qty_mode") or "all"),
+            stop_loss_qty_custom=int(d.get("stop_loss_qty_custom") or 0),
         )
 
 
@@ -95,6 +109,13 @@ class SleeveState:
     # _sleeve_avg_entry when we place the sell order, cleared after the fill
     # credits realized. None = not captured yet (or between cycles).
     sell_entry_avg: Optional[float] = None
+    # Fill price of contracts THIS sleeve BOUGHT via its own state machine.
+    # Set on a BUY fill, cleared on a SELL fill. Used for the sleeve-row
+    # unrealized display so newly-created sleeves show $0 (until they trade)
+    # instead of inheriting mark-to-market on pre-existing paper lots — that
+    # inherited paper gain still shows up in the account-level unrealized at
+    # the top of the card, just not double-counted per sleeve.
+    own_avg_entry: Optional[float] = None
 
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
@@ -111,6 +132,7 @@ class SleeveState:
             trail_high_water_price=float(d.get("trail_high_water_price") or 0.0),
             hybrid_sell_triggered_ts=d.get("hybrid_sell_triggered_ts"),
             current_qty=int(d.get("current_qty") or 0),
+            own_avg_entry=d.get("own_avg_entry"),
         )
 
     def to_dict(self) -> dict:

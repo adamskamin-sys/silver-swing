@@ -377,6 +377,22 @@ export function makeApp({
         if (!Number.isFinite(buf) || buf < 1.0)
           issues.push({ field: `${s.id}.scale_up_buffer_mult`, message: 'scale_up_buffer_mult must be >= 1.0' });
       }
+      // Per-sleeve stop-loss validation. Only enforced when enabled.
+      if (s.stop_loss_enabled) {
+        const stopPx = Number(s.stop_loss_px);
+        if (!Number.isFinite(stopPx) || stopPx <= 0)
+          issues.push({ field: `${s.id}.stop_loss_px`, message: 'stop_loss_px must be > 0' });
+        else if (Number.isFinite(buy) && stopPx >= buy)
+          issues.push({ field: `${s.id}.stop_loss_px`, message: `stop_loss_px (${stopPx}) must be < buy_px (${buy}); otherwise it fires as soon as you're armed` });
+        const mode = String(s.stop_loss_qty_mode || 'all').toLowerCase();
+        if (!['all', 'original', 'custom'].includes(mode))
+          issues.push({ field: `${s.id}.stop_loss_qty_mode`, message: `stop_loss_qty_mode must be all|original|custom, got ${mode}` });
+        if (mode === 'custom') {
+          const cq = Number(s.stop_loss_qty_custom);
+          if (!Number.isFinite(cq) || cq < 1 || cq !== Math.floor(cq))
+            issues.push({ field: `${s.id}.stop_loss_qty_custom`, message: 'stop_loss_qty_custom must be integer >= 1' });
+        }
+      }
     }
     if (issues.length) return res.status(400).json({ ok: false, issues });
 

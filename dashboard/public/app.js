@@ -1096,13 +1096,17 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     // HALTED. To take a strategy out of rotation, use the ✕ (Stop strategy).
     const canSellNow = sState === 'ARMED_SELL' && pos >= sleeveQty && sleeveQty > 0;
 
-    // Unrealized against the ACTUAL lots FIFO-allocated to this sleeve, not
-    // its configured buy_px. Matches what the position row shows for the same
-    // contracts — so if this sleeve owns all your open contracts, the two
-    // numbers agree exactly. Shown as a number always (even $0.00) rather
-    // than "—" so the user knows the field is live.
+    // Per-sleeve unrealized reflects ONLY what THIS sleeve has traded — the
+    // paper gain on contracts it bought via its own state machine (own_avg_entry).
+    // Newly-created sleeves and ARMED_BUY sleeves show $0 here because they
+    // haven't earned any move that belongs to them yet. Inherited paper gains
+    // on pre-existing lots stay at the top-level unrealized on the position row,
+    // so they're not double-counted per strategy.
     const sleeveUnits = allocation.bySleeve[s.id] || [];
-    const unreal = sumUnitsUnrealized(sleeveUnits, mark, contractSize);
+    const ownEntry = ss.own_avg_entry;
+    const unreal = (ownEntry != null && sleeveQty > 0 && sState === 'ARMED_SELL')
+      ? (mark - Number(ownEntry)) * contractSize * sleeveQty
+      : 0;
 
     const sleeveAvgEntry = sleeveUnits.length > 0
       ? sleeveUnits.reduce((n, u) => n + u.entry_price, 0) / sleeveUnits.length
@@ -2180,6 +2184,37 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
         </div>
       </div>
 
+      <!-- Per-sleeve stop-loss. Fires independently — only this sleeve halts. -->
+      <div class="accumulate-block">
+        <label class="accumulate-toggle">
+          <input type="checkbox" id="sl-stoploss" ${draft.stop_loss_enabled ? 'checked' : ''}>
+          <b>Stop-loss (protects during a crash)</b>
+        </label>
+        <div class="accumulate-fields" id="sl-stoploss-fields" ${draft.stop_loss_enabled ? '' : 'hidden'}>
+          <div class="target-inputs">
+            <label>Trigger price ($) — sell when silver falls to
+              <input type="number" id="sl-stop-px" step="0.01" value="${draft.stop_loss_px || Math.max(0, +(mark - 2).toFixed(2))}">
+            </label>
+            <label>Sell how many
+              <select id="sl-stop-mode">
+                <option value="all" ${draft.stop_loss_qty_mode === 'all' ? 'selected' : ''}>all this sleeve's contracts</option>
+                <option value="original" ${draft.stop_loss_qty_mode === 'original' ? 'selected' : ''}>only the current qty (let accumulated ride)</option>
+                <option value="custom" ${draft.stop_loss_qty_mode === 'custom' ? 'selected' : ''}>custom number</option>
+              </select>
+            </label>
+          </div>
+          <div class="target-inputs" id="sl-stop-custom-row" ${draft.stop_loss_qty_mode === 'custom' ? '' : 'hidden'}>
+            <label>Custom sell qty
+              <input type="number" id="sl-stop-qty" min="1" step="1" value="${draft.stop_loss_qty_custom || 1}">
+            </label>
+          </div>
+          <div class="preview-note">
+            When silver ≤ trigger, this sleeve market-sells the configured qty then halts.
+            Core floor is always respected. Only THIS sleeve is affected — other sleeves keep trading.
+          </div>
+        </div>
+      </div>
+
       <div id="sleeve-error" class="issues" hidden></div>
       <div class="modal-footer">
         <button data-close>cancel</button>
@@ -2213,6 +2248,20 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
   if (accumulateToggle && accumulateFields) {
     accumulateToggle.addEventListener('change', () => {
       accumulateFields.hidden = !accumulateToggle.checked;
+    });
+  }
+  const stopLossToggle = m.querySelector('#sl-stoploss');
+  const stopLossFields = m.querySelector('#sl-stoploss-fields');
+  const stopModeEl = m.querySelector('#sl-stop-mode');
+  const stopCustomRow = m.querySelector('#sl-stop-custom-row');
+  if (stopLossToggle && stopLossFields) {
+    stopLossToggle.addEventListener('change', () => {
+      stopLossFields.hidden = !stopLossToggle.checked;
+    });
+  }
+  if (stopModeEl && stopCustomRow) {
+    stopModeEl.addEventListener('change', () => {
+      stopCustomRow.hidden = stopModeEl.value !== 'custom';
     });
   }
 
@@ -2394,6 +2443,11 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     const maxQtyEl = m.querySelector('#sl-max-qty');
     const scaleBufEl = m.querySelector('#sl-scale-buf');
     const accumulateEnabled = !!(accumulateEl && accumulateEl.checked);
+    const stopPxEl = m.querySelector('#sl-stop-px');
+    const stopQtyEl = m.querySelector('#sl-stop-qty');
+    const stopLossEnabled = !!(stopLossToggle && stopLossToggle.checked);
+    const stopMode = stopModeEl?.value || 'all';
+    const stopPx = Number(stopPxEl?.value || 0);
     const patch = {
       id: draft.id,
       name: nameEl.value || draft.id,
@@ -2409,6 +2463,11 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
       accumulate_enabled: accumulateEnabled,
       max_qty: accumulateEnabled ? parseInt(maxQtyEl?.value || 0, 10) : 0,
       scale_up_buffer_mult: accumulateEnabled ? Number(scaleBufEl?.value || 1.5) : 1.5,
+      stop_loss_enabled: stopLossEnabled,
+      stop_loss_px: stopLossEnabled ? stopPx : 0,
+      stop_loss_qty_mode: stopLossEnabled ? stopMode : 'all',
+      stop_loss_qty_custom: stopLossEnabled && stopMode === 'custom'
+        ? parseInt(stopQtyEl?.value || 1, 10) : 0,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
@@ -2416,6 +2475,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
     if (exitEl.value === 'hybrid') {
       if (!(trailActivation > sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Trail activation must be above the sell target'; return; }
       if (!(hybridDelay >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Delay must be at least 1 second'; return; }
+    }
+    if (stopLossEnabled) {
+      if (!(stopPx > 0)) { errEl.hidden = false; errEl.innerHTML = 'Stop-loss trigger price must be > 0'; return; }
+      if (!(stopPx < buyPx)) { errEl.hidden = false; errEl.innerHTML = 'Stop-loss trigger must be below the buy-back target'; return; }
+      if (stopMode === 'custom' && !(parseInt(stopQtyEl?.value || 0, 10) >= 1)) {
+        errEl.hidden = false; errEl.innerHTML = 'Custom stop-loss qty must be at least 1'; return;
+      }
     }
 
     const next = existing

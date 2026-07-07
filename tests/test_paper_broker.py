@@ -270,3 +270,57 @@ def test_snapshot_available_margin_reflects_used():
     snap = b.snapshot()
     assert snap["margin_used"] == pytest.approx(2 * 275.0)
     assert snap["available_margin"] == pytest.approx(snap["equity"] - snap["margin_used"])
+
+
+# ---- Lot consumption priority (multi-strategy attribution) ------------------
+
+
+def _buy_tagged(b, qty, price, strategy_id):
+    """Helper: place a BUY tagged with a strategy_id and fill it."""
+    b.set_pending_source("strategy", strategy_id=strategy_id)
+    b.place_limit("BUY", qty, price)
+    b.tick(price, price)  # fills the limit
+
+
+def test_untagged_sell_prefers_unassigned_lots_over_tagged():
+    """A strategy consuming lots should NOT steal another strategy's tagged
+    lots when unassigned lots are available. Regression: previously the
+    fallback used global FIFO, letting a newer strategy silently drain an
+    older strategy's cost basis."""
+    b = PaperBroker(SLR_CFG)
+    b.tick(60.0, 60.0)  # prime last_mark so BUY can fill
+    # Untagged inherited lot first (older ts) at basis 60.0
+    b.set_pending_source("manual")
+    b.place_limit("BUY", 2, 60.0)
+    b.tick(60.0, 60.0)
+    # Strategy s1's own tagged lot at basis 61.0 (newer ts)
+    _buy_tagged(b, 2, 61.0, "s1")
+    assert b.position.qty == 4
+    # Strategy s2 sells 2 — should consume the UNTAGGED lot (basis 60.0),
+    # leaving s1's tagged 61.0 lot intact for its own future sell.
+    b.set_pending_source("strategy", strategy_id="s2")
+    b.place_limit("SELL", 2, 62.0)
+    b.tick(62.0, 62.0)
+    assert b.position.qty == 2
+    remaining = b.lots
+    assert len(remaining) == 1
+    assert remaining[0].strategy_id == "s1"
+    assert remaining[0].entry_price == pytest.approx(61.0)
+
+
+def test_sell_still_falls_through_to_other_tagged_lots_as_last_resort():
+    """If there are no untagged lots left, a sell should still be able to
+    consume another strategy's tagged lots — the guard is priority, not a hard
+    barrier. Otherwise a strategy could sell more than its own inventory when
+    everything is tagged."""
+    b = PaperBroker(SLR_CFG)
+    b.tick(60.0, 60.0)
+    _buy_tagged(b, 2, 60.0, "s1")
+    _buy_tagged(b, 2, 61.0, "s2")
+    # No untagged lots exist. s2 sells 3, forcing the last-resort branch to
+    # consume 1 of s1's tagged lots after exhausting its own 2.
+    b.set_pending_source("strategy", strategy_id="s2")
+    b.place_limit("SELL", 3, 62.0)
+    b.tick(62.0, 62.0)
+    assert b.position.qty == 1
+    assert b.lots[0].strategy_id == "s1"

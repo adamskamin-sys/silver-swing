@@ -435,3 +435,126 @@ def test_stop_loss_only_fires_at_or_below_trigger(tmp_path):
     trader.step(60.50)
     assert trader.s.state != State.HALTED or "stop-loss" not in (trader.s.halt_reason or "").lower()
     assert broker.position.qty == 12
+
+
+# ---- per-sleeve stop-loss --------------------------------------------------
+
+
+def _config_with_sleeve_stop_loss(mode, custom=0, trigger=60.0, core=0):
+    """Config with one sleeve carrying a stop-loss. Primary swing_qty=0 so
+    the sleeve is the only strategy — keeps the test focused on sleeve logic."""
+    return {
+        "core_qty": core, "swing_qty": 0, "sell_px": 65.0, "buy_px": 63.0,
+        "abort_below": 58.0, "abort_above": 70.0,
+        "contract_size": 50, "margin_per_contract": 275.0,
+        "fee_per_contract_roundtrip": 4.68, "fee_sanity_multiplier": 2.0,
+        "sleeves": [{
+            "id": "s1", "name": "sleeve1", "qty": 4,
+            "exit_mode": "fixed_limit", "sell_px": 65.0, "buy_px": 63.0,
+            "trail_trigger": 65.0, "trail_distance": 0.20,
+            "reanchor_threshold": 2.0,
+            "stop_loss_enabled": True,
+            "stop_loss_px": trigger,
+            "stop_loss_qty_mode": mode,
+            "stop_loss_qty_custom": custom,
+        }],
+    }
+
+
+def test_sleeve_stop_loss_fires_all_and_halts_only_this_sleeve(tmp_path):
+    cfg = _config_with_sleeve_stop_loss("all", trigger=60.0, core=6)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(59.99, 59.99)  # below trigger
+    trader.step(59.99)
+    from sleeves import SleeveStateEnum
+    ss = trader.s.sleeves["s1"]
+    assert ss.state == SleeveStateEnum.HALTED
+    # "all" mode → flatten down to core. Started at 12, core=6 → sells 6.
+    assert broker.position.qty == 6
+    # Primary state must NOT be halted — the sleeve halt is scoped.
+    assert trader.s.state != State.HALTED
+
+
+def test_sleeve_stop_loss_original_mode_sells_config_qty(tmp_path):
+    cfg = _config_with_sleeve_stop_loss("original", trigger=60.0, core=6)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(59.5, 59.5)
+    trader.step(59.5)
+    # "original" mode uses cfg.qty (4). 12 - 4 = 8 remaining.
+    assert broker.position.qty == 8
+
+
+def test_sleeve_stop_loss_disabled_does_not_fire(tmp_path):
+    cfg = _config_with_sleeve_stop_loss("all", trigger=60.0, core=6)
+    cfg["sleeves"][0]["stop_loss_enabled"] = False
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    broker.tick(58.0, 58.0)
+    trader.step(58.0)
+    assert broker.position.qty == 12
+
+
+# ---- per-sleeve own_avg_entry (unrealized display anchor) ------------------
+
+
+def _config_with_plain_sleeve(qty=2, sell=65.0, buy=63.0, core=0):
+    return {
+        "core_qty": core, "swing_qty": 0,
+        "sell_px": 65.0, "buy_px": 63.0,
+        "abort_below": 55.0, "abort_above": 75.0,
+        "contract_size": 50, "margin_per_contract": 275.0,
+        "fee_per_contract_roundtrip": 4.68, "fee_sanity_multiplier": 2.0,
+        "sleeves": [{
+            "id": "s1", "name": "sleeve1", "qty": qty,
+            "exit_mode": "fixed_limit",
+            "sell_px": sell, "buy_px": buy,
+            "trail_trigger": sell, "trail_distance": 0.20,
+            "reanchor_threshold": 2.0,
+        }],
+    }
+
+
+def test_sleeve_own_avg_entry_starts_none(tmp_path):
+    """A brand-new sleeve has not bought anything itself — own_avg_entry should
+    be None so the dashboard shows $0 unrealized, not the paper gain on
+    inherited lots."""
+    cfg = _config_with_plain_sleeve(qty=2, core=0)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    assert trader.s.sleeves["s1"].own_avg_entry is None
+
+
+def test_sleeve_own_avg_entry_set_on_own_buy_fill(tmp_path):
+    """When the sleeve's state machine executes its own BUY fill, own_avg_entry
+    captures the fill price so the sleeve's unrealized reflects THIS sleeve's
+    trading — not lots it inherited from the broker's pre-existing position."""
+    from sleeves import SleeveStateEnum
+    cfg = _config_with_plain_sleeve(qty=2, sell=65.0, buy=63.0, core=0)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    ss = trader.s.sleeves["s1"]
+    # Fast-forward to ARMED_BUY holding no contracts. Simulate the sell fill
+    # that would put it in ARMED_BUY, then drive a buy fill and confirm.
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.own_avg_entry = None
+    trader._sleeve_on_fill(trader._load_sleeves_cfg()[0], ss, fill_price=63.0)
+    assert ss.own_avg_entry == pytest.approx(63.0)
+    assert ss.state == SleeveStateEnum.ARMED_SELL
+
+
+def test_sleeve_own_avg_entry_cleared_on_sell_fill(tmp_path):
+    """After a SELL fill, the sleeve holds nothing so own_avg_entry must clear
+    back to None — otherwise the dashboard would keep showing a stale basis."""
+    from sleeves import SleeveStateEnum
+    cfg = _config_with_plain_sleeve(qty=2, sell=65.0, buy=63.0, core=0)
+    trader, broker, _, _, _ = make_trader(tmp_path, config=cfg)
+    trader.reconcile()
+    ss = trader.s.sleeves["s1"]
+    ss.state = SleeveStateEnum.ARMED_SELL
+    ss.own_avg_entry = 63.0
+    ss.sell_entry_avg = 63.0
+    trader._sleeve_on_fill(trader._load_sleeves_cfg()[0], ss, fill_price=65.0)
+    assert ss.own_avg_entry is None
+    assert ss.state == SleeveStateEnum.ARMED_BUY

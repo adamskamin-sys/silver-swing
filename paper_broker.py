@@ -297,16 +297,21 @@ class PaperBroker:
           1. If a strategy_id is set on the pending source, consume THAT
              strategy's own tagged lots first (FIFO within its own inventory).
              Keeps each sleeve's cost basis tied to what IT actually bought.
-          2. Then fall back to global FIFO (oldest lot first).
+          2. Then untagged (unassigned) lots FIFO — inherited position first.
+          3. Only as a last resort, consume OTHER strategies' tagged lots. If
+             we globally FIFO'd here, a newer strategy could steal an older
+             strategy's cheap tagged lot and leave the original holding only
+             expensive lots — silently wrecking its realized-P/L math.
         Splits a lot if qty doesn't fully close it. Silent no-op if lots empty."""
         remaining = qty
         tag = self._pending_strategy_id
-        if tag is not None:
-            # Preferred: consume this strategy's own tagged lots FIFO
+
+        def _consume_matching(predicate):
+            nonlocal remaining
             i = 0
             while remaining > 0 and i < len(self.lots):
                 lot = self.lots[i]
-                if lot.strategy_id != tag:
+                if not predicate(lot):
                     i += 1
                     continue
                 if lot.qty <= remaining:
@@ -315,15 +320,14 @@ class PaperBroker:
                 else:
                     lot.qty -= remaining
                     remaining = 0
-        # Fallback: global FIFO for anything left
-        while remaining > 0 and self.lots:
-            lot = self.lots[0]
-            if lot.qty <= remaining:
-                remaining -= lot.qty
-                self.lots.pop(0)
-            else:
-                lot.qty -= remaining
-                remaining = 0
+
+        if tag is not None:
+            _consume_matching(lambda l: l.strategy_id == tag)
+        _consume_matching(lambda l: l.strategy_id is None)
+        # Last resort: other strategies' tagged lots. Anything remaining after
+        # this branch means we asked to sell more than the total open position,
+        # which the higher-level guard should have already blocked.
+        _consume_matching(lambda l: True)
 
     def unrealized_pnl(self) -> float:
         if self.position.qty == 0 or self._last_mark == 0:
