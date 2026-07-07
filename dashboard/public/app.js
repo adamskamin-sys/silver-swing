@@ -1123,14 +1123,14 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
 
   const primaryRow = primaryEnabled ? `
     <tr class="sleeve-row primary ${primaryHalted ? 'halted' : ''}">
-      <td class="sleeve-name"><b>Primary</b><div class="sleeve-hint">${primaryHint}</div></td>
-      <td class="sleeve-qty">${primaryQty}</td>
-      <td class="sleeve-params">${primaryParamsHtml}</td>
-      <td class="sleeve-status"><span class="status-pill ${(state?.state || '').toLowerCase()}">${escapeHtml(primaryStateLabel)}</span></td>
-      <td class="sleeve-cycles">${cyclesTotal}</td>
-      <td class="sleeve-unrealized ${classForValue(primaryUnreal)}">${primaryUnreal >= 0 ? '+' : ''}${fmtMoney(primaryUnreal)}</td>
-      <td class="sleeve-realized ${classForValue(realizedTotal)}">${realizedTotal >= 0 ? '+' : ''}${fmtMoney(realizedTotal)}</td>
-      <td class="sleeve-actions">
+      <td class="sleeve-name" data-label="Strategy"><b>Primary</b><div class="sleeve-hint">${primaryHint}</div></td>
+      <td class="sleeve-qty" data-label="Contracts">${primaryQty}</td>
+      <td class="sleeve-params" data-label="Params">${primaryParamsHtml}</td>
+      <td class="sleeve-status" data-label="Status"><span class="status-pill ${(state?.state || '').toLowerCase()}">${escapeHtml(primaryStateLabel)}</span></td>
+      <td class="sleeve-cycles" data-label="Cycles">${cyclesTotal}</td>
+      <td class="sleeve-unrealized ${classForValue(primaryUnreal)}" data-label="Unrealized">${primaryUnreal >= 0 ? '+' : ''}${fmtMoney(primaryUnreal)}</td>
+      <td class="sleeve-realized ${classForValue(realizedTotal)}" data-label="Realized">${realizedTotal >= 0 ? '+' : ''}${fmtMoney(realizedTotal)}</td>
+      <td class="sleeve-actions" data-label="Actions">
         ${primaryHalted ? resumeBtn(tenant, symbol) : ''}
         ${cancelBtn(tenant, symbol, null, primaryHasOrder)}
         ${sellNowBtn(tenant, symbol, primaryQty, primaryCanSellNow)}
@@ -1189,17 +1189,17 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
 
     return `
       <tr class="sleeve-row ${sleeveHalted ? 'halted' : ''}" data-sleeve-id="${escapeHtml(s.id)}">
-        <td class="sleeve-name">
+        <td class="sleeve-name" data-label="Strategy">
           <b>${escapeHtml(s.name || s.id)}</b>
           ${sleeveHalted && ss.halt_reason ? `<div class="sleeve-hint"><span class="halt-why">${escapeHtml(ss.halt_reason)}</span></div>` : ''}
         </td>
-        <td class="sleeve-qty">${sleeveQty}</td>
-        <td class="sleeve-params">${paramsHtml}</td>
-        <td class="sleeve-status"><span class="status-pill ${sState.toLowerCase()}">${escapeHtml(prettyState(sState))}</span></td>
-        <td class="sleeve-cycles">${cycles}</td>
-        <td class="sleeve-unrealized ${classForValue(unreal)}">${unreal >= 0 ? '+' : ''}${fmtMoney(unreal)}</td>
-        <td class="sleeve-realized ${classForValue(realized)}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
-        <td class="sleeve-actions">
+        <td class="sleeve-qty" data-label="Contracts">${sleeveQty}</td>
+        <td class="sleeve-params" data-label="Params">${paramsHtml}</td>
+        <td class="sleeve-status" data-label="Status"><span class="status-pill ${sState.toLowerCase()}">${escapeHtml(prettyState(sState))}</span></td>
+        <td class="sleeve-cycles" data-label="Cycles">${cycles}</td>
+        <td class="sleeve-unrealized ${classForValue(unreal)}" data-label="Unrealized">${unreal >= 0 ? '+' : ''}${fmtMoney(unreal)}</td>
+        <td class="sleeve-realized ${classForValue(realized)}" data-label="Realized">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
+        <td class="sleeve-actions" data-label="Actions">
           ${sleeveHalted ? resumeBtn(tenant, symbol) : ''}
           ${cancelBtn(tenant, symbol, s.id, hasOrder)}
           ${sellNowBtn(tenant, symbol, sleeveQty, canSellNow)}

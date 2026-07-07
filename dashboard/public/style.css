@@ -916,15 +916,16 @@ header { padding: 20px 32px; }
 .budget-ok { color: var(--good); }
 .budget-bad { color: var(--bad); font-weight: 600; }
 
+/* Sleeve table forced to stay inside the card. Row content wraps down
+   instead of pushing off-screen to the right — no more horizontal scroll.
+   Action buttons wrap onto a second line when the row is narrow. */
 .sleeves-table {
   width: 100%; border-collapse: collapse; font-size: var(--fs-sm);
+  table-layout: auto;
 }
-/* On narrow viewports the strategy row's action buttons (Cancel order /
-   Sell N now / Edit / Stop) push off the right edge of the card. Wrap the
-   table in a horizontal scroll container so nothing hides. */
 .sleeves-section .sleeves-table-wrap {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+  overflow: visible;  /* never introduce a horizontal scroll */
+  width: 100%;
 }
 .sleeves-table thead th {
   text-align: left; padding: var(--s2) var(--s3);
@@ -942,12 +943,13 @@ header { padding: 20px 32px; }
 .sleeve-hint { font-size: var(--fs-xs); color: var(--dim); margin-top: 2px; }
 .sleeve-qty {
   text-align: right; font-family: var(--mono);
-  font-size: var(--fs-md); color: var(--text); font-weight: 600; min-width: 60px;
+  font-size: var(--fs-md); color: var(--text); font-weight: 600; min-width: 40px;
   font-variant-numeric: tabular-nums;
 }
 .sleeve-params {
   font-family: var(--mono); color: var(--muted); font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
+  white-space: normal;  /* let params wrap if long */
 }
 .sleeve-cycles {
   font-family: var(--mono); text-align: right; color: var(--muted);
@@ -960,8 +962,46 @@ header { padding: 20px 32px; }
 .sleeve-realized.pos, .sleeve-unrealized.pos { color: var(--good); }
 .sleeve-realized.neg, .sleeve-unrealized.neg { color: var(--bad); }
 .sleeve-realized.dim, .sleeve-unrealized.dim { color: var(--dim); }
-.sleeve-actions { text-align: right; white-space: nowrap; }
-.sleeve-actions button { margin-left: var(--s1); }
+
+/* Actions column: buttons wrap to a second line when the row runs out of
+   horizontal space, so the card never needs horizontal scroll. Buttons stay
+   inline where they fit — on wide viewports it still looks like a single row. */
+.sleeve-actions {
+  text-align: right;
+  white-space: normal;
+  display: flex; flex-wrap: wrap; justify-content: flex-end;
+  gap: var(--s1);
+  min-width: 0;
+}
+.sleeve-actions button { margin: 0; }
+
+/* Below this width the strategy row becomes a stacked mini-card: everything
+   flows top-to-bottom, actions at the bottom, no cell ever gets clipped. */
+@media (max-width: 900px) {
+  .sleeves-table, .sleeves-table thead, .sleeves-table tbody,
+  .sleeves-table tr, .sleeves-table td, .sleeves-table th {
+    display: block; width: 100%;
+  }
+  .sleeves-table thead { display: none; }
+  .sleeves-table tbody tr {
+    padding: var(--s4);
+    background: var(--panel-2);
+    border-radius: var(--r-md);
+    margin-bottom: var(--s3);
+  }
+  .sleeves-table tbody td {
+    padding: var(--s2) 0;
+    border: none;
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: var(--s3);
+  }
+  .sleeves-table tbody td::before {
+    content: attr(data-label);
+    font-size: var(--fs-xs); color: var(--dim);
+    text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
+  }
+  .sleeve-actions { justify-content: flex-start; }
+}
 
 .sleeve-form {
   display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
