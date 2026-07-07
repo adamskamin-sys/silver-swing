@@ -1034,13 +1034,45 @@ header { padding: 20px 32px; }
 
 /* sleeve editor: anchor + profit slider + live preview */
 .sleeve-anchor {
-  display: flex; justify-content: space-between; align-items: baseline;
-  padding: 14px 18px; margin: 8px 0 16px;
-  background: var(--panel-2); border: 1px solid var(--border);
-  border-radius: 10px;
+  padding: var(--s4) var(--s5); margin: var(--s2) 0 var(--s4);
+  background: var(--panel-2); border-radius: var(--r-md);
 }
+.sleeve-anchor-title {
+  font-size: var(--fs-xs); color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
+  margin-bottom: var(--s2);
+}
+.sleeve-anchor-toggle {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--s2);
+}
+.anchor-choice {
+  display: flex; flex-direction: column; gap: var(--s1);
+  padding: var(--s3) var(--s4);
+  background: var(--panel); border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  cursor: pointer; text-align: left;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.anchor-choice:hover { background: var(--panel-3); border-color: var(--dim); }
+.anchor-choice.active {
+  border-color: var(--accent);
+  background: rgba(74, 134, 255, 0.10);
+}
+.anchor-choice-label {
+  font-size: var(--fs-xs); color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500;
+}
+.anchor-choice.active .anchor-choice-label { color: var(--accent); }
+.anchor-choice-value {
+  font-family: var(--mono); font-size: 20px; font-weight: 600;
+  color: var(--text); font-variant-numeric: tabular-nums;
+  letter-spacing: -0.3px;
+}
+/* Legacy classes kept for anywhere else the old markup might live. */
 .sleeve-anchor-label {
-  font-size: 11px; color: var(--dim);
+  font-size: var(--fs-xs); color: var(--dim);
   text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
 }
 .sleeve-anchor-value {
