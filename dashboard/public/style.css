@@ -1349,6 +1349,8 @@ header { padding: 20px 32px; }
 #scanner-table tr.scanner-row { cursor: pointer; transition: background 100ms; }
 #scanner-table tr.scanner-row:hover { background: rgba(143, 122, 224, 0.10); }
 .mode-tab.mode-scanner.active { border-color: #8f7ae0; color: #d5cef5; }
+/* Lab tab — signals it's an experimental/learning surface, not production. */
+.mode-tab.mode-lab.active { border-color: #f5a742; color: #ffddb5; }
 
 /* ---- scanner detail modal ---------------------------------------------- */
 .scanner-detail-summary { display: flex; justify-content: space-between;

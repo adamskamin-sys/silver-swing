@@ -80,10 +80,59 @@ def _default_paper_config():
     }
 
 
+def _default_lab_config():
+    """Lab tenant defaults: free-trading sandbox for learning theory-based
+    strategies. core_qty=0 so the trader doesn't halt on reconcile when the
+    Lab account starts flat with $100k. Abort bands intentionally wide so any
+    tracked derivative fits without hand-tuning."""
+    return {
+        "core_qty": 0, "swing_qty": 0, "max_swing_qty": 10,
+        "sell_px": 0, "buy_px": 0, "contract_size": 50,
+        "margin_per_contract": 275.0, "scale_up_buffer_mult": 1.5,
+        "fee_per_contract_roundtrip": 4.68,
+        "abort_below": 0.0, "abort_above": 1e9,
+        "fee_sanity_multiplier": 2.0,
+        "sleeves": [],
+    }
+
+
+def _is_lab_tenant(tenant: str) -> bool:
+    return tenant == _derive_lab_tenant(TENANT)
+
+
 def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
     if store.get_config(tenant, symbol):
+        _fixup_lab_config(store, tenant, symbol)
         return
-    store.put_config(tenant, symbol, _default_paper_config())
+    if _is_lab_tenant(tenant):
+        store.put_config(tenant, symbol, _default_lab_config())
+    else:
+        store.put_config(tenant, symbol, _default_paper_config())
+
+
+def _fixup_lab_config(store, tenant: str, symbol: str) -> None:
+    """One-time migration for Lab configs that were seeded before this fix
+    landed — they inherited the primary paper defaults (core_qty=10) so a
+    fresh $100k Lab account halted immediately at reconcile with 'position 0
+    below core 10'. Lower core_qty + widen abort bands so the Lab actually
+    behaves as a learning sandbox. Only touches lab tenants; primary paper /
+    live configs are never rewritten by this function."""
+    if not _is_lab_tenant(tenant):
+        return
+    cfg = store.get_config(tenant, symbol) or {}
+    dirty = False
+    if int(cfg.get("core_qty") or 0) > 0:
+        cfg["core_qty"] = 0
+        dirty = True
+    if float(cfg.get("abort_below") or 0) > 0:
+        cfg["abort_below"] = 0.0
+        dirty = True
+    if float(cfg.get("abort_above") or 0) < 1e6:
+        cfg["abort_above"] = 1e9
+        dirty = True
+    if dirty:
+        store.put_config(tenant, symbol, cfg)
+        _log(f"[{tenant}/{symbol}] lab config migrated: core_qty→0, abort bands widened")
 
 
 def _log(msg: str) -> None:

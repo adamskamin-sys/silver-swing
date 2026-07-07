@@ -254,9 +254,12 @@ function renderBanners(store) {
 // ---- asset-class tabs ---------------------------------------------------
 
 function modeOfTenant(tenant) {
-  // Tenant naming convention: `adam-paper` and `adam-live`. Fall back to
-  // matching the snapshot's `mode` when the tenant name doesn't disclose it.
+  // Tenant naming: `adam-paper`, `adam-live`, `adam-lab`. Lab is a dedicated
+  // $100k learning sandbox for theory-based strategies — same paper broker
+  // and feed, isolated from the primary paper tenant so experiments don't
+  // pollute your main account.
   const t = String(tenant || '').toLowerCase();
+  if (t.includes('lab')) return 'lab';
   if (t.includes('live')) return 'live';
   if (t.includes('paper')) return 'paper';
   return null;
@@ -297,7 +300,7 @@ function confirmLive({ title = 'Confirm live action', body = 'This will place a 
 }
 
 function renderModeTabs(store) {
-  const counts = { paper: 0, live: 0 };
+  const counts = { paper: 0, live: 0, lab: 0 };
   for (const [tenant, symbols] of Object.entries(store)) {
     const m = modeOfTenant(tenant);
     if (!m) continue;
@@ -318,6 +321,7 @@ function renderModeTabs(store) {
   };
   modeTabs.appendChild(mk('paper', 'paper', 'mode-paper', counts.paper || 0));
   modeTabs.appendChild(mk('live', 'live', 'mode-live', counts.live || 0));
+  modeTabs.appendChild(mk('lab', 'lab', 'mode-lab', counts.lab || 0));
   modeTabs.appendChild(mk('scanner', 'scanner', 'mode-scanner'));
 }
 
