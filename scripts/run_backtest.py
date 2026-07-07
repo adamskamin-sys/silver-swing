@@ -118,23 +118,60 @@ def execute(req: dict) -> dict:
             "auto_fit": auto_fit,
         }
 
+        cleanup_paths: list[str] = [store_path, store_path.replace(".json", ".jsonl")]
         try:
             if mode == "compare_all":
                 results = []
-                for name in ("fixed_limit", "trailing_stop"):
+                blackout_filtered = _filter_candles_for_blackouts(candles)
+                for model_name, overrides in _MODEL_CONFIGS.items():
                     try:
-                        r = run_backtest(lambda b, n=name: factory(b, n), paper_cfg, candles)
+                        model_cfg = dict(cfg)
+                        skip_blackouts = bool(overrides.get("_skip_blackouts"))
+                        for k, v in overrides.items():
+                            if k.startswith("_"):
+                                continue
+                            model_cfg[k] = v
+                        if model_cfg.get("exit_mode") == "trailing_stop":
+                            model_cfg.setdefault("trail_trigger", model_cfg["sell_px"])
+                            model_cfg.setdefault("trail_distance", 0.15)
+
+                        # Fresh store per Model so cycles / run_state don't leak.
+                        m_slug = model_name.split("—")[0].strip().replace(" ", "_")
+                        m_store_path = store_path.replace(".json", f"_{m_slug}.json")
+                        m_log_path = m_store_path.replace(".json", ".jsonl")
+                        m_store = JsonFileStateStore(m_store_path)
+                        m_store.put_config(tenant, symbol, model_cfg)
+                        m_log = TradeLog(m_log_path)
+                        cleanup_paths.extend([m_store_path, m_log_path])
+
+                        def _mk_factory(store_ref, log_ref):
+                            def _f(broker):
+                                if seed_qty > 0 and seed_price > 0:
+                                    _seed_paper_position(broker, seed_qty, seed_price)
+                                return SwingTrader(broker, store_ref, tenant, symbol, trade_log=log_ref)
+                            return _f
+
+                        run_candles = blackout_filtered if skip_blackouts else candles
+                        r = run_backtest(_mk_factory(m_store, m_log), paper_cfg, run_candles)
                         d = _result_to_dict(r)
-                        d["strategy"] = name
+                        d["strategy"] = model_name
+                        notes = []
+                        if overrides.get("_note"):
+                            notes.append(overrides["_note"])
+                        if skip_blackouts:
+                            skipped = len(candles) - len(run_candles)
+                            notes.append(f"skipped {skipped} candles inside news blackout windows")
+                        if notes:
+                            d["note"] = " · ".join(notes)
                         results.append(d)
                     except Exception as inner:
-                        results.append({"strategy": name, "error": str(inner)})
+                        results.append({"strategy": model_name, "error": str(inner)})
                 return {"ok": True, "results": results, "applied_cfg": applied_cfg}
             else:
                 r = run_backtest(factory, paper_cfg, candles)
                 return {"ok": True, "result": _result_to_dict(r), "applied_cfg": applied_cfg}
         finally:
-            for p in (store_path, store_path.replace(".json", ".jsonl")):
+            for p in cleanup_paths:
                 try: os.remove(p)
                 except OSError: pass
     except Exception as e:
@@ -154,6 +191,55 @@ def main() -> int:
     result = execute(req)
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
+
+
+# ============================================================================
+# Model A–E configs for compare_all — mirrors dashboard PRESETS
+# ============================================================================
+# Each Model overrides fields on the default cfg. Keys prefixed with "_" are
+# meta-flags handled in execute() (not passed into SwingConfig):
+#   _skip_blackouts  — filter candles inside news-event windows before running
+#   _note            — appended to the result so the leaderboard row shows why
+#                      this Model may match another (e.g. microstructure gates
+#                      require live book data and can't be simulated).
+_MODEL_CONFIGS: dict[str, dict] = {
+    "Model A — $10 baseline (fixed limit)": {
+        "exit_mode": "fixed_limit",
+    },
+    "Model B — Defensive plus (trail + reanchor)": {
+        "exit_mode": "trailing_stop",
+        "trail_distance": 0.15,
+        "reanchor_threshold": 0.75,
+    },
+    "Model C — Microstructure-informed": {
+        "exit_mode": "trailing_stop",
+        "trail_distance": 0.15,
+        "reanchor_threshold": 0.75,
+        "_note": "microstructure gates (OBI/VPIN/Kyle-λ) need live book — not simulated on candles",
+    },
+    "Model D — News-aware": {
+        "exit_mode": "trailing_stop",
+        "trail_distance": 0.15,
+        "reanchor_threshold": 0.75,
+        "_skip_blackouts": True,
+    },
+    "Model E — Kitchen sink": {
+        "exit_mode": "trailing_stop",
+        "trail_distance": 0.15,
+        "reanchor_threshold": 0.75,
+        "_skip_blackouts": True,
+        "_note": "microstructure gates (OBI/VPIN/Kyle-λ) need live book — not simulated on candles",
+    },
+}
+
+
+def _filter_candles_for_blackouts(candles):
+    """Drop candles whose timestamp falls inside a scheduled news blackout.
+    Approximates Model D/E behavior: bot stands aside 15 min before + 30 min
+    after FOMC/CPI/NFP/PPI/ISM events.
+    """
+    from news_calendar import blackout_for
+    return [c for c in candles if blackout_for(c.ts) is None]
 
 
 def _default_config():

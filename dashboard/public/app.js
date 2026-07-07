@@ -2154,12 +2154,19 @@ function renderLeaderboard(results, appliedCfg) {
       <td>${r.halted ? '⚠' : '✓'}</td>
     `;
     const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}`;
+    const noteRow = r.note ? `
+      <tr class="leaderboard-note-row">
+        <td></td>
+        <td colspan="7" class="dim leaderboard-note">${escapeHtml(r.note)}</td>
+      </tr>
+    ` : '';
     return `
       <tr class="${winnerCls}">
         <td class="rank-cell">${medal}</td>
         <td class="strategy-cell">${escapeHtml(r.strategy)}${i === 0 && !r.error ? ' <span class="best-tag">BEST</span>' : ''}</td>
         ${err}
       </tr>
+      ${noteRow}
     `;
   }).join('');
 
