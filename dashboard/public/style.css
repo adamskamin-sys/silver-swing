@@ -13,7 +13,7 @@
   --muted: #c4a599;           /* warm neutral — labels, subtext */
   --dim: #7a5f52;             /* deeper warm neutral — tertiary */
   --good: #05b169;            /* bright green — gains (contrasts w/ dark green bg) */
-  --bad: #c0392b;             /* brick red from their palette — losses */
+  --bad: #ef4444;             /* vivid red — losses / sell button. Palette-neutral: trading UI needs a proper red, not the off-premise brick tone. */
   --warn: #d49a7a;            /* tan from their gradient */
   --accent: #e8a882;          /* warm terracotta — their primary accent */
   --accent-2: #c4886b;        /* deeper terracotta — secondary */
