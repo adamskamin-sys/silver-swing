@@ -1253,6 +1253,16 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
       ${priceBar}
       <div class="sleeves-table-wrap">
         <table class="sleeves-table">
+          <colgroup>
+            <col class="col-strategy">
+            <col class="col-contracts">
+            <col class="col-params">
+            <col class="col-status">
+            <col class="col-cycles">
+            <col class="col-unrealized">
+            <col class="col-realized">
+            <col class="col-actions">
+          </colgroup>
           <thead>
             <tr>
               <th>Strategy</th>

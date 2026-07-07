@@ -156,7 +156,12 @@ button.small { padding: var(--s2) var(--s3); font-size: var(--fs-sm); border-rad
 /* MAIN LAYOUT                                                            */
 /* ==================================================================== */
 
-main { padding: var(--s6); max-width: 1200px; margin: 0 auto; }
+/* Full-width layout — no more 1200px centered box with dead space around it.
+   Content flows edge-to-edge, padding keeps it off the walls. Cards inside
+   still cap their own readable width but the whole app fills the viewport. */
+main { padding: var(--s5) var(--s6); max-width: none; margin: 0; }
+html, body { overflow-x: hidden; }
+.card { max-width: 100%; }
 
 /* login */
 #login-view { max-width: 320px; margin: var(--s8) auto; text-align: center; }
@@ -916,17 +921,28 @@ header { padding: 20px 32px; }
 .budget-ok { color: var(--good); }
 .budget-bad { color: var(--bad); font-weight: 600; }
 
-/* Sleeve table forced to stay inside the card. Row content wraps down
-   instead of pushing off-screen to the right — no more horizontal scroll.
-   Action buttons wrap onto a second line when the row is narrow. */
+/* Sleeve table stays inside the card at ALL viewports. table-layout:fixed
+   forces columns to share the card width evenly instead of expanding to fit
+   content, so long params or long names can't push the row off-screen. */
 .sleeves-table {
   width: 100%; border-collapse: collapse; font-size: var(--fs-sm);
-  table-layout: auto;
+  table-layout: fixed;
 }
 .sleeves-section .sleeves-table-wrap {
-  overflow: visible;  /* never introduce a horizontal scroll */
+  overflow: hidden;  /* never allow horizontal scroll — content wraps instead */
   width: 100%;
 }
+/* Explicit column widths so the row divvies up the card without any cell
+   trying to be wider than its share. Sum = 100%. */
+.sleeves-table col.col-strategy { width: 18%; }
+.sleeves-table col.col-contracts { width: 8%; }
+.sleeves-table col.col-params { width: 15%; }
+.sleeves-table col.col-status { width: 12%; }
+.sleeves-table col.col-cycles { width: 7%; }
+.sleeves-table col.col-unrealized { width: 12%; }
+.sleeves-table col.col-realized { width: 12%; }
+.sleeves-table col.col-actions { width: 16%; }
+.sleeves-table td { word-break: break-word; }
 .sleeves-table thead th {
   text-align: left; padding: var(--s2) var(--s3);
   color: var(--dim); font-weight: 500; font-size: var(--fs-xs);
@@ -1221,8 +1237,9 @@ header { padding: 20px 32px; }
 .preview-econ b.pos { color: var(--good); }
 .preview-econ b.neg { color: var(--bad); }
 
-/* keep the strategy name on one line — sleeve names are short */
-.sleeve-name { white-space: nowrap; min-width: 140px; }
+/* Sleeve name column: let it wrap so 8-column tables don't overflow narrow
+   cards. min-width removed for the same reason. */
+.sleeve-name { white-space: normal; word-break: break-word; }
 .sleeve-name b { display: inline-block; }
 
 /* per-strategy unrealized + live trail-stop callout */
