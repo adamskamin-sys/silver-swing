@@ -341,22 +341,51 @@ input:focus, select:focus {
   opacity: 0.4; cursor: not-allowed;
   background: var(--panel-3); border-color: var(--panel-3); color: var(--dim);
 }
-.trade-sidebar-types {
-  margin-top: var(--s3);
+/* Inline trade form inside the sidebar. Everything one click away. */
+.ts-side-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s2); margin-bottom: var(--s3); }
+.ts-side-tab {
+  padding: var(--s3); font-weight: 600; font-size: var(--fs-body);
+  background: var(--panel); border: 1px solid var(--border-soft); color: var(--muted);
+  border-radius: var(--r-sm);
+}
+.ts-side-tab.active.ts-buy { background: var(--good); color: white; border-color: var(--good); }
+.ts-side-tab.active.ts-sell { background: var(--bad); color: white; border-color: var(--bad); }
+.ts-form { display: flex; flex-direction: column; gap: var(--s3); }
+.ts-field { display: flex; flex-direction: column; gap: var(--s1); }
+.ts-field-label {
+  font-size: var(--fs-xs); color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.6px; font-weight: 500;
+}
+.ts-form select, .ts-form input[type=number] {
+  padding: var(--s2) var(--s3);
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: inherit;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ts-preview {
   padding: var(--s3);
   background: var(--panel);
   border-radius: var(--r-sm);
+  display: flex; flex-direction: column; gap: var(--s1);
+}
+.ts-preview-line {
+  display: flex; justify-content: space-between;
   font-size: var(--fs-xs); color: var(--muted);
-  display: flex; flex-direction: column; gap: var(--s2);
 }
-.trade-sidebar-types-label {
-  color: var(--dim); text-transform: uppercase;
-  letter-spacing: 0.6px; font-weight: 500;
+.ts-preview-line .mono { color: var(--text); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.ts-warn {
+  padding: var(--s2) var(--s3);
+  background: rgba(212, 154, 122, 0.15);
+  color: var(--warn);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
 }
-.trade-sidebar-types-item b { color: var(--text); }
-.trade-sidebar-types-note {
-  color: var(--dim); font-style: italic; margin-top: var(--s1);
-}
+.ts-warn b { color: var(--text); }
+.ts-submit { padding: var(--s3); font-weight: 600; }
 .trade-sidebar-hint {
   margin-top: var(--s3);
   font-size: var(--fs-xs); color: var(--muted); line-height: 1.5;

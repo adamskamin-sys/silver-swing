@@ -1037,11 +1037,20 @@ function fmtTrailingParams(exitMode, live, staticCfg) {
         ${fmtLockedLine(lockedProjected, 'If trail: locked')}
       </div>`;
   }
+  // Fixed limit — also compute the ACTUAL net per cycle after fees so the
+  // user can see when a sleeve labeled "$10 net swing" is actually only
+  // netting $6 (mismatch between preset label and configured prices).
+  const sellPx = Number(staticCfg?.sellPx) || 0;
+  const buyPx = Number(staticCfg?.buyPx) || 0;
+  const gross = (sellPx - buyPx) * contractSize * qty;
+  const netPerCycle = gross - totalFees;
+  const netCls = netPerCycle >= 0 ? 'pos' : 'neg';
   return `
     <div class="params-block">
       <div class="params-mode">Fixed limit</div>
       <div class="params-line"><span class="params-label">Sell</span>$${fmtPrice(staticCfg.sellPx)}</div>
       <div class="params-line"><span class="params-label">Buy</span>$${fmtPrice(staticCfg.buyPx)}</div>
+      ${qty > 0 && feeRt > 0 ? `<div class="params-line params-locked"><span class="params-label">Net / cycle</span><b class="${netCls}">${netPerCycle >= 0 ? '+' : ''}${fmtMoney(netPerCycle)}</b></div>` : ''}
     </div>`;
 }
 
@@ -1297,9 +1306,9 @@ function lotAge(ts) {
   return `${(age / 86400).toFixed(1)}d`;
 }
 
-// Coinbase-Advanced-style trade sidebar: Buy/Sell tabs → Market/Limit toggle
-// → qty + optional limit price → preview → confirm. Everything visible at a
-// glance, no modal needed to see order type is an option.
+// Inline trade sidebar — Buy/Sell tab strip, order-type dropdown, quantity
+// input, optional limit price, notional preview, single confirm button.
+// Everything visible without opening a modal. Coinbase Advanced style.
 function renderTradeSidebar(tenant, symbol, state, config, snap) {
   const mark = Number(snap?.last_mark) || 0;
   const bid = Number(snap?.best_bid);
@@ -1307,8 +1316,10 @@ function renderTradeSidebar(tenant, symbol, state, config, snap) {
   const pos = Number(snap?.position_qty) || 0;
   const escSym = escapeHtml(symbol);
   const escTen = escapeHtml(tenant);
+  const uid = `${tenant}-${symbol}`.replace(/[^a-z0-9]/gi, '-');
+  const defaultPx = bid && ask ? ((bid + ask) / 2).toFixed(pricePrecisionFor(mark, config)) : (mark || 0).toFixed(pricePrecisionFor(mark, config));
   return `
-    <div class="trade-sidebar">
+    <div class="trade-sidebar" data-tenant="${escTen}" data-symbol="${escSym}" data-uid="${uid}">
       <div class="trade-sidebar-header">
         <div class="trade-sidebar-title">Trade</div>
         <div class="trade-sidebar-price">
@@ -1316,20 +1327,40 @@ function renderTradeSidebar(tenant, symbol, state, config, snap) {
           ${Number.isFinite(bid) && Number.isFinite(ask) ? `<span class="trade-sidebar-book">bid $${fmtPrice(bid, config)} · ask $${fmtPrice(ask, config)}</span>` : ''}
         </div>
       </div>
-      <div class="trade-sidebar-tabs">
-        <button class="trade-sidebar-tab primary" data-action="trade" data-tenant="${escTen}" data-symbol="${escSym}" data-side="BUY">Buy</button>
-        <button class="trade-sidebar-tab danger" data-action="trade" data-tenant="${escTen}" data-symbol="${escSym}" data-side="SELL"${pos < 1 ? ' disabled' : ''}>Sell</button>
+      <div class="ts-side-tabs" role="tablist">
+        <button class="ts-side-tab ts-buy active" data-side="BUY">Buy / Long</button>
+        <button class="ts-side-tab ts-sell" data-side="SELL">Sell / Short</button>
       </div>
-      <div class="trade-sidebar-types">
-        <span class="trade-sidebar-types-label">Order type:</span>
-        <span class="trade-sidebar-types-item"><b>Market</b> — fills now at best available</span>
-        <span class="trade-sidebar-types-item"><b>Limit</b> — sits at your price until it fills</span>
-        <span class="trade-sidebar-types-note">Click Buy or Sell to pick order type + qty + confirm.</span>
+      <div class="ts-form">
+        <label class="ts-field">
+          <span class="ts-field-label">Order type</span>
+          <select class="ts-order-type">
+            <option value="market" selected>Market</option>
+            <option value="limit">Limit</option>
+          </select>
+        </label>
+        <label class="ts-field ts-limit-field" hidden>
+          <span class="ts-field-label">Limit price</span>
+          <input type="number" class="ts-limit-price" step="${(config?.tick_size || 0.005)}" value="${defaultPx}">
+        </label>
+        <label class="ts-field">
+          <span class="ts-field-label">Contracts</span>
+          <input type="number" class="ts-qty" min="1" step="1" value="1">
+        </label>
+        <div class="ts-preview">
+          <div class="ts-preview-line"><span>Notional</span><span class="ts-notional mono">—</span></div>
+          <div class="ts-preview-line"><span>Est. fee</span><span class="ts-fee mono">—</span></div>
+          <div class="ts-preview-line"><span>Position after</span><span class="ts-after mono">—</span></div>
+        </div>
+        <div class="ts-warn" hidden></div>
+        <button class="ts-submit primary" data-action="ts-submit" data-tenant="${escTen}" data-symbol="${escSym}">Buy 1 contract</button>
       </div>
       <div class="trade-sidebar-hint">
         ${pos === 0
-          ? 'You hold <b>0</b> contracts. Buy to open a long. (Shorting via Sell is off by default — ask to enable.)'
-          : `You hold <b>${pos}</b> contract${pos === 1 ? '' : 's'} long.`}
+          ? 'You hold <b>0</b> contracts. Buy opens a long; Sell opens a short.'
+          : pos > 0
+            ? `You hold <b>${pos}</b> long. Sell more than that = short.`
+            : `You are <b>SHORT ${Math.abs(pos)}</b>. Buy to cover.`}
       </div>
     </div>`;
 }
@@ -2791,31 +2822,35 @@ function openTradeModal(tenant, symbol, side) {
     limitInput.value = defaultPx ? defaultPx.toFixed(3) : '';
   }
 
-  const maxSell = Math.max(0, pos - core);            // core floor guard (0 = full pos)
+  // Shorting enabled: SELL can exceed position — anything past `pos` opens a
+  // short. The core-floor still WARNS but doesn't block, since the user
+  // explicitly asked for shorting to be an option. Max qty is now the margin
+  // ceiling for either side (buys use margin, shorts also use margin).
   const marginCap = Math.floor(availMargin / marginPer);
-  const maxBuy = Math.max(1, Math.min(100, marginCap)); // capped by margin, 100 hard limit
+  const maxTradable = Math.max(1, Math.min(100, marginCap));
+  const maxSellUncovered = Math.max(0, pos - core);  // sell within long, respects core
 
-  tradeModalTitle.textContent = `${side === 'BUY' ? 'Buy' : 'Sell'} contracts at market — ${symbol}`;
-  const holdLine = core > 0
-    ? `You hold <b style="color:var(--text)">${pos} contracts</b> · core floor is <b style="color:var(--text)">${core}</b> (never sold)`
-    : `You hold <b style="color:var(--text)">${pos} contracts</b> · no floor — every contract is tradeable`;
+  tradeModalTitle.textContent = `${side === 'BUY' ? 'Buy / Long' : 'Sell / Short'} — ${symbol}`;
+  const positionLine = pos > 0
+    ? `You hold <b style="color:var(--text)">${pos} contract${pos === 1 ? '' : 's'} LONG</b>` + (core > 0 ? ` · core floor: <b style="color:var(--text)">${core}</b>` : '')
+    : pos < 0
+      ? `You are <b style="color:var(--text)">SHORT ${Math.abs(pos)} contract${Math.abs(pos) === 1 ? '' : 's'}</b>`
+      : `You hold <b style="color:var(--text)">0 contracts</b>`;
   tradeModalBody.innerHTML = `
     <div style="line-height:1.7; color: var(--muted); font-size: 14px;">
-      <div>${holdLine}</div>
+      <div>${positionLine}</div>
       <div>${escapeHtml(symbolLabel(symbol))} market now: <b style="color:var(--text)">$${fmtPrice(mark)}</b> — bid $${fmtPrice(snap.best_bid)} / ask $${fmtPrice(snap.best_ask)}</div>
     </div>
   `;
 
-  const max = side === 'SELL' ? maxSell : maxBuy;
+  const max = maxTradable;
   tradeQty.max = max;
   tradeQty.value = Math.max(1, Math.min(1, max) || 1);
   tradeQty.disabled = max < 1;
   if (max < 1) {
     tradeConfirm.disabled = true;
     tradeError.hidden = false;
-    tradeError.innerHTML = side === 'SELL'
-      ? `<b>Nothing to sell.</b> You hold 0 contracts.`
-      : `<b>Not enough margin.</b> Deposit more or reduce open positions.`;
+    tradeError.innerHTML = `<b>Not enough margin.</b> Deposit more or reduce open positions.`;
   }
 
   // Quick-select chips: 1, 2, half, max
@@ -2833,20 +2868,24 @@ function openTradeModal(tenant, symbol, side) {
   }
   markActiveChip(quickEl, Number(tradeQty.value));
 
-  // Max note
+  // Max note — tells the user WHERE the limit comes from, and warns about the
+  // long→short boundary if this SELL will breach it.
   const maxNote = document.getElementById('trade-max-note');
   if (side === 'SELL') {
-    if (maxSell > 0) {
-      maxNote.textContent = core > 0
-        ? `up to ${maxSell} (protects core floor of ${core})`
-        : `up to ${maxSell} (your full position)`;
+    const partsFor = (qty) => {
+      const closeLong = Math.min(qty, Math.max(0, pos));
+      const openShort = qty - closeLong;
+      return { closeLong, openShort };
+    };
+    if (pos > 0 && maxSellUncovered > 0) {
+      maxNote.innerHTML = `up to ${max} · first ${maxSellUncovered} close long${core > 0 ? ` (respects core ${core})` : ''}, rest open short`;
+    } else if (pos > 0) {
+      maxNote.innerHTML = `up to ${max} · opens short beyond your ${pos} long${core > 0 ? ` (core floor blocks selling into ${core})` : ''}`;
     } else {
-      maxNote.textContent = core > 0
-        ? `nothing to sell — position ${pos} = core ${core}`
-        : `nothing to sell — position is 0`;
+      maxNote.innerHTML = `up to ${max} · opens a new short position`;
     }
   } else {
-    maxNote.textContent = `up to ${maxBuy} (limited by ~$${availMargin.toLocaleString('en-US', { maximumFractionDigits: 0 })} available margin)`;
+    maxNote.textContent = `up to ${max} (limited by ~$${availMargin.toLocaleString('en-US', { maximumFractionDigits: 0 })} available margin)`;
   }
 
   tradeError.hidden = true;
@@ -2890,17 +2929,26 @@ function updateTradePreview() {
   const notional = priceForNotional * contractSize * qty;
   const feeCost = fee * qty;
 
-  const wouldBreach = side === 'SELL' && newPos < core;
-  const wouldGoNegative = side === 'SELL' && newPos < 0;
+  // Shorting enabled: newPos < 0 is a valid short position, no longer a
+  // refusal. Core-floor breach STILL warns (protects a long-side reserve
+  // the user configured) but does not block — the user knows what they're
+  // doing when they explicitly click Sell. Errors below are informational
+  // gates; only bad-limit blocks the confirm.
+  const willBreachCore = side === 'SELL' && pos > core && newPos < core;
+  const willOpenShort = side === 'SELL' && newPos < 0 && pos >= 0;
+  const willIncreaseShort = side === 'SELL' && pos < 0;
   const badLimit = orderType === 'limit' && !(limitPrice > 0);
-  tradeError.hidden = !(wouldBreach || wouldGoNegative || badLimit);
-  tradeConfirm.disabled = wouldBreach || wouldGoNegative || qty < 1 || badLimit;
-  if (wouldGoNegative) {
-    tradeError.innerHTML = `<b>Refused:</b> you only hold ${pos} contracts — can't sell ${qty}.`;
-  } else if (wouldBreach) {
-    tradeError.innerHTML = `<b>Refused:</b> selling ${qty} would take you to ${newPos} contracts, below your core floor of ${core}. Lower your core floor to 0 for free trading, or sell fewer.`;
-  } else if (badLimit) {
+  tradeError.hidden = !(badLimit || willBreachCore || willOpenShort || willIncreaseShort);
+  tradeConfirm.disabled = qty < 1 || badLimit;
+  if (badLimit) {
     tradeError.innerHTML = `<b>Enter a limit price above 0.</b>`;
+  } else if (willOpenShort) {
+    const shortDepth = Math.abs(newPos);
+    tradeError.innerHTML = `<b>Opens SHORT position:</b> you hold ${pos} long, selling ${qty} closes those and opens a ${shortDepth}-contract short. Shorts have unbounded downside — silver rallying means you lose margin.`;
+  } else if (willIncreaseShort) {
+    tradeError.innerHTML = `<b>Adds to your short:</b> you're already short ${Math.abs(pos)}. This sell takes you to ${Math.abs(newPos)} short.`;
+  } else if (willBreachCore) {
+    tradeError.innerHTML = `<b>Below core floor:</b> selling ${qty} takes you to ${newPos} contracts, below your configured core floor of ${core}. Proceeding is allowed but violates your protected-core reserve.`;
   }
 
   // Hint on the limit input: how far from the current mark this price sits.
@@ -3335,7 +3383,111 @@ document.addEventListener('click', (e) => {
   else if (action === 'cancel-order') cancelOrder(tenant, symbol, btn.dataset.sleeveId || null);
   else if (action === 'sell-now') marketSell(tenant, symbol, parseInt(btn.dataset.qty, 10));
   else if (action === 'disable-primary') disablePrimaryStrategy(tenant, symbol);
+  else if (action === 'ts-submit') submitSidebarTrade(btn.closest('.trade-sidebar'));
 });
+
+// Sidebar inline trade form: recompute preview + submit button label when
+// the user changes side/qty/type/limit. Delegated on the cards container so
+// it works across every card without re-binding on each render.
+document.addEventListener('input', e => {
+  const wrap = e.target.closest('.trade-sidebar');
+  if (!wrap) return;
+  updateSidebarPreview(wrap);
+});
+document.addEventListener('change', e => {
+  const wrap = e.target.closest('.trade-sidebar');
+  if (!wrap) return;
+  if (e.target.classList.contains('ts-order-type')) {
+    const isLimit = e.target.value === 'limit';
+    const limitField = wrap.querySelector('.ts-limit-field');
+    if (limitField) limitField.hidden = !isLimit;
+  }
+  updateSidebarPreview(wrap);
+});
+document.addEventListener('click', e => {
+  const tab = e.target.closest('.ts-side-tab');
+  if (!tab) return;
+  const wrap = tab.closest('.trade-sidebar');
+  if (!wrap) return;
+  wrap.querySelectorAll('.ts-side-tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  updateSidebarPreview(wrap);
+});
+
+function sidebarSelectedSide(wrap) {
+  const active = wrap.querySelector('.ts-side-tab.active');
+  return active ? active.dataset.side : 'BUY';
+}
+
+function updateSidebarPreview(wrap) {
+  const tenant = wrap.dataset.tenant;
+  const symbol = wrap.dataset.symbol;
+  const cfg = currentStore[tenant]?.[symbol]?.config || {};
+  const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
+  const side = sidebarSelectedSide(wrap);
+  const orderType = wrap.querySelector('.ts-order-type')?.value || 'market';
+  const qty = Math.max(1, parseInt(wrap.querySelector('.ts-qty')?.value || '1', 10));
+  const mark = Number(snap.last_mark) || 0;
+  const limitPx = Number(wrap.querySelector('.ts-limit-price')?.value) || 0;
+  const price = orderType === 'limit' ? limitPx : mark;
+  const contractSize = Number(cfg.contract_size) || 50;
+  const feeRt = Number(cfg.fee_per_contract_roundtrip) || 4.68;
+  const halfFee = (feeRt / 2) * qty;
+  const notional = price * contractSize * qty;
+  const pos = Number(snap.position_qty) || 0;
+  const newPos = side === 'BUY' ? pos + qty : pos - qty;
+  wrap.querySelector('.ts-notional').textContent = notional > 0 ? '$' + notional.toLocaleString('en-US', {maximumFractionDigits: 2}) : '—';
+  wrap.querySelector('.ts-fee').textContent = '$' + halfFee.toFixed(2);
+  wrap.querySelector('.ts-after').textContent = `${pos} → ${newPos}`;
+  const submit = wrap.querySelector('.ts-submit');
+  submit.textContent = `${side === 'BUY' ? 'Buy' : 'Sell'} ${qty} contract${qty === 1 ? '' : 's'}`;
+  submit.classList.toggle('primary', side === 'BUY');
+  submit.classList.toggle('danger', side === 'SELL');
+  const warn = wrap.querySelector('.ts-warn');
+  if (side === 'SELL' && newPos < 0) {
+    warn.hidden = false;
+    warn.innerHTML = pos > 0
+      ? `<b>Opens short:</b> closes your ${pos} long, opens ${Math.abs(newPos)}-contract short.`
+      : `<b>Opens new short position of ${Math.abs(newPos)}.</b>`;
+  } else {
+    warn.hidden = true;
+  }
+}
+
+async function submitSidebarTrade(wrap) {
+  const tenant = wrap.dataset.tenant;
+  const symbol = wrap.dataset.symbol;
+  const side = sidebarSelectedSide(wrap);
+  const orderType = wrap.querySelector('.ts-order-type')?.value || 'market';
+  const qty = Math.max(1, parseInt(wrap.querySelector('.ts-qty')?.value || '1', 10));
+  const limitPrice = Number(wrap.querySelector('.ts-limit-price')?.value) || 0;
+  if (orderType === 'limit' && !(limitPrice > 0)) {
+    showToast('enter a limit price above 0', 'error');
+    return;
+  }
+  const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
+  const pos = Number(snap.position_qty) || 0;
+  if (side === 'SELL' && (pos - qty) < 0) {
+    const shortDepth = qty - Math.max(0, pos);
+    if (!confirm(`This opens a ${shortDepth}-contract SHORT position. Silver rallying = margin loss. Continue?`)) return;
+  }
+  if (isLiveTenant(tenant)) {
+    const priceLine = orderType === 'limit' ? `at LIMIT $${limitPrice.toFixed(3)}` : `at MARKET`;
+    const ok = await confirmLive({
+      title: `${side} ${qty} ${symbol} — real money`,
+      body: `<b>${side} ${qty}</b> contract${qty === 1 ? '' : 's'} of <b>${escapeHtml(symbol)}</b> ${priceLine} on Coinbase.`,
+    });
+    if (!ok) return;
+  }
+  const res = await postJson('/api/manual-trade', {
+    tenant, symbol, side, qty, order_type: orderType,
+    limit_price: orderType === 'limit' ? limitPrice : null,
+    confirm: 'YES',
+  });
+  if (res._unauthorized) { showLogin(); return; }
+  if (res.ok) { showToast(`${side.toLowerCase()} queued`, 'info'); refreshOnce(); }
+  else showToast(res.error || 'trade failed', 'error');
+}
 
 async function disablePrimaryStrategy(tenant, symbol) {
   if (!confirm('Turn off the Primary strategy? Its swing_qty goes to 0. Only sleeves you explicitly add will run. Re-enable by editing Settings.')) return;
@@ -3368,7 +3520,17 @@ async function cancelOrder(tenant, symbol, sleeveId) {
 async function marketSell(tenant, symbol, qty) {
   const snap = currentStore[tenant]?.[symbol]?.snapshot || {};
   const pos = Number(snap.position_qty) || 0;
-  if (qty < 1 || qty > pos) { showToast(`can't sell ${qty} — you hold ${pos}`, 'error'); return; }
+  if (qty < 1) { showToast('qty must be at least 1', 'error'); return; }
+  // Shorting enabled: selling MORE than you hold takes you into a short
+  // position on Coinbase CFM. Warn explicitly so accidental oversells don't
+  // silently open shorts, but don't block — Adam asked for the option.
+  if (qty > pos) {
+    const shortDepth = qty - pos;
+    const msg = pos > 0
+      ? `Sell ${qty} — closes your ${pos} long AND opens ${shortDepth}-contract short. Continue?`
+      : `You hold 0 contracts. Sell ${qty} opens a NEW ${qty}-contract short. Continue?`;
+    if (!confirm(msg)) return;
+  }
   if (isLiveTenant(tenant)) {
     const ok = await confirmLive({
       title: `Sell ${qty} ${symbol} at market — real money`,

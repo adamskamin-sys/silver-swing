@@ -228,18 +228,18 @@ export function makeApp({
       const store = await readStore(storePath);
       store[tenant] = store[tenant] || {};
       store[tenant][symbol] = store[tenant][symbol] || {};
-      // Server-side floor check for SELL — mirror the bot's guard so the UI
-      // can show an immediate error rather than silently rejecting later.
+      // Core-floor check is now a WARNING only for manual trades — shorting
+      // is a supported action, so refusing the sell would silently block a
+      // legitimate short entry. The bot's per-strategy floor still protects
+      // AUTOMATED sells (sleeves/primary); this endpoint is only reached
+      // when the user explicitly clicked Buy/Sell.
       if (s === 'SELL') {
         const snap = store[tenant][symbol].snapshot || {};
         const cfg = store[tenant][symbol].config || {};
         const pos = Number(snap.position_qty ?? 0);
         const core = Number(cfg.core_qty ?? 0);
-        if (pos - q < core) {
-          return res.status(400).json({
-            ok: false,
-            error: `sell ${q} would take position ${pos} below core ${core}. Increase core, or sell fewer contracts.`,
-          });
+        if (pos > core && pos - q < core) {
+          console.warn(`[manual-trade] sell ${q} takes ${tenant}/${symbol} below core ${core} (from ${pos}). Allowed — user asked explicitly.`);
         }
       }
       const snap = store[tenant][symbol].snapshot || {};
