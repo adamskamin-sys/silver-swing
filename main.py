@@ -694,7 +694,10 @@ def run_paper_mode() -> int:
         # 15s = near real-time refresh of the Live tab's portfolio view
         # (positions, marks, specs). Set higher via SWING_LIVE_PORTFOLIO_INTERVAL
         # if you hit Coinbase rate limits.
-        live_portfolio_interval = float(os.getenv("SWING_LIVE_PORTFOLIO_INTERVAL", "15.0"))
+        # 3s cadence: fast enough that the Live drill-down modal's price bar
+        # feels real-time (client polls every 5s). At 3s × ~3 open positions,
+        # Coinbase get_product runs ~1 req/sec — well under the 30 req/sec limit.
+        live_portfolio_interval = float(os.getenv("SWING_LIVE_PORTFOLIO_INTERVAL", "3.0"))
         last_scanner = 0.0
         last_discover = 0.0
         last_live_portfolio = 0.0

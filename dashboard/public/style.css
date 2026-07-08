@@ -1554,16 +1554,91 @@ header { padding: 20px 32px; }
 .accumulate-fields { margin-top: 12px; }
 .accumulate-fields[hidden] { display: none; }
 
-/* ---- mode tabs (paper / live) ------------------------------------------ */
+/* ---- mode bar: current mode + hamburger menu (live is landing) --------- */
 .mode-tabs {
-  display: flex; gap: 8px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
   margin-bottom: 12px;
-  padding-bottom: 8px;
+  padding: 8px 0;
   border-bottom: 1px solid var(--border);
 }
+.mode-current-badge {
+  font-family: var(--mono);
+  font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.mode-current-badge.mode-live    { border-color: #e0505c; color: #ffd7db; background: rgba(224, 80, 92, 0.08); }
+.mode-current-badge.mode-paper   { border-color: #4bb890; color: #d7f5e9; background: rgba(75, 184, 144, 0.08); }
+.mode-current-badge.mode-lab     { border-color: #f5a742; color: #ffddb5; background: rgba(245, 167, 66, 0.08); }
+.mode-current-badge.mode-scanner { border-color: #8f7ae0; color: #d5cef5; background: rgba(143, 122, 224, 0.08); }
+
+.mode-menu-wrap { position: relative; }
+.mode-menu-btn {
+  width: 36px; height: 36px;
+  padding: 0;
+  display: flex; flex-direction: column;
+  justify-content: center; align-items: center;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mode-menu-btn:hover { background: var(--panel-3); }
+.mode-menu-btn span {
+  display: block;
+  width: 18px; height: 2px;
+  background: var(--text);
+  border-radius: 1px;
+}
+.mode-menu-drop {
+  position: absolute; right: 0; top: calc(100% + 6px);
+  min-width: 260px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 6px;
+  z-index: 60;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.mode-menu-drop[hidden] { display: none; }
+.mode-menu-item {
+  text-align: left;
+  padding: 10px 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-left: 3px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text);
+}
+.mode-menu-item:hover { background: var(--panel-2); }
+.mode-menu-item.active { background: var(--panel-3); }
+.mode-menu-item.mode-live.active    { border-left-color: #e0505c; }
+.mode-menu-item.mode-paper.active   { border-left-color: #4bb890; }
+.mode-menu-item.mode-lab.active     { border-left-color: #f5a742; }
+.mode-menu-item.mode-scanner.active { border-left-color: #8f7ae0; }
+.mode-menu-item .mm-label {
+  font-size: 13px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text);
+}
+.mode-menu-item .mm-sub {
+  font-size: 11px; color: var(--muted); margin-top: 2px;
+}
+/* Legacy .mode-tab rules kept for the scanner button below that still uses
+   them, and to avoid breakage if any other surface references them. */
 .mode-tab { text-transform: uppercase; letter-spacing: 1px; }
 .mode-tab.mode-live.active { border-color: #e0505c; color: #ffd7db; }
 .mode-tab.mode-paper.active { border-color: #4bb890; color: #d7f5e9; }
+
+/* Attached-strategies row Edit + Remove side-by-side */
+.sleeve-row-actions { white-space: nowrap; }
+.sleeve-row-actions .small { margin-right: 4px; }
+.sleeve-row-actions .small:last-child { margin-right: 0; }
 
 /* ---- microstructure panel ---------------------------------------------- */
 .ms-panel {
@@ -1622,12 +1697,21 @@ header { padding: 20px 32px; }
 .mode-tab.mode-lab.active { border-color: #f5a742; color: #ffddb5; }
 
 /* ---- scanner detail modal ---------------------------------------------- */
-.scanner-detail-summary { display: flex; justify-content: space-between;
-  align-items: center; padding: 10px 0 14px 0; border-bottom: 1px solid var(--border);
+/* Vertical stack — each block (price, specs, hold-strip, sleeves) flows
+   top-to-bottom cleanly instead of getting pushed to opposite edges of a
+   flex row that was making the header feel cluttered. */
+.scanner-detail-summary { display: block;
+  padding: 10px 0 14px 0; border-bottom: 1px solid var(--border);
   margin-bottom: 12px; }
-.scanner-detail-price { display: flex; gap: 24px; align-items: baseline;
-  font-family: var(--mono); }
-.scanner-detail-price > .mono { font-size: 22px; font-weight: 600; }
+.scanner-detail-price { display: flex; gap: 20px; align-items: baseline;
+  font-family: var(--mono); flex-wrap: wrap; margin-bottom: 8px; }
+.scanner-detail-price > .mono { font-size: 26px; font-weight: 600; color: var(--text); }
+.scanner-detail-price-live { font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px;
+  color: var(--good); display: inline-flex; align-items: center; gap: 5px; }
+.scanner-detail-price-live::before { content: ''; width: 6px; height: 6px;
+  background: var(--good); border-radius: 50%;
+  animation: pulseLive 1.4s ease-in-out infinite; }
+@keyframes pulseLive { 0%, 100% { opacity: 0.4; } 50% { opacity: 1.0; } }
 .scanner-detail-range { font-size: 13px; color: var(--muted); }
 .scanner-detail-vol { font-size: 13px; color: var(--muted); }
 .scanner-detail-vol b { color: var(--text); }
@@ -1732,7 +1816,8 @@ header { padding: 20px 32px; }
   border-left: 3px solid var(--good); border-radius: 4px;
   font-size: 13px; white-space: nowrap; }
 .scanner-detail-live b { color: var(--text); }
-.scanner-detail-live button { margin-left: auto; white-space: nowrap; padding: 6px 12px; }
+.scanner-detail-live .sdl-hold { flex: 1; }
+.scanner-detail-live button { margin-left: auto; white-space: nowrap; padding: 6px 14px; }
 .live-back-btn { align-self: flex-start; margin-bottom: 12px;
   background: transparent; color: var(--muted); border: 1px solid var(--border);
   border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 13px; }

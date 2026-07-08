@@ -65,7 +65,7 @@ const tradeConfirm = document.getElementById('trade-confirm');
 let pollHandle = null;
 let currentStore = {};          // last full /api/status
 let activeAssetClass = null;    // sidebar-tab filter
-let activeMode = 'paper';       // 'paper' | 'live' | null(all) — top-level mode tab
+let activeMode = 'live';        // 'paper' | 'live' | 'lab' | 'scanner' — Live is the landing dashboard
 let selectedLiveProduct = null; // when set on Live tab, only this product's card renders
 let configEditContext = null;   // {tenant, symbol} while modal open
 let killContext = null;         // {tenant, mode: 'activate'|'clear'} while modal open
@@ -365,20 +365,57 @@ function renderModeTabs(store) {
       counts[m] = (counts[m] || 0) + 1;
     }
   }
+
+  // Live is the landing dashboard. Everything else lives behind a hamburger
+  // menu so returning users don't land on the paper/lab view they no longer
+  // check. The bar now shows: [current-mode badge] ................. [☰ menu]
   modeTabs.innerHTML = '';
 
-  const mk = (label, mode, badgeClass, badge = '') => {
-    const b = document.createElement('button');
-    b.className = 'tab mode-tab' + (activeMode === mode ? ' active' : '')
-      + (badgeClass ? ' ' + badgeClass : '');
-    b.innerHTML = `${label}${badge ? ` <span class="tab-count">${badge}</span>` : ''}`;
-    b.onclick = () => { activeMode = mode; refreshOnce(); };
-    return b;
+  const currentBadge = document.createElement('div');
+  currentBadge.className = 'mode-current-badge mode-' + activeMode;
+  const modeLabels = { live: 'live · real money', paper: 'paper · simulated', lab: 'lab · $100k sandbox', scanner: 'scanner · derivatives' };
+  currentBadge.textContent = modeLabels[activeMode] || activeMode;
+  modeTabs.appendChild(currentBadge);
+
+  const menuWrap = document.createElement('div');
+  menuWrap.className = 'mode-menu-wrap';
+  const menuBtn = document.createElement('button');
+  menuBtn.className = 'mode-menu-btn';
+  menuBtn.setAttribute('aria-label', 'Switch mode');
+  menuBtn.innerHTML = '<span></span><span></span><span></span>';
+  const menuDrop = document.createElement('div');
+  menuDrop.className = 'mode-menu-drop';
+  menuDrop.hidden = true;
+  const modes = [
+    ['live',    'Live',    'real money · your portfolio',  counts.live || 0, 'mode-live'],
+    ['paper',   'Paper',   'simulated fills',              counts.paper || 0, 'mode-paper'],
+    ['lab',     'Lab',     '$100k sandbox · Models A-E',   counts.lab || 0, 'mode-lab'],
+    ['scanner', 'Scanner', 'top derivatives by volatility', 0, 'mode-scanner'],
+  ];
+  for (const [mode, label, sub, count, cls] of modes) {
+    const row = document.createElement('button');
+    row.className = 'mode-menu-item ' + cls + (activeMode === mode ? ' active' : '');
+    row.innerHTML = `
+      <div class="mm-label">${label}${count ? ` <span class="tab-count">${count}</span>` : ''}</div>
+      <div class="mm-sub">${sub}</div>
+    `;
+    row.onclick = () => {
+      activeMode = mode;
+      menuDrop.hidden = true;
+      refreshOnce();
+    };
+    menuDrop.appendChild(row);
+  }
+  menuBtn.onclick = (e) => {
+    e.stopPropagation();
+    menuDrop.hidden = !menuDrop.hidden;
   };
-  modeTabs.appendChild(mk('paper', 'paper', 'mode-paper', counts.paper || 0));
-  modeTabs.appendChild(mk('live', 'live', 'mode-live', counts.live || 0));
-  modeTabs.appendChild(mk('lab', 'lab', 'mode-lab', counts.lab || 0));
-  modeTabs.appendChild(mk('scanner', 'scanner', 'mode-scanner'));
+  document.addEventListener('click', (e) => {
+    if (!menuWrap.contains(e.target)) menuDrop.hidden = true;
+  });
+  menuWrap.appendChild(menuBtn);
+  menuWrap.appendChild(menuDrop);
+  modeTabs.appendChild(menuWrap);
 }
 
 function renderAssetTabs(store) {
@@ -3658,14 +3695,13 @@ function openScannerDetail(row) {
   // "Attach strategy" button so they can jump straight into applying a Model.
   const liveStrip = row._live_tenant ? `
     <div class="scanner-detail-live">
-      You hold <b>${row._live_qty}</b> ${escapeHtml(row._live_side || 'LONG')} @ avg
-      <b class="mono">$${fmtNum(row._live_avg, 4)}</b>
+      <div class="sdl-hold">Position: <b>${row._live_qty}</b> ${escapeHtml(row._live_side || 'LONG')} · avg <b class="mono">$${fmtNum(row._live_avg, 4)}</b></div>
       <button class="small primary" id="scanner-detail-attach-strategy"
               data-tenant="${escapeHtml(row._live_tenant)}"
               data-symbol="${escapeHtml(row.product_id)}"
               data-mark="${row.price}" data-avg="${row._live_avg}"
               data-pos-qty="${row._live_qty}" data-side="${escapeHtml(row._live_side || '')}">
-        + Attach strategy (Model A/B/C/D/E)
+        + Attach strategy
       </button>
     </div>
   ` : '';
@@ -3725,10 +3761,16 @@ function openScannerDetail(row) {
             <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
             <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
             <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
-            <td><button class="small ghost" data-action="delete-sleeve"
-                       data-tenant="${escapeHtml(row._live_tenant)}"
-                       data-symbol="${escapeHtml(row.product_id)}"
-                       data-sleeve-id="${escapeHtml(s.id)}">Remove</button></td>
+            <td class="sleeve-row-actions">
+              <button class="small" data-action="edit-live-sleeve"
+                      data-tenant="${escapeHtml(row._live_tenant)}"
+                      data-symbol="${escapeHtml(row.product_id)}"
+                      data-sleeve-id="${escapeHtml(s.id)}">Edit</button>
+              <button class="small ghost" data-action="delete-sleeve"
+                      data-tenant="${escapeHtml(row._live_tenant)}"
+                      data-symbol="${escapeHtml(row.product_id)}"
+                      data-sleeve-id="${escapeHtml(s.id)}">Remove</button>
+            </td>
           </tr>`;
         }).join('')}
         </tbody>
@@ -3736,11 +3778,14 @@ function openScannerDetail(row) {
     </div>
   ` : '';
 
+  const liveIndicator = row._live_tenant
+    ? `<span class="scanner-detail-price-live">LIVE</span>` : '';
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
-      <span class="scanner-detail-range"><span class="pos">$${fmtNum(row.high_24h, 4)}</span> / <span class="neg">$${fmtNum(row.low_24h, 4)}</span></span>
-      <span class="scanner-detail-vol">24h range <b>${fmtNum(row.vol_pct, 2)}%</b></span>
+      ${liveIndicator}
+      <span class="scanner-detail-range">24h <span class="pos">$${fmtNum(row.high_24h, 4)}</span> / <span class="neg">$${fmtNum(row.low_24h, 4)}</span></span>
+      <span class="scanner-detail-vol"><b>${fmtNum(row.vol_pct, 2)}%</b> range</span>
     </div>
     ${specStrip}
     ${liveStrip}
@@ -3821,8 +3866,9 @@ function refreshScannerDetailLive() {
   if (priceEl) {
     priceEl.innerHTML = `
       <span class="mono">$${fmtNum(mark || ctx.price || 0, 4)}</span>
-      <span class="scanner-detail-range"><span class="pos">$${fmtNum(high, 4)}</span> / <span class="neg">$${fmtNum(low, 4)}</span></span>
-      <span class="scanner-detail-vol">24h range <b>${fmtNum(ctx.vol_pct || 0, 2)}%</b></span>
+      <span class="scanner-detail-price-live">LIVE</span>
+      <span class="scanner-detail-range">24h <span class="pos">$${fmtNum(high, 4)}</span> / <span class="neg">$${fmtNum(low, 4)}</span></span>
+      <span class="scanner-detail-vol"><b>${fmtNum(ctx.vol_pct || 0, 2)}%</b> range</span>
     `;
   }
   // Rebuild the sleeves table so Unrealized reflects the new mark. Same logic
@@ -3860,22 +3906,27 @@ function refreshScannerDetailLive() {
         <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
         <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
         <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
-        <td><button class="small ghost" data-action="delete-sleeve"
-                   data-tenant="${escapeHtml(tenant)}"
-                   data-symbol="${escapeHtml(symbol)}"
-                   data-sleeve-id="${escapeHtml(s.id)}">Remove</button></td>
+        <td class="sleeve-row-actions">
+          <button class="small" data-action="edit-live-sleeve"
+                  data-tenant="${escapeHtml(tenant)}"
+                  data-symbol="${escapeHtml(symbol)}"
+                  data-sleeve-id="${escapeHtml(s.id)}">Edit</button>
+          <button class="small ghost" data-action="delete-sleeve"
+                  data-tenant="${escapeHtml(tenant)}"
+                  data-symbol="${escapeHtml(symbol)}"
+                  data-sleeve-id="${escapeHtml(s.id)}">Remove</button>
+        </td>
       </tr>`;
     }).join('');
   }
-  // Also refresh the "You hold N LONG @ avg $X" strip since qty/avg may change
-  // when the user trades on Coinbase.
+  // Also refresh the "Position: N LONG · avg $X" strip since qty/avg may
+  // change when the user trades on Coinbase.
   const liveEl = scannerDetailSummary.querySelector('.scanner-detail-live');
   if (liveEl) {
     const btn = liveEl.querySelector('#scanner-detail-attach-strategy');
     const btnHtml = btn ? btn.outerHTML : '';
     liveEl.innerHTML = `
-      You hold <b>${qty}</b> ${escapeHtml(ctx._live_side || 'LONG')} @ avg
-      <b class="mono">$${fmtNum(avg, 4)}</b>
+      <div class="sdl-hold">Position: <b>${qty}</b> ${escapeHtml(ctx._live_side || 'LONG')} · avg <b class="mono">$${fmtNum(avg, 4)}</b></div>
       ${btnHtml}
     `;
     // Re-wire the button since we just replaced its DOM.
@@ -3938,14 +3989,14 @@ function updateScannerBuyButton() {
   const previewEl = document.getElementById('scanner-buy-preview');
   if (previewEl) {
     previewEl.innerHTML = `
-      <div>Buying <b style="color:var(--text)">${qty}</b> contract${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
+      <div>Entering <b style="color:var(--text)">${qty}</b> contract${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
       <div>${marginLine}</div>
     `;
   }
 
   scannerBuyBtn.textContent = orderType === 'limit'
-    ? `place ${mode} LIMIT for ${qty} ${symbol}`
-    : `place ${mode} MARKET for ${qty} ${symbol}`;
+    ? `enter ${mode} LIMIT · ${qty} ${symbol}`
+    : `enter ${mode} MARKET · ${qty} ${symbol}`;
   scannerBuyBtn.disabled = orderType === 'limit' && !(limitPrice > 0);
 
   if (mode === 'live') {
@@ -4219,6 +4270,19 @@ document.addEventListener('click', (e) => {
     qty: parseInt(btn.dataset.lotQty, 10),
   });
   else if (action === 'edit-sleeve') openSleeveEditor(tenant, symbol, btn.dataset.sleeveId);
+  else if (action === 'edit-live-sleeve') {
+    // Edit from the Live drill-down: close it, then open the sleeve editor
+    // with the portfolio context so save-flow reopens the drill-down.
+    const ctx = scannerDetailContext;
+    const pf = ctx && ctx._live_tenant ? {
+      mark: Number(ctx.price) || 0,
+      avg: Number(ctx._live_avg) || 0,
+      qty: Number(ctx._live_qty) || 0,
+      side: String(ctx._live_side || ''),
+    } : null;
+    scannerDetailModal.hidden = true;
+    openSleeveEditor(tenant, symbol, btn.dataset.sleeveId, null, pf);
+  }
   else if (action === 'delete-sleeve') deleteSleeve(tenant, symbol, btn.dataset.sleeveId);
   else if (action === 'resume') resumeStrategy(tenant, symbol);
   else if (action === 'cancel-order') cancelOrder(tenant, symbol, btn.dataset.sleeveId || null);
