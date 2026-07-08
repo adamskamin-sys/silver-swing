@@ -4146,6 +4146,25 @@ function refreshScannerDetailLive() {
       }
       const entryPx = Number(s.entry_mark) || 0;
       const posAvgPx = Number(avg) || 0;
+      // Stop-loss cell — mirrors the initial-render logic so column stays
+      // consistent across ticks. Without this the price-tick rebuild produced
+      // one fewer td than the header, shifting every following column left.
+      let stopCell = '<span class="dim">off</span>';
+      if (s.stop_loss_enabled) {
+        const baseStop = Number(s.stop_loss_px) || 0;
+        const hwm = Number(ss.stop_loss_hwm) || 0;
+        const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
+        const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0)
+          ? hwm - ratchetDist
+          : 0;
+        const effective = Math.max(baseStop, ratchetedFloor);
+        if (effective > 0) {
+          const ratcheted = ratchetedFloor > baseStop;
+          stopCell = ratcheted
+            ? `<span class="mono" title="Ratchet armed — floor lifted from base $${fmtPrice(baseStop)} to $${fmtPrice(effective)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">$${fmtPrice(effective)} <span class="sl-ratchet-badge">↑</span></span>`
+            : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
+        }
+      }
       const productHaltReason = state === 'HALTED'
         ? (currentStore[tenant]?.[symbol]?.state?.halt_reason
            || ss.halt_reason || 'halted — check bot log')
@@ -4165,6 +4184,7 @@ function refreshScannerDetailLive() {
         <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
         <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
         <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
+        <td class="mono">${stopCell}</td>
         <td class="mono">${Number(ss.cycles) || 0}</td>
         <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
         <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
