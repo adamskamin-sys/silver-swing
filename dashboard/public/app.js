@@ -3570,6 +3570,45 @@ function openScannerDetail(row) {
     </div>
   ` : '';
 
+  // Attached strategies for this product — read straight from the store's
+  // config.sleeves for (tenant, symbol). Lets you SEE and MANAGE the sleeves
+  // you've attached without needing a full strategy card below the portfolio.
+  const liveSleeves = row._live_tenant
+    ? ((currentStore[row._live_tenant]?.[row.product_id]?.config?.sleeves) || [])
+    : [];
+  const liveSleeveStates = row._live_tenant
+    ? (currentStore[row._live_tenant]?.[row.product_id]?.state?.sleeves || {})
+    : {};
+  const sleevesStrip = liveSleeves.length ? `
+    <div class="scanner-detail-sleeves">
+      <div class="scanner-detail-sleeves-head">Attached strategies (${liveSleeves.length})</div>
+      <table class="scanner-detail-sleeves-table">
+        <thead><tr><th>Name</th><th>Contracts</th><th>Sell</th><th>Buy</th>
+          <th>Cycles</th><th>Realized</th><th>State</th><th></th></tr></thead>
+        <tbody>
+        ${liveSleeves.map(s => {
+          const ss = liveSleeveStates[s.id] || {};
+          const state = String(ss.state || 'ARMED_SELL');
+          const realized = Number(ss.realized_pnl) || 0;
+          return `<tr>
+            <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
+            <td class="mono">${s.qty}</td>
+            <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
+            <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
+            <td class="mono">${Number(ss.cycles) || 0}</td>
+            <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
+            <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
+            <td><button class="small ghost" data-action="delete-sleeve"
+                       data-tenant="${escapeHtml(row._live_tenant)}"
+                       data-symbol="${escapeHtml(row.product_id)}"
+                       data-sleeve-id="${escapeHtml(s.id)}">Remove</button></td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>
+  ` : '';
+
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
@@ -3578,6 +3617,7 @@ function openScannerDetail(row) {
     </div>
     ${specStrip}
     ${liveStrip}
+    ${sleevesStrip}
   `;
   // Wire the attach-strategy button after innerHTML replaces the DOM node.
   const attachBtn = document.getElementById('scanner-detail-attach-strategy');
