@@ -560,12 +560,25 @@ function renderLivePortfolio() {
     }
   }
 
-  if (!rows.length && cashTotal === 0) return '';
+  // Respect the asset-class subtab filter (all / metals / energy / crypto /
+  // other). Filters rows to only that class; cash stays visible on 'all'.
+  const filteredRows = activeAssetClass
+    ? rows.filter(r => {
+        if (r.kind === 'spot') return activeAssetClass === 'crypto';
+        return assetClassOf(r.product) === activeAssetClass;
+      })
+    : rows;
+  const showCash = !activeAssetClass;  // only show cash on 'all'
+  const displayCashTotal = showCash ? cashTotal : 0;
+
+  if (!filteredRows.length && !displayCashTotal) {
+    return `<div class="pf-hint dim">No ${escapeHtml(activeAssetClass || 'live')} positions right now.</div>`;
+  }
 
   const arrow = (v) => v > 0 ? '↗' : v < 0 ? '↘' : '';
   const cls = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
-  const cashLine = cashTotal > 0 ? `
+  const cashLine = displayCashTotal > 0 ? `
     <div class="pf-cash">
       Cash <b>${fmtMoney(cashTotal)}</b>
       <span class="dim">· Primary USD ${fmtMoney(cashPrimary)}
@@ -573,7 +586,7 @@ function renderLivePortfolio() {
        · USDC ${fmtMoney(cashUsdc)}</span>
     </div>` : '';
 
-  const rowsHtml = rows.map(r => {
+  const rowsHtml = filteredRows.map(r => {
     const sym = escapeHtml(r.product || '');
     const dcls = cls(r.pnl || 0);
     const pnlText = r.kind === 'spot'
@@ -3235,11 +3248,31 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     }
     const res = await putJson('/api/sleeves', { tenant, symbol, sleeves: next });
     if (res._unauthorized) { showLogin(); return; }
-    if (res.ok) { m.hidden = true; refreshOnce(); }
+    if (res.ok) {
+      m.hidden = true;
+      showToast(`${existing ? 'updated' : 'attached'} ${patch.name} → ${symbol}`, 'info');
+      // Poll for the refreshed store, then reopen the product-detail modal
+      // so the user immediately SEES the new sleeve in the "Attached
+      // strategies" table. Silent close made it feel like nothing happened.
+      await refreshOnce();
+      if (portfolioContext && isLiveTenant(tenant)) {
+        openScannerDetail({
+          product_id: symbol, price: portfolioContext.mark || 0,
+          high_24h: portfolioContext.mark || 0,
+          low_24h: portfolioContext.mark || 0,
+          vol_pct: 0,
+          _live_tenant: tenant,
+          _live_avg: portfolioContext.avg || 0,
+          _live_qty: portfolioContext.qty || 0,
+          _live_side: portfolioContext.side || '',
+        });
+      }
+    }
     else {
       errEl.hidden = false;
       errEl.innerHTML = escapeHtml(res.error || 'save failed') +
         (res.issues ? '<ul>' + res.issues.map(i => `<li>${escapeHtml(i.field)}: ${escapeHtml(i.message)}</li>`).join('') + '</ul>' : '');
+      showToast(res.error || 'save failed', 'error');
     }
   };
 }
