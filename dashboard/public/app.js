@@ -4125,15 +4125,24 @@ function updateScannerBuyButton() {
     ? (limitPrice > 0 ? `at your limit $${limitPrice.toFixed(3)}` : 'at your limit (enter price)')
     : `at market ~$${(Number(scannerDetailContext.price) || 0).toFixed(3)}`;
 
-  const marginLine = marginRequired > 0
-    ? `Margin required: <b style="color:var(--text)">$${marginRequired.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b> · fee ~$${feeEst.toFixed(2)} <span class="dim">· notional $${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</span>`
-    : `Notional: <b style="color:var(--text)">$${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b> · fee ~$${feeEst.toFixed(2)} <span class="dim">· margin unknown for this product</span>`;
+  const notionalPerCt = priceForPreview * contractSize;
+  const marginPerCt = marginRequired > 0 ? marginRequired / qty : 0;
+  const fmt = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  // Per-contract cost line (Adam asked for "how much one contract would
+  // cost to purchase"). Shows margin/ct if we know it, notional/ct otherwise.
+  const perContractLine = marginPerCt > 0
+    ? `<b>1 contract costs</b> <b style="color:var(--text)">$${fmt(marginPerCt)}</b> margin <span class="dim">(notional $${fmt(notionalPerCt)})</span>`
+    : `<b>1 contract costs</b> <b style="color:var(--text)">$${fmt(notionalPerCt)}</b> notional <span class="dim">(margin unknown for this product)</span>`;
+  const totalLine = marginRequired > 0
+    ? `Total margin: <b style="color:var(--text)">$${fmt(marginRequired)}</b> · fee ~$${feeEst.toFixed(2)}`
+    : `Total notional: <b style="color:var(--text)">$${fmt(notional)}</b> · fee ~$${feeEst.toFixed(2)}`;
 
   const previewEl = document.getElementById('scanner-buy-preview');
   if (previewEl) {
     previewEl.innerHTML = `
       <div>Entering <b style="color:var(--text)">${qty}</b> contract${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
-      <div>${marginLine}</div>
+      <div>${perContractLine}</div>
+      <div>${totalLine}</div>
     `;
   }
 
