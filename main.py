@@ -257,21 +257,22 @@ def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
         if not pid:
             continue
         existing = store.get_config(live_tenant, pid)
-        if existing:
-            continue  # preserve user-tweaked config; don't overwrite
-        cfg = _default_live_holding_config(pid, kind)
-        store.put_config(live_tenant, pid, cfg)
-        # Refresh actual contract specs from Coinbase so tick_size /
-        # contract_size / margin / round-trip fee reflect THIS product
+        if not existing:
+            cfg = _default_live_holding_config(pid, kind)
+            store.put_config(live_tenant, pid, cfg)
+            upserted.append(pid)
+        # Refresh actual contract specs from Coinbase every sync so tick_size
+        # / contract_size / margin / round-trip fee reflect THIS product
         # (silver=50 contracts, oil=10 contracts, etc.), not the silver-based
-        # defaults in _default_live_holding_config. Futures only — spot has
-        # no contract spec.
+        # defaults in _default_live_holding_config. Runs on both new upserts
+        # AND existing entries so a holding added when defaults were wrong
+        # gets its correct specs on the next sync. Futures only — spot has no
+        # contract spec.
         if kind == "futures":
             try:
                 _refresh_contract_spec_into_config(store, live_tenant, pid)
             except Exception as e:
                 _log(f"[{live_tenant}/{pid}] spec refresh skipped: {type(e).__name__}: {e}")
-        upserted.append(pid)
 
     # Also compute + persist the structured portfolio snapshot so the Live
     # tab can render the Coinbase-style Cash / Derivatives / Crypto view.
