@@ -1881,13 +1881,27 @@ async function refreshScanner() {
       tr.dataset.low = String(row.low_24h);
       tr.dataset.volPct = String(row.vol_pct);
       tr.dataset.volume = String(row.volume_24h || 0);
+      const bestSpread = Number(row.best_spread) || 0;
+      const bestRoundtrips = Number(row.best_roundtrips) || 0;
+      const bestScore = Number(row.best_score) || 0;
+      const netPerRt = Number(row.best_net_per_rt) || 0;
+      const spreadCell = bestSpread > 0
+        ? `<span title="Best spread × contract_size − fees = $${fmtNum(netPerRt, 2)} net per roundtrip">$${fmtNum(bestSpread, 4)}</span>`
+        : '<span class="dim">—</span>';
+      const rtCell = bestRoundtrips > 0
+        ? `<b>${bestRoundtrips}</b>`
+        : '<span class="dim">0</span>';
+      const scoreCell = bestScore > 0
+        ? `<b class="pos">$${fmtNum(bestScore, 2)}</b>`
+        : '<span class="dim">—</span>';
       tr.innerHTML = `
         <td>${i + 1}</td>
         <td class="mono">${escapeHtml(row.product_id)}</td>
         <td class="mono">$${fmtNum(row.price, 4)}</td>
-        <td class="mono pos">$${fmtNum(row.high_24h, 4)}</td>
-        <td class="mono neg">$${fmtNum(row.low_24h, 4)}</td>
-        <td class="mono"><b>${fmtNum(row.vol_pct, 2)}%</b></td>
+        <td class="mono">${fmtNum(row.vol_pct, 2)}%</td>
+        <td class="mono">${spreadCell}</td>
+        <td class="mono">${rtCell}</td>
+        <td class="mono">${scoreCell}</td>
         <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
       `;
       tr.onclick = () => openScannerDetail(row);
