@@ -1943,13 +1943,13 @@ header { padding: 20px 32px; }
 /* Column widths (must sum to 100%): Name / Contracts / Pos Avg / Entry /
    Sell / Buy / Stop Loss / Trail / Cycles / Unrealized / Realized / State / Actions */
 .scanner-detail-sleeves-table th:nth-child(1),
-.scanner-detail-sleeves-table td:nth-child(1) { width: 13%; }
+.scanner-detail-sleeves-table td:nth-child(1) { width: 12%; }
 .scanner-detail-sleeves-table th:nth-child(2),
 .scanner-detail-sleeves-table td:nth-child(2) { width: 4%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(3),
-.scanner-detail-sleeves-table td:nth-child(3) { width: 7%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(3) { width: 6%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(4),
-.scanner-detail-sleeves-table td:nth-child(4) { width: 7%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(4) { width: 6%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(5),
 .scanner-detail-sleeves-table td:nth-child(5) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(6),
@@ -1965,9 +1965,9 @@ header { padding: 20px 32px; }
 .scanner-detail-sleeves-table th:nth-child(11),
 .scanner-detail-sleeves-table td:nth-child(11) { width: 8%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(12),
-.scanner-detail-sleeves-table td:nth-child(12) { width: 11%; }
+.scanner-detail-sleeves-table td:nth-child(12) { width: 8%; }
 .scanner-detail-sleeves-table th:nth-child(13),
-.scanner-detail-sleeves-table td:nth-child(13) { width: 6%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(13) { width: 12%; text-align: right; overflow: visible; }
 .scanner-detail-sleeves-table .sl-ratchet-badge {
   display: inline-block; font-size: 10px; color: var(--good);
   background: rgba(76, 205, 138, 0.15); border-radius: 3px;
