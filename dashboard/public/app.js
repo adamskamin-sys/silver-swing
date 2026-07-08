@@ -677,6 +677,10 @@ function renderLivePortfolio() {
     const avgText = r.avg > 0 ? '$' + fmtPrice(r.avg) : '—';
     const markText = r.mark > 0 ? '$' + fmtPrice(r.mark) : '—';
     const liqText = r.liq > 0 ? '$' + fmtPrice(r.liq) : '—';
+    const cycles = r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0;
+    const cyclesText = cycles > 0
+      ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
+      : '<span class="dim">0</span>';
     return `
       <tr class="pf-row" data-action="open-live-strategy"
           data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}"
@@ -689,6 +693,7 @@ function renderLivePortfolio() {
         <td class="mono">${qtyText}</td>
         <td class="mono">${avgText}</td>
         <td class="mono">${markText}</td>
+        <td class="mono">${cyclesText}</td>
         <td class="mono dim">${liqText}</td>
       </tr>`;
   }).join('');
@@ -698,7 +703,7 @@ function renderLivePortfolio() {
     <table class="pf-table-compact">
       <thead><tr>
         <th>Name</th><th>P&amp;L</th><th>Side</th><th>Qty</th>
-        <th>Avg</th><th>Mark</th><th>Liq</th>
+        <th>Avg</th><th>Mark</th><th>Cycles</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table>
