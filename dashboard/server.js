@@ -426,7 +426,16 @@ export function makeApp({
       const snap = store[tenant][symbol].snapshot || {};
       const stateBlock = store[tenant][symbol].state || {};
       const sleeveStates = stateBlock.sleeves || {};
-      const pos = Number(snap.position_qty ?? 0);
+      let pos = Number(snap.position_qty ?? 0);
+      // Live tenant runs read-only — snapshot.position_qty is 0 because no
+      // strategy engine writes it. Real position lives in the __portfolio__
+      // snap we sync from Coinbase. Look it up and prefer whichever is larger
+      // so paper (snap has value) also works.
+      if (String(tenant).toLowerCase().includes('live') && pos === 0) {
+        const pfSnap = store[tenant]?.__portfolio__?.config;
+        const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+        if (posRow) pos = Math.abs(Number(posRow.qty)) || 0;
+      }
       const activeSleeveQty = sleeves.reduce((n, s) => {
         const st = sleeveStates[s.id]?.state || 'ARMED_SELL';
         return n + (st === 'ARMED_SELL' ? Number(s.qty) : 0);
