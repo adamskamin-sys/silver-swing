@@ -580,6 +580,8 @@ function renderLivePortfolio() {
     return `
       <tr class="pf-row" data-action="open-live-strategy"
           data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}"
+          data-mark="${r.mark || 0}" data-avg="${r.avg || 0}" data-pos-qty="${r.qty || 0}"
+          data-side="${escapeHtml(r.side || '')}"
           title="Click to attach a Model / strategy">
         <td><b>${sym}</b></td>
         <td class="mono">${pnlText}</td>
@@ -2317,22 +2319,38 @@ function renderLeaderboard(results, appliedCfg) {
 
 // ---- sleeves editor -----------------------------------------------------
 
-function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
+function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolioContext = null) {
   const block = currentStore[tenant]?.[symbol] || {};
   const cfg = block.config || {};
   const snap = block.snapshot || {};
-  // Live-tenant fallback: this tenant may not have its own price/pos feed
-  // running (portfolio-mirror mode), so pull mark + avg_entry + qty from the
-  // __portfolio__ snapshot that the live sync writes. Keeps "current market"
-  // and "your avg purchase price" populated for Live-tab derivatives.
+  // Live-tenant fallback for mark / avg_entry / qty. Precedence:
+  //   1. portfolioContext — data captured at click time from the row we came
+  //      from. Most reliable: doesn't depend on the __portfolio__ snapshot
+  //      being current in the store.
+  //   2. __portfolio__ snapshot in the store (updated every 2 min by sync).
+  //   3. Same symbol tracked on another tenant (paper / lab) — shares mark.
   let liveMark = 0, liveAvg = 0, liveQty = 0;
-  if (isLiveTenant(tenant)) {
+  if (portfolioContext) {
+    liveMark = Number(portfolioContext.mark) || 0;
+    liveAvg  = Number(portfolioContext.avg) || 0;
+    liveQty  = Number(portfolioContext.qty) || 0;
+  }
+  if (isLiveTenant(tenant) && (!liveMark || !liveAvg || !liveQty)) {
     const pfSnap = currentStore[tenant]?.['__portfolio__']?.config;
     const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
     if (posRow) {
-      liveMark = Number(posRow.mark) || 0;
-      liveAvg  = Number(posRow.avg_entry) || 0;
-      liveQty  = Number(posRow.qty) || 0;
+      liveMark = liveMark || Number(posRow.mark) || 0;
+      liveAvg  = liveAvg  || Number(posRow.avg_entry) || 0;
+      liveQty  = liveQty  || Number(posRow.qty) || 0;
+    }
+  }
+  // Cross-tenant mark fallback: same product tracked on paper/lab has a live
+  // feed, so its snapshot has last_mark even if this tenant's doesn't.
+  if (!liveMark) {
+    for (const t of Object.keys(currentStore || {})) {
+      if (t === tenant) continue;
+      const s = currentStore[t]?.[symbol]?.snapshot;
+      if (s && Number(s.last_mark) > 0) { liveMark = Number(s.last_mark); break; }
     }
   }
   const mark = Number(snap.last_mark) || liveMark || 0;
@@ -3692,12 +3710,19 @@ document.addEventListener('click', (e) => {
   }
   // Live-portfolio derivative row: whole row is a click-target for opening the
   // strategy editor on that product. Skip if the click was on a button inside
-  // the row — that has its own handler below.
-  const pfRow = e.target.closest('tr.pf-deriv-row');
+  // the row — that has its own handler below. Passes the row's mark/avg/qty
+  // as portfolioContext so the modal doesn't depend on __portfolio__ being in
+  // the store yet (which may lag boot-time or fail silently on cred issues).
+  const pfRow = e.target.closest('tr.pf-row');
   if (pfRow && !e.target.closest('button')) {
     const t = pfRow.dataset.tenant, s = pfRow.dataset.symbol;
     if (t && s && pfRow.dataset.action === 'open-live-strategy') {
-      openSleeveEditor(t, s, null);
+      openSleeveEditor(t, s, null, null, {
+        mark: Number(pfRow.dataset.mark) || 0,
+        avg: Number(pfRow.dataset.avg) || 0,
+        qty: Number(pfRow.dataset.posQty) || 0,
+        side: pfRow.dataset.side || '',
+      });
       return;
     }
   }
