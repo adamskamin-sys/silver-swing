@@ -1499,7 +1499,11 @@ header { padding: 20px 32px; }
 }
 
 /* Live-mode confirmation modal — red border + big warning banner so a
-   real-money action can't be blown past by muscle memory. */
+   real-money action can't be blown past by muscle memory. Higher z-index
+   than the sleeve editor / scanner detail (z:100) so it always sits on
+   top when triggered from within one of those. Otherwise the sleeve
+   modal covers the confirmation and clicking Save appears to do nothing. */
+.live-confirm-modal { z-index: 200; }
 .live-confirm-modal .modal-panel {
   border: 2px solid #ef4444;
   box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.15);
