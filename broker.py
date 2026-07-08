@@ -421,8 +421,26 @@ class CoinbaseBroker:
                 except (TypeError, ValueError): avg = 0.0
                 try: mark = float(p.get("current_price") or 0)
                 except (TypeError, ValueError): mark = 0.0
-                try: unreal = float(p.get("unrealized_pnl") or 0)
-                except (TypeError, ValueError): unreal = 0.0
+                # Refresh mark from get_product so we get the freshest price
+                # rather than whatever list_futures_positions cached. Also
+                # recompute unrealized from that fresh mark so it's honest.
+                contract_size = 0.0
+                try:
+                    pd = _dump(self.client.get_product(pid))
+                    fresh_mark = float(pd.get("price") or 0)
+                    if fresh_mark > 0:
+                        mark = fresh_mark
+                    contract_size = float((pd.get("future_product_details") or {}).get("contract_size") or 0)
+                except Exception:
+                    pass
+                # Prefer live-recomputed unrealized when we have contract_size;
+                # otherwise fall back to whatever the position snapshot returned.
+                if mark > 0 and avg > 0 and contract_size > 0:
+                    signed = n if side == "LONG" else -n
+                    unreal = (mark - avg) * signed * contract_size
+                else:
+                    try: unreal = float(p.get("unrealized_pnl") or 0)
+                    except (TypeError, ValueError): unreal = 0.0
                 try: liq = float(p.get("liquidation_price") or 0)
                 except (TypeError, ValueError): liq = 0.0
                 derivatives.append({
