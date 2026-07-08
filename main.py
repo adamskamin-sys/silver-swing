@@ -261,6 +261,16 @@ def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
             continue  # preserve user-tweaked config; don't overwrite
         cfg = _default_live_holding_config(pid, kind)
         store.put_config(live_tenant, pid, cfg)
+        # Refresh actual contract specs from Coinbase so tick_size /
+        # contract_size / margin / round-trip fee reflect THIS product
+        # (silver=50 contracts, oil=10 contracts, etc.), not the silver-based
+        # defaults in _default_live_holding_config. Futures only — spot has
+        # no contract spec.
+        if kind == "futures":
+            try:
+                _refresh_contract_spec_into_config(store, live_tenant, pid)
+            except Exception as e:
+                _log(f"[{live_tenant}/{pid}] spec refresh skipped: {type(e).__name__}: {e}")
         upserted.append(pid)
 
     # Also compute + persist the structured portfolio snapshot so the Live
