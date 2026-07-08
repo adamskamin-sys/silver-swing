@@ -187,6 +187,64 @@ class CoinbaseBroker:
                 return n if (p.get("side") or "").upper() == "LONG" else -n
         return 0
 
+    # ---- Paper-compat surface so _Track can drive us identically ---------
+    # PaperBroker maintains an internal simulated position that the tick loop
+    # feeds bid/ask into, then reads a snapshot from. On the live exchange the
+    # book is the source of truth — we don't need to be told where the market
+    # is. These stubs let the same _Track code path work for both.
+
+    def tick(self, bid: float, ask: float) -> None:
+        """No-op on the live broker — Coinbase's order book already knows
+        where the market is. Kept for interface parity with PaperBroker."""
+        return
+
+    def set_external_day_range(self, high, low) -> None:
+        """No-op — live snapshot() reads 24h range straight from Coinbase."""
+        return
+
+    def to_state_dict(self) -> dict:
+        """Position + realized live on Coinbase, not in local JSON. Return
+        an empty dict so store.put_paper_state() is a no-op equivalent."""
+        return {}
+
+    def restore_from_state_dict(self, _state: dict) -> None:
+        """No-op — position is read fresh from Coinbase on every reconcile()."""
+        return
+
+    @property
+    def position(self):
+        """Compatibility with PaperBroker's .position.qty / .avg_entry access.
+        Returns a tiny namespace populated from the live snapshot() call so
+        callers that read broker.position.qty (logs, _mirror helpers) work."""
+        snap = self.snapshot()
+        class _Pos:
+            pass
+        p = _Pos()
+        p.qty = int(snap.get("position_qty") or 0)
+        p.avg_entry = float(snap.get("position_avg_entry") or 0.0)
+        return p
+
+    @property
+    def balance(self) -> float:
+        """USD cash across CFM + CBI + USDC. Read from Coinbase."""
+        try:
+            return float(self.snapshot().get("balance") or 0.0)
+        except Exception:
+            return 0.0
+
+    @property
+    def realized_pnl(self) -> float:
+        try:
+            return float(self.snapshot().get("realized_pnl") or 0.0)
+        except Exception:
+            return 0.0
+
+    @property
+    def lots(self) -> list:
+        """No lot-level tracking on the live broker — Coinbase reports one
+        blended avg entry per position. Return empty list for API parity."""
+        return []
+
     # ---- §2A fee gate ----------------------------------------------------
 
     def preview_order(self, side: str, qty: int, price: float) -> dict:

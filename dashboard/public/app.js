@@ -3534,11 +3534,26 @@ async function deleteSleeve(tenant, symbol, sleeveId) {
     if (!confirm(`Delete strategy ${sleeveId}? Any live order it holds will be cancelled next tick.`)) return;
   }
   const block = currentStore[tenant]?.[symbol] || {};
-  const sleeves = (block.config?.sleeves || []).filter(s => s.id !== sleeveId);
+  // Sanitize remaining sleeves so a bad stored value on someone else doesn't
+  // block THIS delete. Most common: exit_mode=hybrid with
+  // trail_activation_px <= sell_px (from before the auto-lift fix). Bump it.
+  const sleeves = (block.config?.sleeves || [])
+    .filter(s => s.id !== sleeveId)
+    .map(s => {
+      if (s.exit_mode !== 'hybrid') return s;
+      const sell = Number(s.sell_px) || 0;
+      const act = Number(s.trail_activation_px) || 0;
+      if (sell > 0 && act <= sell) return { ...s, trail_activation_px: sell + 0.05 };
+      return s;
+    });
   const res = await putJson('/api/sleeves', { tenant, symbol, sleeves });
   if (res._unauthorized) { showLogin(); return; }
   if (res.ok) { refreshOnce(); showToast('strategy deleted', 'info'); }
-  else showToast(res.error || 'delete failed', 'error');
+  else {
+    // Surface the actual reason (server issue list wins over generic error).
+    const detail = res.issues ? res.issues.map(i => `${i.field}: ${i.message}`).join('; ') : (res.error || 'delete failed');
+    showToast(detail, 'error');
+  }
 }
 
 // ---- manual trade -------------------------------------------------------
@@ -3895,6 +3910,21 @@ function openScannerDetail(row) {
           }
           const entryPx = Number(s.entry_mark) || 0;
           const posAvgPx = Number(row._live_avg) || 0;
+          // Halt reason lives on the product-level state (not per-sleeve) when
+          // the state machine crashes out (abort_below, reconcile). Show it as
+          // a tooltip on the HALTED pill so Adam knows why to click Resume.
+          const productHaltReason = state === 'HALTED'
+            ? (currentStore[row._live_tenant]?.[row.product_id]?.state?.halt_reason
+               || ss.halt_reason || 'halted — check bot log')
+            : null;
+          const stateCell = productHaltReason
+            ? `<span class="status-pill ${state.toLowerCase()}" title="${escapeHtml(productHaltReason)}">${escapeHtml(prettyState(state))}</span>`
+            : `<span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span>`;
+          const resumeBtn = state === 'HALTED'
+            ? `<button class="small primary" data-action="resume-live-strategy"
+                       data-tenant="${escapeHtml(row._live_tenant)}"
+                       data-symbol="${escapeHtml(row.product_id)}">Resume</button>`
+            : '';
           return `<tr>
             <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
             <td class="mono">${s.qty}</td>
@@ -3905,8 +3935,9 @@ function openScannerDetail(row) {
             <td class="mono">${Number(ss.cycles) || 0}</td>
             <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
             <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
-            <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
+            <td>${stateCell}</td>
             <td class="sleeve-row-actions">
+              ${resumeBtn}
               <button class="small" data-action="edit-live-sleeve"
                       data-tenant="${escapeHtml(row._live_tenant)}"
                       data-symbol="${escapeHtml(row.product_id)}"
@@ -4044,6 +4075,18 @@ function refreshScannerDetailLive() {
       }
       const entryPx = Number(s.entry_mark) || 0;
       const posAvgPx = Number(avg) || 0;
+      const productHaltReason = state === 'HALTED'
+        ? (currentStore[tenant]?.[symbol]?.state?.halt_reason
+           || ss.halt_reason || 'halted — check bot log')
+        : null;
+      const stateCell = productHaltReason
+        ? `<span class="status-pill ${state.toLowerCase()}" title="${escapeHtml(productHaltReason)}">${escapeHtml(prettyState(state))}</span>`
+        : `<span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span>`;
+      const resumeBtn = state === 'HALTED'
+        ? `<button class="small primary" data-action="resume-live-strategy"
+                   data-tenant="${escapeHtml(tenant)}"
+                   data-symbol="${escapeHtml(symbol)}">Resume</button>`
+        : '';
       return `<tr>
         <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
         <td class="mono">${s.qty}</td>
@@ -4054,8 +4097,9 @@ function refreshScannerDetailLive() {
         <td class="mono">${Number(ss.cycles) || 0}</td>
         <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
         <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
-        <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
+        <td>${stateCell}</td>
         <td class="sleeve-row-actions">
+          ${resumeBtn}
           <button class="small" data-action="edit-live-sleeve"
                   data-tenant="${escapeHtml(tenant)}"
                   data-symbol="${escapeHtml(symbol)}"
@@ -4450,6 +4494,15 @@ document.addEventListener('click', (e) => {
     openSleeveEditor(tenant, symbol, btn.dataset.sleeveId, null, pf);
   }
   else if (action === 'delete-sleeve') deleteSleeve(tenant, symbol, btn.dataset.sleeveId);
+  else if (action === 'resume-live-strategy') {
+    // Clear the HALT for this product on the Live tenant. Server writes a
+    // resume_intent; the bot picks it up on the next reconcile tick.
+    postJson('/api/resume', { tenant, symbol }).then(res => {
+      if (res._unauthorized) return showLogin();
+      if (res.ok) { showToast('resume queued — next tick', 'info'); refreshOnce(); }
+      else showToast(res.error || 'resume failed', 'error');
+    });
+  }
   else if (action === 'resume') resumeStrategy(tenant, symbol);
   else if (action === 'cancel-order') cancelOrder(tenant, symbol, btn.dataset.sleeveId || null);
   else if (action === 'sell-now') marketSell(tenant, symbol, parseInt(btn.dataset.qty, 10));
