@@ -1865,6 +1865,11 @@ async function refreshOnce() {
   }
 
   lastUpdated.textContent = `updated ${new Date().toLocaleTimeString()}`;
+
+  // If the scanner detail modal is open, refresh its price bar + sleeves
+  // table from the fresh store so mark/unrealized don't lag while the user
+  // is watching a drill-down. Chart is not re-drawn (would flap).
+  refreshScannerDetailLive();
 }
 
 // ---- CONFIG editor -------------------------------------------------------
@@ -3230,6 +3235,16 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const stopLossEnabled = !!(stopLossToggle && stopLossToggle.checked);
     const stopMode = stopModeEl?.value || 'all';
     const stopPx = Number(stopPxEl?.value || 0);
+    // Entry-basis stamp: unrealized P&L for a sleeve should be measured from
+    // when the STRATEGY started tracking, not the position's overall avg entry
+    // (which reflects buys that predate the sleeve). Stamp once at create time;
+    // preserve on edits so the historical basis doesn't reset when you tweak
+    // targets. Existing pre-stamp sleeves get backfilled with current mark.
+    const existingEntryMark = existing ? Number(draft.entry_mark) : 0;
+    const entryMark = existingEntryMark > 0 ? existingEntryMark : (Number(mark) || 0);
+    const entryTs = existing && Number(draft.entry_ts) > 0
+      ? Number(draft.entry_ts)
+      : Math.floor(Date.now() / 1000);
     const patch = {
       id: draft.id,
       name: nameEl.value || draft.id,
@@ -3237,6 +3252,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       exit_mode: exitEl.value,
       sell_px: sellPx,
       buy_px: buyPx,
+      entry_mark: entryMark,
+      entry_ts: entryTs,
       trail_trigger: sellPx,
       trail_distance: usesTrail ? trailDistance : Math.max(0.02, (sellPx - buyPx) / 4),
       trail_activation_px: exitEl.value === 'hybrid' ? trailActivation : (sellPx + 0.5),
@@ -3678,17 +3695,22 @@ function openScannerDetail(row) {
           const ss = liveSleeveStates[s.id] || {};
           const state = String(ss.state || 'ARMED_SELL');
           const realized = Number(ss.realized_pnl) || 0;
-          // Per-sleeve unrealized: sleeve is holding its own contracts when
-          // it's ARMED_SELL. Basis = sleeve's own_avg_entry (set once the
-          // sleeve's state machine ticks). Fresh sleeves haven't ticked yet,
-          // so fall back to the ACCOUNT's position avg entry (row._live_avg)
-          // — that's what the sleeve will use as basis when it arms.
-          // Fall further back to buy_px only if no position avg exists.
+          // Per-sleeve unrealized measured from STRATEGY entry, not the
+          // account's position avg. When you attach a strategy to an existing
+          // 10-contract position, the strategy took over N of those contracts
+          // at whatever the mark was at attach time — that's the strategy's
+          // basis for its P&L, not what you originally paid for the position.
+          // Precedence: own_avg_entry (from state machine) → entry_mark
+          // (stamped at create/edit) → (sell+buy)/2 legacy proxy → position avg.
           let unrealized = 0;
           if (state === 'ARMED_SELL') {
+            const sell = Number(s.sell_px) || 0;
+            const buy = Number(s.buy_px) || 0;
+            const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
             const basis = Number(ss.own_avg_entry)
+              || Number(s.entry_mark)
+              || midpoint
               || Number(row._live_avg)
-              || Number(s.buy_px)
               || 0;
             if (basis > 0 && liveMarkForSleeves > 0) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
@@ -3762,6 +3784,120 @@ function openScannerDetail(row) {
   loadScannerChart();
 }
 
+// Real-time refresh for the drill-down modal. Called from refreshOnce() every
+// POLL_MS. Re-reads the latest mark/avg from currentStore for the currently
+// open symbol and rewrites just the price bar + sleeves table (not the chart —
+// re-fetching candles every 5s would flap the chart and hammer Coinbase).
+function refreshScannerDetailLive() {
+  if (!scannerDetailModal || scannerDetailModal.hidden) return;
+  const ctx = scannerDetailContext;
+  if (!ctx || !ctx._live_tenant) return;  // only Live-portfolio rows get live-refreshed
+  const tenant = ctx._live_tenant;
+  const symbol = ctx.product_id;
+  // Fresh mark: prefer __portfolio__ snap (updated by sync every 15s); fall
+  // back to same-symbol snapshot on any tenant (paper/lab keep last_mark warm).
+  let mark = 0, avg = Number(ctx._live_avg) || 0, qty = Number(ctx._live_qty) || 0;
+  let high = Number(ctx.high_24h) || 0, low = Number(ctx.low_24h) || 0;
+  const pfSnap = currentStore?.[tenant]?.['__portfolio__']?.config;
+  const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+  if (posRow) {
+    mark = Number(posRow.mark) || 0;
+    avg = Number(posRow.avg_entry) || avg;
+    qty = Number(posRow.qty) || qty;
+  }
+  if (!mark) {
+    for (const t of Object.keys(currentStore || {})) {
+      const s = currentStore[t]?.[symbol]?.snapshot;
+      if (s && Number(s.last_mark) > 0) { mark = Number(s.last_mark); break; }
+    }
+  }
+  if (mark > 0) {
+    ctx.price = mark;
+    ctx._live_avg = avg;
+    ctx._live_qty = qty;
+  }
+  // Rebuild just the price line to avoid re-drawing chart/timeframes.
+  const priceEl = scannerDetailSummary.querySelector('.scanner-detail-price');
+  if (priceEl) {
+    priceEl.innerHTML = `
+      <span class="mono">$${fmtNum(mark || ctx.price || 0, 4)}</span>
+      <span class="scanner-detail-range"><span class="pos">$${fmtNum(high, 4)}</span> / <span class="neg">$${fmtNum(low, 4)}</span></span>
+      <span class="scanner-detail-vol">24h range <b>${fmtNum(ctx.vol_pct || 0, 2)}%</b></span>
+    `;
+  }
+  // Rebuild the sleeves table so Unrealized reflects the new mark. Same logic
+  // as the initial render — but reads from the latest currentStore.
+  const sleeves = currentStore?.[tenant]?.[symbol]?.config?.sleeves || [];
+  const sleeveStates = currentStore?.[tenant]?.[symbol]?.state?.sleeves || {};
+  const contractSize = Number(currentStore?.[tenant]?.[symbol]?.config?.contract_size) || 50;
+  const markForSleeves = mark || Number(ctx.price) || 0;
+  const tbody = scannerDetailSummary.querySelector('.scanner-detail-sleeves-table tbody');
+  if (tbody && sleeves.length) {
+    tbody.innerHTML = sleeves.map(s => {
+      const ss = sleeveStates[s.id] || {};
+      const state = String(ss.state || 'ARMED_SELL');
+      const realized = Number(ss.realized_pnl) || 0;
+      let unrealized = 0;
+      if (state === 'ARMED_SELL') {
+        const sell = Number(s.sell_px) || 0;
+        const buy = Number(s.buy_px) || 0;
+        const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
+        const basis = Number(ss.own_avg_entry)
+          || Number(s.entry_mark)
+          || midpoint
+          || Number(avg)
+          || 0;
+        if (basis > 0 && markForSleeves > 0) {
+          unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
+        }
+      }
+      return `<tr>
+        <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
+        <td class="mono">${s.qty}</td>
+        <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
+        <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
+        <td class="mono">${Number(ss.cycles) || 0}</td>
+        <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
+        <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
+        <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
+        <td><button class="small ghost" data-action="delete-sleeve"
+                   data-tenant="${escapeHtml(tenant)}"
+                   data-symbol="${escapeHtml(symbol)}"
+                   data-sleeve-id="${escapeHtml(s.id)}">Remove</button></td>
+      </tr>`;
+    }).join('');
+  }
+  // Also refresh the "You hold N LONG @ avg $X" strip since qty/avg may change
+  // when the user trades on Coinbase.
+  const liveEl = scannerDetailSummary.querySelector('.scanner-detail-live');
+  if (liveEl) {
+    const btn = liveEl.querySelector('#scanner-detail-attach-strategy');
+    const btnHtml = btn ? btn.outerHTML : '';
+    liveEl.innerHTML = `
+      You hold <b>${qty}</b> ${escapeHtml(ctx._live_side || 'LONG')} @ avg
+      <b class="mono">$${fmtNum(avg, 4)}</b>
+      ${btnHtml}
+    `;
+    // Re-wire the button since we just replaced its DOM.
+    const newBtn = liveEl.querySelector('#scanner-detail-attach-strategy');
+    if (newBtn) {
+      newBtn.dataset.mark = String(mark || ctx.price || 0);
+      newBtn.dataset.avg = String(avg);
+      newBtn.dataset.posQty = String(qty);
+      newBtn.onclick = () => {
+        const ck = {
+          mark: Number(newBtn.dataset.mark) || 0,
+          avg: Number(newBtn.dataset.avg) || 0,
+          qty: Number(newBtn.dataset.posQty) || 0,
+          side: newBtn.dataset.side || '',
+        };
+        scannerDetailModal.hidden = true;
+        openSleeveEditor(newBtn.dataset.tenant, newBtn.dataset.symbol, null, null, ck);
+      };
+    }
+  }
+}
+
 function updateScannerBuyButton() {
   if (!scannerDetailContext) return;
   const symbol = scannerDetailContext.product_id;
@@ -3774,20 +3910,36 @@ function updateScannerBuyButton() {
     ? limitPrice
     : Number(scannerDetailContext.price) || 0;
 
-  // Contract size defaults to 50 (silver/mini futures); would ideally read
-  // from the symbol's spec — good enough for a preview line.
-  const contractSize = 50;
+  // Read spec off the row (scanner.compute_ranking populates it).
+  const ctx = scannerDetailContext;
+  const contractSize = Number(ctx.contract_size) || 50;
+  const intradayRate = Number(ctx.intraday_margin_rate) || 0;
+  // For a live tenant we can also read the stored margin_per_contract as a
+  // fallback if Coinbase didn't return an intraday rate for this product.
+  const liveCfg = ctx._live_tenant
+    ? (currentStore?.[ctx._live_tenant]?.[ctx.product_id]?.config || {})
+    : {};
+  const storedMarginPer = Number(liveCfg.margin_per_contract) || 0;
   const notional = priceForPreview * contractSize * qty;
+  // Margin required = what actually leaves your account for a futures fill.
+  // Prefer the intraday rate from Coinbase; fall back to stored per-contract.
+  const marginRequired = intradayRate > 0
+    ? notional * intradayRate
+    : (storedMarginPer > 0 ? storedMarginPer * qty : 0);
   const feeEst = 2.34 * qty;
   const priceLabel = orderType === 'limit'
     ? (limitPrice > 0 ? `at your limit $${limitPrice.toFixed(3)}` : 'at your limit (enter price)')
     : `at market ~$${(Number(scannerDetailContext.price) || 0).toFixed(3)}`;
 
+  const marginLine = marginRequired > 0
+    ? `Margin required: <b style="color:var(--text)">$${marginRequired.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b> · fee ~$${feeEst.toFixed(2)} <span class="dim">· notional $${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</span>`
+    : `Notional: <b style="color:var(--text)">$${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b> · fee ~$${feeEst.toFixed(2)} <span class="dim">· margin unknown for this product</span>`;
+
   const previewEl = document.getElementById('scanner-buy-preview');
   if (previewEl) {
     previewEl.innerHTML = `
       <div>Buying <b style="color:var(--text)">${qty}</b> contract${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
-      <div>Total: <b style="color:var(--text)">$${notional.toLocaleString('en-US', { maximumFractionDigits: 2 })}</b> · fee ~$${feeEst.toFixed(2)}</div>
+      <div>${marginLine}</div>
     `;
   }
 
