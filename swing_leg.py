@@ -764,9 +764,10 @@ class SwingTrader:
                          sleeve_id=sc.id, error=str(e))
             return False
         if pos <= 0:
-            self._sleeve_halt(sc, ss,
-                              f"stop-loss at {last_price} (≤ {effective_stop}) but position is 0")
-            return True
+            # Nothing to sell — sleeve is in ARMED_BUY (already sold, waiting
+            # to rebuy) or otherwise flat. Stop-loss doesn't apply; skip
+            # silently rather than halting so the cycle continues.
+            return False
         to_sell = self._compute_sleeve_stop_loss_qty(sc, pos)
         if to_sell <= 0:
             self._sleeve_halt(sc, ss,
