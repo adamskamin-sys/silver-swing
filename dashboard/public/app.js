@@ -504,103 +504,103 @@ function renderLabComparison() {
     </table>`;
 }
 
-// Live-tab portfolio view: Coinbase-style Cash / Derivatives / Crypto sections.
-// Reads the __portfolio__ snapshot the backend writes into store on live sync
-// (main.py: _sync_live_portfolio). Each derivative row is clickable and opens
-// the strategy editor so the user can attach Model A/B/C/D/E to that position.
+// Live-tab portfolio view: compact single-screen table of every position.
+// Reads the __portfolio__ snapshot the backend writes (main.py:
+// _sync_live_portfolio). Falls back to reading the tracked-symbol snapshots
+// directly if the sync hasn't populated yet, so you still see something.
 function renderLivePortfolio() {
   const liveTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
   if (!liveTenant) return '';
-  const block = (currentStore[liveTenant] || {})['__portfolio__'];
-  const snap = block?.config;
-  if (!snap || !snap.cash) return '';
+  const tenantBlock = currentStore[liveTenant] || {};
+  const snap = tenantBlock['__portfolio__']?.config;
 
-  const cash = snap.cash || {};
-  const derivatives = snap.derivatives || [];
-  const crypto = snap.crypto || [];
-  const grand = Number(snap.grand_total) || 0;
-  const derivPnl = Number(snap.derivatives_unrealized) || 0;
-  const cryptoTotal = Number(snap.crypto_total) || 0;
+  // Build a single flat row list: [{name, pnl, side, qty, avg, mark, liq}]
+  const rows = [];
+  let cashTotal = 0, cashPrimary = 0, cashDeriv = 0, cashUsdc = 0;
+  if (snap && snap.cash) {
+    cashTotal  = Number(snap.cash.total) || 0;
+    cashPrimary = Number(snap.cash.primary_usd) || 0;
+    cashDeriv  = Number(snap.cash.derivatives_usd) || 0;
+    cashUsdc   = Number(snap.cash.usdc) || 0;
+    for (const d of snap.derivatives || []) {
+      rows.push({
+        kind: 'futures', product: d.product_id, side: d.side || 'LONG',
+        qty: d.qty, avg: d.avg_entry, mark: d.mark,
+        pnl: d.unrealized, liq: d.liquidation_price,
+      });
+    }
+    for (const c of snap.crypto || []) {
+      rows.push({
+        kind: 'spot', product: c.currency, side: '', qty: c.balance,
+        avg: 0, mark: c.mark, pnl: 0, liq: 0, value: c.value_usd,
+      });
+    }
+  } else {
+    // Fallback: read each tracked live symbol's snapshot directly. No cash
+    // breakdown but at least the positions render.
+    for (const sym of Object.keys(tenantBlock)) {
+      if (sym.startsWith('__')) continue;
+      const s = tenantBlock[sym]?.snapshot;
+      if (!s) continue;
+      const qty = Number(s.position_qty) || 0;
+      if (qty === 0) continue;
+      rows.push({
+        kind: 'futures', product: sym,
+        side: qty > 0 ? 'LONG' : 'SHORT',
+        qty: Math.abs(qty), avg: Number(s.position_avg_entry) || 0,
+        mark: Number(s.last_mark) || 0, pnl: Number(s.unrealized_pnl) || 0,
+        liq: Number(s.liquidation_price) || 0,
+      });
+    }
+  }
+
+  if (!rows.length && cashTotal === 0) return '';
 
   const arrow = (v) => v > 0 ? '↗' : v < 0 ? '↘' : '';
-  const cls = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
+  const cls = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
 
-  const cashSection = `
-    <div class="pf-section">
-      <div class="pf-section-head">
-        <h4>Cash <span class="pf-total">${fmtMoney(cash.total || 0)}</span></h4>
-      </div>
-      <table class="pf-table">
-        <tbody>
-          <tr><td class="pf-name">USD</td><td class="mono">${fmtMoney(cash.usd_total || 0)}</td><td class="pf-alloc dim">${grand > 0 ? fmtNum((cash.usd_total / grand) * 100, 2) + '%' : '—'}</td></tr>
-          <tr class="pf-sub"><td class="pf-name">Primary USD balance</td><td class="mono">${fmtMoney(cash.primary_usd || 0)}</td><td></td></tr>
-          <tr class="pf-sub"><td class="pf-name">Derivatives USD balance</td><td class="mono">${fmtMoney(cash.derivatives_usd || 0)}</td><td></td></tr>
-          <tr class="pf-sub"><td class="pf-name">Predictions USD balance</td><td class="mono dim">${fmtMoney(cash.predictions_usd || 0)}</td><td></td></tr>
-          <tr><td class="pf-name">USDC</td><td class="mono">${fmtMoney(cash.usdc || 0)}</td><td class="pf-alloc dim">${grand > 0 ? fmtNum((cash.usdc / grand) * 100, 2) + '%' : '—'}</td></tr>
-        </tbody>
-      </table>
-    </div>`;
+  const cashLine = cashTotal > 0 ? `
+    <div class="pf-cash">
+      Cash <b>${fmtMoney(cashTotal)}</b>
+      <span class="dim">· Primary USD ${fmtMoney(cashPrimary)}
+       · Derivatives USD ${fmtMoney(cashDeriv)}
+       · USDC ${fmtMoney(cashUsdc)}</span>
+    </div>` : '';
 
-  const derivRows = derivatives.map(d => {
-    const dcls = cls(d.unrealized || 0);
-    const sym = escapeHtml(d.product_id || '');
+  const rowsHtml = rows.map(r => {
+    const sym = escapeHtml(r.product || '');
+    const dcls = cls(r.pnl || 0);
+    const pnlText = r.kind === 'spot'
+      ? `<span class="dim">${fmtMoney(r.value || 0)}</span>`
+      : `<span class="${dcls}">${arrow(r.pnl)} ${fmtMoney(Math.abs(r.pnl || 0))}</span>`;
+    const qtyText = r.kind === 'spot' ? fmtNum(r.qty, 6) : r.qty;
+    const avgText = r.avg > 0 ? '$' + fmtPrice(r.avg) : '—';
+    const markText = r.mark > 0 ? '$' + fmtPrice(r.mark) : '—';
+    const liqText = r.liq > 0 ? '$' + fmtPrice(r.liq) : '—';
     return `
-      <tr class="pf-deriv-row" data-action="open-live-strategy" data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}" title="Click to attach a Model / strategy">
-        <td class="pf-name"><b>${sym}</b></td>
-        <td class="mono ${dcls}">${arrow(d.unrealized)} ${fmtMoney(Math.abs(d.unrealized || 0))}</td>
-        <td>${escapeHtml(d.side || '')}</td>
-        <td class="mono">${d.qty}</td>
-        <td class="mono">$${fmtPrice(d.avg_entry || 0)}</td>
-        <td class="mono">$${fmtPrice(d.mark || 0)}</td>
-        <td class="mono">${d.liquidation_price > 0 ? '$' + fmtPrice(d.liquidation_price) : '—'}</td>
-        <td class="pf-add"><button class="small primary" data-action="open-live-strategy" data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}">+ Strategy</button></td>
+      <tr class="pf-row" data-action="open-live-strategy"
+          data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}"
+          title="Click to attach a Model / strategy">
+        <td><b>${sym}</b></td>
+        <td class="mono">${pnlText}</td>
+        <td class="mono dim">${escapeHtml(r.side || '')}</td>
+        <td class="mono">${qtyText}</td>
+        <td class="mono">${avgText}</td>
+        <td class="mono">${markText}</td>
+        <td class="mono dim">${liqText}</td>
       </tr>`;
   }).join('');
-  const derivSection = derivatives.length ? `
-    <div class="pf-section">
-      <div class="pf-section-head">
-        <h4>Derivatives <span class="pf-total ${cls(derivPnl)}">${arrow(derivPnl)} ${fmtMoney(Math.abs(derivPnl))}</span></h4>
-        <div class="dim">Click a row to attach Model A/B/C/D/E</div>
-      </div>
-      <table class="pf-table">
-        <thead><tr>
-          <th>Name</th><th>P&amp;L</th><th>Side</th><th>Amount</th>
-          <th>Avg Entry</th><th>Mark price</th><th>Est Liq Price</th><th></th>
-        </tr></thead>
-        <tbody>${derivRows}</tbody>
-      </table>
-    </div>` : '';
-
-  const cryptoRows = crypto.map(c => `
-    <tr>
-      <td class="pf-name"><b>${escapeHtml(c.currency)}</b></td>
-      <td class="mono">${fmtNum(c.balance, 6)}</td>
-      <td class="mono dim">${fmtNum(c.available, 6)}</td>
-      <td class="mono">$${fmtPrice(c.mark || 0)}</td>
-      <td class="mono">${fmtMoney(c.value_usd || 0)}</td>
-      <td class="mono dim">${fmtNum(c.allocation_pct || 0, 2)}%</td>
-    </tr>`).join('');
-  const cryptoSection = crypto.length ? `
-    <div class="pf-section">
-      <div class="pf-section-head">
-        <h4>Crypto <span class="pf-total">${fmtMoney(cryptoTotal)}</span></h4>
-      </div>
-      <table class="pf-table">
-        <thead><tr>
-          <th>Name</th><th>Balance</th><th>Available</th>
-          <th>Current price</th><th>Value</th><th>Allocation</th>
-        </tr></thead>
-        <tbody>${cryptoRows}</tbody>
-      </table>
-    </div>` : '';
 
   return `
-    <div class="pf-summary">
-      <div class="pf-grand"><span class="dim">Portfolio total</span> <b>${fmtMoney(grand)}</b></div>
-    </div>
-    ${cashSection}
-    ${derivSection}
-    ${cryptoSection}`;
+    ${cashLine}
+    <table class="pf-table-compact">
+      <thead><tr>
+        <th>Name</th><th>P&amp;L</th><th>Side</th><th>Qty</th>
+        <th>Avg</th><th>Mark</th><th>Liq</th>
+      </tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+    <div class="pf-hint dim">Click a row to attach Model A/B/C/D/E · auto-refreshes every 2 min</div>`;
 }
 
 function renderCard(tenant, symbol, { config, state, snapshot }) {
@@ -2321,8 +2321,22 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
   const block = currentStore[tenant]?.[symbol] || {};
   const cfg = block.config || {};
   const snap = block.snapshot || {};
-  const mark = Number(snap.last_mark) || 0;
-  const posAvgEntry = Number(snap.position_avg_entry) || 0;
+  // Live-tenant fallback: this tenant may not have its own price/pos feed
+  // running (portfolio-mirror mode), so pull mark + avg_entry + qty from the
+  // __portfolio__ snapshot that the live sync writes. Keeps "current market"
+  // and "your avg purchase price" populated for Live-tab derivatives.
+  let liveMark = 0, liveAvg = 0, liveQty = 0;
+  if (isLiveTenant(tenant)) {
+    const pfSnap = currentStore[tenant]?.['__portfolio__']?.config;
+    const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+    if (posRow) {
+      liveMark = Number(posRow.mark) || 0;
+      liveAvg  = Number(posRow.avg_entry) || 0;
+      liveQty  = Number(posRow.qty) || 0;
+    }
+  }
+  const mark = Number(snap.last_mark) || liveMark || 0;
+  const posAvgEntry = Number(snap.position_avg_entry) || liveAvg || 0;
   // Priority order for the anchor (the price the swing is centered on):
   //   1. Lot's entry price if opened from a specific lot ("+ Strategy" per lot)
   //   2. Existing sleeve's buy_px (preserve on edit)
@@ -2367,7 +2381,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null) {
   const existing = sleeveId ? sleeves.find(s => s.id === sleeveId) : null;
 
   // Capacity: how many contracts can this sleeve use?
-  const pos = Number(snap.position_qty ?? 0);
+  // Live-tenant: use position qty from the __portfolio__ snapshot since the
+  // regular snap.position_qty isn't updated for read-only mirrored positions.
+  const pos = Number(snap.position_qty ?? 0) || liveQty;
   const core = Number(cfg.core_qty ?? 0);
   const primary = Number(cfg.swing_qty ?? 0);
   const otherSleeves = sleeves.filter(s => s.id !== sleeveId);

@@ -1682,32 +1682,23 @@ header { padding: 20px 32px; }
   border-radius: 4px; font-size: 12px; line-height: 1.6;
 }
 
-/* ---- Live portfolio (Coinbase-style overview) -------------------------- */
+/* ---- Live portfolio (compact single-screen table) ---------------------- */
 .live-portfolio { background: var(--panel); border-radius: 6px;
-  padding: 18px 22px; margin-bottom: 22px; }
-.pf-summary { display: flex; justify-content: space-between; align-items: baseline;
-  padding-bottom: 14px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
-.pf-grand b { font-size: 22px; margin-left: 8px; }
-.pf-section { margin: 16px 0; }
-.pf-section-head { display: flex; justify-content: space-between; align-items: baseline;
-  padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 6px; }
-.pf-section-head h4 { margin: 0; font-size: 15px; letter-spacing: 0.5px; font-weight: 600; }
-.pf-total { margin-left: 10px; font-family: var(--mono); font-size: 14px; }
-.pf-total.pos { color: var(--good); }
-.pf-total.neg { color: var(--bad); }
-.pf-table { width: 100%; border-collapse: collapse; }
-.pf-table th, .pf-table td { padding: 8px 10px; text-align: left; font-size: 13px; }
-.pf-table th { color: var(--muted); text-transform: none; font-weight: 500;
+  padding: 10px 14px; margin-bottom: 12px; }
+.pf-cash { font-size: 12px; padding: 4px 2px 8px;
+  border-bottom: 1px solid var(--border); margin-bottom: 6px; }
+.pf-cash b { font-family: var(--mono); }
+.pf-table-compact { width: 100%; border-collapse: collapse; font-size: 12px; }
+.pf-table-compact th, .pf-table-compact td { padding: 4px 8px; text-align: left; }
+.pf-table-compact th { color: var(--muted); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.5px;
   border-bottom: 1px solid var(--border); }
-.pf-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
-.pf-table tbody tr:last-child { border-bottom: none; }
-.pf-table .mono { font-family: var(--mono); }
-.pf-table .pos { color: var(--good); }
-.pf-table .neg { color: var(--bad); }
-.pf-table .dim { color: var(--muted); opacity: 0.75; }
-.pf-name { min-width: 180px; }
-.pf-sub .pf-name { padding-left: 24px; color: var(--muted); }
-.pf-alloc { text-align: right; min-width: 70px; }
-.pf-add { text-align: right; }
-.pf-deriv-row { cursor: pointer; }
-.pf-deriv-row:hover { background: rgba(232, 168, 130, 0.06); }
+.pf-table-compact tbody tr { border-bottom: 1px solid rgba(255,255,255,0.03); }
+.pf-table-compact tbody tr:last-child { border-bottom: none; }
+.pf-table-compact .mono { font-family: var(--mono); }
+.pf-table-compact .pos { color: var(--good); }
+.pf-table-compact .neg { color: var(--bad); }
+.pf-table-compact .dim { color: var(--muted); opacity: 0.75; }
+.pf-row { cursor: pointer; }
+.pf-row:hover { background: rgba(232, 168, 130, 0.06); }
+.pf-hint { font-size: 11px; padding-top: 6px; }
