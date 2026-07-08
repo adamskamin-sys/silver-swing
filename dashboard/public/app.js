@@ -2907,6 +2907,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           <span>$0.01</span><span>$0.25</span><span>$0.50</span><span>$1.00</span>
         </div>
         <div class="trail-dollars" id="sl-td-dollars"></div>
+        <div class="trail-status" id="sl-td-status"></div>
         <div class="preview-note">
           Trailing stop uses the sell target above as the ARM price — once silver hits it, the trail engages and rides upside. Sells when price pulls back this much from the peak.
         </div>
@@ -3011,6 +3012,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   const tdSliderEl = m.querySelector('#sl-td-slider');
   const tdValEl = m.querySelector('#sl-td-val');
   const tdDollarsEl = m.querySelector('#sl-td-dollars');
+  const tdStatusEl = m.querySelector('#sl-td-status');
   const sellTargetEl = m.querySelector('#sl-sell-target');
   const buyTargetEl = m.querySelector('#sl-buy-target');
   const trailActivationEl = m.querySelector('#sl-trail-activation');
@@ -3236,6 +3238,39 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         <span class="dim">·</span>
         <b>$${total.toFixed(2)}</b> total across ${qty} ct
       `;
+    }
+    if (tdStatusEl && existing) {
+      // Read live sleeve state: trail_high_water_price > 0 means the trail
+      // has activated and is riding a peak. Fresh sleeves have it at 0.
+      const liveSleeveState = currentStore[tenant]?.[symbol]?.state?.sleeves?.[existing.id] || {};
+      const peak = Number(liveSleeveState.trail_high_water_price) || 0;
+      const sellFires = peak > 0 ? peak - tdRaw : 0;
+      if (peak > 0) {
+        const distFromPeak = mark > 0 ? peak - mark : 0;
+        tdStatusEl.innerHTML = `
+          <div class="td-status-on">
+            <b>TRAIL ACTIVE</b>
+            <span class="dim">·</span>
+            Peak <b class="mono">$${fmtPrice(peak)}</b>
+            <span class="dim">·</span>
+            Sells at <b class="mono">$${fmtPrice(sellFires)}</b>
+            ${mark > 0 ? `<span class="dim">·</span> Now $${fmtPrice(mark)} (${distFromPeak >= 0 ? '−' : '+'}$${fmtPrice(Math.abs(distFromPeak))} from peak)` : ''}
+          </div>
+        `;
+      } else {
+        // Not activated yet. Show what mark needs to cross to arm the trail.
+        const armPrice = exitEl.value === 'hybrid'
+          ? Number(m.querySelector('#sl-trail-activation')?.value) || Number(sellTargetEl.value) + 0.10
+          : Number(sellTargetEl.value);
+        tdStatusEl.innerHTML = `
+          <div class="td-status-off">
+            <b>Not yet activated</b>
+            <span class="dim">·</span>
+            Arms once price crosses <b class="mono">$${fmtPrice(armPrice)}</b>
+            ${mark > 0 && armPrice > 0 ? `<span class="dim">(${mark >= armPrice ? 'now above' : `$${fmtPrice(armPrice - mark)} away`})</span>` : ''}
+          </div>
+        `;
+      }
     }
 
     if (mode === 'trailing_stop') {

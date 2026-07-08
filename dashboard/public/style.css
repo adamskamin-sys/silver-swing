@@ -1651,6 +1651,27 @@ header { padding: 20px 32px; }
 .trail-dollars b { color: var(--text); }
 .trail-dollars .dim { opacity: 0.55; padding: 0 4px; }
 
+/* Trail status: whether the trail has activated + current peak/stop */
+.trail-status {
+  font-family: var(--mono); font-size: 12px;
+  padding: 6px 10px; margin-top: 4px;
+  border-radius: 4px;
+}
+.trail-status .td-status-on {
+  background: rgba(75, 184, 144, 0.10);
+  border-left: 3px solid var(--good);
+  padding: 6px 10px; border-radius: 4px;
+  color: var(--good);
+}
+.trail-status .td-status-off {
+  background: var(--panel-3);
+  border-left: 3px solid var(--muted);
+  padding: 6px 10px; border-radius: 4px;
+  color: var(--muted);
+}
+.trail-status b { color: var(--text); }
+.trail-status .dim { opacity: 0.55; padding: 0 4px; }
+
 /* Live tab — "Add a position" tradeable derivatives table below portfolio */
 .live-tradeable {
   margin-top: 24px;
