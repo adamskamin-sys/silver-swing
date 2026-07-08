@@ -191,6 +191,12 @@ class SleeveState:
     # row so the user knows WHY it stopped (paused via dashboard vs stop-loss
     # fired vs abort band vs core-floor breach). Empty when running.
     halt_reason: Optional[str] = None
+    # State the sleeve was in immediately BEFORE it halted. Resume restores
+    # this so a sleeve halted while ARMED_BUY (waiting to rebuy) comes back
+    # as ARMED_BUY — not forced back to ARMED_SELL, which would sell the
+    # position AGAIN and bleed contracts on every resume cycle. Written by
+    # _sleeve_halt, cleared on resume.
+    pre_halt_state: Optional[str] = None
 
     # Ratcheting stop-loss HWM — highest price seen while holding contracts.
     # Reset when the sleeve fully exits (position → 0). Never moves down.
@@ -235,6 +241,7 @@ class SleeveState:
             current_qty=int(d.get("current_qty") or 0),
             own_avg_entry=d.get("own_avg_entry"),
             halt_reason=d.get("halt_reason"),
+            pre_halt_state=d.get("pre_halt_state"),
             stop_loss_hwm=d.get("stop_loss_hwm"),
             consecutive_stops=int(d.get("consecutive_stops") or 0),
             reentry_pending=bool(d.get("reentry_pending") or False),

@@ -485,11 +485,21 @@ class SwingTrader:
             self._record("resume", cleared_reason=intent.get("previous_reason"))
         for sid, ss in self.s.sleeves.items():
             if ss.state == SleeveStateEnum.HALTED:
-                ss.state = SleeveStateEnum.ARMED_SELL
+                # Restore whatever the sleeve was doing before the halt so a
+                # sleeve that halted while ARMED_BUY (mid-cycle, holding no
+                # contracts, waiting to rebuy) resumes as ARMED_BUY. Falling
+                # back to ARMED_SELL — the old behavior — sold the position
+                # AGAIN on every resume and drained OIL from 20 → 0.
+                restored = ss.pre_halt_state or SleeveStateEnum.ARMED_SELL.value
+                try:
+                    ss.state = SleeveStateEnum(restored)
+                except ValueError:
+                    ss.state = SleeveStateEnum.ARMED_SELL
+                ss.pre_halt_state = None
                 ss.live_order_id = None
                 ss.filled_qty = 0
                 ss.halt_reason = None
-                self._record("sleeve_resume", sleeve_id=sid)
+                self._record("sleeve_resume", sleeve_id=sid, restored_to=ss.state.value)
         self.store.clear_resume_intent(self.tenant_id, self.symbol)
         self._save_state()
 
@@ -1518,9 +1528,17 @@ class SwingTrader:
             try: self.b.cancel(ss.live_order_id)
             except Exception: pass
             ss.live_order_id = None
+        # Snapshot the state BEFORE overwriting to HALTED so resume can restore
+        # it. Without this, resume forces every sleeve to ARMED_SELL — which
+        # sells the position AGAIN on a sleeve that halted while ARMED_BUY,
+        # bleeding contracts on every halt/resume cycle. Adam's OIL position
+        # drained from 20 → 0 that way before this fix landed.
+        if ss.state != SleeveStateEnum.HALTED:
+            ss.pre_halt_state = ss.state.value
         ss.state = SleeveStateEnum.HALTED
         ss.halt_reason = reason or "halted"
-        self._record("sleeve_halted", sleeve_id=sc.id, sleeve_name=sc.name, reason=reason)
+        self._record("sleeve_halted", sleeve_id=sc.id, sleeve_name=sc.name,
+                     reason=reason, pre_halt_state=ss.pre_halt_state)
 
     def _on_fill(self, fill_price: Optional[float] = None) -> None:
         self._record(
