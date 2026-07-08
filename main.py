@@ -492,21 +492,30 @@ class _Track:
         self.symbol = symbol
         self.store = store
         self.log = log
+        self.is_live = (tenant == _derive_live_tenant(TENANT))
 
-        self.broker = PaperBroker(PaperConfig(
-            product_id=symbol,
-            contract_size=50.0, tick_size=0.005,
-            fee_per_fill=2.34, margin_per_contract=275.0,
-            starting_balance=starting_balance,
-        ))
-        persisted = store.get_paper_state(tenant, symbol)
-        if persisted:
-            self.broker.restore_from_state_dict(persisted)
-            _log(f"[{symbol}] restored: qty={self.broker.position.qty}, "
-                 f"balance=${self.broker.balance:,.2f}, "
-                 f"realized=${self.broker.realized_pnl:+,.2f}")
+        if self.is_live:
+            # REAL MONEY path. CoinbaseBroker places actual orders and reads
+            # position/balance directly from Coinbase — no simulated state.
+            from broker import BrokerConfig, CoinbaseBroker
+            self.broker = CoinbaseBroker(BrokerConfig(product_id=symbol))
+            _log(f"[REAL MONEY] {tenant}/{symbol} — CoinbaseBroker attached "
+                 f"(pos={self.broker.position.qty}, avg=${self.broker.position.avg_entry:.4f})")
         else:
-            _log(f"[{symbol}] paper starts flat")
+            self.broker = PaperBroker(PaperConfig(
+                product_id=symbol,
+                contract_size=50.0, tick_size=0.005,
+                fee_per_fill=2.34, margin_per_contract=275.0,
+                starting_balance=starting_balance,
+            ))
+            persisted = store.get_paper_state(tenant, symbol)
+            if persisted:
+                self.broker.restore_from_state_dict(persisted)
+                _log(f"[{symbol}] restored: qty={self.broker.position.qty}, "
+                     f"balance=${self.broker.balance:,.2f}, "
+                     f"realized=${self.broker.realized_pnl:+,.2f}")
+            else:
+                _log(f"[{symbol}] paper starts flat")
 
         # Microstructure signals only run for the primary tenant's primary
         # symbol so the lab tenant stays a clean testbed for theory strategies
@@ -553,7 +562,7 @@ class _Track:
         self.trader.step(t["price"])
         if now - self.last_snapshot_ts >= snapshot_interval:
             snap = self.broker.snapshot()
-            snap["mode"] = "paper"
+            snap["mode"] = "live" if self.is_live else "paper"
             snap["product_id"] = self.symbol
             snap["best_bid"] = t["best_bid"]
             snap["best_ask"] = t["best_ask"]
@@ -561,8 +570,9 @@ class _Track:
             if self.ms is not None:
                 snap["microstructure"] = self.ms.snapshot()
             self.store.put_snapshot(self.tenant, self.symbol, snap)
-            self.store.put_paper_state(self.tenant, self.symbol,
-                                       self.broker.to_state_dict())
+            if not self.is_live:
+                self.store.put_paper_state(self.tenant, self.symbol,
+                                           self.broker.to_state_dict())
             self.last_snapshot_ts = now
 
     def close(self) -> None:
@@ -621,8 +631,23 @@ def run_paper_mode() -> int:
         lab_tenant = _derive_lab_tenant(TENANT)
         if lab_tenant != TENANT:
             tenants.append(lab_tenant)
+
+    # Live engine: opt-in, DOUBLE-gated. SWING_LIVE_ENGINE=1 enables the wiring
+    # AND SWING_LIVE_CONFIRM=I_UNDERSTAND acknowledges real orders will place
+    # on Coinbase. Missing either flag runs paper/lab only.
+    live_tenant = _derive_live_tenant(TENANT)
+    live_engine_enabled = (
+        os.getenv("SWING_LIVE_ENGINE", "0") == "1"
+        and os.getenv("SWING_LIVE_CONFIRM") == "I_UNDERSTAND"
+    )
+    if os.getenv("SWING_LIVE_ENGINE", "0") == "1" and not live_engine_enabled:
+        _log("SWING_LIVE_ENGINE=1 but SWING_LIVE_CONFIRM!=I_UNDERSTAND — Live engine will NOT run")
+    if live_engine_enabled and live_tenant != TENANT and live_tenant not in tenants:
+        tenants.append(live_tenant)
+
     _log(f"paper mode: primary={SYMBOL}, tenants={tenants}"
-         f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
+         f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}"
+         f"{' [REAL MONEY LIVE ENGINE ACTIVE]' if live_engine_enabled else ''}")
 
     store = make_store(DATA_DIR)
     log = make_trade_log(DATA_DIR)
@@ -652,12 +677,32 @@ def run_paper_mode() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    # Boot-time live portfolio sync must run BEFORE track seeding when the Live
+    # engine is enabled, so the seed loop finds the correct product_ids on the
+    # Live tenant. When Live engine is off, the sync still runs (dashboard-only
+    # visibility mode), just after track seeding.
+    if live_engine_enabled:
+        live_syms = _sync_live_portfolio(store, live_tenant)
+        # Reset every Live-tenant symbol's state so sleeves come up fresh in
+        # ARMED_SELL — no persisted paper-era state, no dead live_order_ids.
+        for sym in live_syms:
+            cfg = store.get_config(live_tenant, sym) or {}
+            n_sleeves = len(cfg.get("sleeves") or [])
+            store.put_state(live_tenant, sym, {})
+            _log(f"[REAL MONEY] {live_tenant}/{sym} — armed {n_sleeves} sleeve(s) fresh")
+
     # Seed initial tracks: for the primary tenant, use SYMBOL as the primary;
     # for the lab tenant, use SYMBOL too so there's always at least one card
     # visible in the lab on first boot. Both then pick up extras from the store.
     for tenant in tenants:
         balance = _tenant_balance(tenant)
-        initial_symbols = _discover_tracked_symbols(store, tenant, SYMBOL)
+        if tenant == live_tenant:
+            # Live tenant tracks exactly what Coinbase reports it holds. Reserved
+            # store keys (__portfolio__, __tuned_params__, etc.) are not products.
+            initial_symbols = [s for s in (store.list_symbols(tenant) or [])
+                               if not s.startswith("__")]
+        else:
+            initial_symbols = _discover_tracked_symbols(store, tenant, SYMBOL)
         _log(f"[{tenant}] tracking {len(initial_symbols)} symbol(s) at boot: {initial_symbols}")
         for sym in initial_symbols:
             track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
@@ -677,12 +722,10 @@ def run_paper_mode() -> int:
             and os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1"):
         _mirror_live_position_into_paper(primary_track.broker, SYMBOL)
 
-    # Boot-time live portfolio sync: enumerate the real Coinbase account and
-    # upsert every holding as a tracked symbol on the Live tenant. Watchlist
-    # behavior — symbols persist even after positions close, so the user can
-    # re-enter without re-adding. Requires Coinbase creds; safe no-op otherwise.
-    live_tenant = _derive_live_tenant(TENANT)
-    _sync_live_portfolio(store, live_tenant)
+    # If Live engine is off, sync just for dashboard visibility. When Live is
+    # on, we already synced above (before seeding) so this is skipped.
+    if not live_engine_enabled:
+        _sync_live_portfolio(store, live_tenant)
 
     log.record("bot_started", mode="paper", tenants=tenants,
                tracks=[f"{t}:{s}" for (t, s) in tracks.keys()])
@@ -712,7 +755,11 @@ def run_paper_mode() -> int:
             # user's "Track this symbol" click in the Lab tab picks up too.
             if now - last_discover >= symbol_discover_interval:
                 for tenant in tenants:
-                    current = set(_discover_tracked_symbols(store, tenant, SYMBOL))
+                    if tenant == live_tenant:
+                        current = set(s for s in (store.list_symbols(tenant) or [])
+                                      if not s.startswith("__"))
+                    else:
+                        current = set(_discover_tracked_symbols(store, tenant, SYMBOL))
                     existing = {s for (t, s) in tracks if t == tenant}
                     balance = _tenant_balance(tenant)
                     for sym in current - existing:

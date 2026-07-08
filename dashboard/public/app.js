@@ -297,13 +297,19 @@ function renderBanners(store) {
     killBanner.hidden = false;
     const reason = killActive.reason ? ` — ${escapeHtml(killActive.reason)}` : '';
     killBanner.innerHTML = `⏸ Bot paused${reason}. Not arming new orders until you resume.`;
-    killBtn.textContent = 'Resume bot';
+    killBtn.textContent = activeMode === 'live' ? 'Resume LIVE' : 'Resume bot';
     killBtn.className = 'primary';
     killBtn.dataset.mode = 'clear';
   } else {
     killBanner.hidden = true;
-    killBtn.textContent = 'Pause bot';
-    killBtn.className = 'ghost';
+    // Live tab: prominent red KILL-ALL. Any other tab: subtle ghost pause.
+    if (activeMode === 'live') {
+      killBtn.textContent = '⛔ KILL ALL LIVE';
+      killBtn.className = 'kill-all-btn';
+    } else {
+      killBtn.textContent = 'Pause bot';
+      killBtn.className = 'ghost';
+    }
     killBtn.dataset.mode = 'activate';
   }
 }
@@ -2260,15 +2266,22 @@ async function saveConfig() {
 
 function openKillModal(tenant, mode) {
   killContext = { tenant, mode };
+  const isLive = String(tenant || '').endsWith('-live');
   if (mode === 'activate') {
-    killModalTitle.textContent = 'pause all trading?';
-    killModalBody.innerHTML = 'This freezes arming across every instrument for this tenant. Existing positions are not closed; existing orders on the exchange are NOT cancelled. Only new legs are blocked until you resume.';
-    killConfirm.textContent = 'CONFIRM PAUSE';
+    if (isLive) {
+      killModalTitle.textContent = '⛔ KILL ALL LIVE TRADING?';
+      killModalBody.innerHTML = '<b>REAL MONEY.</b> This immediately freezes every Live sleeve across every product. New buy/sell legs are BLOCKED until you resume. <b>Existing open orders on Coinbase are NOT cancelled</b> and <b>existing positions are NOT closed</b> — cancel/close those manually on Coinbase if the panic reason requires it.';
+      killConfirm.textContent = 'KILL LIVE NOW';
+    } else {
+      killModalTitle.textContent = 'pause all trading?';
+      killModalBody.innerHTML = 'This freezes arming across every instrument for this tenant. Existing positions are not closed; existing orders on the exchange are NOT cancelled. Only new legs are blocked until you resume.';
+      killConfirm.textContent = 'CONFIRM PAUSE';
+    }
     killReason.hidden = false;
   } else {
-    killModalTitle.textContent = 'resume trading?';
+    killModalTitle.textContent = isLive ? 'resume LIVE trading?' : 'resume trading?';
     killModalBody.innerHTML = `Kill switch will be cleared. Any HALTED instrument is separately still halted — clearing kill does NOT auto-arm those.`;
-    killConfirm.textContent = 'CONFIRM RESUME';
+    killConfirm.textContent = isLive ? 'RESUME LIVE' : 'CONFIRM RESUME';
     killReason.hidden = true;
   }
   killReason.value = '';

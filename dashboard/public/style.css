@@ -130,6 +130,23 @@ button.ghost {
 button.ghost:hover { background: var(--panel-2); color: var(--text); }
 button.small { padding: var(--s2) var(--s3); font-size: var(--fs-sm); border-radius: var(--r-sm); }
 
+/* KILL-ALL LIVE button — visible only on the Live tab. Deliberately loud so
+   the operator doesn't miss it when Live sleeves are misbehaving. */
+button.kill-all-btn {
+  background: var(--bad);
+  color: white;
+  border-color: var(--bad);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  box-shadow: 0 0 0 0 rgba(240, 68, 56, 0.6);
+  animation: killPulse 2s ease-in-out infinite;
+}
+button.kill-all-btn:hover { filter: brightness(1.1); background: var(--bad); }
+@keyframes killPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(240, 68, 56, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(240, 68, 56, 0); }
+}
+
 /* ==================================================================== */
 /* BANNERS                                                                */
 /* ==================================================================== */
