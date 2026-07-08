@@ -50,6 +50,15 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
         rng = high - low
         vol_pct = (rng / mid) * 100
         vol_24h_usd = _f(p.get("approximate_quote_24h_volume")) or _f(p.get("volume_24h")) or 0
+        # Contract specs — piggyback on what get_products returns so the
+        # scanner-detail modal doesn't have to make another Coinbase call to
+        # show tick_size / contract_size / margin / expiry.
+        details = p.get("future_product_details") or {}
+        tick = _f(p.get("price_increment"))
+        contract_size = _f(details.get("contract_size"))
+        contract_expiry = details.get("contract_expiry")
+        intraday_margin = _f(details.get("intraday_margin_rate"))
+        overnight_margin = _f(details.get("overnight_margin_rate"))
         scored.append({
             "product_id": pid,
             "price": price,
@@ -57,6 +66,12 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
             "low_24h": low,
             "vol_pct": round(vol_pct, 3),
             "volume_24h": vol_24h_usd,
+            "tick_size": tick,
+            "contract_size": contract_size,
+            "tick_value": (tick * contract_size) if (tick and contract_size) else None,
+            "contract_expiry": contract_expiry,
+            "intraday_margin_rate": intraday_margin,
+            "overnight_margin_rate": overnight_margin,
         })
     scored.sort(key=lambda r: (-r["vol_pct"], -r["volume_24h"]))
     return scored[:top_n]

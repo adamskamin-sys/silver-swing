@@ -3423,12 +3423,32 @@ function openScannerDetail(row) {
     qtyInput.value = 1;
     qtyInput.oninput = () => updateScannerBuyButton();
   }
+  // Contract-info strip: shows the specs the trader needs to size a position
+  // (tick, contract size, margin, expiration) alongside the price bar. Sourced
+  // straight from Coinbase's get_products response via scanner.compute_ranking
+  // so nothing extra is fetched when the modal opens.
+  const specParts = [];
+  if (row.contract_size) specParts.push(`Size <b>${row.contract_size}/ct</b>`);
+  if (row.tick_size) specParts.push(`Tick <b>$${fmtNum(row.tick_size, 5)}</b>`);
+  if (row.tick_value) specParts.push(`Tick value <b>$${fmtNum(row.tick_value, 3)}</b>`);
+  if (row.intraday_margin_rate)
+    specParts.push(`Intraday margin <b>${fmtNum(row.intraday_margin_rate * 100, 2)}%</b>`);
+  if (row.contract_expiry) {
+    const exp = String(row.contract_expiry).slice(0, 10);
+    const daysToExp = Math.round((new Date(row.contract_expiry) - Date.now()) / 86400000);
+    specParts.push(`Expires <b>${escapeHtml(exp)}</b>${daysToExp >= 0 ? ` <span class="dim">(${daysToExp}d)</span>` : ''}`);
+  }
+  const specStrip = specParts.length
+    ? `<div class="scanner-detail-specs">${specParts.join(' <span class="dim">·</span> ')}</div>`
+    : '';
+
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
       <span class="scanner-detail-range"><span class="pos">$${fmtNum(row.high_24h, 4)}</span> / <span class="neg">$${fmtNum(row.low_24h, 4)}</span></span>
       <span class="scanner-detail-vol">24h range <b>${fmtNum(row.vol_pct, 2)}%</b></span>
     </div>
+    ${specStrip}
   `;
 
   // Timeframe buttons

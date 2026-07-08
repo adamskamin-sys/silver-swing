@@ -1627,6 +1627,12 @@ header { padding: 20px 32px; }
 .scanner-detail-range { font-size: 13px; color: var(--muted); }
 .scanner-detail-vol { font-size: 13px; color: var(--muted); }
 .scanner-detail-vol b { color: var(--text); }
+.scanner-detail-specs { font-family: var(--mono); font-size: 12px; color: var(--muted);
+  padding: 8px 10px; margin-top: 10px; margin-bottom: 6px;
+  background: var(--panel-3); border-left: 3px solid var(--accent);
+  border-radius: 4px; line-height: 1.7; }
+.scanner-detail-specs b { color: var(--text); }
+.scanner-detail-specs .dim { opacity: 0.55; }
 .scanner-detail-modechooser { display: flex; gap: 14px; align-items: center;
   padding: 10px 0; margin-bottom: 8px; font-size: 13px;
   border-bottom: 1px solid var(--border); }
