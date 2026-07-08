@@ -2877,7 +2877,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   let currentAnchor = anchor;  // mutable so "use market instead" can update it
 
   function applyPreset(name) {
-    const p = PRESETS[name];
+    let p = PRESETS[name];
     if (!p) return;
     exitEl.value = p.exit_mode;
     // Expert-derived per-product values override the preset's silver-tuned
