@@ -184,6 +184,13 @@
         <label>contracts <input type="number" id="scanner-buy-qty" min="1" max="100" step="1" value="1"></label>
       </div>
       <div class="trade-order-type">
+        <div class="trade-order-type-label">Side</div>
+        <div class="trade-order-type-choices">
+          <label><input type="radio" name="scanner-side" value="BUY" checked> Long (buy)</label>
+          <label><input type="radio" name="scanner-side" value="SELL"> Short (sell)</label>
+        </div>
+      </div>
+      <div class="trade-order-type">
         <div class="trade-order-type-label">Order type</div>
         <div class="trade-order-type-choices">
           <label><input type="radio" name="scanner-order-type" value="market" checked> Market</label>

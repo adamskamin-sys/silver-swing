@@ -1651,6 +1651,35 @@ header { padding: 20px 32px; }
 .trail-dollars b { color: var(--text); }
 .trail-dollars .dim { opacity: 0.55; padding: 0 4px; }
 
+/* Live tab — "Add a position" tradeable derivatives table below portfolio */
+.live-tradeable {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.live-tradeable-head {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
+  color: var(--muted); margin-bottom: 10px;
+}
+.live-tradeable-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.live-tradeable-table th, .live-tradeable-table td {
+  padding: 8px 10px; text-align: left;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.live-tradeable-table th {
+  color: var(--muted); font-weight: 500;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+}
+.live-tradeable-table .mono { font-family: var(--mono); }
+.live-tradeable-table .pos { color: var(--good); }
+.live-tradeable-table .neg { color: var(--bad); }
+.live-tradeable-row { cursor: pointer; transition: background 100ms; }
+.live-tradeable-row:hover { background: rgba(143, 122, 224, 0.10); }
+.live-tradeable-row td:last-child { text-align: right; }
+
 /* ---- microstructure panel ---------------------------------------------- */
 .ms-panel {
   margin-top: 16px;

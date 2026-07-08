@@ -279,13 +279,16 @@ function renderBanners(store) {
         continue;
       }
       const s = block.state || {};
-      if (s.state === 'HALTED') haltedInstruments.push({ tenant, symbol });
+      if (s.state === 'HALTED') haltedInstruments.push({ tenant, symbol, mode: modeOfTenant(tenant) });
     }
   }
 
-  if (haltedInstruments.length > 0) {
+  // Only show halts for the mode the user is currently viewing. In Live mode
+  // Adam doesn't care about paper/lab halts — they're background sandboxes.
+  const relevantHalts = haltedInstruments.filter(h => h.mode === activeMode);
+  if (relevantHalts.length > 0) {
     haltBanner.hidden = false;
-    haltBanner.innerHTML = `⚠ Strategy halted — ${haltedInstruments.map(h => `${escapeHtml(h.tenant)}/${escapeHtml(h.symbol)}`).join(', ')}. See the halt reason on the strategy row, fix the underlying issue, then click <b>Resume</b>.`;
+    haltBanner.innerHTML = `⚠ Strategy halted — ${relevantHalts.map(h => `${escapeHtml(h.tenant)}/${escapeHtml(h.symbol)}`).join(', ')}. See the halt reason on the strategy row, fix the underlying issue, then click <b>Resume</b>.`;
   } else {
     haltBanner.hidden = true;
   }
@@ -693,7 +696,72 @@ function renderLivePortfolio() {
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table>
-    <div class="pf-hint dim">Click a row to attach Model A/B/C/D/E · auto-refreshes every 2 min</div>`;
+    <div class="pf-hint dim">Click a row to attach Model A/B/C/D/E · auto-refreshes every 2 min</div>
+    <div id="live-tradeable" class="live-tradeable">
+      <div class="live-tradeable-head">Add a position — all tradeable derivatives</div>
+      <div class="live-tradeable-body dim">loading…</div>
+    </div>`;
+}
+
+// Fetch scanner-ranked derivatives once and render them into the Live tab.
+// Runs after renderLivePortfolio has injected the placeholder <div>. Cached
+// briefly so switching asset-class subtabs doesn't spam Coinbase.
+let _tradeableCache = { data: null, ts: 0 };
+async function renderLiveTradeable() {
+  const container = document.getElementById('live-tradeable');
+  if (!container) return;
+  const body = container.querySelector('.live-tradeable-body');
+  if (!body) return;
+  try {
+    let data = _tradeableCache.data;
+    // Refresh every 60s.
+    if (!data || (Date.now() - _tradeableCache.ts) > 60_000) {
+      const resp = await fetch('/api/scanner');
+      if (!resp.ok) { body.innerHTML = '<span class="dim">could not fetch derivatives</span>'; return; }
+      data = await resp.json();
+      _tradeableCache = { data, ts: Date.now() };
+    }
+    const top = Array.isArray(data.top) ? data.top : [];
+    if (!top.length) { body.innerHTML = '<span class="dim">no ranking yet</span>'; return; }
+    // Filter by active asset class subtab if set.
+    const filtered = activeAssetClass
+      ? top.filter(r => assetClassOf(r.product_id) === activeAssetClass)
+      : top;
+    if (!filtered.length) {
+      body.innerHTML = `<span class="dim">no ${escapeHtml(activeAssetClass)} derivatives available right now</span>`;
+      return;
+    }
+    body.innerHTML = `
+      <table class="live-tradeable-table">
+        <thead><tr>
+          <th>Product</th><th>Price</th><th>24h High</th><th>24h Low</th><th>Range %</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${filtered.map(r => `
+            <tr class="live-tradeable-row" data-product='${encodeURIComponent(JSON.stringify(r))}'>
+              <td><b>${escapeHtml(prettyProductName(r.product_id))}</b></td>
+              <td class="mono">$${fmtNum(r.price, 4)}</td>
+              <td class="mono pos">$${fmtNum(r.high_24h, 4)}</td>
+              <td class="mono neg">$${fmtNum(r.low_24h, 4)}</td>
+              <td class="mono"><b>${fmtNum(r.vol_pct, 2)}%</b></td>
+              <td><button class="small primary">Buy / Short →</button></td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+      <div class="pf-hint dim">Click a row to open the chart + place a Buy (long) or Short order</div>`;
+    // Wire row clicks — opens scanner-detail modal (has LONG/SHORT selector).
+    body.querySelectorAll('tr.live-tradeable-row').forEach(tr => {
+      tr.onclick = () => {
+        try {
+          const row = JSON.parse(decodeURIComponent(tr.dataset.product));
+          openScannerDetail(row);
+        } catch (e) { /* ignore */ }
+      };
+    });
+  } catch (err) {
+    body.innerHTML = `<span class="dim">scanner error: ${escapeHtml(String(err.message || err))}</span>`;
+  }
 }
 
 function renderCard(tenant, symbol, { config, state, snapshot }) {
@@ -1875,6 +1943,9 @@ async function refreshOnce() {
       pfEl.className = 'live-portfolio';
       pfEl.innerHTML = pfHtml;
       cardsEl.appendChild(pfEl);
+      // Fire-and-forget: fetch scanner-ranked derivatives to fill the "Add
+      // a position" section below the portfolio table.
+      renderLiveTradeable();
     }
   }
 
@@ -3283,9 +3354,22 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     b.onclick = () => setAnchor(Number(b.dataset.anchor), b);
   }
 
-  // Initial state
+  // Initial state.
+  // For NEW sleeves: applyPreset seeds the form from the chosen preset.
+  // For EXISTING sleeves: preserve the sleeve's actually-saved sell_px/buy_px
+  // (already in the inputs via `<input value="${existing.sell_px}">`). Do NOT
+  // call syncTargetsFromSlider here — it would derive fresh sell/buy from
+  // the anchor + slider position and overwrite what the user saved. Users
+  // reported "prices don't update after edit" because of exactly this: the
+  // overwrite meant the form saved derived values, not their edits.
   if (!existing) applyPreset(presetEl.value);
-  else { presetNoteEl.textContent = PRESETS[draft.name]?.note || ''; syncTargetsFromSlider(); }
+  else {
+    presetNoteEl.textContent = PRESETS[draft.name]?.note || '';
+    // Cost-floor + slider fill + preview refresh WITHOUT touching sell/buy.
+    updateFillPct(profitEl);
+    updateFillPct(tdSliderEl);
+    updatePreview();
+  }
   applyModeVisibility();
 
   m.querySelector('#sleeve-save-btn').onclick = async () => {
@@ -3992,6 +4076,7 @@ function updateScannerBuyButton() {
   const symbol = scannerDetailContext.product_id;
   const mode = selectedScannerBuyMode();
   const orderType = selectedScannerOrderType();
+  const side = selectedScannerSide();
   const qtyInput = document.getElementById('scanner-buy-qty');
   const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
   const limitPrice = Number(document.getElementById('scanner-limit-price')?.value) || 0;
@@ -4064,6 +4149,11 @@ function selectedScannerBuyMode() {
   return checked ? checked.value : 'paper';
 }
 
+function selectedScannerSide() {
+  const checked = document.querySelector('input[name="scanner-side"]:checked');
+  return checked ? checked.value : 'BUY';
+}
+
 function tenantForMode(mode) {
   const target = ['live', 'paper', 'lab'].includes(mode) ? mode : 'paper';
   for (const t of Object.keys(currentStore || {})) {
@@ -4077,6 +4167,7 @@ scannerBuyBtn.addEventListener('click', async () => {
   const symbol = scannerDetailContext.product_id;
   const mode = selectedScannerBuyMode();
   const orderType = selectedScannerOrderType();
+  const side = selectedScannerSide();
   const qtyInput = document.getElementById('scanner-buy-qty');
   const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
   const limitPrice = Number(document.getElementById('scanner-limit-price')?.value) || 0;
@@ -4088,7 +4179,8 @@ scannerBuyBtn.addEventListener('click', async () => {
     const detail = orderType === 'limit'
       ? `LIMIT at $${limitPrice.toFixed(3)}`
       : 'MARKET at current ask';
-    const ok = confirm(`REAL MONEY: place a ${detail} BUY of ${qty} ${symbol} contract${qty > 1 ? 's' : ''} on Coinbase?`);
+    const verb = side === 'SELL' ? 'SHORT (SELL)' : 'BUY';
+    const ok = confirm(`REAL MONEY: place a ${detail} ${verb} of ${qty} ${symbol} contract${qty > 1 ? 's' : ''} on Coinbase?`);
     if (!ok) return;
   }
   const originalLabel = scannerBuyBtn.textContent;
@@ -4096,7 +4188,7 @@ scannerBuyBtn.addEventListener('click', async () => {
   scannerBuyBtn.textContent = 'placing…';
   try {
     const res = await postJson('/api/scanner-order', {
-      product_id: symbol, side: 'BUY', qty, mode,
+      product_id: symbol, side, qty, mode,
       order_type: orderType,
       limit_price: orderType === 'limit' ? limitPrice : null,
       confirm: 'YES',
