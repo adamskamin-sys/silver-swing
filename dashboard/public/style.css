@@ -1640,6 +1640,17 @@ header { padding: 20px 32px; }
 .sleeve-row-actions .small { margin-right: 4px; }
 .sleeve-row-actions .small:last-child { margin-right: 0; }
 
+/* Trail-distance dollar-equivalent line under the slider */
+.trail-dollars {
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+  padding: 6px 10px; margin-top: 6px;
+  background: var(--panel-3);
+  border-left: 3px solid var(--good);
+  border-radius: 4px;
+}
+.trail-dollars b { color: var(--text); }
+.trail-dollars .dim { opacity: 0.55; padding: 0 4px; }
+
 /* ---- microstructure panel ---------------------------------------------- */
 .ms-panel {
   margin-top: 16px;

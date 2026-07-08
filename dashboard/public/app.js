@@ -2833,6 +2833,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         <div class="profit-slider-ticks">
           <span>$0.01</span><span>$0.25</span><span>$0.50</span><span>$1.00</span>
         </div>
+        <div class="trail-dollars" id="sl-td-dollars"></div>
         <div class="preview-note">
           Trailing stop uses the sell target above as the ARM price — once silver hits it, the trail engages and rides upside. Sells when price pulls back this much from the peak.
         </div>
@@ -2936,6 +2937,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   const hybridBlock = m.querySelector('#sl-hybrid-block');
   const tdSliderEl = m.querySelector('#sl-td-slider');
   const tdValEl = m.querySelector('#sl-td-val');
+  const tdDollarsEl = m.querySelector('#sl-td-dollars');
   const sellTargetEl = m.querySelector('#sl-sell-target');
   const buyTargetEl = m.querySelector('#sl-buy-target');
   const trailActivationEl = m.querySelector('#sl-trail-activation');
@@ -3149,7 +3151,19 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     profitValEl.textContent = `$${profitEl.value}`;
     updateFillPct(profitEl);
     updateFillPct(tdSliderEl);
-    tdValEl.textContent = `$${fmtPrice(Number(tdSliderEl.value))}`;
+    const tdRaw = Number(tdSliderEl.value);
+    tdValEl.textContent = `$${fmtPrice(tdRaw)}`;
+    if (tdDollarsEl) {
+      // trail_distance × contract_size = $/contract given back on pullback.
+      // × qty = total $ this sleeve gives back before the trailing stop fires.
+      const perCt = tdRaw * contractSize;
+      const total = perCt * qty;
+      tdDollarsEl.innerHTML = `
+        $${fmtPrice(tdRaw)} × <b>${contractSize}</b> oz/ct = <b>$${perCt.toFixed(2)}</b> per contract
+        <span class="dim">·</span>
+        <b>$${total.toFixed(2)}</b> total across ${qty} ct
+      `;
+    }
 
     if (mode === 'trailing_stop') {
       const trailDistance = Number(tdSliderEl.value) || 0.1;
