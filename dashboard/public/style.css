@@ -1757,24 +1757,26 @@ header { padding: 20px 32px; }
 .scanner-detail-sleeves-table .mono { font-family: var(--mono); }
 .scanner-detail-sleeves-table .pos { color: var(--good); }
 .scanner-detail-sleeves-table .neg { color: var(--bad); }
-/* Column widths (must sum to 100%): Name / Contracts / Sell / Buy / Cycles /
-   Realized / State / Actions */
+/* Column widths (must sum to 100%): Name / Contracts / Sell / Buy /
+   Cycles / Unrealized / Realized / State / Actions */
 .scanner-detail-sleeves-table th:nth-child(1),
-.scanner-detail-sleeves-table td:nth-child(1) { width: 22%; }
+.scanner-detail-sleeves-table td:nth-child(1) { width: 20%; }
 .scanner-detail-sleeves-table th:nth-child(2),
-.scanner-detail-sleeves-table td:nth-child(2) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(2) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(3),
-.scanner-detail-sleeves-table td:nth-child(3) { width: 11%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(3) { width: 9%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(4),
-.scanner-detail-sleeves-table td:nth-child(4) { width: 11%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(4) { width: 9%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(5),
-.scanner-detail-sleeves-table td:nth-child(5) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(5) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(6),
-.scanner-detail-sleeves-table td:nth-child(6) { width: 13%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(6) { width: 12%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(7),
-.scanner-detail-sleeves-table td:nth-child(7) { width: 16%; }
+.scanner-detail-sleeves-table td:nth-child(7) { width: 12%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(8),
-.scanner-detail-sleeves-table td:nth-child(8) { width: 11%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(8) { width: 14%; }
+.scanner-detail-sleeves-table th:nth-child(9),
+.scanner-detail-sleeves-table td:nth-child(9) { width: 10%; text-align: right; }
 
 /* Scanner-detail modal — fill the viewport so the chart + attached
    strategies table + trade sidebar all fit without scrolling around. */

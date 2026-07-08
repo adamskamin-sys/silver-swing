@@ -3638,23 +3638,40 @@ function openScannerDetail(row) {
   const liveSleeveStates = row._live_tenant
     ? (currentStore[row._live_tenant]?.[row.product_id]?.state?.sleeves || {})
     : {};
+  // Contract size + current mark needed to compute per-sleeve unrealized.
+  const liveContractSize = row._live_tenant
+    ? Number(currentStore[row._live_tenant]?.[row.product_id]?.config?.contract_size) || 50
+    : 50;
+  const liveMarkForSleeves = Number(row.price) || Number(row._live_avg) || 0;
   const sleevesStrip = liveSleeves.length ? `
     <div class="scanner-detail-sleeves">
       <div class="scanner-detail-sleeves-head">Attached strategies (${liveSleeves.length})</div>
       <table class="scanner-detail-sleeves-table">
         <thead><tr><th>Name</th><th>Contracts</th><th>Sell</th><th>Buy</th>
-          <th>Cycles</th><th>Realized</th><th>State</th><th></th></tr></thead>
+          <th>Cycles</th><th>Unrealized</th><th>Realized</th><th>State</th><th></th></tr></thead>
         <tbody>
         ${liveSleeves.map(s => {
           const ss = liveSleeveStates[s.id] || {};
           const state = String(ss.state || 'ARMED_SELL');
           const realized = Number(ss.realized_pnl) || 0;
+          // Per-sleeve unrealized: sleeve is holding its own contracts when
+          // it's ARMED_SELL. Basis = sleeve's own_avg_entry (set at arm time)
+          // or fall back to the sleeve's buy_px if the state hasn't computed
+          // it yet. When ARMED_BUY, sleeve is flat — unrealized = 0.
+          let unrealized = 0;
+          if (state === 'ARMED_SELL') {
+            const basis = Number(ss.own_avg_entry) || Number(s.buy_px) || 0;
+            if (basis > 0 && liveMarkForSleeves > 0) {
+              unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
+            }
+          }
           return `<tr>
             <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
             <td class="mono">${s.qty}</td>
             <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
             <td class="mono">${Number(ss.cycles) || 0}</td>
+            <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
             <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
             <td><span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span></td>
             <td><button class="small ghost" data-action="delete-sleeve"
