@@ -3858,7 +3858,7 @@ function openScannerDetail(row) {
     <div class="scanner-detail-sleeves">
       <div class="scanner-detail-sleeves-head">Attached strategies (${liveSleeves.length})</div>
       <table class="scanner-detail-sleeves-table">
-        <thead><tr><th>Name</th><th>Contracts</th><th>Entry</th><th>Sell</th><th>Buy</th>
+        <thead><tr><th>Name</th><th>Contracts</th><th title="Your position's weighted-avg cost for the underlying contracts">Pos Avg</th><th title="Price at which THIS strategy was attached">Entry</th><th>Sell</th><th>Buy</th>
           <th>Cycles</th><th>Unrealized</th><th>Realized</th><th>State</th><th></th></tr></thead>
         <tbody>
         ${liveSleeves.map(s => {
@@ -3887,9 +3887,11 @@ function openScannerDetail(row) {
             }
           }
           const entryPx = Number(s.entry_mark) || 0;
+          const posAvgPx = Number(row._live_avg) || 0;
           return `<tr>
             <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
             <td class="mono">${s.qty}</td>
+            <td class="mono dim">${posAvgPx > 0 ? `$${fmtPrice(posAvgPx)}` : '—'}</td>
             <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
             <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
@@ -4034,9 +4036,11 @@ function refreshScannerDetailLive() {
         }
       }
       const entryPx = Number(s.entry_mark) || 0;
+      const posAvgPx = Number(avg) || 0;
       return `<tr>
         <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
         <td class="mono">${s.qty}</td>
+        <td class="mono dim">${posAvgPx > 0 ? `$${fmtPrice(posAvgPx)}` : '—'}</td>
         <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
         <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
         <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
