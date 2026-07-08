@@ -2786,7 +2786,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
@@ -2805,7 +2805,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
@@ -2825,7 +2825,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
@@ -2845,7 +2845,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
