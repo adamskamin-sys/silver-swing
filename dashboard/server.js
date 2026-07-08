@@ -422,7 +422,11 @@ export function makeApp({
       // batch of contracts appears "committed" the moment a sleeve rotates
       // into sold-and-waiting state.
       const primaryQty = Number(cfg.swing_qty ?? 0);
-      const core = Number(cfg.core_qty ?? 0);
+      // Live tenant is a portfolio mirror, not a swing bot — no "protected
+      // core" to defend. Old configs still have core_qty=10 stuck in them,
+      // which causes the capacity check to reject every sleeve. Force 0.
+      const isLive = String(tenant).toLowerCase().includes('live');
+      const core = isLive ? 0 : Number(cfg.core_qty ?? 0);
       const snap = store[tenant][symbol].snapshot || {};
       const stateBlock = store[tenant][symbol].state || {};
       const sleeveStates = stateBlock.sleeves || {};
@@ -431,7 +435,7 @@ export function makeApp({
       // strategy engine writes it. Real position lives in the __portfolio__
       // snap we sync from Coinbase. Look it up and prefer whichever is larger
       // so paper (snap has value) also works.
-      if (String(tenant).toLowerCase().includes('live') && pos === 0) {
+      if (isLive && pos === 0) {
         const pfSnap = store[tenant]?.__portfolio__?.config;
         const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
         if (posRow) pos = Math.abs(Number(posRow.qty)) || 0;
