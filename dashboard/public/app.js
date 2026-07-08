@@ -238,6 +238,29 @@ function symbolLabel(symbol) {
   return friendly ? `${friendly} (${fam})` : fam || symbol;
 }
 
+// Coinbase's display convention: NOL-20JUL26-CDE → "OIL 20 JUL 26",
+// SLR-27AUG26-CDE → "SLVR 27 AUG 26". Their app uses a friendlier prefix
+// than the API product_id and a spaced-out date. Matches what the user
+// sees in Coinbase so labels don't feel like insider jargon.
+const COINBASE_DISPLAY_PREFIX = {
+  NOL: 'OIL',
+  SLR: 'SLVR',
+};
+function prettyProductName(symbol) {
+  if (!symbol || typeof symbol !== 'string') return symbol || '';
+  // Crypto perps and spot don't need reformatting — display as-is.
+  if (symbol.includes('-PERP-') || !symbol.includes('-')) return symbol;
+  const parts = symbol.split('-');
+  if (parts.length < 2) return symbol;
+  const prefix = parts[0].toUpperCase();
+  const displayPrefix = COINBASE_DISPLAY_PREFIX[prefix] || prefix;
+  // Expiration part like '27AUG26' → '27 AUG 26'
+  const dateStr = parts[1];
+  const m = dateStr.match(/^(\d{1,2})([A-Z]{3})(\d{2,4})$/i);
+  const formattedDate = m ? `${m[1]} ${m[2].toUpperCase()} ${m[3]}` : dateStr;
+  return `${displayPrefix} ${formattedDate}`;
+}
+
 function iconForAssetClass(c) {
   return { metals: '⚪', energy: '⛽', crypto: '₿', equity: '📈', other: '📊' }[c] || '📊';
 }
@@ -588,6 +611,9 @@ function renderLivePortfolio() {
 
   const rowsHtml = filteredRows.map(r => {
     const sym = escapeHtml(r.product || '');
+    const displayName = escapeHtml(r.kind === 'futures'
+      ? prettyProductName(r.product || '')
+      : (r.product || ''));
     const dcls = cls(r.pnl || 0);
     const pnlText = r.kind === 'spot'
       ? `<span class="dim">${fmtMoney(r.value || 0)}</span>`
@@ -602,7 +628,7 @@ function renderLivePortfolio() {
           data-mark="${r.mark || 0}" data-avg="${r.avg || 0}" data-pos-qty="${r.qty || 0}"
           data-side="${escapeHtml(r.side || '')}"
           title="Click to attach a Model / strategy">
-        <td><b>${sym}</b></td>
+        <td><b>${displayName}</b></td>
         <td class="mono">${pnlText}</td>
         <td class="mono dim">${escapeHtml(r.side || '')}</td>
         <td class="mono">${qtyText}</td>
@@ -3555,7 +3581,7 @@ const TIMEFRAMES = [
 function openScannerDetail(row) {
   scannerDetailContext = row;
   scannerChartWindow = { days: 7, granularity: 'FIVE_MINUTE' };
-  scannerDetailTitle.textContent = row.product_id;
+  scannerDetailTitle.textContent = prettyProductName(row.product_id);
   // Default the mode chooser to whatever tab the user's on if it's meaningful,
   // else fall back to paper (safer default for accidental clicks).
   const defaultMode = ['live', 'lab', 'paper'].includes(activeMode) ? activeMode : 'paper';
