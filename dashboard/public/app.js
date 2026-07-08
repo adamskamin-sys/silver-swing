@@ -3655,12 +3655,17 @@ function openScannerDetail(row) {
           const state = String(ss.state || 'ARMED_SELL');
           const realized = Number(ss.realized_pnl) || 0;
           // Per-sleeve unrealized: sleeve is holding its own contracts when
-          // it's ARMED_SELL. Basis = sleeve's own_avg_entry (set at arm time)
-          // or fall back to the sleeve's buy_px if the state hasn't computed
-          // it yet. When ARMED_BUY, sleeve is flat — unrealized = 0.
+          // it's ARMED_SELL. Basis = sleeve's own_avg_entry (set once the
+          // sleeve's state machine ticks). Fresh sleeves haven't ticked yet,
+          // so fall back to the ACCOUNT's position avg entry (row._live_avg)
+          // — that's what the sleeve will use as basis when it arms.
+          // Fall further back to buy_px only if no position avg exists.
           let unrealized = 0;
           if (state === 'ARMED_SELL') {
-            const basis = Number(ss.own_avg_entry) || Number(s.buy_px) || 0;
+            const basis = Number(ss.own_avg_entry)
+              || Number(row._live_avg)
+              || Number(s.buy_px)
+              || 0;
             if (basis > 0 && liveMarkForSleeves > 0) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
             }
