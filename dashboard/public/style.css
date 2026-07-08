@@ -1708,3 +1708,15 @@ header { padding: 20px 32px; }
 .pf-row { cursor: pointer; }
 .pf-row:hover { background: rgba(232, 168, 130, 0.06); }
 .pf-hint { font-size: 11px; padding-top: 6px; }
+
+/* ---- Expert-tuned strip in sleeve editor ------------------------------- */
+.sleeve-expert { background: rgba(232, 168, 130, 0.06);
+  border-left: 3px solid var(--accent); border-radius: 4px;
+  padding: 10px 14px; margin-bottom: 14px; }
+.sleeve-expert-head { font-size: 13px; line-height: 1.6;
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.sleeve-expert-head b { color: var(--text); }
+.sleeve-expert-formulas { font-size: 12px; padding-top: 6px;
+  color: var(--muted); line-height: 1.8; }
+.sleeve-expert-formulas b { color: var(--text); }
+.sleeve-expert .dim { opacity: 0.5; }

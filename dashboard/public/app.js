@@ -198,9 +198,11 @@ function escapeHtml(s) {
 // ---- asset class inference ----------------------------------------------
 
 function assetClassOf(symbol) {
-  // SLR = silver (CDE), GC = gold, CL = crude, etc.  Crypto perps look like BTC-PERP-INTX.
+  // Coinbase CFM nano futures: SLR = silver, NOL = nano oil, GC = gold, etc.
+  // Traditional futures tickers (CL/NG/BZ) covered too. Crypto perps look
+  // like BTC-PERP-INTX.
   if (/^(SLR|SIL|GC|GOLD|PA|PL|HG|COPPER)/.test(symbol)) return 'metals';
-  if (/^(CL|NG|BZ|RB|HO)/.test(symbol)) return 'energy';
+  if (/^(NOL|CL|NG|BZ|RB|HO)/.test(symbol)) return 'energy';
   if (/-PERP-/.test(symbol) || /^(BTC|ETH|SOL|BCH|LTC|XRP)-/.test(symbol)) return 'crypto';
   if (/^(ES|NQ|YM|RTY)/.test(symbol)) return 'equity';
   return 'other';
@@ -218,6 +220,7 @@ const SYMBOL_FAMILY_NAMES = {
   PA: 'PALLADIUM', PL: 'PLATINUM',
   HG: 'COPPER', COPPER: 'COPPER',
   CL: 'CRUDE OIL', NG: 'NATURAL GAS', BZ: 'BRENT',
+  NOL: 'NANO CRUDE OIL',
   BTC: 'BITCOIN', ETH: 'ETHEREUM', SOL: 'SOLANA', LTC: 'LITECOIN',
   XRP: 'RIPPLE', BCH: 'BITCOIN CASH', AVE: 'AVALANCHE', DOGE: 'DOGECOIN',
   LINK: 'CHAINLINK', UNI: 'UNISWAP', MATIC: 'POLYGON',
@@ -334,6 +337,7 @@ function renderModeTabs(store) {
     for (const symbol of Object.keys(symbols || {})) {
       if (symbol === '__account_kill_switch__') continue;
       if (symbol === '__portfolio__') continue;
+      if (symbol === '__tuned_params__') continue;
       counts[m] = (counts[m] || 0) + 1;
     }
   }
@@ -359,6 +363,7 @@ function renderAssetTabs(store) {
     for (const symbol of Object.keys(symbols || {})) {
       if (symbol === '__account_kill_switch__') continue;
       if (symbol === '__portfolio__') continue;
+      if (symbol === '__tuned_params__') continue;
       const c = assetClassOf(symbol);
       counts[c] = (counts[c] || 0) + 1;
     }
@@ -1794,6 +1799,7 @@ async function refreshOnce() {
     for (const symbol of symbols) {
       if (symbol === '__account_kill_switch__') continue;
       if (symbol === '__portfolio__') continue;
+      if (symbol === '__tuned_params__') continue;
       if (activeAssetClass && assetClassOf(symbol) !== activeAssetClass) continue;
       cardsEl.appendChild(renderCard(tenant, symbol, currentStore[tenant][symbol]));
       anyRendered = true;
@@ -2355,6 +2361,39 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   }
   const mark = Number(snap.last_mark) || liveMark || 0;
   const posAvgEntry = Number(snap.position_avg_entry) || liveAvg || 0;
+
+  // Expert params per THIS product: ATR from real candles + asset-class
+  // multipliers from published trader literature (Layer 1), overridden by
+  // any Layer 2 grid-search tuning that ran against this product's own
+  // recent history. Silver / oil / BTC all end up with different numbers.
+  let expertATR = 0;
+  let expertParams = null;
+  let tunedParams = null;
+  const liveTenantKey = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
+  if (liveTenantKey) {
+    const pfSnap = currentStore[liveTenantKey]?.['__portfolio__']?.config;
+    const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+    if (posRow) {
+      expertATR = Number(posRow.atr) || 0;
+      expertParams = posRow.expert_params || null;
+    }
+    const tuned = currentStore[liveTenantKey]?.['__tuned_params__']?.config;
+    if (tuned && tuned[symbol]) tunedParams = tuned[symbol];
+  }
+  // Merge: Layer 2 (tuned) trail_x_atr overrides Layer 1's multiplier.
+  const effectiveMultipliers = expertParams ? { ...expertParams.multipliers } : null;
+  if (effectiveMultipliers && tunedParams?.trail_x_atr) {
+    effectiveMultipliers.trail_x_atr = tunedParams.trail_x_atr;
+  }
+  // Recompute dollar values from the (possibly-tuned) multipliers.
+  const expertDollars = (effectiveMultipliers && expertATR > 0) ? {
+    trail_distance: +(expertATR * effectiveMultipliers.trail_x_atr).toFixed(4),
+    stop_loss_distance: +(expertATR * effectiveMultipliers.stop_x_atr).toFixed(4),
+    activation_offset: +(expertATR * effectiveMultipliers.activation_offset_x_atr).toFixed(4),
+    ratchet_distance: +(expertATR * effectiveMultipliers.ratchet_x_atr).toFixed(4),
+    ratchet_activation: +(expertATR * effectiveMultipliers.ratchet_activation_x_atr).toFixed(4),
+    reanchor_threshold: +(expertATR * effectiveMultipliers.reanchor_x_atr).toFixed(4),
+  } : null;
   // Priority order for the anchor (the price the swing is centered on):
   //   1. Lot's entry price if opened from a specific lot ("+ Strategy" per lot)
   //   2. Existing sleeve's buy_px (preserve on edit)
@@ -2568,6 +2607,36 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         <h2>${existing ? 'Edit strategy' : 'Add strategy'}</h2>
         <button class="modal-close" data-close>✕</button>
       </div>
+      ${expertParams ? `
+        <div class="sleeve-expert">
+          <div class="sleeve-expert-head">
+            <b>Expert-tuned to ${escapeHtml(symbolFamilyOf(symbol) || symbol)}</b>
+            <span class="dim">·</span>
+            <span>ATR (14, 5min) <b class="mono">$${fmtPrice(expertATR)}</b></span>
+            <span class="dim">·</span>
+            <span>Asset class: <b>${escapeHtml(expertParams.asset_class || 'other')}</b></span>
+            ${tunedParams?.trail_x_atr ? `
+              <span class="dim">·</span>
+              <span>Layer 2 tuned: trail <b class="mono">${tunedParams.trail_x_atr}×ATR</b>
+                <span class="dim">(from ${tunedParams.days || 30}d history)</span>
+              </span>
+            ` : `
+              <span class="dim">·</span>
+              <span class="dim">Layer 2 tuning pending (runs daily)</span>
+            `}
+          </div>
+          <div class="sleeve-expert-formulas">
+            Trail <b class="mono">$${fmtPrice(expertDollars?.trail_distance || 0)}</b>
+              (${(effectiveMultipliers?.trail_x_atr || 0).toFixed(1)}×ATR, Turtle 2N)
+            <span class="dim">·</span>
+            Stop <b class="mono">$${fmtPrice(expertDollars?.stop_loss_distance || 0)}</b>
+              (${(effectiveMultipliers?.stop_x_atr || 0).toFixed(1)}×ATR, Van Tharp 1R)
+            <span class="dim">·</span>
+            Ratchet <b class="mono">$${fmtPrice(expertDollars?.ratchet_distance || 0)}</b>
+              (${(effectiveMultipliers?.ratchet_x_atr || 0).toFixed(1)}×ATR, Le Beau chandelier)
+          </div>
+        </div>
+      ` : ''}
       <div class="sleeve-anchor ${anchorStale ? 'stale' : ''}">
         <div class="sleeve-anchor-title">Anchor the strategy around</div>
         <div class="sleeve-anchor-toggle" role="tablist">
@@ -2784,6 +2853,23 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const p = PRESETS[name];
     if (!p) return;
     exitEl.value = p.exit_mode;
+    // Expert-derived per-product values override the preset's silver-tuned
+    // defaults when we have ATR for this product. So Model B applied to oil
+    // gets oil's trail distance (~$0.84), not silver's ($0.15).
+    if (expertDollars) {
+      p = {
+        ...p,
+        trailDistance: expertDollars.trail_distance,
+        trailActivationOffset: expertDollars.activation_offset,
+        stopLoss: p.stopLoss ? {
+          ...p.stopLoss,
+          price_below_buy: expertDollars.stop_loss_distance,
+          ratchet_distance: expertDollars.ratchet_distance,
+          ratchet_activation: expertDollars.ratchet_activation,
+        } : p.stopLoss,
+        reanchorThreshold: expertDollars.reanchor_threshold,
+      };
+    }
     const qty = Math.max(1, Number(qtyEl.value) || 1);
     // Two preset flavors:
     //  - profitDollarsFixed:  net-per-cycle stays constant regardless of qty

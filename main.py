@@ -200,6 +200,65 @@ def _seed_lab_comparison_sleeves(store, tenant: str, symbol: str) -> None:
     _log(f"[{tenant}/{symbol}] seeded Lab with 5 comparison sleeves (Models A–E, 2 contracts each)")
 
 
+def _attach_expert_params(broker, portfolio_snap: dict) -> None:
+    """For every derivative in the snapshot, compute ATR from recent 5-min
+    candles and attach Layer-1 expert params (asset-class multipliers ×
+    ATR). Also attaches Layer-2 tuned params if a cached tuning exists.
+    Best-effort — failures per product don't stall the caller."""
+    from datetime import datetime, timedelta, timezone
+    from backtest import fetch_candles
+    from expert_params import compute_atr, expert_params
+
+    derivs = portfolio_snap.get("derivatives") or []
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=24)  # 24h of 5-min = ~288 candles, ample for ATR-14
+    for d in derivs:
+        pid = d.get("product_id")
+        if not pid:
+            continue
+        try:
+            candles = fetch_candles(broker.client, pid, start, end, granularity="FIVE_MINUTE")
+            atr = compute_atr(candles, period=14)
+            if atr > 0:
+                d["atr"] = round(atr, 5)
+                d["expert_params"] = expert_params(pid, atr)
+        except Exception:
+            pass
+
+
+_last_tuner_run_ts: dict[str, float] = {}
+_TUNER_INTERVAL_SECS = 24 * 3600  # daily
+
+
+def _maybe_run_tuner(store, live_tenant: str) -> None:
+    """Layer 2: run the grid-search tuner over the last 30 days for each Live
+    derivative. Slow (~5-15s per product) so only runs once per day. Results
+    written to '__tuned_params__' on the live tenant; the modal reads them
+    and prefers them over Layer 1 literature defaults."""
+    import time as _t
+    now = _t.time()
+    last = _last_tuner_run_ts.get(live_tenant, 0.0)
+    if now - last < _TUNER_INTERVAL_SECS:
+        return
+    _last_tuner_run_ts[live_tenant] = now
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        from expert_tuner import tune_products
+        # Only tune derivatives we're actually holding on Live.
+        pf = store.get_config(live_tenant, "__portfolio__") or {}
+        pids = [d.get("product_id") for d in (pf.get("derivatives") or []) if d.get("product_id")]
+        if not pids:
+            return
+        _log(f"[{live_tenant}] tuner: grid-searching best multipliers over 30d for {pids}")
+        seed = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
+        client = CoinbaseBroker(BrokerConfig(product_id=seed)).client
+        tuned = tune_products(client, pids, days=30)
+        store.put_config(live_tenant, "__tuned_params__", tuned)
+        _log(f"[{live_tenant}] tuner: done, tuned {len(tuned)} products")
+    except Exception as e:
+        _log(f"[{live_tenant}] tuner failed: {type(e).__name__}: {e}")
+
+
 def _derive_live_tenant(paper_tenant: str) -> str:
     """adam-paper → adam-live. Anything else gets '-live' appended."""
     if paper_tenant.endswith("-paper"):
@@ -280,6 +339,9 @@ def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
     # this key in the regular card render loop.
     try:
         snap = broker.portfolio_snapshot()
+        # Attach per-product expert params derived from real ATR. Layer 1:
+        # ATR × asset-class multipliers from published trader literature.
+        _attach_expert_params(broker, snap)
         store.put_config(live_tenant, "__portfolio__", snap)
     except Exception as e:
         _log(f"[{live_tenant}] portfolio_snapshot skipped: {type(e).__name__}: {e}")
@@ -656,6 +718,7 @@ def run_paper_mode() -> int:
             # Existing entries are preserved (watchlist behavior).
             if now - last_live_portfolio >= live_portfolio_interval:
                 _sync_live_portfolio(store, live_tenant)
+                _maybe_run_tuner(store, live_tenant)
                 last_live_portfolio = now
 
             if redis_url and now - last_scanner >= scanner_interval:
