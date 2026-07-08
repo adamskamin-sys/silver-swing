@@ -1985,8 +1985,10 @@ header { padding: 20px 32px; }
   padding: 2px 6px;
 }
 .scanner-detail-sleeves-table .trail-peak-note {
-  font-size: 10px; color: var(--muted); font-weight: 400;
-  margin-left: 3px;
+  /* Match the surrounding trail-pill-on so both prices render uniformly
+     — same color, weight, and size. Only add a small left margin for
+     spacing between the effective-stop and peak numbers. */
+  margin-left: 4px;
 }
 
 /* Scanner-detail modal — fill the viewport so the chart + attached
