@@ -2438,9 +2438,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   const existing = sleeveId ? sleeves.find(s => s.id === sleeveId) : null;
 
   // Capacity: how many contracts can this sleeve use?
-  // Live-tenant: use position qty from the __portfolio__ snapshot since the
-  // regular snap.position_qty isn't updated for read-only mirrored positions.
-  const pos = Number(snap.position_qty ?? 0) || liveQty;
+  // Live-tenant: the regular snap.position_qty is 0 (read-only mirror, no
+  // strategy engine writing snapshots). Trust liveQty from the portfolio
+  // row, which came directly from Coinbase list_futures_positions.
+  // Take MAX so a stale 0 in either source doesn't override the good value.
+  const rawPosQty = Number(snap.position_qty) || 0;
+  const pos = Math.max(rawPosQty, liveQty, 0);
   const core = Number(cfg.core_qty ?? 0);
   const primary = Number(cfg.swing_qty ?? 0);
   const otherSleeves = sleeves.filter(s => s.id !== sleeveId);
