@@ -683,13 +683,16 @@ def run_paper_mode() -> int:
     # visibility mode), just after track seeding.
     if live_engine_enabled:
         live_syms = _sync_live_portfolio(store, live_tenant)
-        # Reset every Live-tenant symbol's state so sleeves come up fresh in
-        # ARMED_SELL — no persisted paper-era state, no dead live_order_ids.
+        # DO NOT wipe existing state on boot. That was destroying halt state,
+        # ratcheted stop-loss HWM, hybrid delay windows, and consecutive-stop
+        # counters on every deploy — un-halting sleeves and re-triggering
+        # protective sells that had already been suppressed. Preserve state;
+        # dead live_order_ids get cleared organically on the next tick when
+        # the sleeve polls order_status and sees CANCELLED/EXPIRED/UNKNOWN.
         for sym in live_syms:
             cfg = store.get_config(live_tenant, sym) or {}
             n_sleeves = len(cfg.get("sleeves") or [])
-            store.put_state(live_tenant, sym, {})
-            _log(f"[REAL MONEY] {live_tenant}/{sym} — armed {n_sleeves} sleeve(s) fresh")
+            _log(f"[REAL MONEY] {live_tenant}/{sym} — {n_sleeves} sleeve(s) attached (state preserved)")
 
     # Seed initial tracks: for the primary tenant, use SYMBOL as the primary;
     # for the lab tenant, use SYMBOL too so there's always at least one card
