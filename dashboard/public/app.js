@@ -3749,7 +3749,7 @@ function openScannerDetail(row) {
     <div class="scanner-detail-sleeves">
       <div class="scanner-detail-sleeves-head">Attached strategies (${liveSleeves.length})</div>
       <table class="scanner-detail-sleeves-table">
-        <thead><tr><th>Name</th><th>Contracts</th><th>Sell</th><th>Buy</th>
+        <thead><tr><th>Name</th><th>Contracts</th><th>Entry</th><th>Sell</th><th>Buy</th>
           <th>Cycles</th><th>Unrealized</th><th>Realized</th><th>State</th><th></th></tr></thead>
         <tbody>
         ${liveSleeves.map(s => {
@@ -3777,9 +3777,11 @@ function openScannerDetail(row) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
             }
           }
+          const entryPx = Number(s.entry_mark) || 0;
           return `<tr>
             <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
             <td class="mono">${s.qty}</td>
+            <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
             <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
             <td class="mono">${Number(ss.cycles) || 0}</td>
@@ -3922,9 +3924,11 @@ function refreshScannerDetailLive() {
           unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
         }
       }
+      const entryPx = Number(s.entry_mark) || 0;
       return `<tr>
         <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
         <td class="mono">${s.qty}</td>
+        <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
         <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
         <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
         <td class="mono">${Number(ss.cycles) || 0}</td>
