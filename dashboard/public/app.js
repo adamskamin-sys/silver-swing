@@ -709,6 +709,24 @@ function renderLivePortfolio() {
     </div>`;
 }
 
+// Cycles for a product across every tenant that runs a strategy on it —
+// primary strategy + all sleeves. Useful signal: "the bot has round-tripped
+// this thing N times somewhere" without pinning to a single tenant.
+function totalCyclesForProduct(productId) {
+  let total = 0;
+  const store = currentStore || {};
+  for (const tenant of Object.keys(store)) {
+    const entry = store[tenant] && store[tenant][productId];
+    if (!entry) continue;
+    total += Number((entry.state && entry.state.cycles) || 0);
+    const sleeves = (entry.state && entry.state.sleeves) || {};
+    for (const sid of Object.keys(sleeves)) {
+      total += Number((sleeves[sid] && sleeves[sid].cycles) || 0);
+    }
+  }
+  return total;
+}
+
 // Fetch scanner-ranked derivatives once and render them into the Live tab.
 // Runs after renderLivePortfolio has injected the placeholder <div>. Cached
 // briefly so switching asset-class subtabs doesn't spam Coinbase.
@@ -740,19 +758,26 @@ async function renderLiveTradeable() {
     body.innerHTML = `
       <table class="live-tradeable-table">
         <thead><tr>
-          <th>Product</th><th>Price</th><th>24h High</th><th>24h Low</th><th>Range %</th><th></th>
+          <th>Product</th><th>Price</th><th>24h High</th><th>24h Low</th><th>Range %</th><th>Cycles</th><th></th>
         </tr></thead>
         <tbody>
-          ${filtered.map(r => `
+          ${filtered.map(r => {
+            const cycles = totalCyclesForProduct(r.product_id);
+            const cyclesCell = cycles > 0
+              ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
+              : '<span class="dim">0</span>';
+            return `
             <tr class="live-tradeable-row" data-product='${encodeURIComponent(JSON.stringify(r))}'>
               <td><b>${escapeHtml(prettyProductName(r.product_id))}</b></td>
               <td class="mono">$${fmtNum(r.price, 4)}</td>
               <td class="mono pos">$${fmtNum(r.high_24h, 4)}</td>
               <td class="mono neg">$${fmtNum(r.low_24h, 4)}</td>
               <td class="mono"><b>${fmtNum(r.vol_pct, 2)}%</b></td>
+              <td class="mono">${cyclesCell}</td>
               <td><button class="small primary">Buy / Short →</button></td>
             </tr>
-          `).join('')}
+            `;
+          }).join('')}
         </tbody>
       </table>
       <div class="pf-hint dim">Click a row to open the chart + place a Buy (long) or Short order</div>`;
@@ -1916,6 +1941,10 @@ async function refreshScanner() {
       const scoreCell = bestScore > 0
         ? `<b class="pos">$${fmtNum(bestScore, 2)}</b>`
         : '<span class="dim">—</span>';
+      const cycles = totalCyclesForProduct(row.product_id);
+      const cyclesCell = cycles > 0
+        ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
+        : '<span class="dim">0</span>';
       tr.innerHTML = `
         <td>${i + 1}</td>
         <td class="mono">${escapeHtml(row.product_id)}</td>
@@ -1924,9 +1953,18 @@ async function refreshScanner() {
         <td class="mono">${spreadCell}</td>
         <td class="mono">${rtCell}</td>
         <td class="mono">${scoreCell}</td>
+        <td class="mono">${cyclesCell}</td>
         <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
+        <td><button class="small primary scanner-buy-btn">Buy / Short →</button></td>
       `;
-      tr.onclick = () => openScannerDetail(row);
+      tr.onclick = (e) => {
+        // Click anywhere on the row (including the button) → open detail
+        // modal which has BUY (long) / SHORT (short) side selector.
+        if (e.target.closest('button')) e.stopPropagation();
+        openScannerDetail(row);
+      };
+      const buyBtn = tr.querySelector('.scanner-buy-btn');
+      if (buyBtn) buyBtn.onclick = (e) => { e.stopPropagation(); openScannerDetail(row); };
       tbody.appendChild(tr);
     });
   } catch (err) {
