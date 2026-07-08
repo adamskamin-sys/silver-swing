@@ -293,6 +293,93 @@ class CoinbaseBroker:
         except Exception:
             return 0.0
 
+    def list_all_holdings(self) -> list[dict]:
+        """Every non-zero position + spot balance on the connected Coinbase
+        account. Powers the Live tab's "actual portfolio" view — everything the
+        user owns is a candidate for either manual trading or Model attachment.
+
+        Returns list of dicts:
+          {kind: 'futures'|'spot', product_id, qty, avg_entry, mark, unrealized,
+           display: 'BTC-USD' style label}
+
+        Best-effort — swallows per-page failures so a broken cursor can't stall
+        the caller. Empty list on total failure.
+        """
+        out: list[dict] = []
+
+        # Futures positions (all products, not just self.cfg.product_id)
+        try:
+            for p in _dump(self.client.list_futures_positions()).get("positions") or []:
+                pid = p.get("product_id")
+                if not pid:
+                    continue
+                n = int(float(p.get("number_of_contracts") or 0))
+                if n == 0:
+                    continue
+                signed = n if (p.get("side") or "").upper() == "LONG" else -n
+                try: avg = float(p.get("avg_entry_price") or 0)
+                except (TypeError, ValueError): avg = 0.0
+                try: mark = float(p.get("current_price") or 0)
+                except (TypeError, ValueError): mark = 0.0
+                try: unreal = float(p.get("unrealized_pnl") or 0)
+                except (TypeError, ValueError): unreal = 0.0
+                out.append({
+                    "kind": "futures",
+                    "product_id": pid,
+                    "qty": signed,
+                    "avg_entry": avg,
+                    "mark": mark,
+                    "unrealized": unreal,
+                    "display": pid,
+                })
+        except Exception:
+            pass
+
+        # Spot balances (all currencies with a non-zero available or hold).
+        # Coinbase pages accounts; iterate until has_next is False. USD/USDC
+        # excluded here because they're cash, not tradeable assets — surfaced
+        # separately via futures_balance/stablecoin_balance if callers want them.
+        try:
+            cursor = None
+            for _ in range(20):
+                kwargs = {"limit": 250}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = _dump(self.client.get_accounts(**kwargs))
+                for a in resp.get("accounts") or []:
+                    cur = (a.get("currency") or "").upper()
+                    if cur in ("USD", "USDC", ""):
+                        continue
+                    avail = 0.0
+                    hold = 0.0
+                    try: avail = float((a.get("available_balance") or {}).get("value") or 0)
+                    except (TypeError, ValueError): pass
+                    try: hold = float((a.get("hold") or {}).get("value") or 0)
+                    except (TypeError, ValueError): pass
+                    total = avail + hold
+                    if total <= 0:
+                        continue
+                    product_id = f"{cur}-USD"
+                    out.append({
+                        "kind": "spot",
+                        "product_id": product_id,
+                        "currency": cur,
+                        "qty": total,
+                        "avg_entry": 0.0,
+                        "mark": 0.0,
+                        "unrealized": 0.0,
+                        "display": product_id,
+                    })
+                if not resp.get("has_next"):
+                    break
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+        except Exception:
+            pass
+
+        return out
+
     def snapshot(self) -> dict:
         """Unified snapshot in the same shape as PaperBroker.snapshot() so the
         dashboard can render either without branching. Best-effort — any subcall

@@ -200,6 +200,74 @@ def _seed_lab_comparison_sleeves(store, tenant: str, symbol: str) -> None:
     _log(f"[{tenant}/{symbol}] seeded Lab with 5 comparison sleeves (Models A–E, 2 contracts each)")
 
 
+def _derive_live_tenant(paper_tenant: str) -> str:
+    """adam-paper → adam-live. Anything else gets '-live' appended."""
+    if paper_tenant.endswith("-paper"):
+        return paper_tenant[: -len("-paper")] + "-live"
+    return f"{paper_tenant}-live"
+
+
+def _default_live_holding_config(product_id: str, kind: str) -> dict:
+    """Minimal config for an auto-discovered Live-tenant holding. Zero swing_qty
+    so no strategy fires until user attaches one. Core=0 so no floor guard
+    complaints. Wide abort bands. tick_size/contract_size get overwritten by
+    _refresh_contract_spec_into_config on next spec refresh."""
+    return {
+        "core_qty": 0, "swing_qty": 0, "max_swing_qty": 10,
+        "sell_px": 0.0, "buy_px": 0.0,
+        "contract_size": 1.0 if kind == "spot" else 50.0,
+        "tick_size": 0.005,
+        "margin_per_contract": 0.0 if kind == "spot" else 275.0,
+        "scale_up_buffer_mult": 1.5,
+        "fee_per_contract_roundtrip": 0.0,
+        "abort_below": 0.0, "abort_above": 1e9,
+        "fee_sanity_multiplier": 2.0,
+        "asset_kind": kind,   # "futures" or "spot"
+        "sleeves": [],
+    }
+
+
+def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
+    """Pull the user's real Coinbase portfolio (all futures positions + all
+    non-zero spot balances) and upsert each holding as a tracked symbol on the
+    Live tenant. Watchlist behavior: once added, a symbol persists in the store
+    even after the position closes on Coinbase, so the user can re-enter
+    without re-adding it.
+
+    Preserves any existing config for a known symbol (user-added sleeves,
+    tweaked prices, etc.) — only creates fresh entries for new holdings.
+
+    Returns the list of upserted symbols. Empty list on failure.
+    """
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        # product_id required by BrokerConfig but list_all_holdings is
+        # product-agnostic; the seed symbol is only used to construct the client.
+        seed = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
+        broker = CoinbaseBroker(BrokerConfig(product_id=seed))
+        holdings = broker.list_all_holdings()
+    except Exception as e:
+        _log(f"[{live_tenant}] live portfolio sync failed: {type(e).__name__}: {e}")
+        return []
+
+    upserted: list[str] = []
+    for h in holdings:
+        pid = h.get("product_id")
+        kind = h.get("kind") or "futures"
+        if not pid:
+            continue
+        existing = store.get_config(live_tenant, pid)
+        if existing:
+            continue  # preserve user-tweaked config; don't overwrite
+        cfg = _default_live_holding_config(pid, kind)
+        store.put_config(live_tenant, pid, cfg)
+        upserted.append(pid)
+
+    if upserted:
+        _log(f"[{live_tenant}] added {len(upserted)} live holdings to portfolio: {upserted}")
+    return upserted
+
+
 def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:
     """Fetch the live Coinbase spec for this product and merge tick_size,
     contract_size, contract_expiry, and margin rates into the config. Runs on
@@ -515,6 +583,13 @@ def run_paper_mode() -> int:
             and os.getenv("SWING_PAPER_MIRROR_LIVE", "0") == "1"):
         _mirror_live_position_into_paper(primary_track.broker, SYMBOL)
 
+    # Boot-time live portfolio sync: enumerate the real Coinbase account and
+    # upsert every holding as a tracked symbol on the Live tenant. Watchlist
+    # behavior — symbols persist even after positions close, so the user can
+    # re-enter without re-adding. Requires Coinbase creds; safe no-op otherwise.
+    live_tenant = _derive_live_tenant(TENANT)
+    _sync_live_portfolio(store, live_tenant)
+
     log.record("bot_started", mode="paper", tenants=tenants,
                tracks=[f"{t}:{s}" for (t, s) in tracks.keys()])
 
@@ -522,8 +597,10 @@ def run_paper_mode() -> int:
         snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
         scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "60.0"))
         symbol_discover_interval = float(os.getenv("SWING_SYMBOL_DISCOVER_INTERVAL", "10.0"))
+        live_portfolio_interval = float(os.getenv("SWING_LIVE_PORTFOLIO_INTERVAL", "120.0"))
         last_scanner = 0.0
         last_discover = 0.0
+        last_live_portfolio = 0.0
         _coinbase_for_scanner = None
         redis_url = os.getenv("REDIS_URL")
 
@@ -549,6 +626,13 @@ def run_paper_mode() -> int:
 
             for track in list(tracks.values()):
                 track.step(now, snapshot_interval)
+
+            # Periodic live portfolio refresh — picks up newly-opened positions
+            # on the real Coinbase account and adds them to the Live tab.
+            # Existing entries are preserved (watchlist behavior).
+            if now - last_live_portfolio >= live_portfolio_interval:
+                _sync_live_portfolio(store, live_tenant)
+                last_live_portfolio = now
 
             if redis_url and now - last_scanner >= scanner_interval:
                 try:
