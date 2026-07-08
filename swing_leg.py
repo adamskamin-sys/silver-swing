@@ -717,6 +717,12 @@ class SwingTrader:
         if sellable_ceiling == 0:
             return 0
         mode = (getattr(sc, "stop_loss_qty_mode", "all") or "all").lower()
+        # Live-tenant safety cap: never sell more than the sleeve's own qty
+        # regardless of what the config says. The user set this up to swing
+        # 1–2 contracts, not to liquidate the whole holding when a stop
+        # trips — "all" mode has been draining positions in bulk.
+        if self.tenant_id.endswith("-live"):
+            mode = "original"
         if mode == "original":
             # Use the sleeve's current qty (accumulated size). "Original" here
             # means "just this sleeve, not all your other holdings" — which is
@@ -1009,6 +1015,10 @@ class SwingTrader:
         if sellable_ceiling == 0:
             return 0
         mode = (self.cfg.stop_loss_qty_mode or "all").lower()
+        # Live-tenant safety cap: primary can never sell more than swing_qty
+        # on a stop trip. Matches the sleeve cap — protect the core holding.
+        if self.tenant_id.endswith("-live"):
+            mode = "original"
         if mode == "all":
             return sellable_ceiling
         if mode == "original":
