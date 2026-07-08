@@ -215,6 +215,7 @@ def fetch_and_rank(
     swing_fee_per_contract_roundtrip: float = 0.5,
     swing_lookback_secs: int = 24 * 3600,
     swing_granularity: str = "FIFTEEN_MINUTE",
+    default_target_net_per_contract: float = 10.0,
 ) -> list[dict]:
     """Fetch all CFM futures from Coinbase, score each on both amplitude
     (24h range %) AND swing frequency (roundtrips per lookback window at a
@@ -249,6 +250,22 @@ def fetch_and_rank(
                                       granularity=swing_granularity,
                                       lookback_secs=swing_lookback_secs)
         swing = score_product_swings(closes, tick, csize, swing_fee_per_contract_roundtrip)
+        # "Cycles at your defaults" — the spread that would net Adam's
+        # configured target ($10/contract by default). Solves:
+        #   spread × contract_size − fee_rt = target
+        # for spread, then counts roundtrips at that exact spread. Lets the
+        # user compare "amplitude score" (best possible) vs "cycles at what
+        # I'd actually set" (what my presets would have caught).
+        target = float(default_target_net_per_contract or 0.0)
+        if target > 0 and csize > 0:
+            default_spread = (target + float(swing_fee_per_contract_roundtrip or 0.0)) / csize
+            # Snap up to a whole number of ticks so the spread is achievable.
+            if tick and tick > 0:
+                default_spread = max(tick, round(default_spread / tick) * tick)
+            default_rt, _, _ = compute_roundtrip_metric(closes, default_spread)
+        else:
+            default_spread = 0.0
+            default_rt = 0
         entry.update({
             "best_score": swing["best_score"],
             "best_roundtrips": swing["best_roundtrips"],
@@ -259,6 +276,9 @@ def fetch_and_rank(
             "swing_candidates": swing["candidates"],
             "swing_lookback_secs": swing_lookback_secs,
             "swing_bars": len(closes),
+            "default_spread": round(default_spread, 6),
+            "default_target_net_per_contract": target,
+            "default_roundtrips": default_rt,
         })
         # Courtesy pause between candle calls — one product ~= one API request,
         # ~30 products/scan × 60s cadence = well under Coinbase's rate limit,

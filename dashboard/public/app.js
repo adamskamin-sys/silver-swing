@@ -1941,6 +1941,11 @@ async function refreshScanner() {
       const scoreCell = bestScore > 0
         ? `<b class="pos">$${fmtNum(bestScore, 2)}</b>`
         : '<span class="dim">—</span>';
+      const defaultRt = Number(row.default_roundtrips) || 0;
+      const defaultSpread = Number(row.default_spread) || 0;
+      const defaultRtCell = defaultRt > 0
+        ? `<span title="At spread $${fmtNum(defaultSpread, 4)} (your $10/contract preset)"><b>${defaultRt}</b></span>`
+        : '<span class="dim" title="No roundtrips in last 24h at your default $10/contract spread">0</span>';
       const cycles = totalCyclesForProduct(row.product_id);
       const cyclesCell = cycles > 0
         ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
@@ -1952,6 +1957,7 @@ async function refreshScanner() {
         <td class="mono">${fmtNum(row.vol_pct, 2)}%</td>
         <td class="mono">${spreadCell}</td>
         <td class="mono">${rtCell}</td>
+        <td class="mono">${defaultRtCell}</td>
         <td class="mono">${scoreCell}</td>
         <td class="mono">${cyclesCell}</td>
         <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
