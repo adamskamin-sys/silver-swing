@@ -2900,7 +2900,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       <div class="profit-slider-block" id="sl-fixed-block">
         <div class="profit-slider-header">
           <span class="slider-label">Or drag: <b>net</b> take-home per swing (after fees, all <span id="sl-qty-echo">${startingQty}</span> contracts)</span>
-          <span class="slider-value" id="sl-profit-val">$${existingTotalProfit}</span>
+          <span class="slider-value-input-wrap">$<input type="number" id="sl-profit-val" class="slider-value-input" min="10" max="2000" step="1" value="${existingTotalProfit}"></span>
         </div>
         <input type="range" id="sl-profit" min="10" max="2000" step="10" value="${existingTotalProfit}" class="profit-slider">
         <div class="profit-slider-ticks">
@@ -3236,7 +3236,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const grossPerSwing = (sellPx - buyPx) * contractSize * qty;
     const netPerSwing = grossPerSwing - feesPerSwing;
 
-    profitValEl.textContent = `$${profitEl.value}`;
+    // Only overwrite the input if the user isn't currently focused in it —
+    // otherwise we clobber their typing mid-edit.
+    if (document.activeElement !== profitValEl) profitValEl.value = profitEl.value;
     updateFillPct(profitEl);
     updateFillPct(tdSliderEl);
     const tdRaw = Number(tdSliderEl.value);
@@ -3365,6 +3367,21 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     if (presetEl.value !== 'Custom' && nameEl.value !== presetEl.value) presetEl.value = 'Custom';
   });
   profitEl.addEventListener('input', () => { syncTargetsFromSlider(); updatePreview(); });
+  // Manual net-profit entry — mirrors the slider. Typing directly is the
+  // precision path (slider steps in $10); input steps in $1 and accepts any
+  // value clamped to the slider's dynamic min/max (min = fees + $1 floor).
+  profitValEl.addEventListener('input', () => {
+    const raw = Number(profitValEl.value);
+    if (!Number.isFinite(raw)) return;
+    const min = Number(profitEl.min) || 10;
+    const max = Number(profitEl.max) || 2000;
+    profitEl.value = Math.max(min, Math.min(max, raw));
+    syncTargetsFromSlider();
+    updatePreview();
+  });
+  // On blur, snap the input's visible value back to what actually got applied
+  // (clamped + sanitized) so the field never disagrees with the slider.
+  profitValEl.addEventListener('blur', () => { profitValEl.value = profitEl.value; });
   qtyEl.addEventListener('input', () => {
     // Re-apply the preset when qty changes so per-contract-scaled presets
     // recompute their target (e.g., Paul preset at 1c = $25 net, at 3c = $75

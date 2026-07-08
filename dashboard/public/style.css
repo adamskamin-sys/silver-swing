@@ -1345,6 +1345,26 @@ header { padding: 20px 32px; }
 .slider-value {
   font-family: var(--mono); font-size: 20px; font-weight: 600; color: var(--accent);
 }
+/* Manual net-profit entry: sits where the readout used to. Same visual
+   weight as the slider readout but editable. */
+.slider-value-input-wrap {
+  font-family: var(--mono); font-size: 20px; font-weight: 600;
+  color: var(--accent); display: inline-flex; align-items: baseline; gap: 2px;
+}
+.slider-value-input {
+  font-family: var(--mono); font-size: 20px; font-weight: 600;
+  color: var(--accent); background: transparent; border: 1px solid transparent;
+  border-radius: 4px; padding: 2px 4px; width: 90px; text-align: right;
+  -moz-appearance: textfield;
+}
+.slider-value-input::-webkit-outer-spin-button,
+.slider-value-input::-webkit-inner-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+.slider-value-input:hover { border-color: var(--border); }
+.slider-value-input:focus {
+  outline: none; border-color: var(--accent); background: var(--panel-2);
+}
 .profit-slider {
   width: 100%; height: 6px; margin: 12px 0 4px;
   -webkit-appearance: none; appearance: none;
