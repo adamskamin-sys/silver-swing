@@ -1681,3 +1681,33 @@ header { padding: 20px 32px; }
   background: rgba(143, 122, 224, 0.08); border-left: 3px solid #8f7ae0;
   border-radius: 4px; font-size: 12px; line-height: 1.6;
 }
+
+/* ---- Live portfolio (Coinbase-style overview) -------------------------- */
+.live-portfolio { background: var(--panel); border-radius: 6px;
+  padding: 18px 22px; margin-bottom: 22px; }
+.pf-summary { display: flex; justify-content: space-between; align-items: baseline;
+  padding-bottom: 14px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.pf-grand b { font-size: 22px; margin-left: 8px; }
+.pf-section { margin: 16px 0; }
+.pf-section-head { display: flex; justify-content: space-between; align-items: baseline;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 6px; }
+.pf-section-head h4 { margin: 0; font-size: 15px; letter-spacing: 0.5px; font-weight: 600; }
+.pf-total { margin-left: 10px; font-family: var(--mono); font-size: 14px; }
+.pf-total.pos { color: var(--good); }
+.pf-total.neg { color: var(--bad); }
+.pf-table { width: 100%; border-collapse: collapse; }
+.pf-table th, .pf-table td { padding: 8px 10px; text-align: left; font-size: 13px; }
+.pf-table th { color: var(--muted); text-transform: none; font-weight: 500;
+  border-bottom: 1px solid var(--border); }
+.pf-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
+.pf-table tbody tr:last-child { border-bottom: none; }
+.pf-table .mono { font-family: var(--mono); }
+.pf-table .pos { color: var(--good); }
+.pf-table .neg { color: var(--bad); }
+.pf-table .dim { color: var(--muted); opacity: 0.75; }
+.pf-name { min-width: 180px; }
+.pf-sub .pf-name { padding-left: 24px; color: var(--muted); }
+.pf-alloc { text-align: right; min-width: 70px; }
+.pf-add { text-align: right; }
+.pf-deriv-row { cursor: pointer; }
+.pf-deriv-row:hover { background: rgba(232, 168, 130, 0.06); }

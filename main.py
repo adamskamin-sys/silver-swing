@@ -263,6 +263,16 @@ def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
         store.put_config(live_tenant, pid, cfg)
         upserted.append(pid)
 
+    # Also compute + persist the structured portfolio snapshot so the Live
+    # tab can render the Coinbase-style Cash / Derivatives / Crypto view.
+    # Stored under a reserved symbol '__portfolio__'; the dashboard skips
+    # this key in the regular card render loop.
+    try:
+        snap = broker.portfolio_snapshot()
+        store.put_config(live_tenant, "__portfolio__", snap)
+    except Exception as e:
+        _log(f"[{live_tenant}] portfolio_snapshot skipped: {type(e).__name__}: {e}")
+
     if upserted:
         _log(f"[{live_tenant}] added {len(upserted)} live holdings to portfolio: {upserted}")
     return upserted

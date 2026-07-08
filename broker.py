@@ -380,6 +380,135 @@ class CoinbaseBroker:
 
         return out
 
+    def portfolio_snapshot(self) -> dict:
+        """Structured full-account snapshot for the Live tab's Coinbase-style
+        portfolio view. Sections: cash (USD accounts + USDC), derivatives
+        (futures positions), crypto (non-USD spot balances). Also computes
+        allocation percentages and totals.
+
+        Best-effort: any subcall that fails still returns a partial snapshot
+        with zeros for the missing section so the dashboard can render.
+        """
+        # ---- cash breakdown ---------------------------------------------
+        try:
+            balance = self.futures_balance()
+        except Exception:
+            balance = {}
+        def _bnum(node):
+            try: return float(((balance.get(node) or {}).get("value")) or 0)
+            except (TypeError, ValueError): return 0.0
+        cbi = _bnum("cbi_usd_balance")       # Primary USD (spot)
+        cfm = _bnum("cfm_usd_balance")       # Derivatives USD (futures collateral)
+        try:
+            usdc = self.stablecoin_balance()
+        except Exception:
+            usdc = 0.0
+        cash_total = cbi + cfm + usdc
+
+        # ---- futures positions ------------------------------------------
+        derivatives: list[dict] = []
+        derivatives_unrealized = 0.0
+        try:
+            for p in _dump(self.client.list_futures_positions()).get("positions") or []:
+                pid = p.get("product_id")
+                if not pid:
+                    continue
+                n = int(float(p.get("number_of_contracts") or 0))
+                if n == 0:
+                    continue
+                side = (p.get("side") or "").upper()
+                try: avg = float(p.get("avg_entry_price") or 0)
+                except (TypeError, ValueError): avg = 0.0
+                try: mark = float(p.get("current_price") or 0)
+                except (TypeError, ValueError): mark = 0.0
+                try: unreal = float(p.get("unrealized_pnl") or 0)
+                except (TypeError, ValueError): unreal = 0.0
+                try: liq = float(p.get("liquidation_price") or 0)
+                except (TypeError, ValueError): liq = 0.0
+                derivatives.append({
+                    "product_id": pid,
+                    "side": side,
+                    "qty": n,
+                    "avg_entry": avg,
+                    "mark": mark,
+                    "unrealized": unreal,
+                    "liquidation_price": liq,
+                })
+                derivatives_unrealized += unreal
+        except Exception:
+            pass
+
+        # ---- spot crypto ------------------------------------------------
+        crypto: list[dict] = []
+        crypto_total = 0.0
+        try:
+            cursor = None
+            for _ in range(20):
+                kwargs = {"limit": 250}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = _dump(self.client.get_accounts(**kwargs))
+                for a in resp.get("accounts") or []:
+                    cur = (a.get("currency") or "").upper()
+                    # Skip fiat & stablecoins — they're in the cash section.
+                    if cur in ("USD", "USDC", ""):
+                        continue
+                    try: avail = float((a.get("available_balance") or {}).get("value") or 0)
+                    except (TypeError, ValueError): avail = 0.0
+                    try: hold = float((a.get("hold") or {}).get("value") or 0)
+                    except (TypeError, ValueError): hold = 0.0
+                    total = avail + hold
+                    if total <= 0:
+                        continue
+                    # Try to price it: spot product is CURRENCY-USD
+                    product_id = f"{cur}-USD"
+                    mark = 0.0
+                    try:
+                        pd = _dump(self.client.get_product(product_id))
+                        mark = float(pd.get("price") or 0)
+                    except Exception:
+                        pass
+                    value_usd = total * mark if mark > 0 else 0.0
+                    crypto.append({
+                        "currency": cur,
+                        "product_id": product_id,
+                        "balance": total,
+                        "available": avail,
+                        "mark": mark,
+                        "value_usd": value_usd,
+                    })
+                    crypto_total += value_usd
+                if not resp.get("has_next"):
+                    break
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+        except Exception:
+            pass
+
+        # ---- allocation percentages -------------------------------------
+        grand_total = cash_total + derivatives_unrealized + crypto_total
+        gt_pos = grand_total if grand_total > 0 else 1.0
+        for c in crypto:
+            c["allocation_pct"] = (c["value_usd"] / gt_pos) * 100 if gt_pos else 0.0
+
+        return {
+            "cash": {
+                "primary_usd": cbi,
+                "derivatives_usd": cfm,
+                "predictions_usd": 0.0,  # not exposed via public API; placeholder
+                "usdc": usdc,
+                "total": cash_total,
+                "usd_total": cbi + cfm,
+            },
+            "derivatives": derivatives,
+            "derivatives_unrealized": derivatives_unrealized,
+            "crypto": crypto,
+            "crypto_total": crypto_total,
+            "grand_total": grand_total,
+            "generated_at": __import__("time").time(),
+        }
+
     def snapshot(self) -> dict:
         """Unified snapshot in the same shape as PaperBroker.snapshot() so the
         dashboard can render either without branching. Best-effort — any subcall

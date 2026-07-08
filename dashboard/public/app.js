@@ -333,6 +333,7 @@ function renderModeTabs(store) {
     if (!m) continue;
     for (const symbol of Object.keys(symbols || {})) {
       if (symbol === '__account_kill_switch__') continue;
+      if (symbol === '__portfolio__') continue;
       counts[m] = (counts[m] || 0) + 1;
     }
   }
@@ -357,6 +358,7 @@ function renderAssetTabs(store) {
   for (const [_, symbols] of Object.entries(store)) {
     for (const symbol of Object.keys(symbols || {})) {
       if (symbol === '__account_kill_switch__') continue;
+      if (symbol === '__portfolio__') continue;
       const c = assetClassOf(symbol);
       counts[c] = (counts[c] || 0) + 1;
     }
@@ -500,6 +502,105 @@ function renderLabComparison() {
       </thead>
       <tbody>${rowsHtml}</tbody>
     </table>`;
+}
+
+// Live-tab portfolio view: Coinbase-style Cash / Derivatives / Crypto sections.
+// Reads the __portfolio__ snapshot the backend writes into store on live sync
+// (main.py: _sync_live_portfolio). Each derivative row is clickable and opens
+// the strategy editor so the user can attach Model A/B/C/D/E to that position.
+function renderLivePortfolio() {
+  const liveTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
+  if (!liveTenant) return '';
+  const block = (currentStore[liveTenant] || {})['__portfolio__'];
+  const snap = block?.config;
+  if (!snap || !snap.cash) return '';
+
+  const cash = snap.cash || {};
+  const derivatives = snap.derivatives || [];
+  const crypto = snap.crypto || [];
+  const grand = Number(snap.grand_total) || 0;
+  const derivPnl = Number(snap.derivatives_unrealized) || 0;
+  const cryptoTotal = Number(snap.crypto_total) || 0;
+
+  const arrow = (v) => v > 0 ? '↗' : v < 0 ? '↘' : '';
+  const cls = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
+
+  const cashSection = `
+    <div class="pf-section">
+      <div class="pf-section-head">
+        <h4>Cash <span class="pf-total">${fmtMoney(cash.total || 0)}</span></h4>
+      </div>
+      <table class="pf-table">
+        <tbody>
+          <tr><td class="pf-name">USD</td><td class="mono">${fmtMoney(cash.usd_total || 0)}</td><td class="pf-alloc dim">${grand > 0 ? fmtNum((cash.usd_total / grand) * 100, 2) + '%' : '—'}</td></tr>
+          <tr class="pf-sub"><td class="pf-name">Primary USD balance</td><td class="mono">${fmtMoney(cash.primary_usd || 0)}</td><td></td></tr>
+          <tr class="pf-sub"><td class="pf-name">Derivatives USD balance</td><td class="mono">${fmtMoney(cash.derivatives_usd || 0)}</td><td></td></tr>
+          <tr class="pf-sub"><td class="pf-name">Predictions USD balance</td><td class="mono dim">${fmtMoney(cash.predictions_usd || 0)}</td><td></td></tr>
+          <tr><td class="pf-name">USDC</td><td class="mono">${fmtMoney(cash.usdc || 0)}</td><td class="pf-alloc dim">${grand > 0 ? fmtNum((cash.usdc / grand) * 100, 2) + '%' : '—'}</td></tr>
+        </tbody>
+      </table>
+    </div>`;
+
+  const derivRows = derivatives.map(d => {
+    const dcls = cls(d.unrealized || 0);
+    const sym = escapeHtml(d.product_id || '');
+    return `
+      <tr class="pf-deriv-row" data-action="open-live-strategy" data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}" title="Click to attach a Model / strategy">
+        <td class="pf-name"><b>${sym}</b></td>
+        <td class="mono ${dcls}">${arrow(d.unrealized)} ${fmtMoney(Math.abs(d.unrealized || 0))}</td>
+        <td>${escapeHtml(d.side || '')}</td>
+        <td class="mono">${d.qty}</td>
+        <td class="mono">$${fmtPrice(d.avg_entry || 0)}</td>
+        <td class="mono">$${fmtPrice(d.mark || 0)}</td>
+        <td class="mono">${d.liquidation_price > 0 ? '$' + fmtPrice(d.liquidation_price) : '—'}</td>
+        <td class="pf-add"><button class="small primary" data-action="open-live-strategy" data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}">+ Strategy</button></td>
+      </tr>`;
+  }).join('');
+  const derivSection = derivatives.length ? `
+    <div class="pf-section">
+      <div class="pf-section-head">
+        <h4>Derivatives <span class="pf-total ${cls(derivPnl)}">${arrow(derivPnl)} ${fmtMoney(Math.abs(derivPnl))}</span></h4>
+        <div class="dim">Click a row to attach Model A/B/C/D/E</div>
+      </div>
+      <table class="pf-table">
+        <thead><tr>
+          <th>Name</th><th>P&amp;L</th><th>Side</th><th>Amount</th>
+          <th>Avg Entry</th><th>Mark price</th><th>Est Liq Price</th><th></th>
+        </tr></thead>
+        <tbody>${derivRows}</tbody>
+      </table>
+    </div>` : '';
+
+  const cryptoRows = crypto.map(c => `
+    <tr>
+      <td class="pf-name"><b>${escapeHtml(c.currency)}</b></td>
+      <td class="mono">${fmtNum(c.balance, 6)}</td>
+      <td class="mono dim">${fmtNum(c.available, 6)}</td>
+      <td class="mono">$${fmtPrice(c.mark || 0)}</td>
+      <td class="mono">${fmtMoney(c.value_usd || 0)}</td>
+      <td class="mono dim">${fmtNum(c.allocation_pct || 0, 2)}%</td>
+    </tr>`).join('');
+  const cryptoSection = crypto.length ? `
+    <div class="pf-section">
+      <div class="pf-section-head">
+        <h4>Crypto <span class="pf-total">${fmtMoney(cryptoTotal)}</span></h4>
+      </div>
+      <table class="pf-table">
+        <thead><tr>
+          <th>Name</th><th>Balance</th><th>Available</th>
+          <th>Current price</th><th>Value</th><th>Allocation</th>
+        </tr></thead>
+        <tbody>${cryptoRows}</tbody>
+      </table>
+    </div>` : '';
+
+  return `
+    <div class="pf-summary">
+      <div class="pf-grand"><span class="dim">Portfolio total</span> <b>${fmtMoney(grand)}</b></div>
+    </div>
+    ${cashSection}
+    ${derivSection}
+    ${cryptoSection}`;
 }
 
 function renderCard(tenant, symbol, { config, state, snapshot }) {
@@ -1671,12 +1772,26 @@ async function refreshOnce() {
     }
   }
 
+  // Live tab: render the Coinbase-style portfolio overview (Cash / Derivatives
+  // / Crypto sections) at the top, above any individual strategy cards. Reads
+  // the __portfolio__ snapshot the paper worker writes to store on live sync.
+  if (activeMode === 'live') {
+    const pfHtml = renderLivePortfolio();
+    if (pfHtml) {
+      const pfEl = document.createElement('section');
+      pfEl.className = 'live-portfolio';
+      pfEl.innerHTML = pfHtml;
+      cardsEl.appendChild(pfEl);
+    }
+  }
+
   for (const tenant of tenants) {
     const m = modeOfTenant(tenant);
     if (activeMode && activeMode !== 'scanner' && m && m !== activeMode) continue;
     const symbols = Object.keys(currentStore[tenant] || {}).sort();
     for (const symbol of symbols) {
       if (symbol === '__account_kill_switch__') continue;
+      if (symbol === '__portfolio__') continue;
       if (activeAssetClass && assetClassOf(symbol) !== activeAssetClass) continue;
       cardsEl.appendChild(renderCard(tenant, symbol, currentStore[tenant][symbol]));
       anyRendered = true;
@@ -3559,6 +3674,17 @@ document.addEventListener('click', (e) => {
     e.target.hidden = true;
     return;
   }
+  // Live-portfolio derivative row: whole row is a click-target for opening the
+  // strategy editor on that product. Skip if the click was on a button inside
+  // the row — that has its own handler below.
+  const pfRow = e.target.closest('tr.pf-deriv-row');
+  if (pfRow && !e.target.closest('button')) {
+    const t = pfRow.dataset.tenant, s = pfRow.dataset.symbol;
+    if (t && s && pfRow.dataset.action === 'open-live-strategy') {
+      openSleeveEditor(t, s, null);
+      return;
+    }
+  }
   const btn = e.target.closest('button');
   if (!btn) return;
   if (btn.dataset.close !== undefined) {
@@ -3579,6 +3705,7 @@ document.addEventListener('click', (e) => {
     }
   }
   else if (action === 'add-sleeve') openSleeveEditor(tenant, symbol, null);
+  else if (action === 'open-live-strategy') openSleeveEditor(tenant, symbol, null);
   else if (action === 'add-sleeve-from-lot') openSleeveEditor(tenant, symbol, null, {
     entry_price: parseFloat(btn.dataset.lotEntry),
     qty: parseInt(btn.dataset.lotQty, 10),
