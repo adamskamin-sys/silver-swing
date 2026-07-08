@@ -2681,7 +2681,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       exit_mode: 'fixed_limit',
       profitDollarsFixed: 10,
       trailDistance: 0.10,
-      stopLoss: { enabled: true, price_below_buy: 1.5, qty_mode: 'all' },
+      stopLoss: { enabled: false, price_below_buy: 1.5, qty_mode: 'all' },
       note: 'Baseline / control. Fixed $10 swing + static stop-loss $1.50 below buy. No trail, no reanchor, no microstructure. Use to measure whether extras (Models B–E) actually help.',
     },
     'Model B — Defensive plus (ratchet + reanchor + volatility re-entry)': {
@@ -2695,7 +2695,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
@@ -2714,7 +2714,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
@@ -2734,7 +2734,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
@@ -2754,7 +2754,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: true, max_consecutive: 3,
       },
