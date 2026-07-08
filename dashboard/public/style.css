@@ -1720,3 +1720,15 @@ header { padding: 20px 32px; }
   color: var(--muted); line-height: 1.8; }
 .sleeve-expert-formulas b { color: var(--text); }
 .sleeve-expert .dim { opacity: 0.5; }
+
+.scanner-detail-live { display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; margin-top: 10px;
+  background: rgba(75, 184, 144, 0.08);
+  border-left: 3px solid var(--good); border-radius: 4px;
+  font-size: 13px; }
+.scanner-detail-live b { color: var(--text); }
+.scanner-detail-live button { margin-left: auto; }
+.live-back-btn { align-self: flex-start; margin-bottom: 12px;
+  background: transparent; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+.live-back-btn:hover { color: var(--text); border-color: var(--muted); }

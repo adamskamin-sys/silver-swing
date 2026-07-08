@@ -66,6 +66,7 @@ let pollHandle = null;
 let currentStore = {};          // last full /api/status
 let activeAssetClass = null;    // sidebar-tab filter
 let activeMode = 'paper';       // 'paper' | 'live' | null(all) — top-level mode tab
+let selectedLiveProduct = null; // when set on Live tab, only this product's card renders
 let configEditContext = null;   // {tenant, symbol} while modal open
 let killContext = null;         // {tenant, mode: 'activate'|'clear'} while modal open
 let strategyContext = null;     // {tenant, symbol, name} while modal open
@@ -1801,9 +1802,19 @@ async function refreshOnce() {
       if (symbol === '__portfolio__') continue;
       if (symbol === '__tuned_params__') continue;
       if (activeAssetClass && assetClassOf(symbol) !== activeAssetClass) continue;
+      // Live tab: drop the per-symbol cards from the flat render. The Coinbase-
+      // style portfolio table is the entry point; drilling into a specific
+      // product opens the scanner-detail modal (chart + trade + add strategy).
+      // No noise from 10 idle cards below the table.
+      if (m === 'live' && activeMode === 'live') continue;
       cardsEl.appendChild(renderCard(tenant, symbol, currentStore[tenant][symbol]));
       anyRendered = true;
     }
+  }
+  // Live-tab special case: if the portfolio table rendered, count that as
+  // "rendered" so we don't show the 'no state yet' empty-state.
+  if (activeMode === 'live' && cardsEl.querySelector('.live-portfolio')) {
+    anyRendered = true;
   }
   if (!anyRendered) {
     cardsEl.innerHTML = '<div class="field-value dim">no state yet — has the bot run?</div>';
@@ -3543,6 +3554,22 @@ function openScannerDetail(row) {
     ? `<div class="scanner-detail-specs">${specParts.join(' <span class="dim">·</span> ')}</div>`
     : '';
 
+  // When opened from a Live portfolio row, show the user's position + an
+  // "Attach strategy" button so they can jump straight into applying a Model.
+  const liveStrip = row._live_tenant ? `
+    <div class="scanner-detail-live">
+      You hold <b>${row._live_qty}</b> ${escapeHtml(row._live_side || 'LONG')} @ avg
+      <b class="mono">$${fmtNum(row._live_avg, 4)}</b>
+      <button class="small primary" id="scanner-detail-attach-strategy"
+              data-tenant="${escapeHtml(row._live_tenant)}"
+              data-symbol="${escapeHtml(row.product_id)}"
+              data-mark="${row.price}" data-avg="${row._live_avg}"
+              data-pos-qty="${row._live_qty}" data-side="${escapeHtml(row._live_side || '')}">
+        + Attach strategy (Model A/B/C/D/E)
+      </button>
+    </div>
+  ` : '';
+
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
@@ -3550,7 +3577,22 @@ function openScannerDetail(row) {
       <span class="scanner-detail-vol">24h range <b>${fmtNum(row.vol_pct, 2)}%</b></span>
     </div>
     ${specStrip}
+    ${liveStrip}
   `;
+  // Wire the attach-strategy button after innerHTML replaces the DOM node.
+  const attachBtn = document.getElementById('scanner-detail-attach-strategy');
+  if (attachBtn) {
+    attachBtn.onclick = () => {
+      const ctx = {
+        mark: Number(attachBtn.dataset.mark) || 0,
+        avg: Number(attachBtn.dataset.avg) || 0,
+        qty: Number(attachBtn.dataset.posQty) || 0,
+        side: attachBtn.dataset.side || '',
+      };
+      scannerDetailModal.hidden = true;
+      openSleeveEditor(attachBtn.dataset.tenant, attachBtn.dataset.symbol, null, null, ctx);
+    };
+  }
 
   // Timeframe buttons
   scannerDetailTimeframes.innerHTML = '';
@@ -3829,20 +3871,27 @@ document.addEventListener('click', (e) => {
     e.target.hidden = true;
     return;
   }
-  // Live-portfolio derivative row: whole row is a click-target for opening the
-  // strategy editor on that product. Skip if the click was on a button inside
-  // the row — that has its own handler below. Passes the row's mark/avg/qty
-  // as portfolioContext so the modal doesn't depend on __portfolio__ being in
-  // the store yet (which may lag boot-time or fail silently on cred issues).
+  // Live-portfolio derivative row: opens the product-detail modal (reuses
+  // the scanner-detail modal) which has the chart + Buy/Sell + Attach
+  // strategy button. Portfolio table stays as the entry point; a click
+  // drills into ONE product without cluttering the page with cards.
   const pfRow = e.target.closest('tr.pf-row');
   if (pfRow && !e.target.closest('button')) {
     const t = pfRow.dataset.tenant, s = pfRow.dataset.symbol;
-    if (t && s && pfRow.dataset.action === 'open-live-strategy') {
-      openSleeveEditor(t, s, null, null, {
-        mark: Number(pfRow.dataset.mark) || 0,
-        avg: Number(pfRow.dataset.avg) || 0,
-        qty: Number(pfRow.dataset.posQty) || 0,
-        side: pfRow.dataset.side || '',
+    if (t && s) {
+      const mark = Number(pfRow.dataset.mark) || 0;
+      const avg = Number(pfRow.dataset.avg) || 0;
+      const qty = Number(pfRow.dataset.posQty) || 0;
+      openScannerDetail({
+        product_id: s,
+        price: mark,
+        high_24h: mark,
+        low_24h: mark,
+        vol_pct: 0,
+        _live_tenant: t,
+        _live_avg: avg,
+        _live_qty: qty,
+        _live_side: pfRow.dataset.side || '',
       });
       return;
     }
