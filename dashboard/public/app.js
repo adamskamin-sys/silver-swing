@@ -3427,7 +3427,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       entry_ts: entryTs,
       trail_trigger: sellPx,
       trail_distance: usesTrail ? trailDistance : Math.max(0.02, (sellPx - buyPx) / 4),
-      trail_activation_px: exitEl.value === 'hybrid' ? trailActivation : (sellPx + 0.5),
+      // Auto-bump trail_activation above sell_px so the server's invariant
+      // (act > sell) always holds. Users hit save failures when they changed
+      // the sell target but the activation input was equal or below — this
+      // silently lifts it to sell + 0.05 rather than making them re-align.
+      trail_activation_px: exitEl.value === 'hybrid'
+        ? (trailActivation > sellPx ? trailActivation : sellPx + 0.05)
+        : (sellPx + 0.5),
       hybrid_delay_secs: exitEl.value === 'hybrid' ? hybridDelay : 5.0,
       reanchor_threshold: draft.reanchor_threshold,
       accumulate_enabled: accumulateEnabled,
@@ -3459,7 +3465,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
     if (usesTrail && !(trailDistance > 0)) { errEl.hidden = false; errEl.innerHTML = 'Trail distance must be > 0'; return; }
     if (exitEl.value === 'hybrid') {
-      if (!(trailActivation > sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Trail activation must be above the sell target'; return; }
+      // trail_activation is auto-lifted above sell_px in the patch above, so
+      // no need to gate the save on it here. Only guard the delay.
       if (!(hybridDelay >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Delay must be at least 1 second'; return; }
     }
     if (stopLossEnabled) {
