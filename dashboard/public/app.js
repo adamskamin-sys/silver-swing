@@ -3997,7 +3997,7 @@ function openScannerDetail(row) {
             const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
             if (peak > 0 && trailDist > 0) {
               const effectiveStop = peak - trailDist;
-              trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">peak $${fmtPrice(peak)}</span></span>`;
+              trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">$${fmtPrice(peak)}</span></span>`;
             } else if (armPx > 0) {
               trailCell = `<span class="mono trail-pill-off" title="Not yet activated — trail arms once price crosses $${fmtPrice(armPx)}">$${fmtPrice(armPx)}</span>`;
             }
@@ -4201,7 +4201,7 @@ function refreshScannerDetailLive() {
         const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
         if (peak > 0 && trailDist > 0) {
           const effectiveStop = peak - trailDist;
-          trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">peak $${fmtPrice(peak)}</span></span>`;
+          trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">$${fmtPrice(peak)}</span></span>`;
         } else if (armPx > 0) {
           trailCell = `<span class="mono trail-pill-off" title="Not yet activated — trail arms once price crosses $${fmtPrice(armPx)}">$${fmtPrice(armPx)}</span>`;
         }
