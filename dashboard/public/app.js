@@ -696,7 +696,7 @@ function renderLivePortfolio() {
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table>
-    <div class="pf-hint dim">Click a row to attach Model A/B/C/D/E · auto-refreshes every 2 min</div>
+    <div class="pf-hint dim">Click a row to attach Model B/C/D/E · auto-refreshes every 2 min</div>
     <div id="live-tradeable" class="live-tradeable">
       <div class="live-tradeable-head">Add a position — all tradeable derivatives</div>
       <div class="live-tradeable-body dim">loading…</div>
@@ -2672,20 +2672,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // Five head-to-head strategy models — designed to run side-by-side in the
   // Lab tenant so you can compare which combination of features actually
   // makes money on live silver data. Same base $10-net-swing math, layered
-  // additions. Model A is the control (what you had before).
+  // additions. Model A (fixed-limit control) was removed at Adam's request —
+  // it sells at target and misses breakouts, so it's not a strategy he'd want
+  // to run live. Remaining Models all use hybrid mode with a trail so
+  // they capture upside continuation.
   const PRESETS = {
-    'Model A — $10 net swing (baseline)': {
-      // Control: pure fixed limit with a static stop-loss. Nothing fancy.
-      // Any Model B–E outperforming this proves the added features are
-      // adding value; matching this means the extras are noise.
-      exit_mode: 'fixed_limit',
-      profitDollarsFixed: 10,
-      trailDistance: 0.10,
-      stopLoss: { enabled: false, price_below_buy: 1.5, qty_mode: 'all' },
-      note: 'Baseline / control. Fixed $10 swing + static stop-loss $1.50 below buy. No trail, no reanchor, no microstructure. Use to measure whether extras (Models B–E) actually help.',
-    },
     'Model B — Defensive plus (ratchet + reanchor + volatility re-entry)': {
-      // Everything Model A has PLUS: ratcheting stop-loss (preserves gains),
+      // Everything the removed baseline had PLUS: ratcheting stop-loss (preserves gains),
       // auto-reanchor on stalled buy, volatility-contraction re-entry after
       // stop. This is the "expert stack" from the methodology discussion.
       exit_mode: 'hybrid',
@@ -2701,7 +2694,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       },
       reanchorThreshold: 0.75,
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
-      note: 'Model A + moderate hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + reanchor on stalled buy + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore.',
+      note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + reanchor on stalled buy + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore.',
     },
     'Model C — Microstructure-informed': {
       // Model B + sleeve-level microstructure gates. Uses OBI (order book

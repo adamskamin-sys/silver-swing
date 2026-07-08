@@ -194,18 +194,18 @@ def main() -> int:
 
 
 # ============================================================================
-# Model A–E configs for compare_all — mirrors dashboard PRESETS
+# Model B–E configs for compare_all — mirrors dashboard PRESETS
 # ============================================================================
-# Each Model overrides fields on the default cfg. Keys prefixed with "_" are
-# meta-flags handled in execute() (not passed into SwingConfig):
+# Model A (fixed_limit control) was removed at Adam's request — it caps upside
+# by selling at the target and misses breakouts, so we don't run it live or
+# benchmark against it. Each Model overrides fields on the default cfg. Keys
+# prefixed with "_" are meta-flags handled in execute() (not passed into
+# SwingConfig):
 #   _skip_blackouts  — filter candles inside news-event windows before running
 #   _note            — appended to the result so the leaderboard row shows why
 #                      this Model may match another (e.g. microstructure gates
 #                      require live book data and can't be simulated).
 _MODEL_CONFIGS: dict[str, dict] = {
-    "Model A — $10 baseline (fixed limit)": {
-        "exit_mode": "fixed_limit",
-    },
     "Model B — Defensive plus (trail + reanchor)": {
         "exit_mode": "trailing_stop",
         "trail_distance": 0.15,

@@ -151,9 +151,9 @@ def _seed_lab_comparison_sleeves(store, tenant: str, symbol: str) -> None:
         "stop_loss_qty_mode": "all",
         "stop_loss_qty_custom": 0,
     }
+    # Model A (fixed_limit baseline) removed at Adam's request — see PRESETS
+    # in app.js for the same rationale (caps upside, misses breakouts).
     models = [
-        {**base, "id": "model_a", "name": "Model A — Baseline",
-         "exit_mode": "fixed_limit", "stop_loss_enabled": True},
         {**base, "id": "model_b", "name": "Model B — Defensive Plus",
          "exit_mode": "hybrid",
          "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
