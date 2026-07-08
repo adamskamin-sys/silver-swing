@@ -3396,7 +3396,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     // preserve on edits so the historical basis doesn't reset when you tweak
     // targets. Existing pre-stamp sleeves get backfilled with current mark.
     const existingEntryMark = existing ? Number(draft.entry_mark) : 0;
-    const entryMark = existingEntryMark > 0 ? existingEntryMark : (Number(mark) || 0);
+    let entryMark = existingEntryMark > 0 ? existingEntryMark : (Number(mark) || 0);
+    // If qty INCREASED on an existing sleeve, the newly-added contracts enter
+    // at the current mark (they weren't part of the original entry). Weighted-
+    // average old-qty at old-basis + added-qty at current-mark so the sleeve's
+    // unrealized doesn't multiply by qty. If qty decreased, keep basis as-is.
+    const newQty = parseInt(qtyEl.value, 10);
+    const oldQty = existing ? (Number(draft.qty) || 0) : 0;
+    if (existing && newQty > oldQty && oldQty > 0 && existingEntryMark > 0 && mark > 0) {
+      const added = newQty - oldQty;
+      entryMark = (oldQty * existingEntryMark + added * mark) / newQty;
+    }
     const entryTs = existing && Number(draft.entry_ts) > 0
       ? Number(draft.entry_ts)
       : Math.floor(Date.now() / 1000);
