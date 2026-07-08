@@ -3397,15 +3397,21 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     // targets. Existing pre-stamp sleeves get backfilled with current mark.
     const existingEntryMark = existing ? Number(draft.entry_mark) : 0;
     let entryMark = existingEntryMark > 0 ? existingEntryMark : (Number(mark) || 0);
+    // Read qty ONCE, coerce blank/invalid to existing.qty (edit) or 1 (new).
+    // Users hit "Contracts must be at least 1" when they cleared the input
+    // while just trying to change the preset — auto-fill instead of erroring.
+    const rawQty = parseInt(qtyEl.value, 10);
+    const safeQty = Number.isFinite(rawQty) && rawQty >= 1
+      ? rawQty
+      : (existing ? Number(existing.qty) || 1 : 1);
     // If qty INCREASED on an existing sleeve, the newly-added contracts enter
     // at the current mark (they weren't part of the original entry). Weighted-
     // average old-qty at old-basis + added-qty at current-mark so the sleeve's
     // unrealized doesn't multiply by qty. If qty decreased, keep basis as-is.
-    const newQty = parseInt(qtyEl.value, 10);
     const oldQty = existing ? (Number(draft.qty) || 0) : 0;
-    if (existing && newQty > oldQty && oldQty > 0 && existingEntryMark > 0 && mark > 0) {
-      const added = newQty - oldQty;
-      entryMark = (oldQty * existingEntryMark + added * mark) / newQty;
+    if (existing && safeQty > oldQty && oldQty > 0 && existingEntryMark > 0 && mark > 0) {
+      const added = safeQty - oldQty;
+      entryMark = (oldQty * existingEntryMark + added * mark) / safeQty;
     }
     const entryTs = existing && Number(draft.entry_ts) > 0
       ? Number(draft.entry_ts)
@@ -3413,7 +3419,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const patch = {
       id: draft.id,
       name: nameEl.value || draft.id,
-      qty: parseInt(qtyEl.value, 10),
+      qty: safeQty,
       exit_mode: exitEl.value,
       sell_px: sellPx,
       buy_px: buyPx,
