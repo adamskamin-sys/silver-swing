@@ -1776,5 +1776,10 @@ header { padding: 20px 32px; }
 .scanner-detail-sleeves-table th:nth-child(8),
 .scanner-detail-sleeves-table td:nth-child(8) { width: 11%; text-align: right; }
 
-/* Scanner-detail modal — widen so the sleeves table + trade sidebar fit. */
-#scanner-detail-modal .modal-panel { max-width: 1400px; width: 95vw; }
+/* Scanner-detail modal — fill the viewport so the chart + attached
+   strategies table + trade sidebar all fit without scrolling around. */
+#scanner-detail-modal .modal-panel {
+  max-width: none; width: 96vw;
+  max-height: 96vh; height: 96vh;
+  min-width: 0;
+}
