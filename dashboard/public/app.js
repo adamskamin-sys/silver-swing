@@ -596,8 +596,17 @@ function renderLivePortfolio() {
       });
     }
     for (const c of snap.crypto || []) {
+      // Filter dust — anything under $1 USD is round-off from prior trades
+      // and just clutters the portfolio (Coinbase returns dust as scientific
+      // notation like 3.26e-10 BTC which renders as noise).
+      if (Number(c.value_usd) < 1) continue;
+      // Use product_id (BTC-USD) as the row's product, not the raw currency
+      // code (BTC). Chart + get_product endpoints all need the -USD suffix.
+      // Display name still shows the pretty currency code.
       rows.push({
-        kind: 'spot', product: c.currency, side: '', qty: c.balance,
+        kind: 'spot', product: c.product_id || `${c.currency}-USD`,
+        display: c.currency,
+        side: '', qty: c.balance,
         avg: 0, mark: c.mark, pnl: 0, liq: 0, value: c.value_usd,
       });
     }
@@ -650,7 +659,7 @@ function renderLivePortfolio() {
     const sym = escapeHtml(r.product || '');
     const displayName = escapeHtml(r.kind === 'futures'
       ? prettyProductName(r.product || '')
-      : (r.product || ''));
+      : (r.display || r.product || ''));
     const dcls = cls(r.pnl || 0);
     const pnlText = r.kind === 'spot'
       ? `<span class="dim">${fmtMoney(r.value || 0)}</span>`
