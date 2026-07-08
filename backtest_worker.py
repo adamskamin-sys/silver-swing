@@ -143,18 +143,29 @@ def _handle_candles_job(r, job_id: str) -> None:
         req = json.loads(raw)
         product_id = req["product_id"]
         granularity = req.get("granularity", "FIVE_MINUTE")
+        # Sub-day windows pass `minutes`; day-scale windows pass `days`. Prefer
+        # minutes when both somehow arrive.
+        minutes = req.get("minutes")
         days = int(req.get("days", 7))
     except Exception as e:
         r.set(res_key, json.dumps({"ok": False, "error": f"bad request: {e}"}), ex=_RESULT_TTL_SECS)
         r.delete(req_key)
         return
 
-    cache_key = f"{_CANDLES_CACHE}{product_id}:{granularity}:{days}"
+    if minutes is not None:
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError):
+            minutes = None
+
+    range_key = f"m{minutes}" if minutes is not None else f"d{days}"
+    cache_key = f"{_CANDLES_CACHE}{product_id}:{granularity}:{range_key}"
+    window_label = f"{minutes}m" if minutes is not None else f"{days}d"
     cached = r.get(cache_key)
     if cached:
         r.set(res_key, cached, ex=_RESULT_TTL_SECS)
         r.delete(req_key)
-        _log(f"candles {job_id}: cache hit {product_id} {days}d {granularity}")
+        _log(f"candles {job_id}: cache hit {product_id} {window_label} {granularity}")
         return
 
     started = time.time()
@@ -162,22 +173,26 @@ def _handle_candles_job(r, job_id: str) -> None:
         from backtest import fetch_candles
         client = _get_coinbase_client()
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=days)
+        start = end - (timedelta(minutes=minutes) if minutes is not None else timedelta(days=days))
         candles = fetch_candles(client, product_id, start, end, granularity=granularity)
         # Compact form: [ts, open, high, low, close] tuples. Skip volume for size.
         packed = [[c.ts, c.open, c.high, c.low, c.close] for c in candles]
-        payload = json.dumps({
+        result_payload = {
             "ok": True,
             "product_id": product_id,
             "granularity": granularity,
-            "days": days,
             "candles": packed,
             "generated_at": time.time(),
-        })
+        }
+        if minutes is not None:
+            result_payload["minutes"] = minutes
+        else:
+            result_payload["days"] = days
+        payload = json.dumps(result_payload)
         r.set(res_key, payload, ex=_RESULT_TTL_SECS)
         r.set(cache_key, payload, ex=_CANDLES_CACHE_TTL_SECS)
         r.delete(req_key)
-        _log(f"candles {job_id}: {product_id} {days}d {granularity} → {len(packed)} bars ({time.time()-started:.1f}s)")
+        _log(f"candles {job_id}: {product_id} {window_label} {granularity} → {len(packed)} bars ({time.time()-started:.1f}s)")
     except Exception as e:
         r.set(res_key, json.dumps({
             "ok": False,

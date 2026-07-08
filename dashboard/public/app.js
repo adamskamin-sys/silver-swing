@@ -3855,9 +3855,12 @@ let scannerDetailContext = null;
 let scannerChartWindow = { days: 1, granularity: 'FIVE_MINUTE' };
 
 const TIMEFRAMES = [
-  { label: '1D', days: 1,  granularity: 'FIVE_MINUTE' },
-  { label: '7D', days: 7,  granularity: 'FIVE_MINUTE' },
-  { label: '30D', days: 30, granularity: 'ONE_HOUR' },
+  { label: '5m',  minutes: 5,   granularity: 'ONE_MINUTE' },
+  { label: '30m', minutes: 30,  granularity: 'ONE_MINUTE' },
+  { label: '1H',  minutes: 60,  granularity: 'FIVE_MINUTE' },
+  { label: '1D',  days: 1,      granularity: 'FIVE_MINUTE' },
+  { label: '7D',  days: 7,      granularity: 'FIVE_MINUTE' },
+  { label: '30D', days: 30,     granularity: 'ONE_HOUR' },
 ];
 
 function openScannerDetail(row) {
@@ -4078,10 +4081,15 @@ function openScannerDetail(row) {
   for (const tf of TIMEFRAMES) {
     const b = document.createElement('button');
     b.type = 'button';
-    b.className = 'timeframe-btn' + (tf.days === scannerChartWindow.days ? ' active' : '');
+    const isActive = tf.minutes != null
+      ? tf.minutes === scannerChartWindow.minutes
+      : tf.days === scannerChartWindow.days && scannerChartWindow.minutes == null;
+    b.className = 'timeframe-btn' + (isActive ? ' active' : '');
     b.textContent = tf.label;
     b.onclick = () => {
-      scannerChartWindow = { days: tf.days, granularity: tf.granularity };
+      scannerChartWindow = tf.minutes != null
+        ? { minutes: tf.minutes, granularity: tf.granularity }
+        : { days: tf.days, granularity: tf.granularity };
       scannerDetailTimeframes.querySelectorAll('.timeframe-btn').forEach(x => x.classList.remove('active'));
       b.classList.add('active');
       loadScannerChart();
@@ -4469,10 +4477,11 @@ document.getElementById('scanner-limit-price')?.addEventListener('input', update
 async function loadScannerChart() {
   if (!scannerDetailContext) return;
   const { product_id } = scannerDetailContext;
-  const { days, granularity } = scannerChartWindow;
+  const { days, minutes, granularity } = scannerChartWindow;
   scannerDetailChart.innerHTML = '<div class="chart-status">loading candles…</div>';
   try {
-    const resp = await fetch(`/api/candles?product_id=${encodeURIComponent(product_id)}&days=${days}&granularity=${granularity}`, { credentials: 'same-origin' });
+    const rangeParam = minutes != null ? `minutes=${minutes}` : `days=${days}`;
+    const resp = await fetch(`/api/candles?product_id=${encodeURIComponent(product_id)}&${rangeParam}&granularity=${granularity}`, { credentials: 'same-origin' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     if (!data.ok) throw new Error(data.error || 'unknown error');

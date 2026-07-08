@@ -617,12 +617,20 @@ export function makeApp({
   app.get('/api/candles', requireAuth, async (req, res) => {
     const product_id = String(req.query.product_id || '');
     const granularity = String(req.query.granularity || 'FIVE_MINUTE');
-    const days = Math.max(1, Math.min(30, parseInt(req.query.days || '7', 10)));
+    // Sub-day windows use `minutes` (5, 30, 60). Day-scale windows use `days`
+    // (1, 7, 30). Frontend passes exactly one; server prefers minutes if set.
+    const minutesRaw = req.query.minutes;
+    const payload = { product_id, granularity };
+    if (minutesRaw != null) {
+      payload.minutes = Math.max(1, Math.min(1440, parseInt(minutesRaw, 10)));
+    } else {
+      payload.days = Math.max(1, Math.min(30, parseInt(req.query.days || '7', 10)));
+    }
     if (!product_id) return res.status(400).json({ ok: false, error: 'product_id required' });
     const r = await getRedis();
     if (!r) return res.status(503).json({ ok: false, error: 'redis not configured' });
     try {
-      const result = await fetchCandlesViaRedis(r, { product_id, granularity, days });
+      const result = await fetchCandlesViaRedis(r, payload);
       res.json(result);
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
