@@ -2895,8 +2895,20 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const targetNet = Number(profitEl.value);
     const grossNeeded = targetNet + feesTotal;
     const spread = grossNeeded / (qty * contractSize);
-    sellTargetEl.value = (currentAnchor + spread / 2).toFixed(3);
+    // Preserve the current activation-above-sell offset so a user who set a
+    // wider offset (e.g. +$0.50) keeps it as sell target moves. Default to
+    // $0.10 when the offset is zero or negative (fresh state / preset default).
+    const prevSellPx = Number(sellTargetEl.value) || currentAnchor;
+    const prevActivation = Number(trailActivationEl?.value) || prevSellPx;
+    const activationOffset = Math.max(0.005, prevActivation - prevSellPx || 0.10);
+    const newSellPx = currentAnchor + spread / 2;
+    sellTargetEl.value = newSellPx.toFixed(3);
     buyTargetEl.value = (currentAnchor - spread / 2).toFixed(3);
+    // Auto-slide trail activation up with the sell target so the invariant
+    // "activation > sell target" always holds — no manual re-edit needed.
+    if (trailActivationEl) {
+      trailActivationEl.value = (newSellPx + activationOffset).toFixed(3);
+    }
   }
 
   function updateFillPct(el) {
