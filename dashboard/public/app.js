@@ -3835,7 +3835,7 @@ const scannerBuyBtn = document.getElementById('scanner-buy-btn');
 // {product_id, price, high_24h, low_24h, vol_pct, volume_24h}
 let scannerDetailContext = null;
 // {days, granularity}
-let scannerChartWindow = { days: 7, granularity: 'FIVE_MINUTE' };
+let scannerChartWindow = { days: 1, granularity: 'FIVE_MINUTE' };
 
 const TIMEFRAMES = [
   { label: '1D', days: 1,  granularity: 'FIVE_MINUTE' },
@@ -3845,7 +3845,7 @@ const TIMEFRAMES = [
 
 function openScannerDetail(row) {
   scannerDetailContext = row;
-  scannerChartWindow = { days: 7, granularity: 'FIVE_MINUTE' };
+  scannerChartWindow = { days: 1, granularity: 'FIVE_MINUTE' };
   scannerDetailTitle.textContent = prettyProductName(row.product_id);
   // Default the mode chooser to whatever tab the user's on if it's meaningful,
   // else fall back to paper (safer default for accidental clicks).
@@ -3912,6 +3912,7 @@ function openScannerDetail(row) {
       <div class="scanner-detail-sleeves-head">Attached strategies (${liveSleeves.length})</div>
       <table class="scanner-detail-sleeves-table">
         <thead><tr><th>Name</th><th>Contracts</th><th title="Your position's weighted-avg cost for the underlying contracts">Pos Avg</th><th title="Price at which THIS strategy was attached">Entry</th><th>Sell</th><th>Buy</th>
+          <th title="Effective stop-loss price. If the ratchet is armed and above the base stop, this shows the ratcheted floor.">Stop Loss</th>
           <th>Cycles</th><th>Unrealized</th><th>Realized</th><th>State</th><th></th></tr></thead>
         <tbody>
         ${liveSleeves.map(s => {
@@ -3941,6 +3942,27 @@ function openScannerDetail(row) {
           }
           const entryPx = Number(s.entry_mark) || 0;
           const posAvgPx = Number(row._live_avg) || 0;
+          // Effective stop-loss: base is stop_loss_px, but if the ratchet is
+          // enabled AND armed (hwm exists), the floor lifts to hwm − distance.
+          // Show whichever is higher — that's what the trader will actually
+          // fire on. Ratchet+base bracket the same event; showing max means
+          // you always see the closer trigger.
+          let stopCell = '<span class="dim">off</span>';
+          if (s.stop_loss_enabled) {
+            const baseStop = Number(s.stop_loss_px) || 0;
+            const hwm = Number(ss.stop_loss_hwm) || 0;
+            const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
+            const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0)
+              ? hwm - ratchetDist
+              : 0;
+            const effective = Math.max(baseStop, ratchetedFloor);
+            if (effective > 0) {
+              const ratcheted = ratchetedFloor > baseStop;
+              stopCell = ratcheted
+                ? `<span class="mono" title="Ratchet armed — floor lifted from base $${fmtPrice(baseStop)} to $${fmtPrice(effective)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">$${fmtPrice(effective)} <span class="sl-ratchet-badge">↑</span></span>`
+                : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
+            }
+          }
           // Halt reason lives on the product-level state (not per-sleeve) when
           // the state machine crashes out (abort_below, reconcile). Show it as
           // a tooltip on the HALTED pill so Adam knows why to click Resume.
@@ -3963,6 +3985,7 @@ function openScannerDetail(row) {
             <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
             <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
+            <td class="mono">${stopCell}</td>
             <td class="mono">${Number(ss.cycles) || 0}</td>
             <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
             <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
