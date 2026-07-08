@@ -3526,20 +3526,10 @@ async function deleteSleeve(tenant, symbol, sleeveId) {
   } else {
     if (!confirm(`Delete strategy ${sleeveId}? Any live order it holds will be cancelled next tick.`)) return;
   }
-  const block = currentStore[tenant]?.[symbol] || {};
-  // Sanitize remaining sleeves so a bad stored value on someone else doesn't
-  // block THIS delete. Most common: exit_mode=hybrid with
-  // trail_activation_px <= sell_px (from before the auto-lift fix). Bump it.
-  const sleeves = (block.config?.sleeves || [])
-    .filter(s => s.id !== sleeveId)
-    .map(s => {
-      if (s.exit_mode !== 'hybrid') return s;
-      const sell = Number(s.sell_px) || 0;
-      const act = Number(s.trail_activation_px) || 0;
-      if (sell > 0 && act <= sell) return { ...s, trail_activation_px: sell + 0.05 };
-      return s;
-    });
-  const res = await putJson('/api/sleeves', { tenant, symbol, sleeves });
+  // Dedicated delete endpoint — server just filters out the target id and
+  // writes without re-validating survivors. That way a bad stored field on
+  // some OTHER sleeve doesn't block this delete.
+  const res = await postJson('/api/sleeves/delete', { tenant, symbol, sleeve_id: sleeveId });
   if (res._unauthorized) { showLogin(); return; }
   if (res.ok) { refreshOnce(); showToast('strategy deleted', 'info'); }
   else {

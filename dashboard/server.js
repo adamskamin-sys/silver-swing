@@ -461,6 +461,36 @@ export function makeApp({
     }
   });
 
+  // --- delete one sleeve without re-validating the survivors --------------
+  // The regular PUT /api/sleeves re-validates every sleeve in the payload,
+  // so if a survivor has a bad stored field (e.g. old max_qty < new qty,
+  // stop_px >= buy_px from a pre-migration save) the whole delete is rejected.
+  // This endpoint pulls the current array, removes the target id, writes it
+  // back — no validation. Bad survivors keep working; only the target dies.
+  app.post('/api/sleeves/delete', requireAuth, async (req, res) => {
+    const { tenant, symbol, sleeve_id } = req.body || {};
+    if (!tenant || !symbol || !sleeve_id) {
+      return res.status(400).json({ ok: false, error: 'tenant, symbol, sleeve_id required' });
+    }
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      const cfg = store[tenant][symbol].config || {};
+      const before = (cfg.sleeves || []).length;
+      cfg.sleeves = (cfg.sleeves || []).filter(s => s.id !== sleeve_id);
+      const removed = before - cfg.sleeves.length;
+      if (removed === 0) {
+        return res.json({ ok: true, removed: 0, message: 'sleeve not found' });
+      }
+      store[tenant][symbol].config = cfg;
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, removed });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/positions', requireAuth, async (req, res) => {
     // Read lots straight from the snapshot (paper broker writes them there
     // every ~5s). No enrichment here — the snapshot already carries mark and
