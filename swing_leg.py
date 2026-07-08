@@ -562,6 +562,13 @@ class SwingTrader:
     def _ensure_armed(self, current_price: float) -> None:
         if self.s.live_order_id or self.s.state == State.HALTED:
             return
+        # Primary strategy disabled: swing_qty=0 means sleeves own the whole
+        # position (Live tenant, Lab tenant, sleeve-only paper configs).
+        # Without this guard, ARMED_SELL fires SellDirective(qty=0, price=0.0),
+        # which PaperBroker accepts silently but CoinbaseBroker rejects with
+        # INVALID_LIMIT_PRICE, taking the worker down on every tick.
+        if self.s.swing_qty <= 0:
+            return
         pos = self.b.position_qty()
         strat = self._exit_strategy()
         if self.s.state == State.ARMED_SELL:
