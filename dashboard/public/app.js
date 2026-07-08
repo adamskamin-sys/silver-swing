@@ -2496,30 +2496,43 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // other. anchor = the default (initially selected) value; anchorAlt = the
   // OTHER option shown next to it. When neither purchased-at nor
   // strategy's-original is applicable, only Current market is offered.
+  // Anchor choices: up to three buttons, showing whichever are distinct enough
+  // to be meaningful. In edit mode Adam wants to see BOTH the current market
+  // AND his contract avg (so he can retarget the sleeve around whichever one
+  // makes sense right now). If the sleeve has a stamped entry_mark from when
+  // the strategy was originally attached, expose that too — it's the natural
+  // "keep original targets relative to strategy entry" pick.
+  const existingSleeveForAnchor = sleeveId ? (cfg.sleeves || []).find(s => s.id === sleeveId) : null;
+  const strategyEntryMark = Number(existingSleeveForAnchor?.entry_mark) || 0;
+  const strategyEntryTs = Number(existingSleeveForAnchor?.entry_ts) || 0;
+  const anchorChoices = [];
+  const pushChoice = (label, value) => {
+    if (!(value > 0)) return;
+    if (anchorChoices.some(c => Math.abs(c.value - value) < 0.001)) return;  // dedupe near-identical
+    anchorChoices.push({ label, value });
+  };
+  if (lotContext) {
+    pushChoice('Purchased price', Number(lotContext.entry_price));
+    pushChoice('Current market', mark);
+  } else if (existingSleeveForAnchor) {
+    pushChoice('Current market', mark);
+    pushChoice('Your contract avg', posAvgEntry);
+    pushChoice('Strategy entry', strategyEntryMark);
+  } else {
+    pushChoice('Current market', mark);
+    pushChoice('Your contract avg', posAvgEntry);
+  }
+  // Default anchor: for edits, keep the sleeve's original buy_px behavior
+  // (users' targets shouldn't jump around on re-open). For new / from-lot,
+  // use the first choice.
   let anchor;
   let anchorLabel;
-  let anchorAlt = null;
-  let anchorAltLabel = null;
   if (lotContext) {
     anchor = Number(lotContext.entry_price) || mark;
-    anchorLabel = "Purchased price";
-    anchorAlt = mark;
-    anchorAltLabel = 'Current market';
-  } else if (sleeveId) {
-    const existingSleeve = (cfg.sleeves || []).find(s => s.id === sleeveId);
-    anchor = existingSleeve ? Number(existingSleeve.buy_px) || mark : mark;
+    anchorLabel = 'Purchased price';
+  } else if (existingSleeveForAnchor) {
+    anchor = Number(existingSleeveForAnchor.buy_px) || mark;
     anchorLabel = "Strategy's original entry";
-    anchorAlt = mark;
-    anchorAltLabel = 'Current market';
-  } else if (posAvgEntry > 0 && Math.abs(posAvgEntry - mark) > 0.001) {
-    // For fresh strategies with an existing position, offer the position's
-    // weighted-avg entry price as the "purchased at" alternative. Lets the
-    // user swing around what they actually paid instead of forcing the anchor
-    // to today's mark.
-    anchor = mark;
-    anchorLabel = 'Current market';
-    anchorAlt = posAvgEntry;
-    anchorAltLabel = 'Your avg purchase price';
   } else {
     anchor = mark;
     anchorLabel = 'Current market';
@@ -2743,19 +2756,20 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       <div class="sleeve-anchor ${anchorStale ? 'stale' : ''}">
         <div class="sleeve-anchor-title">Anchor the strategy around</div>
         <div class="sleeve-anchor-toggle" role="tablist">
-          ${anchorAlt !== null ? `
-            <button type="button" class="anchor-choice ${anchor === anchorAlt ? 'active' : ''}" id="sl-anchor-alt"
-                    data-anchor="${anchorAlt}">
-              <span class="anchor-choice-label">${anchorAltLabel}</span>
-              <span class="anchor-choice-value">$${fmtPrice(anchorAlt)}</span>
+          ${anchorChoices.map((c, i) => `
+            <button type="button" class="anchor-choice ${Math.abs(anchor - c.value) < 0.001 ? 'active' : ''}"
+                    data-anchor-idx="${i}" data-anchor="${c.value}">
+              <span class="anchor-choice-label">${escapeHtml(c.label)}</span>
+              <span class="anchor-choice-value">$${fmtPrice(c.value)}</span>
             </button>
-          ` : ''}
-          <button type="button" class="anchor-choice ${anchor === mark ? 'active' : ''}" id="sl-anchor-market"
-                  data-anchor="${mark}">
-            <span class="anchor-choice-label">Current market</span>
-            <span class="anchor-choice-value">$${fmtPrice(mark)}</span>
-          </button>
+          `).join('')}
         </div>
+        ${strategyEntryMark > 0 && existingSleeveForAnchor ? `
+          <div class="sleeve-anchor-sub">
+            <span class="dim">Strategy originally entered at</span>
+            <b class="mono">$${fmtPrice(strategyEntryMark)}</b>
+            ${strategyEntryTs > 0 ? `<span class="dim">on ${new Date(strategyEntryTs * 1000).toLocaleString()}</span>` : ''}
+          </div>` : ''}
         ${anchorStale ? `
           <div class="sleeve-anchor-sub">
             <span class="stale-warn">Selected anchor is $${fmtPrice(anchorToMarketDist)} away from current market — targets below may be off-market</span>
@@ -2926,8 +2940,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   const buyTargetEl = m.querySelector('#sl-buy-target');
   const trailActivationEl = m.querySelector('#sl-trail-activation');
   const hybridDelayEl = m.querySelector('#sl-hybrid-delay');
-  const anchorMarketBtn = m.querySelector('#sl-anchor-market');
-  const anchorAltBtn = m.querySelector('#sl-anchor-alt');
+  const anchorChoiceBtns = Array.from(m.querySelectorAll('.anchor-choice'));
   const accumulateToggle = m.querySelector('#sl-accumulate');
   const accumulateFields = m.querySelector('#sl-accumulate-fields');
   if (accumulateToggle && accumulateFields) {
@@ -3237,17 +3250,15 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   if (hybridDelayEl) hybridDelayEl.addEventListener('input', updatePreview);
   function setAnchor(newAnchor, activeBtn) {
     currentAnchor = newAnchor;
-    // Toggle the .active class on the two choice buttons so the user can
-    // always see which anchor is in play. Both buttons remain visible so the
-    // choice is reversible.
-    if (anchorMarketBtn) anchorMarketBtn.classList.toggle('active', activeBtn === anchorMarketBtn);
-    if (anchorAltBtn) anchorAltBtn.classList.toggle('active', activeBtn === anchorAltBtn);
+    // Toggle .active across all anchor choice buttons so the user can see
+    // which one is in play. All remain visible so the choice is reversible.
+    for (const b of anchorChoiceBtns) b.classList.toggle('active', b === activeBtn);
     syncTargetsFromSlider();
     updatePreview();
   }
-  if (anchorMarketBtn) anchorMarketBtn.onclick = () => setAnchor(mark, anchorMarketBtn);
-  if (anchorAltBtn) anchorAltBtn.onclick = () =>
-    setAnchor(Number(anchorAltBtn.dataset.anchor), anchorAltBtn);
+  for (const b of anchorChoiceBtns) {
+    b.onclick = () => setAnchor(Number(b.dataset.anchor), b);
+  }
 
   // Initial state
   if (!existing) applyPreset(presetEl.value);
