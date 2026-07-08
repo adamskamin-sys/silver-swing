@@ -1941,35 +1941,52 @@ header { padding: 20px 32px; }
 .scanner-detail-sleeves-table .pos { color: var(--good); }
 .scanner-detail-sleeves-table .neg { color: var(--bad); }
 /* Column widths (must sum to 100%): Name / Contracts / Pos Avg / Entry /
-   Sell / Buy / Stop Loss / Cycles / Unrealized / Realized / State / Actions */
+   Sell / Buy / Stop Loss / Trail / Cycles / Unrealized / Realized / State / Actions */
 .scanner-detail-sleeves-table th:nth-child(1),
-.scanner-detail-sleeves-table td:nth-child(1) { width: 14%; }
+.scanner-detail-sleeves-table td:nth-child(1) { width: 13%; }
 .scanner-detail-sleeves-table th:nth-child(2),
-.scanner-detail-sleeves-table td:nth-child(2) { width: 5%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(2) { width: 4%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(3),
-.scanner-detail-sleeves-table td:nth-child(3) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(3) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(4),
-.scanner-detail-sleeves-table td:nth-child(4) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(4) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(5),
-.scanner-detail-sleeves-table td:nth-child(5) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(5) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(6),
-.scanner-detail-sleeves-table td:nth-child(6) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(6) { width: 7%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(7),
 .scanner-detail-sleeves-table td:nth-child(7) { width: 8%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(8),
-.scanner-detail-sleeves-table td:nth-child(8) { width: 4%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(8) { width: 10%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(9),
-.scanner-detail-sleeves-table td:nth-child(9) { width: 9%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(9) { width: 4%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(10),
-.scanner-detail-sleeves-table td:nth-child(10) { width: 9%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(10) { width: 8%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(11),
-.scanner-detail-sleeves-table td:nth-child(11) { width: 11%; }
+.scanner-detail-sleeves-table td:nth-child(11) { width: 8%; text-align: right; }
 .scanner-detail-sleeves-table th:nth-child(12),
-.scanner-detail-sleeves-table td:nth-child(12) { width: 8%; text-align: right; }
+.scanner-detail-sleeves-table td:nth-child(12) { width: 11%; }
+.scanner-detail-sleeves-table th:nth-child(13),
+.scanner-detail-sleeves-table td:nth-child(13) { width: 6%; text-align: right; }
 .scanner-detail-sleeves-table .sl-ratchet-badge {
   display: inline-block; font-size: 10px; color: var(--good);
   background: rgba(76, 205, 138, 0.15); border-radius: 3px;
   padding: 0 4px; margin-left: 3px; vertical-align: baseline;
+}
+/* Trail column pill — grey when not yet armed (shows the arm price so you
+   see how close you are), pulsing green when engaged (shows effective stop
+   and peak so you see the ratchet working). */
+.scanner-detail-sleeves-table .trail-pill-off {
+  color: var(--muted);
+}
+.scanner-detail-sleeves-table .trail-pill-on {
+  color: var(--good); font-weight: 600;
+  background: rgba(76, 205, 138, 0.10); border-radius: 4px;
+  padding: 2px 6px;
+}
+.scanner-detail-sleeves-table .trail-peak-note {
+  font-size: 10px; color: var(--muted); font-weight: 400;
+  margin-left: 3px;
 }
 
 /* Scanner-detail modal — fill the viewport so the chart + attached

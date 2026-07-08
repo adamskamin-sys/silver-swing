@@ -3930,6 +3930,7 @@ function openScannerDetail(row) {
       <table class="scanner-detail-sleeves-table">
         <thead><tr><th>Name</th><th>Contracts</th><th title="Your position's weighted-avg cost for the underlying contracts">Pos Avg</th><th title="Price at which THIS strategy was attached">Entry</th><th>Sell</th><th>Buy</th>
           <th title="Effective stop-loss price. If the ratchet is armed and above the base stop, this shows the ratcheted floor.">Stop Loss</th>
+          <th title="Trail activation. Grey = not yet armed (shows the arm price). Green = armed, showing peak / effective sell floor.">Trail</th>
           <th>Cycles</th><th>Unrealized</th><th>Realized</th><th>State</th><th></th></tr></thead>
         <tbody>
         ${liveSleeves.map(s => {
@@ -3980,6 +3981,24 @@ function openScannerDetail(row) {
                 : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
             }
           }
+          // Trail cell — grey pill with arm price when trail isn't engaged;
+          // green pill with peak + effective stop when it is. Same source as
+          // the sleeve-editor trail-status block: state.trail_high_water_price
+          // > 0 means the trail is armed (state.trail_armed on the primary,
+          // but sleeves persist this on trail_high_water_price only).
+          let trailCell = '<span class="dim">—</span>';
+          const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
+          if (trailModes) {
+            const peak = Number(ss.trail_high_water_price) || 0;
+            const trailDist = Number(s.trail_distance) || 0;
+            const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
+            if (peak > 0 && trailDist > 0) {
+              const effectiveStop = peak - trailDist;
+              trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">peak $${fmtPrice(peak)}</span></span>`;
+            } else if (armPx > 0) {
+              trailCell = `<span class="mono trail-pill-off" title="Not yet activated — trail arms once price crosses $${fmtPrice(armPx)}">$${fmtPrice(armPx)}</span>`;
+            }
+          }
           // Halt reason lives on the product-level state (not per-sleeve) when
           // the state machine crashes out (abort_below, reconcile). Show it as
           // a tooltip on the HALTED pill so Adam knows why to click Resume.
@@ -4003,6 +4022,7 @@ function openScannerDetail(row) {
             <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
             <td class="mono">${stopCell}</td>
+            <td class="mono">${trailCell}</td>
             <td class="mono">${Number(ss.cycles) || 0}</td>
             <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
             <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
@@ -4165,6 +4185,19 @@ function refreshScannerDetailLive() {
             : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
         }
       }
+      let trailCell = '<span class="dim">—</span>';
+      const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
+      if (trailModes) {
+        const peak = Number(ss.trail_high_water_price) || 0;
+        const trailDist = Number(s.trail_distance) || 0;
+        const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
+        if (peak > 0 && trailDist > 0) {
+          const effectiveStop = peak - trailDist;
+          trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">peak $${fmtPrice(peak)}</span></span>`;
+        } else if (armPx > 0) {
+          trailCell = `<span class="mono trail-pill-off" title="Not yet activated — trail arms once price crosses $${fmtPrice(armPx)}">$${fmtPrice(armPx)}</span>`;
+        }
+      }
       const productHaltReason = state === 'HALTED'
         ? (currentStore[tenant]?.[symbol]?.state?.halt_reason
            || ss.halt_reason || 'halted — check bot log')
@@ -4185,6 +4218,7 @@ function refreshScannerDetailLive() {
         <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
         <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
         <td class="mono">${stopCell}</td>
+        <td class="mono">${trailCell}</td>
         <td class="mono">${Number(ss.cycles) || 0}</td>
         <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
         <td class="mono ${realized >= 0 ? 'pos' : 'neg'}">${realized >= 0 ? '+' : ''}${fmtMoney(realized)}</td>
