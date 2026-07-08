@@ -529,6 +529,22 @@ export function makeApp({
     }
   });
 
+  // Ask the paper worker to run one scan. Sets a Redis flag with a 5-min TTL;
+  // the worker checks each loop iteration, runs one scan, then clears the
+  // flag. Scanner is on-demand only to save Coinbase API budget.
+  app.post('/api/scanner/refresh', requireAuth, async (req, res) => {
+    const r = await getRedis();
+    if (!r) return res.status(503).json({ ok: false, error: 'redis not configured' });
+    try {
+      await r.set('silver-swing:scanner:refresh_requested',
+                  String(Math.floor(Date.now() / 1000)),
+                  'EX', 300);
+      res.json({ ok: true, requested_at: Math.floor(Date.now() / 1000) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // One-shot buy/sell of any Coinbase futures product straight from the
   // scanner — doesn't require a tracked strategy. Same Redis queue pattern:
   // dashboard queues, paper worker executes via CoinbaseBroker (LIVE) or

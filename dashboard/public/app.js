@@ -1854,7 +1854,25 @@ function renderTradeEvent(ev) {
 
 // ---- refresh loop -------------------------------------------------------
 
+let scannerTriggerLastAt = 0;
+
+async function triggerScannerRefresh() {
+  try {
+    await fetch('/api/scanner/refresh', { method: 'POST', credentials: 'same-origin' });
+    scannerTriggerLastAt = Date.now();
+  } catch (err) {
+    console.error('scanner trigger failed', err);
+  }
+}
+
 async function refreshScanner() {
+  // On-demand only: trigger a scan when the tab opens and every ~60s while
+  // it stays open. Saves the Coinbase API cost of ~30 candle fetches per
+  // scan when nobody's looking at it. Polling every ~5s just re-reads the
+  // Redis cache; the trigger is what tells the paper worker to run one.
+  if (Date.now() - scannerTriggerLastAt > 60_000) {
+    triggerScannerRefresh();
+  }
   try {
     const resp = await fetch('/api/scanner');
     if (!resp.ok) return;
@@ -1865,12 +1883,16 @@ async function refreshScanner() {
     tbody.innerHTML = '';
     const top = Array.isArray(data.top) ? data.top : [];
     if (top.length === 0) {
-      updated.textContent = 'no ranking yet — the paper bot writes one every ~60 seconds.';
+      updated.innerHTML = 'no ranking yet — scan requested, results arrive shortly. <button id="scanner-force-refresh" class="small ghost">Refresh now</button>';
+      const forceBtn = document.getElementById('scanner-force-refresh');
+      if (forceBtn) forceBtn.onclick = () => { triggerScannerRefresh(); refreshScanner(); };
       return;
     }
     if (data.generated_at) {
       const dt = new Date(data.generated_at * 1000);
-      updated.textContent = `updated ${dt.toLocaleTimeString()}`;
+      updated.innerHTML = `updated ${dt.toLocaleTimeString()} <button id="scanner-force-refresh" class="small ghost">Refresh</button>`;
+      const forceBtn = document.getElementById('scanner-force-refresh');
+      if (forceBtn) forceBtn.onclick = () => { triggerScannerRefresh(); };
     }
     top.forEach((row, i) => {
       const tr = document.createElement('tr');

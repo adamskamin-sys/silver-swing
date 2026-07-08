@@ -272,6 +272,29 @@ def fetch_and_rank(
 
 
 REDIS_KEY = "silver-swing:scanner"
+REFRESH_KEY = "silver-swing:scanner:refresh_requested"
+
+
+def request_refresh(url: str, ttl_secs: int = 300) -> None:
+    """Set a Redis flag telling the paper worker to run one scan on its next
+    loop iteration. Called by the dashboard when the user opens the scanner
+    tab so we don't burn API budget when nobody's looking. TTL prevents a
+    stale flag from firing scans indefinitely after a worker restart."""
+    import redis
+    r = redis.Redis.from_url(url, decode_responses=True)
+    r.set(REFRESH_KEY, str(int(time.time())), ex=ttl_secs)
+
+
+def check_and_clear_refresh_request(url: str) -> bool:
+    """Atomically check + delete the refresh flag. Returns True if a refresh
+    was requested since the last check (i.e., worker should run one scan)."""
+    import redis
+    r = redis.Redis.from_url(url, decode_responses=True)
+    val = r.get(REFRESH_KEY)
+    if val is None:
+        return False
+    r.delete(REFRESH_KEY)
+    return True
 
 
 def write_ranking_to_redis(url: str, ranking: list[dict], generated_at: Optional[float] = None) -> None:

@@ -735,7 +735,10 @@ def run_paper_mode() -> int:
 
     try:
         snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
-        scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "60.0"))
+        # Minimum interval between scans — even if the user hammers the tab.
+        # Scanner is on-demand now, but 30s floor keeps us under API limits
+        # if two browsers open at once or someone clicks refresh in a loop.
+        scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "30.0"))
         symbol_discover_interval = float(os.getenv("SWING_SYMBOL_DISCOVER_INTERVAL", "10.0"))
         # 15s = near real-time refresh of the Live tab's portfolio view
         # (positions, marks, specs). Set higher via SWING_LIVE_PORTFOLIO_INTERVAL
@@ -785,19 +788,30 @@ def run_paper_mode() -> int:
                 _maybe_run_tuner(store, live_tenant)
                 last_live_portfolio = now
 
+            # Scanner is on-demand only: paper worker runs a scan only when the
+            # dashboard requests one (user opened the scanner tab). Saves the
+            # Coinbase API budget of ~30 candle fetches/scan when nobody's
+            # looking. Rate-limit at min-interval so a spammy click can't hose
+            # us either.
             if redis_url and now - last_scanner >= scanner_interval:
                 try:
-                    from scanner import fetch_and_rank, write_ranking_to_redis
-                    if _coinbase_for_scanner is None:
-                        from broker import BrokerConfig, CoinbaseBroker
-                        _coinbase_for_scanner = CoinbaseBroker(
-                            BrokerConfig(product_id=SYMBOL)
-                        ).client
-                    ranking = fetch_and_rank(_coinbase_for_scanner, top_n=10)
-                    write_ranking_to_redis(redis_url, ranking, generated_at=now)
+                    from scanner import (
+                        fetch_and_rank, write_ranking_to_redis,
+                        check_and_clear_refresh_request,
+                    )
+                    if check_and_clear_refresh_request(redis_url):
+                        if _coinbase_for_scanner is None:
+                            from broker import BrokerConfig, CoinbaseBroker
+                            _coinbase_for_scanner = CoinbaseBroker(
+                                BrokerConfig(product_id=SYMBOL)
+                            ).client
+                        _log("scanner: refresh requested — running one scan")
+                        ranking = fetch_and_rank(_coinbase_for_scanner, top_n=10)
+                        write_ranking_to_redis(redis_url, ranking, generated_at=now)
+                        last_scanner = now
                 except Exception as e:
                     _log(f"scanner refresh failed: {type(e).__name__}: {e}")
-                last_scanner = now
+                    last_scanner = now  # back off on repeated failure
 
             time.sleep(LOOP_INTERVAL_SECS)
 
