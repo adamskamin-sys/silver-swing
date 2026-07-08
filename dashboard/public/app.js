@@ -2509,11 +2509,19 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // Free capacity for THIS sleeve. If everything's already assigned, freeCapacity
   // is 0 — the modal will show a warning and disable the qty input instead of
   // pretending the user can add "1 more".
-  const freeCapacity = Math.max(0, pos - core - primary - otherSleeveQty);
+  // Live tenant: the position count may be stale in the store (portfolio
+  // snap lag). Skip the frontend gate and let the server-side check be the
+  // authority — it reads __portfolio__ directly and will reject if there's
+  // really no capacity. Prevents false "NO FREE CAPACITY" on Live drills
+  // where the qty just hasn't propagated yet.
+  const skipCapacityGate = isLiveTenant(tenant);
+  const freeCapacity = skipCapacityGate
+    ? Math.max(1, pos - core - primary - otherSleeveQty)  // never block on Live
+    : Math.max(0, pos - core - primary - otherSleeveQty);
   // When editing an existing sleeve, its own qty is already counted against
   // freeCapacity via the filter above (otherSleeves), so max = freeCapacity + its own qty.
   const maxQty = freeCapacity + (existing ? Number(existing.qty || 0) : 0);
-  const atCapacity = maxQty < 1;
+  const atCapacity = !skipCapacityGate && maxQty < 1;
 
   // Slider is TOTAL NET profit (after fees) for the strategy (all contracts, one
   // swing). Per spec §5A: you set take-home, the bot places gross = target + fees.
@@ -2942,10 +2950,26 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     // at qty=3 where fees alone exceed $5), surface that truthfully in the
     // note — silent clamping was the previous bug where users thought they
     // were nettting $5 but actually netting $16.
+    // Rewrite the preset note to reflect the ACTUAL applied values (which
+    // may be expert-tuned per this product), not the hardcoded silver text.
+    let liveNote = p.note;
+    if (expertDollars) {
+      const parts = [`ATR-tuned to this product (${expertParams?.asset_class || 'other'}).`];
+      if (p.stopLoss?.enabled ?? p.stopLoss) {
+        parts.push(`Stop $${fmtPrice(expertDollars.stop_loss_distance)} below buy (2×ATR, Van Tharp 1R).`);
+      }
+      if (p.exit_mode === 'trailing_stop' || p.exit_mode === 'hybrid') {
+        parts.push(`Trail $${fmtPrice(expertDollars.trail_distance)} (2×ATR, Turtle 2N).`);
+      }
+      if (p.stopLoss?.ratchet_enabled || p.stopLoss?.ratchet_distance != null) {
+        parts.push(`Ratchet $${fmtPrice(expertDollars.ratchet_distance)} (3×ATR, Le Beau chandelier).`);
+      }
+      liveNote = parts.join(' ') + ' ' + p.note;
+    }
     if (p.profitDollarsFixed != null && appliedTarget > p.profitDollarsFixed) {
-      presetNoteEl.innerHTML = p.note + ` <b style="color:var(--warn)">Note: at ${qty} contracts, fees alone are $${feesTotal.toFixed(2)}, so this preset targets $${appliedTarget} net (the floor) not $${p.profitDollarsFixed}.</b>`;
+      presetNoteEl.innerHTML = liveNote + ` <b style="color:var(--warn)">Note: at ${qty} contracts, fees alone are $${feesTotal.toFixed(2)}, so this preset targets $${appliedTarget} net (the floor) not $${p.profitDollarsFixed}.</b>`;
     } else {
-      presetNoteEl.textContent = p.note;
+      presetNoteEl.textContent = liveNote;
     }
     syncTargetsFromSlider();
     // Now that sell/buy targets are computed, populate the hybrid fields.
