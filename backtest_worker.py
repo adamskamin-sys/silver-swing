@@ -45,6 +45,10 @@ _SCANNER_ORDER_QUEUE = "silver-swing:scanner_order:queue"
 _SCANNER_ORDER_REQ = "silver-swing:scanner_order:req:"
 _SCANNER_ORDER_RES = "silver-swing:scanner_order:res:"
 
+_LIVE_PORTFOLIO_QUEUE = "silver-swing:live_portfolio:queue"
+_LIVE_PORTFOLIO_REQ = "silver-swing:live_portfolio:req:"
+_LIVE_PORTFOLIO_RES = "silver-swing:live_portfolio:res:"
+
 _RESULT_TTL_SECS = 300
 
 
@@ -67,7 +71,8 @@ def _run_loop(redis_url: str, stop_event: threading.Event) -> None:
             # BRPOP over all queues in priority: scanner orders (user is placing
             # real money orders, respond fast), backtests (actively waiting),
             # candles (usually cache hits).
-            item = r.brpop([_SCANNER_ORDER_QUEUE, _BT_QUEUE, _CANDLES_QUEUE], timeout=2)
+            item = r.brpop([_LIVE_PORTFOLIO_QUEUE, _SCANNER_ORDER_QUEUE,
+                            _BT_QUEUE, _CANDLES_QUEUE], timeout=2)
             if item is None:
                 continue
             queue_key, job_id = item
@@ -75,8 +80,10 @@ def _run_loop(redis_url: str, stop_event: threading.Event) -> None:
                 _handle_backtest_job(r, job_id)
             elif queue_key == _CANDLES_QUEUE:
                 _handle_candles_job(r, job_id)
-            else:
+            elif queue_key == _SCANNER_ORDER_QUEUE:
                 _handle_scanner_order_job(r, job_id)
+            else:
+                _handle_live_portfolio_job(r, job_id)
         except Exception as e:
             _log(f"loop error ({type(e).__name__}: {e}) — reconnecting in {backoff:.1f}s")
             r = None
@@ -271,6 +278,53 @@ def _handle_scanner_order_job(r, job_id: str) -> None:
     r.set(res_key, json.dumps(result), ex=_RESULT_TTL_SECS)
     r.delete(req_key)
     _log(f"scanner_order {job_id}: done in {elapsed:.1f}s ok={result.get('ok')}")
+
+
+def _handle_live_portfolio_job(r, job_id: str) -> None:
+    """On-demand live portfolio pull. Dashboard triggers this when the user
+    opens the Live tab or clicks a derivative row so they see fresh data
+    directly from Coinbase — not a 15-second-old cached snapshot.
+
+    Returns the full portfolio_snapshot() dict so the frontend can render
+    without waiting for the next background sync.
+    """
+    req_key = f"{_LIVE_PORTFOLIO_REQ}{job_id}"
+    res_key = f"{_LIVE_PORTFOLIO_RES}{job_id}"
+    raw = r.get(req_key)
+    if not raw:
+        _log(f"live_portfolio {job_id}: request key missing — dropping")
+        return
+    started = time.time()
+    try:
+        req = json.loads(raw) if raw else {}
+        product_id = req.get("product_id") or _get_default_product()
+        from broker import BrokerConfig, CoinbaseBroker
+        broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
+        snap = broker.portfolio_snapshot()
+        # Also expose per-product contract specs so the modal can render
+        # correct swing width / per-contract math without another round trip.
+        specs = {}
+        for d in snap.get("derivatives") or []:
+            pid = d.get("product_id")
+            if not pid:
+                continue
+            try:
+                specs[pid] = CoinbaseBroker(BrokerConfig(product_id=pid)).contract_spec()
+            except Exception:
+                pass
+        result = {"ok": True, "portfolio": snap, "specs": specs}
+    except Exception as e:
+        result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    elapsed = time.time() - started
+    result["_elapsed_secs"] = round(elapsed, 2)
+    r.set(res_key, json.dumps(result), ex=_RESULT_TTL_SECS)
+    r.delete(req_key)
+    _log(f"live_portfolio {job_id}: done in {elapsed:.1f}s ok={result.get('ok')}")
+
+
+def _get_default_product() -> str:
+    import os
+    return os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
 
 
 def start(redis_url: str) -> threading.Event:

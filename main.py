@@ -618,7 +618,10 @@ def run_paper_mode() -> int:
         snapshot_interval = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
         scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "60.0"))
         symbol_discover_interval = float(os.getenv("SWING_SYMBOL_DISCOVER_INTERVAL", "10.0"))
-        live_portfolio_interval = float(os.getenv("SWING_LIVE_PORTFOLIO_INTERVAL", "120.0"))
+        # 15s = near real-time refresh of the Live tab's portfolio view
+        # (positions, marks, specs). Set higher via SWING_LIVE_PORTFOLIO_INTERVAL
+        # if you hit Coinbase rate limits.
+        live_portfolio_interval = float(os.getenv("SWING_LIVE_PORTFOLIO_INTERVAL", "15.0"))
         last_scanner = 0.0
         last_discover = 0.0
         last_live_portfolio = 0.0

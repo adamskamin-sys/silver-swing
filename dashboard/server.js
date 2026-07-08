@@ -703,6 +703,23 @@ const SCANNER_ORDER_RES_PREFIX = 'silver-swing:scanner_order:res:';
 const SCANNER_ORDER_MAX_WAIT_MS = 30_000;
 const SCANNER_ORDER_TTL_SECS = 120;
 
+const LIVE_PORTFOLIO_QUEUE_KEY = 'silver-swing:live_portfolio:queue';
+const LIVE_PORTFOLIO_REQ_PREFIX = 'silver-swing:live_portfolio:req:';
+const LIVE_PORTFOLIO_RES_PREFIX = 'silver-swing:live_portfolio:res:';
+const LIVE_PORTFOLIO_MAX_WAIT_MS = 15_000;
+const LIVE_PORTFOLIO_TTL_SECS = 60;
+
+async function livePortfolioViaRedis(redis, payload) {
+  return jobViaRedis(redis, {
+    queueKey: LIVE_PORTFOLIO_QUEUE_KEY,
+    reqPrefix: LIVE_PORTFOLIO_REQ_PREFIX,
+    resPrefix: LIVE_PORTFOLIO_RES_PREFIX,
+    reqTtl: LIVE_PORTFOLIO_TTL_SECS,
+    maxWaitMs: LIVE_PORTFOLIO_MAX_WAIT_MS,
+    timeoutMsg: 'live portfolio fetch timed out after 15s. Paper worker may be down.',
+  }, payload);
+}
+
 async function scannerOrderViaRedis(redis, payload) {
   return jobViaRedis(redis, {
     queueKey: SCANNER_ORDER_QUEUE_KEY,
