@@ -1319,6 +1319,14 @@ header { padding: 20px 32px; }
   color: var(--text); font-variant-numeric: tabular-nums;
   letter-spacing: -0.3px;
 }
+.anchor-custom-input {
+  font-family: var(--mono); font-size: 20px; font-weight: 600;
+  color: var(--text); font-variant-numeric: tabular-nums;
+  letter-spacing: -0.3px;
+  background: transparent; border: none; padding: 0;
+  width: 100%; outline: none;
+}
+.anchor-choice-custom { cursor: text; }
 /* Legacy classes kept for anywhere else the old markup might live. */
 .sleeve-anchor-label {
   font-size: var(--fs-xs); color: var(--dim);

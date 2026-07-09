@@ -2700,6 +2700,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     pushChoice('Current market', mark);
     pushChoice('Your contract avg', posAvgEntry);
   }
+  // Third option — user-entered target price. Rendered with an inline input
+  // so the user can pick the exact price they want the strategy anchored on.
+  // Initial value = current mark (a sensible default that's guaranteed > 0).
+  anchorChoices.push({ label: 'Custom target', value: mark, custom: true });
   // Default anchor: for edits, keep the sleeve's original buy_px behavior
   // (users' targets shouldn't jump around on re-open). For new / from-lot,
   // use the first choice.
@@ -2927,7 +2931,14 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       <div class="sleeve-anchor ${anchorStale ? 'stale' : ''}">
         <div class="sleeve-anchor-title">Anchor the strategy around</div>
         <div class="sleeve-anchor-toggle" role="tablist">
-          ${anchorChoices.map((c, i) => `
+          ${anchorChoices.map((c, i) => c.custom ? `
+            <div class="anchor-choice anchor-choice-custom"
+                 data-anchor-idx="${i}" data-anchor-custom="1">
+              <span class="anchor-choice-label">${escapeHtml(c.label)}</span>
+              <span class="anchor-choice-value">$<input type="number" step="any"
+                   class="anchor-custom-input" value="${fmtPrice(c.value)}"></span>
+            </div>
+          ` : `
             <button type="button" class="anchor-choice ${Math.abs(anchor - c.value) < 0.001 ? 'active' : ''}"
                     data-anchor-idx="${i}" data-anchor="${c.value}">
               <span class="anchor-choice-label">${escapeHtml(c.label)}</span>
@@ -3494,7 +3505,25 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     updatePreview();
   }
   for (const b of anchorChoiceBtns) {
-    b.onclick = () => setAnchor(Number(b.dataset.anchor), b);
+    if (b.dataset.anchorCustom === '1') {
+      // Custom-target choice: clicking anywhere on the tile activates it
+      // (using whatever price is currently in the input); typing into the
+      // input keeps the tile active and re-syncs targets live.
+      const input = b.querySelector('.anchor-custom-input');
+      b.addEventListener('click', (e) => {
+        if (e.target !== input) input && input.focus();
+        const v = Number(input && input.value) || 0;
+        if (v > 0) setAnchor(v, b);
+      });
+      if (input) {
+        input.addEventListener('input', () => {
+          const v = Number(input.value) || 0;
+          if (v > 0) setAnchor(v, b);
+        });
+      }
+    } else {
+      b.onclick = () => setAnchor(Number(b.dataset.anchor), b);
+    }
   }
 
   // Initial state.
