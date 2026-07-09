@@ -637,6 +637,30 @@ function renderLivePortfolio() {
       });
     }
   }
+  // Also surface products where position = 0 but a sleeve is still attached
+  // (state = ARMED_BUY, waiting to rebuy after a completed sell cycle).
+  // Without this, the sleeve disappears from view and the user thinks the
+  // strategy was deleted — but it's actually alive, holding a buy order.
+  const seenProducts = new Set(rows.map(r => r.product));
+  for (const sym of Object.keys(tenantBlock)) {
+    if (sym.startsWith('__')) continue;
+    if (seenProducts.has(sym)) continue;
+    const block = tenantBlock[sym] || {};
+    const cfg = block.config || {};
+    const sleeves = Array.isArray(cfg.sleeves) ? cfg.sleeves : [];
+    if (!sleeves.length) continue;
+    // Only futures — spot doesn't run the sleeve engine.
+    if (!/^[A-Z0-9]+-[0-9A-Z]+-[A-Z]+$/i.test(sym)) continue;
+    const snapRow = block.snapshot || {};
+    rows.push({
+      kind: 'futures', product: sym,
+      side: 'WAITING',  // rendered as label in the Side column
+      qty: 0, avg: 0,
+      mark: Number(snapRow.last_mark) || 0,
+      pnl: 0, liq: 0,
+      _waiting: true,  // used by row renderer to style differently
+    });
+  }
 
   // Respect the asset-class subtab filter (all / metals / energy / crypto /
   // other). Filters rows to only that class; cash stays visible on 'all'.
