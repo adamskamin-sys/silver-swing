@@ -732,9 +732,82 @@ function renderLivePortfolio() {
       <tbody>${rowsHtml}</tbody>
     </table>
     <div class="pf-hint dim">Click a row to attach Model B/C/D/E · auto-refreshes every 2 min</div>
+    ${renderOpenOrders(liveTenant)}
     <div id="live-tradeable" class="live-tradeable">
       <div class="live-tradeable-head">Add a position — all tradeable derivatives</div>
       <div class="live-tradeable-body dim">loading…</div>
+    </div>`;
+}
+
+// All attached strategies across every live product, in one flat table so
+// the user can see every open order + state without clicking through per-
+// product modals. Rows include products where position=0 (waiting to
+// rebuy) so nothing hides just because a cycle finished.
+function renderOpenOrders(liveTenant) {
+  if (!liveTenant) return '';
+  const tenantBlock = currentStore[liveTenant] || {};
+  const rows = [];
+  for (const sym of Object.keys(tenantBlock)) {
+    if (sym.startsWith('__')) continue;
+    const block = tenantBlock[sym] || {};
+    const cfg = block.config || {};
+    const sleeves = Array.isArray(cfg.sleeves) ? cfg.sleeves : [];
+    if (!sleeves.length) continue;
+    const sleeveStates = (block.state && block.state.sleeves) || {};
+    const snap = block.snapshot || {};
+    const mark = Number(snap.last_mark) || 0;
+    for (const s of sleeves) {
+      const ss = sleeveStates[s.id] || {};
+      const state = String(ss.state || 'ARMED_SELL');
+      const halted = state === 'HALTED';
+      // Choose target price based on state — SELL leg waits at sell_px,
+      // BUY leg waits at buy_px. HALTED shows the last-known side target.
+      const isBuyLeg = state === 'ARMED_BUY';
+      const target = isBuyLeg ? Number(s.buy_px) : Number(s.sell_px);
+      const sideLabel = halted ? 'HALTED' : (isBuyLeg ? 'BUY' : 'SELL');
+      const dist = (mark > 0 && target > 0) ? (mark - target) : 0;
+      const distText = mark > 0 && target > 0
+        ? (Math.abs(dist) < 0.001 ? 'at target' : `${dist > 0 ? '+' : ''}$${fmtPrice(dist)}`)
+        : '—';
+      const haltReason = halted
+        ? (block.state?.halt_reason || ss.halt_reason || 'halted')
+        : '';
+      rows.push({
+        product: sym, name: s.name || s.id, qty: s.qty,
+        side: sideLabel, target, mark, dist, distText,
+        cycles: Number(ss.cycles) || 0, halted, haltReason,
+        sleeveId: s.id,
+      });
+    }
+  }
+  if (!rows.length) return '';
+  const rowsHtml = rows.map(r => {
+    const sideCls = r.halted ? 'neg' : (r.side === 'BUY' ? 'pos' : 'neg');
+    return `
+      <tr class="pf-row" data-action="open-live-strategy"
+          data-tenant="${escapeHtml(liveTenant)}" data-symbol="${escapeHtml(r.product)}"
+          data-mark="${r.mark || 0}" data-pos-qty="0" data-side=""
+          title="Open the strategy detail modal for ${escapeHtml(prettyProductName(r.product))}">
+        <td><b>${escapeHtml(prettyProductName(r.product))}</b></td>
+        <td class="mono">${escapeHtml(r.name)}</td>
+        <td class="mono">${r.qty}</td>
+        <td class="mono ${sideCls}">${r.side}${r.halted && r.haltReason ? `<div class="halt-why-inline">${escapeHtml(r.haltReason)}</div>` : ''}</td>
+        <td class="mono">${r.target > 0 ? '$' + fmtPrice(r.target) : '—'}</td>
+        <td class="mono dim">${r.mark > 0 ? '$' + fmtPrice(r.mark) : '—'}</td>
+        <td class="mono">${r.distText}</td>
+        <td class="mono">${r.cycles}</td>
+      </tr>`;
+  }).join('');
+  return `
+    <div class="open-orders">
+      <div class="open-orders-head">All open orders (${rows.length})</div>
+      <table class="open-orders-table">
+        <thead><tr>
+          <th>Product</th><th>Strategy</th><th>Qty</th><th>Side</th>
+          <th>Target</th><th>Mark</th><th>Distance</th><th>Cycles</th>
+        </tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
     </div>`;
 }
 

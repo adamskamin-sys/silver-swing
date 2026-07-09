@@ -1723,6 +1723,34 @@ header { padding: 20px 32px; }
 .trail-status b { color: var(--text); }
 .trail-status .dim { opacity: 0.55; padding: 0 4px; }
 
+/* Live tab — "All open orders" table between positions and tradeable list */
+.open-orders {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.open-orders-head {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;
+  color: var(--muted); margin-bottom: 10px;
+}
+.open-orders-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.open-orders-table th, .open-orders-table td {
+  padding: 8px 10px; text-align: left;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.open-orders-table th {
+  color: var(--muted); font-weight: 500;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+}
+.open-orders-table .mono { font-family: var(--mono); }
+.open-orders-table .pos { color: var(--good); }
+.open-orders-table .neg { color: var(--bad); }
+.open-orders-table tbody tr { cursor: pointer; transition: background 100ms; }
+.open-orders-table tbody tr:hover { background: rgba(143, 122, 224, 0.10); }
+
 /* Live tab — "Add a position" tradeable derivatives table below portfolio */
 .live-tradeable {
   margin-top: 24px;
