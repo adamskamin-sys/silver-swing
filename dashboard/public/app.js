@@ -4025,22 +4025,21 @@ function openScannerDetail(row) {
           const ss = liveSleeveStates[s.id] || {};
           const state = String(ss.state || 'ARMED_SELL');
           const realized = Number(ss.realized_pnl) || 0;
-          // Per-sleeve unrealized. For a sleeve that has actually traded,
-          // own_avg_entry is its true cost basis — always prefer that. Otherwise
-          // (fresh sleeve attached to pre-existing contracts), fall back to the
-          // position's weighted-avg cost — that's the price you actually paid
-          // for the underlying contracts, so the P/L reflects real dollars.
-          // entry_mark is only accurate for a strategy that OPENED the position;
-          // for adopted contracts it understates gains (or overstates losses).
+          // Per-sleeve unrealized = P/L since THIS strategy was attached.
+          // Prefer own_avg_entry (sleeve has actually traded, so it has a
+          // real basis); otherwise use entry_mark (mark at attach time) so
+          // multiple sleeves on the same position show DIFFERENT numbers,
+          // reflecting each strategy's own attach point. Falling back to
+          // pos_avg would make every sleeve identical.
           let unrealized = 0;
           if (state === 'ARMED_SELL') {
             const sell = Number(s.sell_px) || 0;
             const buy = Number(s.buy_px) || 0;
             const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
             const basis = Number(ss.own_avg_entry)
-              || Number(row._live_avg)
               || Number(s.entry_mark)
               || midpoint
+              || Number(row._live_avg)
               || 0;
             if (basis > 0 && liveMarkForSleeves > 0) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
@@ -4248,12 +4247,14 @@ function refreshScannerDetailLive() {
         const sell = Number(s.sell_px) || 0;
         const buy = Number(s.buy_px) || 0;
         const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
-        // Match initial-render precedence: prefer own_avg_entry (real trades),
-        // then position avg (real basis for adopted contracts), then entry_mark.
+        // Precedence: sleeve's own filled basis → attach-time mark → midpoint
+        // → position avg. entry_mark differs per sleeve so two co-attached
+        // strategies show DIFFERENT unrealized values rather than identical
+        // pos_avg-based numbers.
         const basis = Number(ss.own_avg_entry)
-          || Number(avg)
           || Number(s.entry_mark)
           || midpoint
+          || Number(avg)
           || 0;
         if (basis > 0 && markForSleeves > 0) {
           unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
