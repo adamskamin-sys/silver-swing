@@ -149,6 +149,20 @@ class SwingTrader:
         # populated the same commit those exit_modes are wired in.
         self._sleeve_price_history: dict = {}
 
+    def _snap_to_tick(self, price: float) -> float:
+        """Snap a price to the product's tick_size. Coinbase rejects orders
+        whose limit_price isn't a multiple of price_increment with
+        INVALID_PRICE_PRECISION — that's what was silently killing every
+        arm on 2-decimal-tick futures (e.g., oil at 0.01) while 3-decimal
+        silver (0.005 tick) coincidentally worked. Round to nearest tick;
+        the extra round(., 8) eats floating-point residue like
+        0.29999999999 → 0.3.
+        """
+        tick = float(self.cfg.tick_size or 0.0)
+        if tick <= 0 or price is None:
+            return float(price or 0.0)
+        return round(round(float(price) / tick) * tick, 8)
+
     # ---- persistence / crash recovery ------------------------------------
 
     def _load_config(self) -> SwingConfig:
@@ -546,6 +560,9 @@ class SwingTrader:
     # ---- arming ----------------------------------------------------------
 
     def _arm(self, side: str, qty: int, price: float) -> None:
+        # Snap price to tick_size — Coinbase rejects off-tick prices with
+        # INVALID_PRICE_PRECISION on 2-decimal-tick products (e.g., oil).
+        price = self._snap_to_tick(price)
         if not self._fee_gate_ok(side, qty, price):
             return
         if self.s.live_order_id:
@@ -820,8 +837,8 @@ class SwingTrader:
         # 3. Else: halt as before (fixed stop-loss with no auto-recovery).
         if sc.stop_loss_reanchor_on_trigger:
             spread = max(0.005, sc.sell_px - sc.buy_px)
-            new_buy = round(last_price - spread / 2, 3)
-            new_sell = round(last_price + spread / 2, 3)
+            new_buy = self._snap_to_tick(last_price - spread / 2)
+            new_sell = self._snap_to_tick(last_price + spread / 2)
             self._reanchor_sleeve(sc, ss, new_buy, new_sell, last_price)
             ss.state = SleeveStateEnum.ARMED_BUY
             return True
@@ -897,8 +914,8 @@ class SwingTrader:
 
         # Reanchor to current price so the buy fires at market immediately.
         spread = max(0.005, sc.sell_px - sc.buy_px)
-        new_buy = round(last_price - spread / 2, 3)
-        new_sell = round(last_price + spread / 2, 3)
+        new_buy = self._snap_to_tick(last_price - spread / 2)
+        new_sell = self._snap_to_tick(last_price + spread / 2)
         self._reanchor_sleeve(sc, ss, new_buy, new_sell, last_price)
         ss.reentry_pending = False
         ss.reentry_stop_ts = None
@@ -1265,8 +1282,8 @@ class SwingTrader:
                 spread = sc.sell_px - sc.buy_px
                 if spread > 0 and sc.reanchor_threshold > 0 \
                         and last_price - sc.buy_px > sc.reanchor_threshold:
-                    new_buy_px = round(last_price - spread / 2, 3)
-                    new_sell_px = round(last_price + spread / 2, 3)
+                    new_buy_px = self._snap_to_tick(last_price - spread / 2)
+                    new_sell_px = self._snap_to_tick(last_price + spread / 2)
                     self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
                     return  # next tick uses the new targets
                 ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, sc.buy_px, last_price)
@@ -1467,6 +1484,11 @@ class SwingTrader:
         return sum(mine) / len(mine)
 
     def _sleeve_arm(self, sc: SleeveConfig, ss: SleeveState, side: str, qty: int, price: float) -> None:
+        # Snap the limit price to the product's tick_size. Belt-and-suspenders
+        # for configs saved before the reanchor snap fix — Coinbase rejects
+        # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
+        # spins forever emitting sleeve_arm_failed with no order on the book.
+        price = self._snap_to_tick(price)
         # For SELL: capture cost basis of the contracts we're about to sell so
         # realized P/L on the fill uses the ACTUAL price paid, not sc.buy_px.
         if side == "SELL" and ss.sell_entry_avg is None:
