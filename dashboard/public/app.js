@@ -816,6 +816,69 @@ function renderOpenOrders(liveTenant) {
     </div>`;
 }
 
+// Fetch scanner data and render spread recommendations for the sleeve
+// editor. Non-blocking. `opts.onApply(spread)` fires when the user picks
+// one — the caller derives buy_px/sell_px from the current anchor.
+async function loadSpreadRecommendations(productId, modalEl, opts) {
+  const container = modalEl.querySelector('#sleeve-spread-recs');
+  const body = container && container.querySelector('.sleeve-spread-recs-body');
+  if (!container || !body) return;
+  try {
+    const resp = await fetch('/api/scanner');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const rows = Array.isArray(data.top) ? data.top : [];
+    const row = rows.find(r => r.product_id === productId);
+    const candidates = row && Array.isArray(row.swing_candidates) ? row.swing_candidates : null;
+    const csize = row ? Number(row.contract_size) || 0 : 0;
+    if (!row || !candidates || !candidates.length || csize <= 0) {
+      container.hidden = false;
+      body.innerHTML = `<span class="dim">no scanner data for ${escapeHtml(productId)} yet — open the Scanner tab to run one.</span>`;
+      return;
+    }
+    // Rank recs by score (best-first). Fee-adjusted net per roundtrip is
+    // already baked into `score`, so weekly/monthly = score × 7 / × 30.
+    const ranked = [...candidates].sort((a, b) => (b.score || 0) - (a.score || 0));
+    const rowsHtml = ranked.map((c, i) => {
+      const spread = Number(c.spread) || 0;
+      const rt = Number(c.roundtrips) || 0;
+      const daily = Number(c.score) || 0;
+      const weekly = daily * 7;
+      const monthly = daily * 30;
+      const net = Number(c.net_per_rt) || 0;
+      const bestBadge = i === 0 ? '<span class="spread-rec-badge">BEST</span>' : '';
+      return `
+        <button type="button" class="spread-rec-tile" data-spread="${spread}">
+          <div class="spread-rec-head">
+            $${fmtNum(spread, 4)} ${bestBadge}
+            <span class="dim">· ${rt} roundtrips/day · $${fmtNum(net, 2)} net each</span>
+          </div>
+          <div class="spread-rec-grid">
+            <div><span class="dim">$/day</span> <b class="pos">$${fmtNum(daily, 2)}</b></div>
+            <div><span class="dim">$/week</span> <b class="pos">$${fmtNum(weekly, 2)}</b></div>
+            <div><span class="dim">$/month</span> <b class="pos">$${fmtNum(monthly, 2)}</b></div>
+          </div>
+        </button>`;
+    }).join('');
+    container.hidden = false;
+    body.innerHTML = rowsHtml;
+    body.querySelectorAll('.spread-rec-tile').forEach(btn => {
+      btn.onclick = () => {
+        const spread = Number(btn.dataset.spread) || 0;
+        if (spread > 0 && opts && typeof opts.onApply === 'function') {
+          opts.onApply(spread);
+          // Highlight selection.
+          body.querySelectorAll('.spread-rec-tile').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+        }
+      };
+    });
+  } catch (err) {
+    body.innerHTML = `<span class="dim">could not load recommendations: ${escapeHtml(String(err.message || err))}</span>`;
+    container.hidden = false;
+  }
+}
+
 // Cycles for a product across every tenant that runs a strategy on it —
 // primary strategy + all sleeves. Useful signal: "the bot has round-tripped
 // this thing N times somewhere" without pinning to a single tenant.
@@ -3099,6 +3162,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
             <span class="stale-warn">Selected anchor is $${fmtPrice(anchorToMarketDist)} away from current market — targets below may be off-market</span>
           </div>` : ''}
       </div>
+      <div id="sleeve-spread-recs" class="sleeve-spread-recs" hidden>
+        <div class="sleeve-spread-recs-head">
+          Recommended spreads
+          <span class="dim">— from last scanner run · click one to apply</span>
+        </div>
+        <div class="sleeve-spread-recs-body dim">loading…</div>
+      </div>
       <div class="sleeve-form">
         <label>Preset (author)
           <select id="sl-preset">
@@ -3691,6 +3761,23 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     updatePreview();
   }
   applyModeVisibility();
+
+  // Fetch scanner spread recommendations for this product and render as
+  // clickable tiles with daily/weekly/monthly projections. Non-blocking —
+  // editor is fully usable while this loads.
+  loadSpreadRecommendations(symbol, m, {
+    onApply: (spread) => {
+      // Apply the picked spread as sell_px/buy_px centered around the
+      // current anchor. Same math as syncTargetsFromSlider so the values
+      // stay consistent with everything else in the form.
+      const halfSpread = spread / 2;
+      const newSell = Number((currentAnchor + halfSpread).toFixed(3));
+      const newBuy = Number((currentAnchor - halfSpread).toFixed(3));
+      sellTargetEl.value = newSell;
+      buyTargetEl.value = newBuy;
+      updatePreview();
+    }
+  });
 
   m.querySelector('#sleeve-save-btn').onclick = async () => {
     const errEl = m.querySelector('#sleeve-error');
