@@ -583,9 +583,13 @@ function renderLabComparison() {
 // Reads the __portfolio__ snapshot the backend writes (main.py:
 // _sync_live_portfolio). Falls back to reading the tracked-symbol snapshots
 // directly if the sync hasn't populated yet, so you still see something.
-function renderLivePortfolio() {
-  const liveTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
+// Optionally accepts a specific tenant + mode so paper can share the same
+// Portfolio → Open Orders → Add-a-Position layout as live.
+function renderLivePortfolio(tenantOverride, modeOverride) {
+  const liveTenant = tenantOverride
+    || Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
   if (!liveTenant) return '';
+  const isLive = modeOverride ? modeOverride === 'live' : true;
   const tenantBlock = currentStore[liveTenant] || {};
   const snap = tenantBlock['__portfolio__']?.config;
 
@@ -733,10 +737,11 @@ function renderLivePortfolio() {
     </table>
     <div class="pf-hint dim">Click a row to attach Model B/C/D/E · auto-refreshes every 2 min</div>
     ${renderOpenOrders(liveTenant)}
+    ${isLive ? `
     <div id="live-tradeable" class="live-tradeable">
       <div class="live-tradeable-head">Add a position — all tradeable derivatives</div>
       <div class="live-tradeable-body dim">loading…</div>
-    </div>`;
+    </div>` : ''}`;
 }
 
 // All attached strategies across every live product, in one flat table so
@@ -2136,6 +2141,22 @@ async function refreshOnce() {
       renderLiveTradeable();
     }
   }
+  // Paper tab: same layout as Live — positions table + open orders. Reuses
+  // the same renderer with the paper tenant so the UX is identical (Adam
+  // was constantly switching modes and losing track of where he was
+  // because paper looked totally different).
+  if (activeMode === 'paper') {
+    const paperTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'paper');
+    if (paperTenant) {
+      const pfHtml = renderLivePortfolio(paperTenant, 'paper');
+      if (pfHtml) {
+        const pfEl = document.createElement('section');
+        pfEl.className = 'live-portfolio';
+        pfEl.innerHTML = pfHtml;
+        cardsEl.appendChild(pfEl);
+      }
+    }
+  }
 
   for (const tenant of tenants) {
     const m = modeOfTenant(tenant);
@@ -2146,18 +2167,20 @@ async function refreshOnce() {
       if (symbol === '__portfolio__') continue;
       if (symbol === '__tuned_params__') continue;
       if (activeAssetClass && assetClassOf(symbol) !== activeAssetClass) continue;
-      // Live tab: drop the per-symbol cards from the flat render. The Coinbase-
-      // style portfolio table is the entry point; drilling into a specific
+      // Live + Paper tabs: drop the per-symbol cards from the flat render.
+      // The portfolio table is the entry point; drilling into a specific
       // product opens the scanner-detail modal (chart + trade + add strategy).
-      // No noise from 10 idle cards below the table.
+      // No noise from N idle cards below the table.
       if (m === 'live' && activeMode === 'live') continue;
+      if (m === 'paper' && activeMode === 'paper') continue;
       cardsEl.appendChild(renderCard(tenant, symbol, currentStore[tenant][symbol]));
       anyRendered = true;
     }
   }
-  // Live-tab special case: if the portfolio table rendered, count that as
-  // "rendered" so we don't show the 'no state yet' empty-state.
-  if (activeMode === 'live' && cardsEl.querySelector('.live-portfolio')) {
+  // Live/Paper special case: if the portfolio table rendered, count that
+  // as "rendered" so we don't show the 'no state yet' empty-state.
+  if ((activeMode === 'live' || activeMode === 'paper')
+      && cardsEl.querySelector('.live-portfolio')) {
     anyRendered = true;
   }
   if (!anyRendered) {
