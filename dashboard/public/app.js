@@ -2048,6 +2048,14 @@ async function refreshScanner() {
       const scoreCell = bestScore > 0
         ? `<b class="pos">$${fmtNum(bestScore, 2)}</b>`
         : '<span class="dim">—</span>';
+      const weeklyScore = Number(row.weekly_score) || 0;
+      const monthlyScore = Number(row.monthly_score) || 0;
+      const weeklyCell = weeklyScore > 0
+        ? `<b class="pos" title="Best-spread daily × 7">$${fmtNum(weeklyScore, 2)}</b>`
+        : '<span class="dim">—</span>';
+      const monthlyCell = monthlyScore > 0
+        ? `<b class="pos" title="Best-spread daily × 30">$${fmtNum(monthlyScore, 2)}</b>`
+        : '<span class="dim">—</span>';
       const defaultRt = Number(row.default_roundtrips) || 0;
       const defaultSpread = Number(row.default_spread) || 0;
       const defaultRtCell = defaultRt > 0
@@ -2066,6 +2074,8 @@ async function refreshScanner() {
         <td class="mono">${rtCell}</td>
         <td class="mono">${defaultRtCell}</td>
         <td class="mono">${scoreCell}</td>
+        <td class="mono">${weeklyCell}</td>
+        <td class="mono">${monthlyCell}</td>
         <td class="mono">${cyclesCell}</td>
         <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
         <td><button class="small primary scanner-buy-btn">Buy / Short →</button></td>

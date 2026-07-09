@@ -266,6 +266,20 @@ def fetch_and_rank(
         else:
             default_spread = 0.0
             default_rt = 0
+        # Weekly / monthly projections. Extrapolate from the 24h roundtrip
+        # metric — a proper multi-day scan would fetch 7d/30d of candles per
+        # product, which is ~7×/30× the API cost. Extrapolation assumes today
+        # is a representative day; if it's not, the projection is directionally
+        # right but noisy. Adam's using this as a "which products should I
+        # attach a strategy to" signal, not a P&L forecast.
+        weekly_score = float(swing["best_score"]) * 7.0
+        monthly_score = float(swing["best_score"]) * 30.0
+        weekly_default_score = default_rt * 7 * max(
+            0.0, (default_spread * csize) - float(swing_fee_per_contract_roundtrip or 0.0)
+        )
+        monthly_default_score = default_rt * 30 * max(
+            0.0, (default_spread * csize) - float(swing_fee_per_contract_roundtrip or 0.0)
+        )
         entry.update({
             "best_score": swing["best_score"],
             "best_roundtrips": swing["best_roundtrips"],
@@ -279,6 +293,11 @@ def fetch_and_rank(
             "default_spread": round(default_spread, 6),
             "default_target_net_per_contract": target,
             "default_roundtrips": default_rt,
+            # Extrapolated projections (24h × N)
+            "weekly_score": round(weekly_score, 2),
+            "monthly_score": round(monthly_score, 2),
+            "weekly_default_score": round(weekly_default_score, 2),
+            "monthly_default_score": round(monthly_default_score, 2),
         })
         # Courtesy pause between candle calls — one product ~= one API request,
         # ~30 products/scan × 60s cadence = well under Coinbase's rate limit,
