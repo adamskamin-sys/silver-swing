@@ -4147,7 +4147,7 @@ function openScannerDetail(row) {
                || ss.halt_reason || 'halted — check bot log')
             : null;
           const stateCell = productHaltReason
-            ? `<span class="status-pill ${state.toLowerCase()}" title="${escapeHtml(productHaltReason)}">${escapeHtml(prettyState(state))}</span>`
+            ? `<span class="status-pill ${state.toLowerCase()}" title="${escapeHtml(productHaltReason)}">${escapeHtml(prettyState(state))}</span><div class="halt-why-inline">${escapeHtml(productHaltReason)}</div>`
             : `<span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span>`;
           const resumeBtn = state === 'HALTED'
             ? `<button class="small primary" data-action="resume-live-strategy"
@@ -4352,7 +4352,7 @@ function refreshScannerDetailLive() {
            || ss.halt_reason || 'halted — check bot log')
         : null;
       const stateCell = productHaltReason
-        ? `<span class="status-pill ${state.toLowerCase()}" title="${escapeHtml(productHaltReason)}">${escapeHtml(prettyState(state))}</span>`
+        ? `<span class="status-pill ${state.toLowerCase()}" title="${escapeHtml(productHaltReason)}">${escapeHtml(prettyState(state))}</span><div class="halt-why-inline">${escapeHtml(productHaltReason)}</div>`
         : `<span class="status-pill ${state.toLowerCase()}">${escapeHtml(prettyState(state))}</span>`;
       const resumeBtn = state === 'HALTED'
         ? `<button class="small primary" data-action="resume-live-strategy"
