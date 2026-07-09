@@ -1002,6 +1002,10 @@ class SwingTrader:
         sc.buy_px = float(new_buy_px)
         sc.sell_px = float(new_sell_px)
         sc.trail_trigger = float(new_sell_px)
+        # Reset the ARMED_BUY timer — we just moved targets to bracket the
+        # current market, so the "priced out" clock restarts from here.
+        import time as _time
+        ss.armed_buy_since_ts = _time.time()
         cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
         sleeves = list(cfg.get("sleeves") or [])
         for s in sleeves:
@@ -1286,6 +1290,54 @@ class SwingTrader:
                     new_sell_px = self._snap_to_tick(last_price + spread / 2)
                     self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
                     return  # next tick uses the new targets
+                # Time-based reanchor: if we've been waiting to rebuy for
+                # too long with the market above our buy target, walk forward.
+                # Only fires when actually priced-out (last_price > buy_px);
+                # a sleeve sitting AT its buy target isn't stuck, it's working.
+                if spread > 0 and sc.time_reanchor_secs > 0 \
+                        and last_price > sc.buy_px and ss.armed_buy_since_ts:
+                    import time as _time
+                    elapsed = _time.time() - float(ss.armed_buy_since_ts)
+                    if elapsed >= float(sc.time_reanchor_secs):
+                        new_buy_px = self._snap_to_tick(last_price - spread / 2)
+                        new_sell_px = self._snap_to_tick(last_price + spread / 2)
+                        self._record(
+                            "sleeve_time_reanchor",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            elapsed_secs=round(elapsed, 1),
+                            timeout_secs=sc.time_reanchor_secs,
+                            old_buy=sc.buy_px, new_buy=new_buy_px,
+                            last_price=last_price,
+                        )
+                        self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
+                        return
+                # Volatility-aware reanchor: if last_price is at/above the top
+                # N% of recent bars, we're at (or near) a run's peak — market
+                # is trending up, not oscillating around our target. Walk
+                # forward. Requires enough history to compute the percentile.
+                if spread > 0 and sc.vol_reanchor_percentile > 0 \
+                        and last_price > sc.buy_px:
+                    history = self._sleeve_price_history.get(sc.id)
+                    win = int(sc.vol_reanchor_window or 60)
+                    if history and len(history) >= win:
+                        recent = sorted(list(history)[-win:])
+                        idx = int(len(recent) * float(sc.vol_reanchor_percentile) / 100.0)
+                        idx = min(idx, len(recent) - 1)
+                        threshold = recent[idx]
+                        if last_price >= threshold:
+                            new_buy_px = self._snap_to_tick(last_price - spread / 2)
+                            new_sell_px = self._snap_to_tick(last_price + spread / 2)
+                            self._record(
+                                "sleeve_vol_reanchor",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                percentile=sc.vol_reanchor_percentile,
+                                threshold=round(threshold, 4),
+                                old_buy=sc.buy_px, new_buy=new_buy_px,
+                                last_price=last_price,
+                                bars_analyzed=win,
+                            )
+                            self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
+                            return
                 ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, sc.buy_px, last_price)
                 if ms_qty is None:
                     return  # microstructure gate said pause
@@ -1541,6 +1593,10 @@ class SwingTrader:
             # ratcheting HWM — next cycle starts fresh at the new basis.
             ss.consecutive_stops = 0
             ss.stop_loss_hwm = None
+            # Timestamp for time-based reanchor — starts counting from the
+            # moment this cycle finished the sell leg.
+            import time as _time
+            ss.armed_buy_since_ts = _time.time()
             self._record(
                 "sleeve_cycle_completed",
                 sleeve_id=sc.id, sleeve_name=sc.name,

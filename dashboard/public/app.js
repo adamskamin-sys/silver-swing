@@ -2915,6 +2915,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         reanchor_on_trigger: true, max_consecutive: 3,
       },
       reanchorThreshold: 0.75,
+      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
+      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
+      volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
       note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + reanchor on stalled buy + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore.',
     },
@@ -2934,6 +2937,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         reanchor_on_trigger: true, max_consecutive: 3,
       },
       reanchorThreshold: 0.75,
+      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
+      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
+      volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
       microstructureGate: true,
       note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
@@ -2954,6 +2960,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         reanchor_on_trigger: true, max_consecutive: 3,
       },
       reanchorThreshold: 0.75,
+      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
+      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
+      volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
@@ -2974,6 +2983,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         reanchor_on_trigger: true, max_consecutive: 3,
       },
       reanchorThreshold: 0.75,
+      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
+      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
+      volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
       microstructureGate: true,
       newsBlackout: { enabled: true, tier: 2 },
@@ -3379,6 +3391,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     if (p.reanchorThreshold != null) {
       draft.reanchor_threshold = p.reanchorThreshold;
     }
+    // Time + volatility reanchor — additional triggers alongside the
+    // price-based reanchor_threshold. All three can fire; whichever hits
+    // first wins.
+    draft.time_reanchor_secs = p.timeReanchorSecs ?? 0;
+    draft.vol_reanchor_percentile = p.volReanchorPercentile ?? 0;
+    draft.vol_reanchor_window = p.volReanchorWindow ?? 60;
     // Ratcheting stop-loss + re-entry + news blackout + microstructure gate —
     // no editor UI, presets are the primary way to configure. Flow through
     // draft to the save patch. Explicitly write nulls when the preset omits
@@ -3728,6 +3746,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         : (sellPx + 0.5),
       hybrid_delay_secs: exitEl.value === 'hybrid' ? hybridDelay : 5.0,
       reanchor_threshold: draft.reanchor_threshold,
+      time_reanchor_secs: draft.time_reanchor_secs || 0,
+      vol_reanchor_percentile: draft.vol_reanchor_percentile || 0,
+      vol_reanchor_window: draft.vol_reanchor_window || 60,
       accumulate_enabled: accumulateEnabled,
       max_qty: accumulateEnabled ? parseInt(maxQtyEl?.value || 0, 10) : 0,
       scale_up_buffer_mult: accumulateEnabled ? Number(scaleBufEl?.value || 1.5) : 1.5,

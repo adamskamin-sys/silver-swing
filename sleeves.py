@@ -91,6 +91,19 @@ class SleeveConfig:
     reentry_range_window: int = 60                 # ticks in rolling range calc
     reentry_min_wait_secs: float = 30.0            # earliest re-entry after stop
 
+    # Time-based reanchor: if the sleeve has been ARMED_BUY (waiting to rebuy
+    # after a completed cycle) for at least this many seconds AND price is
+    # still above buy_px, walk targets forward to bracket current market. Keeps
+    # the sleeve trading when a directional run has priced us out. 0 = off.
+    time_reanchor_secs: float = 0.0
+
+    # Volatility-aware reanchor: reanchors when last_price sits at or above the
+    # Nth percentile of recent price history — a signal the market is at (or
+    # near) a run's peak and unlikely to revert to our stale buy target soon.
+    # 0 = off. Typical: 90 (top 10% of recent bars = strong upward run).
+    vol_reanchor_percentile: float = 0.0
+    vol_reanchor_window: int = 60                  # bars in the percentile calc
+
     # Scale-in on re-entry (Livermore-style progressive entry):
     #   stage 1: half qty at re-entry signal
     #   stage 2: other half after price moves 0.5 × pre-stop-range in expected
@@ -149,6 +162,9 @@ class SleeveConfig:
             reentry_min_wait_secs=float(d.get("reentry_min_wait_secs") or 30.0),
             reentry_scale_in=bool(d.get("reentry_scale_in") or False),
             reentry_second_half_move_pct=float(d.get("reentry_second_half_move_pct") or 0.5),
+            time_reanchor_secs=float(d.get("time_reanchor_secs") or 0.0),
+            vol_reanchor_percentile=float(d.get("vol_reanchor_percentile") or 0.0),
+            vol_reanchor_window=int(d.get("vol_reanchor_window") or 60),
             news_blackout_enabled=bool(d.get("news_blackout_enabled") or False),
             news_blackout_tier=int(d.get("news_blackout_tier") or 2),
             microstructure_gate_enabled=bool(d.get("microstructure_gate_enabled") or False),
@@ -224,6 +240,12 @@ class SleeveState:
     # until now > blackout_until_ts.
     blackout_until_ts: Optional[float] = None
 
+    # When the sleeve most recently entered ARMED_BUY (after a completed
+    # cycle). Powers time-based reanchor — reset to now on every ARMED_BUY
+    # transition (fill flip + explicit reanchor). None = not yet in ARMED_BUY
+    # this session (legacy state).
+    armed_buy_since_ts: Optional[float] = None
+
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
         return cls(
@@ -250,6 +272,7 @@ class SleeveState:
             reentry_scale_in_stage=int(d.get("reentry_scale_in_stage") or 0),
             reentry_stage_1_price=d.get("reentry_stage_1_price"),
             blackout_until_ts=d.get("blackout_until_ts"),
+            armed_buy_since_ts=d.get("armed_buy_since_ts"),
         )
 
     def to_dict(self) -> dict:
