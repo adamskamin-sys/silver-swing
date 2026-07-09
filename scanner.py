@@ -178,23 +178,58 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
     return scored[:top_n]
 
 
+# Coinbase's Advanced Trade candles endpoint caps at ~350 candles per call,
+# so lookbacks that would exceed that at the chosen granularity have to page.
+_GRANULARITY_SECS = {
+    "ONE_MINUTE": 60,
+    "FIVE_MINUTE": 300,
+    "FIFTEEN_MINUTE": 900,
+    "THIRTY_MINUTE": 1800,
+    "ONE_HOUR": 3600,
+    "TWO_HOUR": 7200,
+    "SIX_HOUR": 21600,
+    "ONE_DAY": 86400,
+}
+
+
 def _fetch_recent_closes(coinbase_client, product_id: str, granularity: str = "FIFTEEN_MINUTE",
                           lookback_secs: int = 24 * 3600) -> list[float]:
-    """Fetch recent candle closes for a product. Returns [] on error rather
-    than raising — swing-scoring for one product shouldn't break the whole scan.
+    """Fetch recent candle closes for a product. Pages transparently when the
+    lookback would exceed Coinbase's ~350-candle-per-call cap so a caller can
+    request 30 days at 1H without thinking about it. Returns [] on error
+    rather than raising — swing-scoring for one product shouldn't break the
+    whole scan.
     """
     try:
+        per = _GRANULARITY_SECS.get(granularity, 900)
+        page_seconds = per * 300  # stay comfortably under the 350 cap
         end = int(time.time())
         start = end - lookback_secs
-        resp = coinbase_client.get_candles(
-            product_id=product_id,
-            start=str(start), end=str(end),
-            granularity=granularity,
-        )
-        d = resp.to_dict() if hasattr(resp, "to_dict") else resp
-        raws = d.get("candles") or []
-        # Coinbase returns descending; sort ascending for our walk.
-        raws = sorted(raws, key=lambda r: float(r.get("start", 0)))
+        all_raws: list[dict] = []
+        cursor = start
+        while cursor < end:
+            page_end = min(cursor + page_seconds, end)
+            resp = coinbase_client.get_candles(
+                product_id=product_id,
+                start=str(cursor), end=str(page_end),
+                granularity=granularity,
+            )
+            d = resp.to_dict() if hasattr(resp, "to_dict") else resp
+            for r in (d.get("candles") or []):
+                all_raws.append(r)
+            cursor = page_end
+            # Small pause between pages to spread API calls out.
+            if cursor < end:
+                time.sleep(0.02)
+        # Coinbase returns descending; de-dup by start-ts and sort ascending.
+        seen: set = set()
+        raws: list[dict] = []
+        for r in sorted(all_raws, key=lambda x: float(x.get("start", 0))):
+            ts = float(r.get("start", 0))
+            if ts in seen:
+                continue
+            seen.add(ts)
+            raws.append(r)
         closes = []
         for r in raws:
             c = r.get("close")
@@ -250,6 +285,35 @@ def fetch_and_rank(
                                       granularity=swing_granularity,
                                       lookback_secs=swing_lookback_secs)
         swing = score_product_swings(closes, tick, csize, swing_fee_per_contract_roundtrip)
+        # Real-data weekly + monthly: fetch 7d and 30d of hourly candles
+        # per product and count roundtrips at the same best spread. Costs a
+        # few extra API calls per product per scan but avoids the naive
+        # "daily × 7 / × 30" extrapolation which assumes today is a
+        # representative day (it usually isn't).
+        best_spread_for_periods = float(swing["best_spread"] or 0.0)
+        weekly_rt = 0
+        weekly_score_val = 0.0
+        monthly_rt = 0
+        monthly_score_val = 0.0
+        if best_spread_for_periods > 0:
+            weekly_closes = _fetch_recent_closes(
+                coinbase_client, pid,
+                granularity="ONE_HOUR", lookback_secs=7 * 24 * 3600,
+            )
+            time.sleep(0.03)
+            monthly_closes = _fetch_recent_closes(
+                coinbase_client, pid,
+                granularity="ONE_HOUR", lookback_secs=30 * 24 * 3600,
+            )
+            time.sleep(0.03)
+            gross_per_rt = best_spread_for_periods * csize
+            net_per_rt = gross_per_rt - float(swing_fee_per_contract_roundtrip or 0.0)
+            if weekly_closes:
+                weekly_rt, _, _ = compute_roundtrip_metric(weekly_closes, best_spread_for_periods)
+                weekly_score_val = max(0.0, weekly_rt * net_per_rt)
+            if monthly_closes:
+                monthly_rt, _, _ = compute_roundtrip_metric(monthly_closes, best_spread_for_periods)
+                monthly_score_val = max(0.0, monthly_rt * net_per_rt)
         # "Cycles at your defaults" — the spread that would net Adam's
         # configured target ($10/contract by default). Solves:
         #   spread × contract_size − fee_rt = target
@@ -266,20 +330,24 @@ def fetch_and_rank(
         else:
             default_spread = 0.0
             default_rt = 0
-        # Weekly / monthly projections. Extrapolate from the 24h roundtrip
-        # metric — a proper multi-day scan would fetch 7d/30d of candles per
-        # product, which is ~7×/30× the API cost. Extrapolation assumes today
-        # is a representative day; if it's not, the projection is directionally
-        # right but noisy. Adam's using this as a "which products should I
-        # attach a strategy to" signal, not a P&L forecast.
-        weekly_score = float(swing["best_score"]) * 7.0
-        monthly_score = float(swing["best_score"]) * 30.0
-        weekly_default_score = default_rt * 7 * max(
-            0.0, (default_spread * csize) - float(swing_fee_per_contract_roundtrip or 0.0)
-        )
-        monthly_default_score = default_rt * 30 * max(
-            0.0, (default_spread * csize) - float(swing_fee_per_contract_roundtrip or 0.0)
-        )
+        # Real weekly / monthly scores (computed above from actual 7d/30d
+        # of 1H candles). Also compute default-preset weekly/monthly with
+        # the same real data at the target-net spread.
+        weekly_default_score = 0.0
+        monthly_default_score = 0.0
+        if default_spread > 0 and csize > 0:
+            gross_per_default_rt = default_spread * csize
+            net_per_default_rt = gross_per_default_rt - float(swing_fee_per_contract_roundtrip or 0.0)
+            if best_spread_for_periods > 0:
+                # Reuse the same weekly/monthly closes we already fetched.
+                if weekly_score_val > 0 or weekly_rt > 0:
+                    weekly_default_rt, _, _ = compute_roundtrip_metric(weekly_closes, default_spread)
+                    weekly_default_score = max(0.0, weekly_default_rt * net_per_default_rt)
+                if monthly_score_val > 0 or monthly_rt > 0:
+                    monthly_default_rt, _, _ = compute_roundtrip_metric(monthly_closes, default_spread)
+                    monthly_default_score = max(0.0, monthly_default_rt * net_per_default_rt)
+        weekly_score = weekly_score_val
+        monthly_score = monthly_score_val
         entry.update({
             "best_score": swing["best_score"],
             "best_roundtrips": swing["best_roundtrips"],
@@ -293,9 +361,12 @@ def fetch_and_rank(
             "default_spread": round(default_spread, 6),
             "default_target_net_per_contract": target,
             "default_roundtrips": default_rt,
-            # Extrapolated projections (24h × N)
+            # Real (not extrapolated) — actual 7d / 30d roundtrip counts
+            # at the same best_spread as the daily score.
             "weekly_score": round(weekly_score, 2),
+            "weekly_roundtrips": weekly_rt,
             "monthly_score": round(monthly_score, 2),
+            "monthly_roundtrips": monthly_rt,
             "weekly_default_score": round(weekly_default_score, 2),
             "monthly_default_score": round(monthly_default_score, 2),
         })

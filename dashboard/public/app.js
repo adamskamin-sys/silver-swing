@@ -2113,11 +2113,13 @@ async function refreshScanner() {
         : '<span class="dim">—</span>';
       const weeklyScore = Number(row.weekly_score) || 0;
       const monthlyScore = Number(row.monthly_score) || 0;
+      const weeklyRt = Number(row.weekly_roundtrips) || 0;
+      const monthlyRt = Number(row.monthly_roundtrips) || 0;
       const weeklyCell = weeklyScore > 0
-        ? `<b class="pos" title="Best-spread daily × 7">$${fmtNum(weeklyScore, 2)}</b>`
+        ? `<b class="pos" title="${weeklyRt} roundtrips over the last 7 days (1H candles) at best spread">$${fmtNum(weeklyScore, 2)}</b>`
         : '<span class="dim">—</span>';
       const monthlyCell = monthlyScore > 0
-        ? `<b class="pos" title="Best-spread daily × 30">$${fmtNum(monthlyScore, 2)}</b>`
+        ? `<b class="pos" title="${monthlyRt} roundtrips over the last 30 days (1H candles) at best spread">$${fmtNum(monthlyScore, 2)}</b>`
         : '<span class="dim">—</span>';
       const defaultRt = Number(row.default_roundtrips) || 0;
       const defaultSpread = Number(row.default_spread) || 0;
