@@ -1135,6 +1135,12 @@ class SwingTrader:
             self.s.filled_qty = st.get("filled_qty", 0)
             if st.get("status") == "FILLED" and self.s.filled_qty >= self.s.swing_qty:
                 self._on_fill(fill_price=st.get("average_filled_price"))
+                # Same-tick re-arm — after a fill, immediately place the
+                # next-leg order rather than waiting for the next tick.
+                # Prevents a rapid opposite-side move from trading past
+                # the next target during the ~1s gap.
+                if self.s.state != State.HALTED and not self.s.live_order_id:
+                    self._ensure_armed(last_price)
 
         # Reload sleeve configs each tick — user may have added/removed sleeves
         # from the dashboard. Ensure state dict has entries for all configured.
@@ -1275,6 +1281,16 @@ class SwingTrader:
         status = st.get("status")
         if status == "FILLED" and filled >= sc.qty:
             self._sleeve_on_fill(sc, ss, st.get("average_filled_price"))
+            # Same-tick re-arm: after a fill, immediately place the next-leg
+            # order rather than waiting ~1s for the next tick. Fixes the gap
+            # where a fast opposite-side move (e.g., a downward wick after
+            # a sell fill) could trade past the next target before we've
+            # placed the order to catch it. Recursion terminates naturally:
+            # the arm block either sets live_order_id or returns, and the
+            # next entry re-hits the fresh live_order_id.
+            if ss.state != SleeveStateEnum.HALTED and not ss.live_order_id:
+                self._sleeve_step(sc, ss, last_price)
+            return
         elif status in ("CANCELLED", "EXPIRED", "UNKNOWN"):
             # Zombie order — most commonly a live_order_id persisted through a
             # restart while the broker was re-created (paper) or the exchange
