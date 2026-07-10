@@ -646,6 +646,15 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
   // Without this, the sleeve disappears from view and the user thinks the
   // strategy was deleted — but it's actually alive, holding a buy order.
   const seenProducts = new Set(rows.map(r => r.product));
+  // Look up recent scanner marks for products missing snapshot.last_mark
+  // (position=0 means the primary loop isn't updating the snapshot for
+  // this symbol — but the scanner has a fresh price we can borrow).
+  const scannerMarks = {};
+  const cachedTop = _tradeableCache && _tradeableCache.data && Array.isArray(_tradeableCache.data.top)
+    ? _tradeableCache.data.top : [];
+  for (const s of cachedTop) {
+    if (s && s.product_id) scannerMarks[s.product_id] = Number(s.price) || 0;
+  }
   for (const sym of Object.keys(tenantBlock)) {
     if (sym.startsWith('__')) continue;
     if (seenProducts.has(sym)) continue;
@@ -656,11 +665,12 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     // Only futures — spot doesn't run the sleeve engine.
     if (!/^[A-Z0-9]+-[0-9A-Z]+-[A-Z]+$/i.test(sym)) continue;
     const snapRow = block.snapshot || {};
+    const mark = Number(snapRow.last_mark) || scannerMarks[sym] || 0;
     rows.push({
       kind: 'futures', product: sym,
       side: 'WAITING',  // rendered as label in the Side column
       qty: 0, avg: 0,
-      mark: Number(snapRow.last_mark) || 0,
+      mark: mark,
       pnl: 0, liq: 0,
       _waiting: true,  // used by row renderer to style differently
     });
@@ -4460,6 +4470,29 @@ function openScannerDetail(row) {
       scannerDetailModal.hidden = true;
       openSleeveEditor(attachBtn.dataset.tenant, attachBtn.dataset.symbol, null, null, ctx);
     };
+  }
+
+  // Fetch a fresh mark if the row didn't have one. Happens on WAITING rows
+  // (position=0 so the primary loop wasn't updating the snapshot for that
+  // symbol). Kick a candles request for 1 bar at 1min granularity — the
+  // paper worker fills it via Coinbase's get_candles and Redis pushes back
+  // the response. Non-blocking; the modal is fully usable while this loads.
+  if (!(Number(row.price) > 0) && row.product_id) {
+    fetch(`/api/candles?product_id=${encodeURIComponent(row.product_id)}&granularity=ONE_MINUTE&minutes=5`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data || !Array.isArray(data.candles) || !data.candles.length) return;
+        // Coinbase returns descending; last candle in the sorted list is
+        // whatever the response gave us — take max ts for safety.
+        const latest = data.candles.reduce((a, b) => (Number(a.ts) || 0) > (Number(b.ts) || 0) ? a : b);
+        const fresh = Number(latest.close) || 0;
+        if (fresh > 0 && scannerDetailContext && scannerDetailContext.product_id === row.product_id) {
+          scannerDetailContext.price = fresh;
+          const priceSpan = scannerDetailSummary.querySelector('.scanner-detail-price .mono');
+          if (priceSpan) priceSpan.textContent = '$' + fmtNum(fresh, 4);
+        }
+      })
+      .catch(() => { /* silent — modal stays usable */ });
   }
 
   // Timeframe buttons
