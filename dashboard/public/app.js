@@ -709,6 +709,11 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     const cyclesText = cycles > 0
       ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
       : '<span class="dim">0</span>';
+    const realized = r.kind === 'futures' ? totalRealizedForProduct(r.product) : 0;
+    const realizedCls = realized > 0 ? 'pos' : (realized < 0 ? 'neg' : '');
+    const realizedText = realized !== 0
+      ? `<span class="${realizedCls}" title="Sum of primary + sleeve realized_pnl across all tenants">${realized > 0 ? '+' : ''}${fmtMoney(realized)}</span>`
+      : '<span class="dim">$0</span>';
     return `
       <tr class="pf-row" data-action="open-live-strategy"
           data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}"
@@ -722,6 +727,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td class="mono">${avgText}</td>
         <td class="mono">${markText}</td>
         <td class="mono">${cyclesText}</td>
+        <td class="mono">${realizedText}</td>
         <td class="mono dim">${liqText}</td>
       </tr>`;
   }).join('');
@@ -731,7 +737,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     <table class="pf-table-compact">
       <thead><tr>
         <th>Name</th><th>P&amp;L</th><th>Side</th><th>Qty</th>
-        <th>Avg</th><th>Mark</th><th>Cycles</th><th>Liq</th>
+        <th>Avg</th><th>Mark</th><th>Cycles</th><th>Realized</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table>
@@ -877,6 +883,25 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     body.innerHTML = `<span class="dim">could not load recommendations: ${escapeHtml(String(err.message || err))}</span>`;
     container.hidden = false;
   }
+}
+
+// Sum of realized P/L for a product across every tenant that runs a
+// strategy on it — primary state.realized_pnl + every sleeve's realized_pnl.
+// Used by the Live/Paper positions table so the user can see "this product
+// has banked $X so far" without opening the drill-down.
+function totalRealizedForProduct(productId) {
+  let total = 0;
+  const store = currentStore || {};
+  for (const tenant of Object.keys(store)) {
+    const entry = store[tenant] && store[tenant][productId];
+    if (!entry) continue;
+    total += Number((entry.state && entry.state.realized_pnl) || 0);
+    const sleeves = (entry.state && entry.state.sleeves) || {};
+    for (const sid of Object.keys(sleeves)) {
+      total += Number((sleeves[sid] && sleeves[sid].realized_pnl) || 0);
+    }
+  }
+  return total;
 }
 
 // Cycles for a product across every tenant that runs a strategy on it —
