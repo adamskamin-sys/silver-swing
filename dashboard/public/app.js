@@ -714,6 +714,13 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     const realizedText = realized !== 0
       ? `<span class="${realizedCls}" title="Sum of primary + sleeve realized_pnl across all tenants">${realized > 0 ? '+' : ''}${fmtMoney(realized)}</span>`
       : '<span class="dim">$0</span>';
+    // Combined P/L: unrealized (mark-to-market) + realized (closed trades).
+    // The full profit picture per product without eyeballing two columns.
+    const totalPnl = (Number(r.pnl) || 0) + realized;
+    const totalCls = totalPnl > 0 ? 'pos' : (totalPnl < 0 ? 'neg' : '');
+    const totalText = totalPnl !== 0
+      ? `<span class="${totalCls}" title="Unrealized P/L + Realized gains — total banked + open">${arrow(totalPnl)} ${fmtMoney(Math.abs(totalPnl))}</span>`
+      : '<span class="dim">$0</span>';
     return `
       <tr class="pf-row" data-action="open-live-strategy"
           data-tenant="${escapeHtml(liveTenant)}" data-symbol="${sym}"
@@ -728,6 +735,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td class="mono">${markText}</td>
         <td class="mono">${cyclesText}</td>
         <td class="mono">${realizedText}</td>
+        <td class="mono">${totalText}</td>
         <td class="mono dim">${liqText}</td>
       </tr>`;
   }).join('');
@@ -736,8 +744,8 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     ${cashLine}
     <table class="pf-table-compact">
       <thead><tr>
-        <th>Name</th><th>P&amp;L</th><th>Side</th><th>Qty</th>
-        <th>Avg</th><th>Mark</th><th>Cycles</th><th>Realized</th><th>Liq</th>
+        <th>Name</th><th title="Unrealized (mark-to-market on open position)">P&amp;L</th><th>Side</th><th>Qty</th>
+        <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized P/L + Realized gains">P/L + Realized</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
     </table>
