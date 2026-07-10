@@ -1971,6 +1971,13 @@ header { padding: 20px 32px; }
 .pf-table-compact .neg { color: var(--bad); }
 .pf-table-compact .dim { color: var(--muted); opacity: 0.75; }
 .pf-row { cursor: pointer; }
+.pf-table-compact tfoot .pf-total-row td {
+  border-top: 1px solid var(--border);
+  border-bottom: none;
+  padding-top: 8px; padding-bottom: 8px;
+  font-weight: 600;
+  background: rgba(255,255,255,0.02);
+}
 .pf-row:hover { background: rgba(232, 168, 130, 0.06); }
 .pf-hint { font-size: 11px; padding-top: 6px; }
 

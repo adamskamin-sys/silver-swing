@@ -750,6 +750,35 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
       </tr>`;
   }).join('');
 
+  // Column totals for the footer row. Sum P&L (unrealized), Cycles,
+  // Realized, and P/L + Realized across every futures row. Skip Qty / Avg
+  // / Mark / Liq since those don't sum across products with different
+  // contract sizes.
+  const totalPnlSum = filteredRows.reduce((a, r) =>
+    a + (r.kind === 'futures' ? (Number(r.pnl) || 0) : 0), 0);
+  const totalCyclesSum = filteredRows.reduce((a, r) =>
+    a + (r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0), 0);
+  const totalRealizedSum = filteredRows.reduce((a, r) =>
+    a + (r.kind === 'futures' ? totalRealizedForProduct(r.product) : 0), 0);
+  const grandTotal = totalPnlSum + totalRealizedSum;
+  const footClass = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
+  const fmtSigned = (v) => v === 0 ? '$0' : `${v > 0 ? '+' : '-'}${fmtMoney(Math.abs(v))}`;
+  const footHtml = filteredRows.some(r => r.kind === 'futures') ? `
+    <tfoot>
+      <tr class="pf-total-row">
+        <td><b>Total</b></td>
+        <td class="mono ${footClass(totalPnlSum)}">${fmtSigned(totalPnlSum)}</td>
+        <td></td>
+        <td></td>
+        <td></td>
+        <td></td>
+        <td class="mono"><b>${totalCyclesSum}</b></td>
+        <td class="mono ${footClass(totalRealizedSum)}">${fmtSigned(totalRealizedSum)}</td>
+        <td class="mono ${footClass(grandTotal)}">${fmtSigned(grandTotal)}</td>
+        <td></td>
+      </tr>
+    </tfoot>` : '';
+
   return `
     ${cashLine}
     <table class="pf-table-compact">
@@ -758,6 +787,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized P/L + Realized gains">P/L + Realized</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
+      ${footHtml}
     </table>
     <div class="pf-hint dim">Click a row to attach Model B/C/D/E · auto-refreshes every 2 min</div>
     ${renderOpenOrders(liveTenant)}
