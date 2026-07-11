@@ -783,8 +783,8 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     ${cashLine}
     <table class="pf-table-compact">
       <thead><tr>
-        <th>Name</th><th title="Unrealized (mark-to-market on open position)">P&amp;L</th><th>Side</th><th>Qty</th>
-        <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized P/L + Realized gains">P/L + Realized</th><th>Liq</th>
+        <th>Name</th><th title="Unrealized (mark-to-market on open position)">Unrealized</th><th>Side</th><th>Qty</th>
+        <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized + Realized">Unrealized + Realized</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
       ${footHtml}
