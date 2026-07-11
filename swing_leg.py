@@ -812,11 +812,13 @@ class SwingTrader:
                               f"{self.cfg.core_qty} blocks the sell (pos={pos})")
             return True
         was_ratcheted = effective_stop > float(sc.stop_loss_px or 0.0)
+        sell_ok = False
         try:
             source = getattr(self.b, "set_pending_source", None)
             if callable(source):
                 source(f"sleeve_stop_loss:{sc.id}")
             oid = self.b.place_market("SELL", to_sell)
+            sell_ok = True
             self._record(
                 "sleeve_stop_loss_triggered",
                 sleeve_id=sc.id, sleeve_name=sc.name,
@@ -830,7 +832,18 @@ class SwingTrader:
                          sleeve_id=sc.id, error=str(e),
                          price=last_price, trigger=effective_stop)
 
-        # Post-trigger housekeeping.
+        # If the market SELL didn't actually go through (exchange closed on the
+        # weekend, broker rejected, network blip), the position is still held.
+        # Do NOT increment consecutive_stops or wipe hwm/own_avg_entry — that
+        # would falsely rack up "consecutive stops" without any sells, hit the
+        # max-consecutive brake, and halt a sleeve whose position never moved.
+        # Just bail out; the next tick will re-check and either the sell
+        # succeeds (state advances) or the mark moved back above the stop
+        # (nothing needed).
+        if not sell_ok:
+            return True
+
+        # Post-trigger housekeeping — only when the sell actually fired.
         ss.consecutive_stops = int(ss.consecutive_stops or 0) + 1
         ss.stop_loss_hwm = None  # reset — no longer holding, HWM restarts on next buy
         ss.own_avg_entry = None  # position now flat
