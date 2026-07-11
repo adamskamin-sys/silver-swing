@@ -4696,7 +4696,11 @@ function refreshScannerDetailLive() {
         const baseStop = Number(s.stop_loss_px) || 0;
         const hwm = Number(ss.stop_loss_hwm) || 0;
         const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-        const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0)
+        const activation = Number(s.stop_loss_ratchet_activation) || 0;
+        const ownAvgEntry = Number(ss.own_avg_entry) || 0;
+        const unrealizedPerContract = ownAvgEntry > 0 ? hwm - ownAvgEntry : 0;
+        const ratchetArmed = ownAvgEntry > 0 && unrealizedPerContract >= activation;
+        const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0 && ratchetArmed)
           ? hwm - ratchetDist
           : 0;
         const effective = Math.max(baseStop, ratchetedFloor);
