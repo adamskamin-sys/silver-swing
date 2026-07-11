@@ -56,6 +56,9 @@ NEW_DEFAULTS = {
     "entry_trend_filter_enabled": True,
     "microstructure_gate_enabled": True,
     "reentry_mode": "volatility",
+    # Flavor 3: after a trail-based sell, wait for volatility to contract
+    # THEN a new high before re-arming buys. Sequential Kaufman-then-Turtle.
+    "post_trail_reentry_mode": "sequential",
 }
 
 # Fields we only fill in when missing / zero — we don't overwrite user tuning.
@@ -68,6 +71,7 @@ FILL_IF_ABSENT = {
     "reentry_range_contraction": 0.5,
     "reentry_min_wait_secs": 30.0,
     "reentry_range_window": 60,
+    "post_trail_stage_b_max_wait_secs": 3600.0,
 }
 
 
