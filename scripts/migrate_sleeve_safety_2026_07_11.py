@@ -224,6 +224,18 @@ def main() -> int:
                 if state_changed:
                     state["sleeves"] = sleeves_state
                     store.put_state(tenant, symbol, state)
+                    # ALSO write a reset intent so the bot's next tick clears
+                    # its own in-memory HWM. Without this, the bot loads state
+                    # once at startup and overwrites Redis on every tick — our
+                    # clear gets clobbered on the next tick.
+                    try:
+                        store._put_scope(tenant, symbol,
+                                         "sleeve_state_reset_intent",
+                                         {"clear_hwm": True})
+                        print(f"    → sleeve_state_reset_intent written to force bot to honor HWM clear on next tick")
+                    except Exception as e:
+                        print(f"    → WARNING: could not write reset intent: {e}")
+                        print(f"       (bot may re-clobber the HWM until restart)")
 
     print()
     print(f"Total sleeves scanned: {total_sleeves}")

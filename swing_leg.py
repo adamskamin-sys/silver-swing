@@ -446,6 +446,45 @@ class SwingTrader:
 
     # ---- reset intent (dashboard wipes paper state) -----------------------
 
+    def _maybe_consume_sleeve_state_reset(self) -> None:
+        """Consume a sleeve_state_reset_intent written by migration scripts.
+        The intent shape:
+          {"clear_hwm": True}                 # clear stop_loss_hwm on ALL sleeves
+          {"clear_hwm": ["s1", "s2"]}         # clear only specific sleeve IDs
+          {"clear_fields": ["stop_loss_hwm"]} # generic form (extend later)
+        Applied to IN-MEMORY state so the next _save_state doesn't clobber the
+        migration's Redis write. Cleared after apply."""
+        if not hasattr(self.store, "get_intent"):
+            return
+        intent = None
+        try:
+            intent = self.store._get_scope(self.tenant_id, self.symbol, "sleeve_state_reset_intent")
+        except Exception:
+            return
+        if not intent:
+            return
+        clear_hwm = intent.get("clear_hwm")
+        if clear_hwm:
+            target_ids = None if clear_hwm is True else set(clear_hwm)
+            cleared = []
+            for sid, ss in self.s.sleeves.items():
+                if target_ids is not None and sid not in target_ids:
+                    continue
+                if ss.stop_loss_hwm is not None:
+                    cleared.append((sid, ss.stop_loss_hwm))
+                    ss.stop_loss_hwm = None
+            if cleared:
+                self._record(
+                    "sleeve_state_reset_applied",
+                    field="stop_loss_hwm",
+                    cleared=[{"sleeve_id": sid, "prev_hwm": prev} for sid, prev in cleared],
+                )
+        # Clear the intent so it doesn't re-apply next tick.
+        try:
+            self.store._clear_scope(self.tenant_id, self.symbol, "sleeve_state_reset_intent")
+        except Exception:
+            pass
+
     def _maybe_consume_reset_intent(self) -> None:
         """Full paper-state wipe. Only applies to paper brokers — the broker
         must implement a reset() method. Live CoinbaseBroker doesn't (and
@@ -1294,6 +1333,13 @@ class SwingTrader:
         # Dashboard can request an unhalt via a resume intent. Consume it BEFORE
         # the HALTED early-return so a halted strategy can actually restart.
         self._maybe_consume_resume_intent()
+
+        # Migration/scripts can request specific state fields be reset without
+        # forcing a full bot restart. E.g. after a silver→per-product stop_loss
+        # migration, the old ratchet HWM in memory would clobber the cleared
+        # Redis value on next tick. This consumes the intent and applies the
+        # requested resets to in-memory state before anything else runs.
+        self._maybe_consume_sleeve_state_reset()
 
         if self.s.state == State.HALTED:
             return
