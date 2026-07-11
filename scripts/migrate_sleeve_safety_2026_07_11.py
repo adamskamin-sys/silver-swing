@@ -75,8 +75,14 @@ FILL_IF_ABSENT = {
 }
 
 
-def migrate_sleeve(sleeve: dict) -> tuple[dict, list[str]]:
-    """Return (updated_sleeve, list_of_changes)."""
+def migrate_sleeve(sleeve: dict, position_avg_entry: float = 0.0) -> tuple[dict, list[str]]:
+    """Return (updated_sleeve, list_of_changes).
+
+    position_avg_entry: the actual cost basis of the underlying position
+    (from snapshot.position_avg_entry). Used as the anchor for stop_loss_px
+    so the stop is 5% below what you actually paid, not 5% below the
+    sleeve's next-buy target. Pass 0 if unknown — falls back to sleeve.buy_px.
+    """
     changes = []
     updated = dict(sleeve)  # shallow copy — sleeve dicts are flat
 
@@ -97,23 +103,36 @@ def migrate_sleeve(sleeve: dict) -> tuple[dict, list[str]]:
             changes.append(f"{k}: {cur!r} → {v!r}")
             updated[k] = v
 
-    # stop_loss_px must be > 0 AND < buy_px for the validator. If it's unset,
-    # anchor at 5% below buy_px so the stop scales to the product's price
-    # (silver at $60 gets $3 distance, XLP at $0.19 gets $0.0095, PLAT at
-    # $1640 gets $82). Prior version used a fixed $1.50 distance from silver,
-    # which put the NGS stop at $1.52 — 50% below its $3 buy — and the PLAT
-    # stop 0.09% below its $1640 buy. Neither scales sanely across products.
+    # stop_loss_px must be > 0 AND < buy_px for the validator. Rewrite it to
+    # 5% below buy_px so the stop scales to the product's price (silver at
+    # $60 gets $3 distance, XLP at $0.19 gets $0.0095, PLAT at $1640 gets
+    # $82). Prior versions of this migration used a fixed $1.50 distance
+    # from silver, which put the NGS stop at $1.52 — 50% below its $3 buy —
+    # and the PLAT stop 0.09% below its $1640 buy. Neither scales sanely.
+    #
+    # Overwrite even when the current value is > 0 and < buy_px: the earlier
+    # migration produced valid-but-wrong values (silver-scale, applied to
+    # every product), and those need to be normalized. A user's hand-tuned
+    # values would only survive if this script is re-run in error — flip
+    # to "only fill when 0" if that becomes a concern.
     buy_px = float(updated.get("buy_px") or 0.0)
     cur_sl_px = float(updated.get("stop_loss_px") or 0.0)
-    if buy_px > 0 and (cur_sl_px <= 0 or cur_sl_px >= buy_px):
-        # 5% below buy — same default as the sleeve editor UI and Model B/C/D/E
-        # presets after the 2026-07-11 fix.
-        decimals = 4 if buy_px < 1 else 2
-        new_sl_px = round(buy_px * 0.95, decimals)
+    # Anchor on actual position avg entry when we have it — that's what the
+    # user actually paid. Fall back to sleeve.buy_px (the next-buy target)
+    # only when the position hasn't been captured yet.
+    anchor_px = float(position_avg_entry) if position_avg_entry > 0 else buy_px
+    if anchor_px > 0:
+        decimals = 4 if anchor_px < 1 else 2
+        new_sl_px = round(anchor_px * 0.95, decimals)
         # Safety: never below 0.0001 (would fail the > 0 validator).
         new_sl_px = max(0.0001, new_sl_px)
-        changes.append(f"stop_loss_px: {cur_sl_px!r} → {new_sl_px!r}")
-        updated["stop_loss_px"] = new_sl_px
+        # But never above buy_px either — validator enforces stop < buy.
+        if buy_px > 0 and new_sl_px >= buy_px:
+            new_sl_px = round(buy_px * 0.99, decimals)
+        if abs(new_sl_px - cur_sl_px) > 10 ** (-decimals):
+            anchor_note = "pos_avg" if position_avg_entry > 0 else "buy_px"
+            changes.append(f"stop_loss_px: {cur_sl_px!r} → {new_sl_px!r} (5% below {anchor_note} {anchor_px})")
+            updated["stop_loss_px"] = new_sl_px
 
     return updated, changes
 
@@ -154,11 +173,28 @@ def main() -> int:
             sleeves = cfg.get("sleeves") or []
             if not sleeves:
                 continue
+            # Try to fetch actual position cost basis for this product so the
+            # stop_loss anchor is what the user paid, not the sleeve's next-buy
+            # target. Per-product snapshot first; fall back to the tenant-level
+            # __portfolio__.derivatives list (populated by _sync_live_portfolio).
+            snap = store.get_snapshot(tenant, symbol) or {}
+            pos_avg = float(snap.get("position_avg_entry") or 0.0)
+            pos_qty = int(snap.get("position_qty") or 0)
+            if pos_avg <= 0:
+                pf = store.get_config(tenant, "__portfolio__") or {}
+                for d in (pf.get("derivatives") or []):
+                    if d.get("product_id") == symbol:
+                        pos_avg = float(d.get("avg_entry") or 0.0)
+                        pos_qty = pos_qty or abs(int(d.get("qty") or 0))
+                        break
+            # Only pass avg_entry if we're actually IN the position. If flat,
+            # migrate_sleeve falls back to sleeve.buy_px (waiting-to-buy anchor).
+            anchor_avg = pos_avg if pos_qty > 0 else 0.0
             new_sleeves = []
             symbol_changed = False
             for s in sleeves:
                 total_sleeves += 1
-                updated, changes = migrate_sleeve(s)
+                updated, changes = migrate_sleeve(s, position_avg_entry=anchor_avg)
                 if changes and changes != ["skipped (Custom sleeve)"]:
                     total_updated += 1
                     print(f"[{tenant}/{symbol}] {s.get('name', s.get('id'))}:")
