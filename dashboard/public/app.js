@@ -4411,6 +4411,7 @@ function openScannerDetail(row) {
       <table class="scanner-detail-sleeves-table">
         <thead><tr><th>Name</th><th>Contracts</th><th title="Your position's weighted-avg cost for the underlying contracts">Pos Avg</th><th title="Price at which THIS strategy was attached">Entry</th><th>Sell</th><th>Buy</th>
           <th title="Effective stop-loss price. If the ratchet is armed and above the base stop, this shows the ratcheted floor.">Stop Loss</th>
+          <th title="Total P&amp;L this cycle if the stop-loss fires now: banked realized + (effective_stop − basis) × contract_size × qty − sell fee.">If Stopped</th>
           <th title="Trail activation. Grey = not yet armed (shows the arm price). Green = armed, showing peak / effective sell floor.">Trail</th>
           <th>Cycles</th><th>Unrealized</th><th>Realized</th><th>State</th><th></th></tr></thead>
         <tbody>
@@ -4471,6 +4472,31 @@ function openScannerDetail(row) {
                 : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
             }
           }
+          // If-stopped projection: realized (already banked this cycle) plus
+          // per-contract stop-out P&L (effective_stop − sleeve basis) × size × qty,
+          // minus the sell-side fee. Matches the effective stop displayed in
+          // the STOP LOSS column — shows "—" when stop is off.
+          let ifStoppedCell = '<span class="dim">—</span>';
+          if (s.stop_loss_enabled) {
+            const baseStop2 = Number(s.stop_loss_px) || 0;
+            const hwm2 = Number(ss.stop_loss_hwm) || 0;
+            const ratchetDist2 = Number(s.stop_loss_ratchet_distance) || 0;
+            const activation2 = Number(s.stop_loss_ratchet_activation) || 0;
+            const ownAvg2 = Number(ss.own_avg_entry) || 0;
+            const unrl2 = ownAvg2 > 0 ? hwm2 - ownAvg2 : 0;
+            const armed2 = ownAvg2 > 0 && unrl2 >= activation2;
+            const floor2 = (s.stop_loss_ratchet_enabled && hwm2 > 0 && ratchetDist2 > 0 && armed2) ? hwm2 - ratchetDist2 : 0;
+            const eff2 = Math.max(baseStop2, floor2);
+            if (eff2 > 0) {
+              const basis2 = ownAvg2 || Number(row._live_avg) || Number(s.entry_mark) || 0;
+              const qty2 = Number(s.qty) || 0;
+              const cfg2 = currentStore[row._live_tenant]?.[row.product_id]?.config || {};
+              const sellFee = Number(cfg2.fee_per_fill_sell) || ((Number(cfg2.fee_per_contract_roundtrip) || 0) / 2);
+              const stopPnl = basis2 > 0 ? (eff2 - basis2) * liveContractSize * qty2 : 0;
+              const projected = realized + stopPnl - sellFee * qty2;
+              ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(eff2)}−${fmtPrice(basis2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+            }
+          }
           // Trail cell — grey pill with arm price when trail isn't engaged;
           // green pill with peak + effective stop when it is. Same source as
           // the sleeve-editor trail-status block: state.trail_high_water_price
@@ -4512,6 +4538,7 @@ function openScannerDetail(row) {
             <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
             <td class="mono">${stopCell}</td>
+            <td class="mono">${ifStoppedCell}</td>
             <td class="mono">${trailCell}</td>
             <td class="mono">${Number(ss.cycles) || 0}</td>
             <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
@@ -4692,6 +4719,7 @@ function refreshScannerDetailLive() {
       // consistent across ticks. Without this the price-tick rebuild produced
       // one fewer td than the header, shifting every following column left.
       let stopCell = '<span class="dim">off</span>';
+      let ifStoppedCell = '<span class="dim">—</span>';
       if (s.stop_loss_enabled) {
         const baseStop = Number(s.stop_loss_px) || 0;
         const hwm = Number(ss.stop_loss_hwm) || 0;
@@ -4709,6 +4737,13 @@ function refreshScannerDetailLive() {
           stopCell = ratcheted
             ? `<span class="mono" title="Ratchet armed — floor lifted from base $${fmtPrice(baseStop)} to $${fmtPrice(effective)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">$${fmtPrice(effective)} <span class="sl-ratchet-badge">↑</span></span>`
             : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
+          const basisIf = ownAvgEntry || Number(avg) || Number(s.entry_mark) || 0;
+          const qtyIf = Number(s.qty) || 0;
+          const cfgIf = currentStore?.[tenant]?.[symbol]?.config || {};
+          const sellFeeIf = Number(cfgIf.fee_per_fill_sell) || ((Number(cfgIf.fee_per_contract_roundtrip) || 0) / 2);
+          const stopPnlIf = basisIf > 0 ? (effective - basisIf) * contractSize * qtyIf : 0;
+          const projectedIf = realized + stopPnlIf - sellFeeIf * qtyIf;
+          ifStoppedCell = `<span class="mono ${projectedIf >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(effective)}−${fmtPrice(basisIf)})×${contractSize}×${qtyIf} − sell fee $${(sellFeeIf * qtyIf).toFixed(2)}">${projectedIf >= 0 ? '+' : ''}${fmtMoney(projectedIf)}</span>`;
         }
       }
       let trailCell = '<span class="dim">—</span>';
@@ -4744,6 +4779,7 @@ function refreshScannerDetailLive() {
         <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
         <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
         <td class="mono">${stopCell}</td>
+        <td class="mono">${ifStoppedCell}</td>
         <td class="mono">${trailCell}</td>
         <td class="mono">${Number(ss.cycles) || 0}</td>
         <td class="mono ${unrealized >= 0 ? 'pos' : 'neg'}">${unrealized >= 0 ? '+' : ''}${fmtMoney(unrealized)}</td>
