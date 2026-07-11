@@ -3058,7 +3058,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: false, max_consecutive: 3,
         protect_realized_enabled: true, protect_realized_frac: 0.5,
@@ -3084,7 +3084,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: false, max_consecutive: 3,
         protect_realized_enabled: true, protect_realized_frac: 0.5,
@@ -3110,7 +3110,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: false, max_consecutive: 3,
         protect_realized_enabled: true, protect_realized_frac: 0.5,
@@ -3137,7 +3137,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
         reanchor_on_trigger: false, max_consecutive: 3,
         protect_realized_enabled: true, protect_realized_frac: 0.5,
@@ -3319,7 +3319,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         <div class="trail-dollars" id="sl-td-dollars"></div>
         <div class="trail-status" id="sl-td-status"></div>
         <div class="preview-note">
-          Trailing stop uses the sell target above as the ARM price — once silver hits it, the trail engages and rides upside. Sells when price pulls back this much from the peak.
+          Trailing stop uses the sell target above as the ARM price — once ${escapeHtml(symbolFamilyOf(symbol) || 'price')} hits it, the trail engages and rides upside. Sells when price pulls back this much from the peak.
         </div>
       </div>
 
@@ -3334,7 +3334,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           </label>
         </div>
         <div class="preview-note">
-          Once silver crosses the <b>sell target</b>, we wait this many seconds to see if it pushes through the <b>trail activation price</b>.
+          Once ${escapeHtml(symbolFamilyOf(symbol) || 'price')} crosses the <b>sell target</b>, we wait this many seconds to see if it pushes through the <b>trail activation price</b>.
           If it does → trailing stop engages and rides the breakout. If it doesn't → we take the swing at market when the delay expires.
         </div>
       </div>
@@ -3375,8 +3375,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         </label>
         <div class="accumulate-fields" id="sl-stoploss-fields" ${draft.stop_loss_enabled ? '' : 'hidden'}>
           <div class="target-inputs">
-            <label>Trigger price ($) — sell when silver falls to
-              <input type="number" id="sl-stop-px" step="0.01" value="${draft.stop_loss_px || Math.max(0, +(mark - 2).toFixed(2))}">
+            <label>Trigger price ($) — sell when ${escapeHtml(symbolFamilyOf(symbol) || 'price')} falls to
+              <input type="number" id="sl-stop-px" step="0.01" value="${draft.stop_loss_px || Math.max(0, +(mark * 0.95).toFixed(Math.max(2, mark < 1 ? 4 : 2)))}">
             </label>
             <label>Sell how many
               <select id="sl-stop-mode">
@@ -3392,7 +3392,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
             </label>
           </div>
           <div class="preview-note">
-            When silver ≤ trigger, this sleeve market-sells the configured qty then halts.
+            When ${escapeHtml(symbolFamilyOf(symbol) || 'price')} ≤ trigger, this sleeve market-sells the configured qty then halts.
             Core floor is always respected. Only THIS sleeve is affected — other sleeves keep trading.
           </div>
         </div>
@@ -3547,9 +3547,23 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       const slFields = m.querySelector('#sl-stoploss-fields');
       if (slEl) slEl.checked = !!p.stopLoss.enabled;
       if (slFields) slFields.hidden = !p.stopLoss.enabled;
-      if (slPxEl && p.stopLoss.price_below_buy != null && buyTargetEl) {
+      if (slPxEl && buyTargetEl) {
         const buyPx = Number(buyTargetEl.value) || 0;
-        slPxEl.value = Math.max(0, buyPx - p.stopLoss.price_below_buy).toFixed(2);
+        // Product-scale-aware: prefer the percent-based value so a $3 gas
+        // contract doesn't inherit silver's $1.50 fixed distance (which
+        // would put the stop at $1.50 — 50% below buy — on a natural gas
+        // sleeve). Fall back to the legacy fixed dollar field for older
+        // preset shapes still in the wild.
+        let stopPx = null;
+        if (p.stopLoss.price_below_buy_pct != null) {
+          stopPx = buyPx * (1 - Number(p.stopLoss.price_below_buy_pct));
+        } else if (p.stopLoss.price_below_buy != null) {
+          stopPx = buyPx - Number(p.stopLoss.price_below_buy);
+        }
+        if (stopPx !== null) {
+          const decimals = buyPx < 1 ? 4 : 2;
+          slPxEl.value = Math.max(0, +stopPx.toFixed(decimals)).toString();
+        }
       }
       if (slModeEl && p.stopLoss.qty_mode) {
         slModeEl.value = p.stopLoss.qty_mode;

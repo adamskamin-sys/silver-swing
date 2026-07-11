@@ -98,16 +98,20 @@ def migrate_sleeve(sleeve: dict) -> tuple[dict, list[str]]:
             updated[k] = v
 
     # stop_loss_px must be > 0 AND < buy_px for the validator. If it's unset,
-    # anchor at buy_px − 1.5 (the preset default), floored at 0.01.
+    # anchor at 5% below buy_px so the stop scales to the product's price
+    # (silver at $60 gets $3 distance, XLP at $0.19 gets $0.0095, PLAT at
+    # $1640 gets $82). Prior version used a fixed $1.50 distance from silver,
+    # which put the NGS stop at $1.52 — 50% below its $3 buy — and the PLAT
+    # stop 0.09% below its $1640 buy. Neither scales sanely across products.
     buy_px = float(updated.get("buy_px") or 0.0)
     cur_sl_px = float(updated.get("stop_loss_px") or 0.0)
     if buy_px > 0 and (cur_sl_px <= 0 or cur_sl_px >= buy_px):
-        new_sl_px = max(0.01, round(buy_px - 1.5, 4))
-        # If buy_px is tiny (like XLP at $0.19), $1.5 is meaningless — use 10%
-        # of buy_px as a safety floor so we don't set stop_px to 0.01 for
-        # micro-priced contracts.
-        if new_sl_px >= buy_px or (buy_px - new_sl_px) / buy_px > 0.5:
-            new_sl_px = round(buy_px * 0.9, 4)
+        # 5% below buy — same default as the sleeve editor UI and Model B/C/D/E
+        # presets after the 2026-07-11 fix.
+        decimals = 4 if buy_px < 1 else 2
+        new_sl_px = round(buy_px * 0.95, decimals)
+        # Safety: never below 0.0001 (would fail the > 0 validator).
+        new_sl_px = max(0.0001, new_sl_px)
         changes.append(f"stop_loss_px: {cur_sl_px!r} → {new_sl_px!r}")
         updated["stop_loss_px"] = new_sl_px
 
