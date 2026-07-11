@@ -281,6 +281,7 @@ def fetch_and_rank(
     swing_lookback_secs: int = 24 * 3600,
     swing_granularity: str = "FIFTEEN_MINUTE",
     default_target_net_per_contract: float = 10.0,
+    force_include: list[str] | None = None,
 ) -> list[dict]:
     """Fetch all CFM futures from Coinbase, score each on both amplitude
     (24h range %) AND swing frequency (roundtrips per lookback window at a
@@ -289,6 +290,12 @@ def fetch_and_rank(
 
     Falls back to spot if futures listing is unavailable. Per-product candle
     fetch failures degrade to vol_pct-only scoring for that product.
+
+    force_include: product_ids that must appear in the output even if they
+    rank below the top-N. Used to ensure every product Adam has an active
+    strategy on always gets swing_candidates populated — otherwise the
+    Edit modal's "Recommended spreads" tiles disappear for products that
+    happen to have low 24h range that day.
     """
     products = []
     for product_type in ("FUTURE", "SPOT"):
@@ -302,6 +309,23 @@ def fetch_and_rank(
         except Exception:
             continue
     ranking = compute_ranking(products, top_n=max(top_n * 3, 30))
+    # Force-include any user-strategy product not in the natural ranking.
+    # Same scoring logic (compute_ranking on the singleton product), then
+    # merged in — top_n cap is honored by the natural ranking; forced
+    # entries are appended past that cap so ranking stays complete.
+    if force_include:
+        ranked_ids = {e.get("product_id") for e in ranking}
+        for pid in force_include:
+            if not pid or pid in ranked_ids:
+                continue
+            # Find the raw Coinbase product dict and score it.
+            raw = next((p for p in products if (p.get("product_id") or p.get("product_type_id")) == pid), None)
+            if not raw:
+                continue
+            forced = compute_ranking([raw], top_n=1)
+            if forced:
+                ranking.extend(forced)
+                ranked_ids.add(pid)
     for entry in ranking:
         pid = entry.get("product_id")
         tick = entry.get("tick_size")

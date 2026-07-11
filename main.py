@@ -833,8 +833,27 @@ def run_paper_mode() -> int:
                             _coinbase_for_scanner = CoinbaseBroker(
                                 BrokerConfig(product_id=SYMBOL)
                             ).client
-                        _log("scanner: refresh requested — running one scan")
-                        ranking = fetch_and_rank(_coinbase_for_scanner, top_n=10)
+                        # Force-include every product Adam has an active
+                        # strategy on so the Edit modal's "Recommended spreads"
+                        # tiles always populate. Without this, low-24h-range
+                        # products (that Adam is still actively swinging) drop
+                        # off the top-N and their modal shows "no scanner data".
+                        forced = set()
+                        try:
+                            for t in store.list_tenants():
+                                for sym in store.list_symbols(t):
+                                    if sym.startswith("__"):
+                                        continue
+                                    cfg = store.get_config(t, sym) or {}
+                                    if cfg.get("sleeves") or cfg.get("swing_qty"):
+                                        forced.add(sym)
+                        except Exception as e:
+                            _log(f"scanner: force-include gather failed: {type(e).__name__}: {e}")
+                        _log(f"scanner: refresh requested — running one scan (force_include={sorted(forced)})")
+                        ranking = fetch_and_rank(
+                            _coinbase_for_scanner, top_n=10,
+                            force_include=list(forced),
+                        )
                         write_ranking_to_redis(redis_url, ranking, generated_at=now)
                         last_scanner = now
                 except Exception as e:
