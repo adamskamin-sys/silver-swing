@@ -115,16 +115,26 @@ def main() -> int:
                     help="Tenant to resync (default: adam-live).")
     ap.add_argument("--target-net", type=float, default=2.0,
                     help="Target $ net per swing per sleeve (default: 2.0).")
+    ap.add_argument("--only-below", action="store_true",
+                    help="Only rewrite sleeves whose current implied net is BELOW target. "
+                         "Leaves overtuned sleeves (netting more than target) alone.")
+    ap.add_argument("--only-symbols", default="",
+                    help="Comma-separated substrings to filter symbols "
+                         "(e.g., 'NER,NGS'). Empty = all products.")
     ap.add_argument("--data-dir", default="./data",
                     help="Local data dir (used when REDIS_URL not set).")
     args = ap.parse_args()
 
     store = make_store(args.data_dir)
     backend = "Redis" if os.getenv("REDIS_URL") else f"JSON ({args.data_dir}/store.json)"
+    filters = [x.strip() for x in args.only_symbols.split(",") if x.strip()]
     print(f"Backend: {backend}")
     print(f"Mode: {'APPLY' if args.apply else 'DRY RUN'}")
     print(f"Tenant: {args.tenant}")
     print(f"Target net / swing / sleeve: ${args.target_net}")
+    print(f"Only rewrite sleeves below target: {args.only_below}")
+    if filters:
+        print(f"Symbol filter: {filters}")
     print("=" * 90)
 
     symbols = [s for s in store.list_symbols(args.tenant) if not s.startswith("__")]
@@ -142,6 +152,9 @@ def main() -> int:
             continue
         # Skip coin products — no futures spec available.
         if not any(x in symbol for x in ("-CDE", "-CFE", "-USD-FUT")) and "-USD" in symbol:
+            continue
+        # Symbol filter (--only-symbols NER,NGS).
+        if filters and not any(f in symbol for f in filters):
             continue
 
         stat_products += 1
@@ -203,11 +216,21 @@ def main() -> int:
                                   live["fee_per_contract_roundtrip"])
 
             drift_price = abs(new_buy - buy_px) > 0.0001 or abs(new_sell - sell_px) > 0.0001
-            marker = "← REWRITE" if drift_price else "ok"
+            # --only-below: leave sleeves that are already netting >= target
+            # alone. Adam explicitly asked for this — his overtuned sleeves
+            # (PT $50/swing, CU $18/swing) are working as configured, no reason
+            # to narrow them to target.
+            skip_because_above = args.only_below and live_net >= args.target_net
+            if skip_because_above:
+                marker = "left alone (over target)"
+            elif drift_price:
+                marker = "← REWRITE"
+            else:
+                marker = "ok"
             print(f"  sleeve {name} qty={qty}: "
                   f"buy=${buy_px:.4f} sell=${sell_px:.4f} → net=${live_net:.2f}  |  "
                   f"target ${args.target_net}: buy=${new_buy:.4f} sell=${new_sell:.4f} → net=${new_net:.2f}  {marker}")
-            if drift_price:
+            if drift_price and not skip_because_above:
                 new_sl["buy_px"] = new_buy
                 new_sl["sell_px"] = new_sell
                 sleeves_changed = True

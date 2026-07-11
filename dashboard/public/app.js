@@ -4474,27 +4474,28 @@ function openScannerDetail(row) {
           }
           // If-stopped projection: realized (already banked this cycle) plus
           // per-contract stop-out P&L (effective_stop − sleeve basis) × size × qty,
-          // minus the sell-side fee. Matches the effective stop displayed in
-          // the STOP LOSS column — shows "—" when stop is off.
+          // minus the sell-side fee. Only shown when the sleeve actually holds
+          // contracts (own_avg_entry > 0) — a flat sleeve has nothing to stop
+          // out of, so projecting against entry_mark would fabricate a scary
+          // loss for a position that doesn't exist.
           let ifStoppedCell = '<span class="dim">—</span>';
-          if (s.stop_loss_enabled) {
+          const ownAvg2 = Number(ss.own_avg_entry) || 0;
+          if (s.stop_loss_enabled && ownAvg2 > 0) {
             const baseStop2 = Number(s.stop_loss_px) || 0;
             const hwm2 = Number(ss.stop_loss_hwm) || 0;
             const ratchetDist2 = Number(s.stop_loss_ratchet_distance) || 0;
             const activation2 = Number(s.stop_loss_ratchet_activation) || 0;
-            const ownAvg2 = Number(ss.own_avg_entry) || 0;
-            const unrl2 = ownAvg2 > 0 ? hwm2 - ownAvg2 : 0;
-            const armed2 = ownAvg2 > 0 && unrl2 >= activation2;
+            const unrl2 = hwm2 - ownAvg2;
+            const armed2 = unrl2 >= activation2;
             const floor2 = (s.stop_loss_ratchet_enabled && hwm2 > 0 && ratchetDist2 > 0 && armed2) ? hwm2 - ratchetDist2 : 0;
             const eff2 = Math.max(baseStop2, floor2);
             if (eff2 > 0) {
-              const basis2 = ownAvg2 || Number(row._live_avg) || Number(s.entry_mark) || 0;
               const qty2 = Number(s.qty) || 0;
               const cfg2 = currentStore[row._live_tenant]?.[row.product_id]?.config || {};
               const sellFee = Number(cfg2.fee_per_fill_sell) || ((Number(cfg2.fee_per_contract_roundtrip) || 0) / 2);
-              const stopPnl = basis2 > 0 ? (eff2 - basis2) * liveContractSize * qty2 : 0;
+              const stopPnl = (eff2 - ownAvg2) * liveContractSize * qty2;
               const projected = realized + stopPnl - sellFee * qty2;
-              ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(eff2)}−${fmtPrice(basis2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+              ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(eff2)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
             }
           }
           // Trail cell — grey pill with arm price when trail isn't engaged;
@@ -4737,13 +4738,15 @@ function refreshScannerDetailLive() {
           stopCell = ratcheted
             ? `<span class="mono" title="Ratchet armed — floor lifted from base $${fmtPrice(baseStop)} to $${fmtPrice(effective)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">$${fmtPrice(effective)} <span class="sl-ratchet-badge">↑</span></span>`
             : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
-          const basisIf = ownAvgEntry || Number(avg) || Number(s.entry_mark) || 0;
-          const qtyIf = Number(s.qty) || 0;
-          const cfgIf = currentStore?.[tenant]?.[symbol]?.config || {};
-          const sellFeeIf = Number(cfgIf.fee_per_fill_sell) || ((Number(cfgIf.fee_per_contract_roundtrip) || 0) / 2);
-          const stopPnlIf = basisIf > 0 ? (effective - basisIf) * contractSize * qtyIf : 0;
-          const projectedIf = realized + stopPnlIf - sellFeeIf * qtyIf;
-          ifStoppedCell = `<span class="mono ${projectedIf >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(effective)}−${fmtPrice(basisIf)})×${contractSize}×${qtyIf} − sell fee $${(sellFeeIf * qtyIf).toFixed(2)}">${projectedIf >= 0 ? '+' : ''}${fmtMoney(projectedIf)}</span>`;
+          // Only project IF STOPPED when the sleeve actually holds contracts.
+          if (ownAvgEntry > 0) {
+            const qtyIf = Number(s.qty) || 0;
+            const cfgIf = currentStore?.[tenant]?.[symbol]?.config || {};
+            const sellFeeIf = Number(cfgIf.fee_per_fill_sell) || ((Number(cfgIf.fee_per_contract_roundtrip) || 0) / 2);
+            const stopPnlIf = (effective - ownAvgEntry) * contractSize * qtyIf;
+            const projectedIf = realized + stopPnlIf - sellFeeIf * qtyIf;
+            ifStoppedCell = `<span class="mono ${projectedIf >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(effective)}−${fmtPrice(ownAvgEntry)})×${contractSize}×${qtyIf} − sell fee $${(sellFeeIf * qtyIf).toFixed(2)}">${projectedIf >= 0 ? '+' : ''}${fmtMoney(projectedIf)}</span>`;
+          }
         }
       }
       let trailCell = '<span class="dim">—</span>';
