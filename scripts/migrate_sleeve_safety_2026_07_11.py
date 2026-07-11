@@ -206,6 +206,24 @@ def main() -> int:
                 cfg["sleeves"] = new_sleeves
                 store.put_config(tenant, symbol, cfg)
                 print(f"    → written to {tenant}/{symbol}")
+                # Clear stale ratchet HWM on state for each migrated sleeve.
+                # The migration replaced a silver-scale base stop with a
+                # product-scale one; the HWM was from a past peak whose
+                # ratchet_distance was silver-scale. Keeping it would let the
+                # old ratchet ($3.0083 on NGS) override the new base ($2.87)
+                # via max(base, hwm - dist). Clearing forces the effective
+                # stop to equal the new base until a fresh cycle rebuilds HWM.
+                state = store.get_state(tenant, symbol) or {}
+                sleeves_state = (state.get("sleeves") or {})
+                state_changed = False
+                for sid, ss in list(sleeves_state.items()):
+                    if ss.get("stop_loss_hwm") is not None:
+                        print(f"    → cleared stop_loss_hwm={ss.get('stop_loss_hwm')} on state sleeve {sid}")
+                        ss["stop_loss_hwm"] = None
+                        state_changed = True
+                if state_changed:
+                    state["sleeves"] = sleeves_state
+                    store.put_state(tenant, symbol, state)
 
     print()
     print(f"Total sleeves scanned: {total_sleeves}")
