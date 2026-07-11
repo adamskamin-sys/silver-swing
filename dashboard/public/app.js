@@ -2987,8 +2987,15 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     anchor = mark;
     anchorLabel = 'Current market';
   }
-  const contractSize = Number(cfg.contract_size) || 50;
-  const feeRt = Number(cfg.fee_per_contract_roundtrip) || 4.68;
+  // NO silver defaults. If the bot hasn't synced Coinbase specs for this
+  // product yet, contract_size and fee_per_contract_roundtrip are 0 — we
+  // MUST refuse to compute spreads against silver-scale fallbacks, because
+  // the user's target ($/net swing) would silently be honored at wrong
+  // scale and the sleeve would save prices producing a fraction of intent
+  // (this exact bug hit NER + NGS: $2 preset → $0.60/$0.90 actual net).
+  const contractSize = Number(cfg.contract_size);
+  const feeRt = Number(cfg.fee_per_contract_roundtrip);
+  const specMissing = !(contractSize > 0) || !(feeRt > 0);
   const sleeves = Array.isArray(cfg.sleeves) ? [...cfg.sleeves] : [];
   const existing = sleeveId ? sleeves.find(s => s.id === sleeveId) : null;
 
@@ -3251,6 +3258,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
             <span class="stale-warn">Selected anchor is $${fmtPrice(anchorToMarketDist)} away from current market — targets below may be off-market</span>
           </div>` : ''}
       </div>
+      ${specMissing ? `
+      <div class="sleeve-spec-missing-warn" style="background:rgba(255,159,64,0.12);border:1px solid var(--warn);border-radius:6px;padding:10px 12px;margin:8px 0;color:var(--warn);font-size:13px;">
+        <b>Coinbase specs not synced yet for ${escapeHtml(symbol)}.</b>
+        <div style="margin-top:4px;color:var(--muted);">
+          The bot pulls contract_size and per-fill fees from Coinbase on each product's first tick. Presets and the $/swing slider are disabled until that lands — otherwise silver-scale defaults would leak into the spread math and save prices that produce a fraction of your target (this is what happened to NER + NGS earlier). Close this modal, wait 60s, and reopen.
+        </div>
+      </div>` : ''}
       <div id="sleeve-spread-recs" class="sleeve-spread-recs" hidden>
         <div class="sleeve-spread-recs-head">
           Recommended spreads
@@ -3455,6 +3469,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   function applyPreset(name) {
     let p = PRESETS[name];
     if (!p) return;
+    if (specMissing) {
+      alert(`Cannot apply preset — Coinbase specs (contract_size, fees) haven't loaded yet for ${symbol}. Wait a few seconds and reopen this modal. The bot fetches specs from Coinbase on each product's first tick.`);
+      return;
+    }
     exitEl.value = p.exit_mode;
     // Expert-derived per-product values override the preset's silver-tuned
     // defaults when we have ATR for this product. So Model B applied to oil
@@ -3624,6 +3642,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     //   gross_needed = target_net + roundtrip_fees
     //   spread_per_contract = gross_needed / (qty × contract_size)
     // That's the price gap the bot must actually capture to hand you the net.
+    if (specMissing) return;  // guard — refuse to compute with silver defaults
     const qty = Math.max(1, Number(qtyEl.value) || 1);
     const feesTotal = feeRt * qty;
     // Cost-gated MINIMUM (spec §5A): can't set a net target that's lower than
