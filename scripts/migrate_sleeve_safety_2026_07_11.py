@@ -206,19 +206,27 @@ def main() -> int:
                 cfg["sleeves"] = new_sleeves
                 store.put_config(tenant, symbol, cfg)
                 print(f"    → written to {tenant}/{symbol}")
-                # Clear stale ratchet HWM on state for each migrated sleeve.
-                # The migration replaced a silver-scale base stop with a
-                # product-scale one; the HWM was from a past peak whose
-                # ratchet_distance was silver-scale. Keeping it would let the
-                # old ratchet ($3.0083 on NGS) override the new base ($2.87)
-                # via max(base, hwm - dist). Clearing forces the effective
-                # stop to equal the new base until a fresh cycle rebuilds HWM.
+
+            # HWM clear + intent write runs INDEPENDENTLY of config changes.
+            # A prior migration run may have already corrected config but the
+            # HWM in state is still stale — that's exactly the case where the
+            # earlier gate-on-symbol_changed was too strict. This block runs
+            # every apply pass, even if config didn't need updating.
+            #
+            # Clear stale ratchet HWM on state for each migrated sleeve.
+            # The migration replaced a silver-scale base stop with a
+            # product-scale one; the HWM was from a past peak whose
+            # ratchet_distance was silver-scale. Keeping it would let the
+            # old ratchet ($3.0083 on NGS) override the new base ($2.87)
+            # via max(base, hwm - dist). Clearing forces the effective
+            # stop to equal the new base until a fresh cycle rebuilds HWM.
+            if args.apply:
                 state = store.get_state(tenant, symbol) or {}
                 sleeves_state = (state.get("sleeves") or {})
                 state_changed = False
                 for sid, ss in list(sleeves_state.items()):
                     if ss.get("stop_loss_hwm") is not None:
-                        print(f"    → cleared stop_loss_hwm={ss.get('stop_loss_hwm')} on state sleeve {sid}")
+                        print(f"[{tenant}/{symbol}] → cleared stop_loss_hwm={ss.get('stop_loss_hwm')} on state sleeve {sid}")
                         ss["stop_loss_hwm"] = None
                         state_changed = True
                 if state_changed:
@@ -232,10 +240,11 @@ def main() -> int:
                         store._put_scope(tenant, symbol,
                                          "sleeve_state_reset_intent",
                                          {"clear_hwm": True})
-                        print(f"    → sleeve_state_reset_intent written to force bot to honor HWM clear on next tick")
+                        print(f"[{tenant}/{symbol}] → sleeve_state_reset_intent written to force bot to honor HWM clear on next tick")
                     except Exception as e:
-                        print(f"    → WARNING: could not write reset intent: {e}")
+                        print(f"[{tenant}/{symbol}] → WARNING: could not write reset intent: {e}")
                         print(f"       (bot may re-clobber the HWM until restart)")
+                    total_updated += 1  # count HWM clears in the summary too
 
     print()
     print(f"Total sleeves scanned: {total_sleeves}")
