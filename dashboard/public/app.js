@@ -4450,7 +4450,17 @@ function openScannerDetail(row) {
             const baseStop = Number(s.stop_loss_px) || 0;
             const hwm = Number(ss.stop_loss_hwm) || 0;
             const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-            const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0)
+            // Ratchet only actually applies once unrealized/contract crosses
+            // stop_loss_ratchet_activation — see swing_leg._sleeve_effective_stop.
+            // Without this activation check, the dashboard shows a "ratcheted"
+            // stop even when the sleeve is underwater and the ratchet doesn't
+            // apply — misleading users into thinking the effective stop is
+            // higher than it actually is.
+            const activation = Number(s.stop_loss_ratchet_activation) || 0;
+            const ownAvgEntry = Number(ss.own_avg_entry) || 0;
+            const unrealizedPerContract = ownAvgEntry > 0 ? hwm - ownAvgEntry : 0;
+            const ratchetArmed = ownAvgEntry > 0 && unrealizedPerContract >= activation;
+            const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0 && ratchetArmed)
               ? hwm - ratchetDist
               : 0;
             const effective = Math.max(baseStop, ratchetedFloor);
