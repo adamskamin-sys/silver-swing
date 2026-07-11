@@ -155,11 +155,19 @@ def main() -> int:
         print("Each flagged product's realized_pnl and target_net gates are using the wrong fee.")
         print("Fix: edit any attached sleeve in the dashboard to trigger a config re-save,")
         print("which forces main.py:_refresh_contract_spec_into_config to re-preview and update.")
-    elif client:
-        print("All stored fees match live Coinbase preview within threshold. ✓")
     else:
-        print("Live preview not available — compare stored values against your Coinbase fills")
-        print("(Portfolio → History) to catch any drift manually.")
+        # Distinguish "all match" (we actually compared) from "we don't know"
+        # (client couldn't preview). Prior version conflated the two and would
+        # print a green check even when nothing was verified.
+        rows_with_live = sum(1 for r in rows if r["live_rt"] is not None)
+        if rows_with_live > 0:
+            print(f"All {rows_with_live} product(s) with a live-preview comparison match within threshold. ✓")
+            if rows_with_live < len(rows):
+                print(f"({len(rows) - rows_with_live} product(s) had no live preview — see rows above with '—' in LIVE-RT.)")
+        else:
+            print("No live preview available — every row's LIVE-RT is '—', so no drift check was performed.")
+            print("Compare stored values against your Coinbase fills (Portfolio → History) manually,")
+            print("or run this script from a machine with a working ECDSA/ES256 Coinbase key.")
     return 0
 
 

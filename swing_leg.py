@@ -1329,6 +1329,14 @@ class SwingTrader:
                         and last_price - sc.buy_px > sc.reanchor_threshold:
                     new_buy_px = self._snap_to_tick(last_price - spread / 2)
                     new_sell_px = self._snap_to_tick(last_price + spread / 2)
+                    # No-op guard: if spread/2 > reanchor_threshold, the reanchor
+                    # condition stays TRUE forever after the first walk (last_price
+                    # − new_buy_px == spread/2 > threshold), and every subsequent
+                    # tick recomputes the same prices — flooding the log with
+                    # identical reanchor events. Only fire if targets actually
+                    # move.
+                    if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
+                        return
                     self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
                     return  # next tick uses the new targets
                 # Time-based reanchor: if we've been waiting to rebuy for
@@ -1342,6 +1350,11 @@ class SwingTrader:
                     if elapsed >= float(sc.time_reanchor_secs):
                         new_buy_px = self._snap_to_tick(last_price - spread / 2)
                         new_sell_px = self._snap_to_tick(last_price + spread / 2)
+                        # No-op guard (same rationale as the price-threshold path
+                        # above): if tick-snap produces the same buy/sell we
+                        # already have, don't fire.
+                        if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
+                            return
                         self._record(
                             "sleeve_time_reanchor",
                             sleeve_id=sc.id, sleeve_name=sc.name,
@@ -1368,6 +1381,11 @@ class SwingTrader:
                         if last_price >= threshold:
                             new_buy_px = self._snap_to_tick(last_price - spread / 2)
                             new_sell_px = self._snap_to_tick(last_price + spread / 2)
+                            # No-op guard (same rationale as the price-threshold
+                            # path above): if tick-snap produces the same
+                            # buy/sell we already have, don't fire.
+                            if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
+                                return
                             self._record(
                                 "sleeve_vol_reanchor",
                                 sleeve_id=sc.id, sleeve_name=sc.name,
