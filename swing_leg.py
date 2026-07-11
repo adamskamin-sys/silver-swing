@@ -750,21 +750,35 @@ class SwingTrader:
         return sellable_ceiling  # "all"
 
     def _sleeve_effective_stop(self, sc, ss) -> float:
-        """Compute the effective stop-loss price. If ratchet is enabled AND
-        the position has cleared the activation profit threshold, returns
-        max(fixed_stop, HWM - ratchet_distance). Otherwise returns the fixed
-        stop. Always monotonic-up: once ratcheted higher, never drops."""
+        """Compute the effective stop-loss price by taking the max (tightest,
+        highest-for-LONG) of three candidates:
+          1. fixed_stop        — the configured stop_loss_px (base floor)
+          2. ratchet_stop      — HWM − ratchet_distance, once activation crossed
+          3. protect_realized  — cost_basis − (realized_pnl × frac) / (size × qty)
+                                 caps loss on this cycle at frac of what the
+                                 sleeve has already booked
+        Whichever is highest wins. Always monotonic-up: once ratcheted or
+        protect-realized-tightened, never drops on the same position."""
         fixed_stop = float(sc.stop_loss_px or 0.0)
-        if not sc.stop_loss_ratchet_enabled:
-            return fixed_stop
-        if ss.stop_loss_hwm is None or ss.own_avg_entry is None:
-            return fixed_stop
-        # Ratchet only arms once unrealized/contract is above activation.
-        unrealized_per_contract = ss.stop_loss_hwm - float(ss.own_avg_entry)
-        if unrealized_per_contract < sc.stop_loss_ratchet_activation:
-            return fixed_stop
-        ratchet_stop = float(ss.stop_loss_hwm) - float(sc.stop_loss_ratchet_distance)
-        return max(fixed_stop, ratchet_stop)
+        candidates = [fixed_stop]
+        # Ratchet candidate
+        if sc.stop_loss_ratchet_enabled \
+                and ss.stop_loss_hwm is not None \
+                and ss.own_avg_entry is not None:
+            unrealized_per_contract = ss.stop_loss_hwm - float(ss.own_avg_entry)
+            if unrealized_per_contract >= sc.stop_loss_ratchet_activation:
+                candidates.append(float(ss.stop_loss_hwm) - float(sc.stop_loss_ratchet_distance))
+        # Protect-realized candidate — only meaningful when the sleeve has
+        # positive realized_pnl AND we know the cost basis of what we hold.
+        if sc.stop_loss_protect_realized_enabled \
+                and ss.own_avg_entry is not None \
+                and float(ss.realized_pnl or 0.0) > 0 \
+                and int(sc.qty) > 0:
+            frac = float(sc.stop_loss_protect_realized_frac or 0.5)
+            max_loss_dollars = float(ss.realized_pnl) * frac
+            price_move = max_loss_dollars / (float(self.cfg.contract_size) * int(sc.qty))
+            candidates.append(float(ss.own_avg_entry) - price_move)
+        return max(candidates)
 
     def _maybe_trigger_sleeve_stop_loss(self, sc, ss, last_price: float) -> bool:
         """Per-sleeve stop-loss. Fires either from fixed floor OR from a
@@ -858,6 +872,33 @@ class SwingTrader:
         return True
 
     # ---- rolling price range for volatility detection ---------------------
+
+    def _sleeve_trend_ok_for_buy(self, sc, last_price: float) -> bool:
+        """Trend gate on the BUY arm. Returns False (block the buy) when the
+        filter is enabled AND last_price < the M-bar SMA of the sleeve's
+        rolling price history. Turtle / Livermore rule: don't buy into a
+        confirmed downtrend. If we don't have enough history yet, allow the
+        buy — the filter should be permissive at cold start rather than
+        stall the sleeve indefinitely."""
+        if not getattr(sc, "entry_trend_filter_enabled", False):
+            return True
+        window = int(getattr(sc, "entry_trend_sma_window", 20) or 0)
+        if window <= 0:
+            return True
+        history = self._sleeve_price_history.get(sc.id)
+        if not history or len(history) < window:
+            return True  # cold start — don't block
+        recent = list(history)[-window:]
+        sma = sum(recent) / len(recent)
+        if last_price < sma:
+            self._record(
+                "sleeve_trend_gate_blocked",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                last_price=round(float(last_price), 4),
+                sma=round(sma, 4), window=window,
+            )
+            return False
+        return True
 
     def _sleeve_recent_range(self, sc) -> float:
         """Peak-to-trough range of the last N ticks in this sleeve's price
@@ -1338,6 +1379,13 @@ class SwingTrader:
                             )
                             self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
                             return
+                # Trend gate: refuse to arm a buy while price is under the
+                # M-bar SMA of this sleeve's rolling price history. Prevents
+                # the buy leg from filling into a downtrend (falling knife).
+                # Only gates while trending down — reanchor rules above handle
+                # the "priced-out to the upside" case.
+                if not self._sleeve_trend_ok_for_buy(sc, last_price):
+                    return
                 ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, sc.buy_px, last_price)
                 if ms_qty is None:
                     return  # microstructure gate said pause

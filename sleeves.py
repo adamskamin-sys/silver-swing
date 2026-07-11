@@ -124,6 +124,24 @@ class SleeveConfig:
     # whichever SWING_MS_* env vars are set on the bot.
     microstructure_gate_enabled: bool = False
 
+    # Realized-gains-protect stop-loss floor. When enabled AND the sleeve has
+    # positive realized_pnl, the effective stop is tightened so that a stop-out
+    # cannot cost more than (realized_pnl × frac). Guarantees the sleeve keeps
+    # at least (1 − frac) of what it's already booked, no matter what happens
+    # on the current position. Added as a THIRD candidate to _sleeve_effective_stop:
+    #   effective_stop = max(fixed_stop, ratchet_stop, protect_realized_stop)
+    # Only kicks in from cycle 2+ (realized_pnl > 0). First cycle uses the base.
+    stop_loss_protect_realized_enabled: bool = False
+    stop_loss_protect_realized_frac: float = 0.5
+
+    # Trend gate on the BUY arm — refuses to arm a buy when last_price is
+    # below the M-bar SMA of the sleeve's rolling price history. Prevents the
+    # sleeve from filling into a still-tanking market ("catching a falling
+    # knife"). Turtle/Livermore-style: wait for the trend to prove itself.
+    # 0 window = disabled even if the flag is on.
+    entry_trend_filter_enabled: bool = False
+    entry_trend_sma_window: int = 20
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -168,6 +186,10 @@ class SleeveConfig:
             news_blackout_enabled=bool(d.get("news_blackout_enabled") or False),
             news_blackout_tier=int(d.get("news_blackout_tier") or 2),
             microstructure_gate_enabled=bool(d.get("microstructure_gate_enabled") or False),
+            stop_loss_protect_realized_enabled=bool(d.get("stop_loss_protect_realized_enabled") or False),
+            stop_loss_protect_realized_frac=float(d.get("stop_loss_protect_realized_frac") or 0.5),
+            entry_trend_filter_enabled=bool(d.get("entry_trend_filter_enabled") or False),
+            entry_trend_sma_window=int(d.get("entry_trend_sma_window") or 20),
         )
 
 

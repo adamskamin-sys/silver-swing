@@ -383,23 +383,49 @@ def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:
                 cfg[k] = v
                 dirty = True
 
-        # Fetch the real per-fill commission via preview_order and write
-        # 2 × that into fee_per_contract_roundtrip. Coinbase adjusts these
-        # occasionally (silver dropped from $2.34 to $2.32/fill on 2026-07-07)
-        # and Adam's fee tier can shift as his 30d volume grows — hardcoding
-        # any single value silently drifts against reality. This keeps the
-        # bot's cost floor + preset math tied to what he ACTUALLY pays.
+        # Fetch the real per-fill commission via preview_order — BOTH sides.
+        # Prior versions only previewed the SELL side and doubled it. That
+        # assumes buy_fee == sell_fee, which is *usually* true on CFM but not
+        # guaranteed (fee-tier changes, product-specific carve-outs). Preview
+        # each side, store them separately, and derive round-trip as the sum.
+        # Coinbase adjusts these occasionally (silver dropped $2.34 → $2.32/fill
+        # on 2026-07-07) and Adam's fee tier can shift as his 30d volume grows
+        # — hardcoding any single value silently drifts against reality.
         try:
-            preview = broker.client.preview_limit_order_gtc_sell(
-                product_id=symbol, base_size="1", limit_price="999999.99",
-            )
-            preview_d = preview.to_dict() if hasattr(preview, "to_dict") else preview
-            per_fill = float(preview_d.get("commission_total") or 0)
-            if per_fill > 0:
-                round_trip = round(per_fill * 2, 4)
-                if cfg.get("fee_per_contract_roundtrip") != round_trip:
+            def _preview_side_commission(side: str) -> float:
+                if side == "BUY":
+                    preview = broker.client.preview_limit_order_gtc_buy(
+                        product_id=symbol, base_size="1", limit_price="0.001",
+                    )
+                else:
+                    preview = broker.client.preview_limit_order_gtc_sell(
+                        product_id=symbol, base_size="1", limit_price="999999.99",
+                    )
+                pd = preview.to_dict() if hasattr(preview, "to_dict") else preview
+                return float(pd.get("commission_total") or 0.0)
+
+            per_fill_buy = _preview_side_commission("BUY")
+            per_fill_sell = _preview_side_commission("SELL")
+            if per_fill_buy > 0 or per_fill_sell > 0:
+                # If only one side previews cleanly, fall back to 2× that side
+                # so we still get *some* accurate value rather than dropping to
+                # the stale default.
+                if per_fill_buy <= 0:
+                    per_fill_buy = per_fill_sell
+                if per_fill_sell <= 0:
+                    per_fill_sell = per_fill_buy
+                round_trip = round(per_fill_buy + per_fill_sell, 4)
+                per_fill_avg = round((per_fill_buy + per_fill_sell) / 2.0, 4)
+                changed = (
+                    cfg.get("fee_per_contract_roundtrip") != round_trip
+                    or cfg.get("fee_per_fill_buy") != round(per_fill_buy, 4)
+                    or cfg.get("fee_per_fill_sell") != round(per_fill_sell, 4)
+                )
+                if changed:
                     cfg["fee_per_contract_roundtrip"] = round_trip
-                    cfg["fee_per_fill_empirical"] = per_fill
+                    cfg["fee_per_fill_buy"] = round(per_fill_buy, 4)
+                    cfg["fee_per_fill_sell"] = round(per_fill_sell, 4)
+                    cfg["fee_per_fill_empirical"] = per_fill_avg
                     dirty = True
         except Exception as fee_err:
             _log(f"[{tenant}/{symbol}] fee refresh skipped: {type(fee_err).__name__}: {fee_err}")
@@ -408,6 +434,8 @@ def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:
             store.put_config(tenant, symbol, cfg)
             _log(f"[{tenant}/{symbol}] spec refreshed: tick={spec.get('tick_size')}, "
                  f"size={spec.get('contract_size')}, expiry={spec.get('contract_expiry')}, "
+                 f"buy_fee=${cfg.get('fee_per_fill_buy')}, "
+                 f"sell_fee=${cfg.get('fee_per_fill_sell')}, "
                  f"round_trip_fee=${cfg.get('fee_per_contract_roundtrip')}")
     except Exception as e:
         _log(f"[{tenant}/{symbol}] spec refresh skipped: {type(e).__name__}: {e}")

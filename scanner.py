@@ -33,6 +33,36 @@ def _f(v) -> Optional[float]:
         return None
 
 
+# Per-product fee cache. Keyed by product_id → (per_fill_commission, ts).
+# TTL 24h — Coinbase adjusts fee tiers rarely enough that a daily refresh is
+# plenty, and avoids N preview calls per scan.
+_FEE_CACHE: dict[str, tuple[float, float]] = {}
+_FEE_TTL_SECS = 24 * 3600
+
+
+def _fetch_per_fill_commission(coinbase_client, product_id: str) -> Optional[float]:
+    """Preview a 1-contract SELL far above market so nothing can fill, read
+    commission_total. Cache per product for 24h. Returns per-fill commission
+    in USD, or None if the preview call fails (product ineligible, expired,
+    auth quirk). Callers must fall back sanely on None."""
+    cached = _FEE_CACHE.get(product_id)
+    now = time.time()
+    if cached and (now - cached[1]) < _FEE_TTL_SECS:
+        return cached[0]
+    try:
+        preview = coinbase_client.preview_limit_order_gtc_sell(
+            product_id=product_id, base_size="1", limit_price="999999.99",
+        )
+        pd = preview.to_dict() if hasattr(preview, "to_dict") else preview
+        per_fill = float(pd.get("commission_total") or 0.0)
+    except Exception:
+        return cached[0] if cached else None
+    if per_fill <= 0:
+        return cached[0] if cached else None
+    _FEE_CACHE[product_id] = (per_fill, now)
+    return per_fill
+
+
 def compute_roundtrip_metric(prices: list[float], spread: float) -> tuple[int, float, float]:
     """Zig-zag swing detection: walk the price series, count reversals of
     amplitude >= spread. Returns (roundtrip_count, avg_swing_amp, max_swing_amp).
@@ -348,6 +378,9 @@ def fetch_and_rank(
                     monthly_default_score = max(0.0, monthly_default_rt * net_per_default_rt)
         weekly_score = weekly_score_val
         monthly_score = monthly_score_val
+        # Per-product fee lookup — so the scanner-buy preview and confirm can
+        # show the ACTUAL cost per trade instead of a hardcoded silver number.
+        per_fill_fee = _fetch_per_fill_commission(coinbase_client, pid)
         entry.update({
             "best_score": swing["best_score"],
             "best_roundtrips": swing["best_roundtrips"],
@@ -369,6 +402,8 @@ def fetch_and_rank(
             "monthly_roundtrips": monthly_rt,
             "weekly_default_score": round(weekly_default_score, 2),
             "monthly_default_score": round(monthly_default_score, 2),
+            "fee_per_fill": round(per_fill_fee, 4) if per_fill_fee else None,
+            "fee_per_contract_roundtrip": round(per_fill_fee * 2, 4) if per_fill_fee else None,
         })
         # Courtesy pause between candle calls — one product ~= one API request,
         # ~30 products/scan × 60s cadence = well under Coinbase's rate limit,

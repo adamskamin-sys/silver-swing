@@ -3058,16 +3058,19 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: true, max_consecutive: 3,
+        reanchor_on_trigger: false, max_consecutive: 3,
+        protect_realized_enabled: true, protect_realized_frac: 0.5,
       },
       reanchorThreshold: 0.75,
       timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
-      note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + reanchor on stalled buy + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore.',
+      entryTrendFilter: { enabled: true, sma_window: 20 },
+      microstructureGate: true,
+      note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore / Turtles.',
     },
     'Model C — Microstructure-informed': {
       // Model B + sleeve-level microstructure gates. Uses OBI (order book
@@ -3080,15 +3083,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: true, max_consecutive: 3,
+        reanchor_on_trigger: false, max_consecutive: 3,
+        protect_realized_enabled: true, protect_realized_frac: 0.5,
       },
       reanchorThreshold: 0.75,
       timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
     },
@@ -3103,15 +3108,18 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: true, max_consecutive: 3,
+        reanchor_on_trigger: false, max_consecutive: 3,
+        protect_realized_enabled: true, protect_realized_frac: 0.5,
       },
       reanchorThreshold: 0.75,
       timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      entryTrendFilter: { enabled: true, sma_window: 20 },
+      microstructureGate: true,
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
     },
@@ -3126,15 +3134,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       hybridDelay: 5,
       accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
       stopLoss: {
-        enabled: false, price_below_buy: 1.5, qty_mode: 'all',
+        enabled: true, price_below_buy: 1.5, qty_mode: 'all',
         ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: true, max_consecutive: 3,
+        reanchor_on_trigger: false, max_consecutive: 3,
+        protect_realized_enabled: true, protect_realized_frac: 0.5,
       },
       reanchorThreshold: 0.75,
       timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Everything combined: Model B + microstructure gates + news blackout. Highest theoretical EV. Also highest complexity — a good win here vs Model B tells you the microstructure + news signals add real edge; a small/negative delta means those signals are noise for your timescale.',
@@ -3562,6 +3572,16 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     draft.stop_loss_ratchet_activation = sl.ratchet_activation ?? 0.50;
     draft.stop_loss_reanchor_on_trigger = !!sl.reanchor_on_trigger;
     draft.stop_loss_max_consecutive = sl.max_consecutive ?? 0;
+    // Protect-half realized-gains stop: caps loss on this cycle at
+    // (realized_pnl × frac). Only meaningful from cycle 2+. Flows through
+    // draft — no editor UI, presets are the interface.
+    draft.stop_loss_protect_realized_enabled = !!sl.protect_realized_enabled;
+    draft.stop_loss_protect_realized_frac = sl.protect_realized_frac ?? 0.5;
+    // Trend gate on buy arm: refuses to arm buys when last_price < N-bar SMA
+    // (Turtle / Livermore anti-falling-knife rule).
+    const etf = p.entryTrendFilter || {};
+    draft.entry_trend_filter_enabled = !!etf.enabled;
+    draft.entry_trend_sma_window = etf.sma_window ?? 20;
     const re = p.reentry || {};
     draft.reentry_mode = re.mode || 'off';
     draft.reentry_range_contraction = re.range_contraction ?? 0.5;
@@ -3945,6 +3965,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       news_blackout_enabled: !!draft.news_blackout_enabled,
       news_blackout_tier: parseInt(draft.news_blackout_tier || 2, 10),
       microstructure_gate_enabled: !!draft.microstructure_gate_enabled,
+      stop_loss_protect_realized_enabled: !!draft.stop_loss_protect_realized_enabled,
+      stop_loss_protect_realized_frac: Number(draft.stop_loss_protect_realized_frac) || 0.5,
+      entry_trend_filter_enabled: !!draft.entry_trend_filter_enabled,
+      entry_trend_sma_window: parseInt(draft.entry_trend_sma_window || 20, 10),
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
@@ -4757,7 +4781,17 @@ function updateScannerBuyButton() {
   const marginRequired = intradayRate > 0
     ? notional * intradayRate
     : (storedMarginPer > 0 ? storedMarginPer * qty : 0);
-  const feeEst = 2.34 * qty;
+  // Real per-fill fee for THIS product. Scanner attaches fee_per_fill from a
+  // live Coinbase preview; tracked-product configs also store the round-trip
+  // number. Fall back to silver's $2.34 only if we've genuinely never seen
+  // this product before (a stale scanner cache, or bot never previewed it).
+  const rowPerFill = Number(ctx.fee_per_fill) || 0;
+  const cfgRt = Number(liveCfg.fee_per_contract_roundtrip) || 0;
+  const perFillFee = rowPerFill > 0
+    ? rowPerFill
+    : (cfgRt > 0 ? cfgRt / 2 : 2.34);
+  const feeEst = perFillFee * qty;
+  const feeIsEstimate = !(rowPerFill > 0 || cfgRt > 0);
   const priceLabel = orderType === 'limit'
     ? (limitPrice > 0 ? `at your limit $${limitPrice.toFixed(3)}` : 'at your limit (enter price)')
     : `at market ~$${(Number(scannerDetailContext.price) || 0).toFixed(3)}`;
@@ -4770,9 +4804,10 @@ function updateScannerBuyButton() {
   const perContractLine = marginPerCt > 0
     ? `<b>1 contract costs</b> <b style="color:var(--text)">$${fmt(marginPerCt)}</b> margin <span class="dim">(notional $${fmt(notionalPerCt)})</span>`
     : `<b>1 contract costs</b> <b style="color:var(--text)">$${fmt(notionalPerCt)}</b> notional <span class="dim">(margin unknown for this product)</span>`;
+  const feeSuffix = feeIsEstimate ? ' <span class="dim">(silver-tier estimate)</span>' : '';
   const totalLine = marginRequired > 0
-    ? `Total margin: <b style="color:var(--text)">$${fmt(marginRequired)}</b> · fee ~$${feeEst.toFixed(2)}`
-    : `Total notional: <b style="color:var(--text)">$${fmt(notional)}</b> · fee ~$${feeEst.toFixed(2)}`;
+    ? `Total margin: <b style="color:var(--text)">$${fmt(marginRequired)}</b> · fee ~$${feeEst.toFixed(2)}${feeSuffix}`
+    : `Total notional: <b style="color:var(--text)">$${fmt(notional)}</b> · fee ~$${feeEst.toFixed(2)}${feeSuffix}`;
 
   const previewEl = document.getElementById('scanner-buy-preview');
   if (previewEl) {
@@ -4846,7 +4881,43 @@ scannerBuyBtn.addEventListener('click', async () => {
       ? `LIMIT at $${limitPrice.toFixed(3)}`
       : 'MARKET at current ask';
     const verb = side === 'SELL' ? 'SHORT (SELL)' : 'BUY';
-    const ok = confirm(`REAL MONEY: place a ${detail} ${verb} of ${qty} ${symbol} contract${qty > 1 ? 's' : ''} on Coinbase?`);
+    // Recompute cost lines from the same inputs updateScannerBuyButton uses,
+    // so the confirm dialog restates the exact $ that live in the preview
+    // panel — no chance of the popup and the panel disagreeing.
+    const ctx = scannerDetailContext;
+    const contractSize = Number(ctx.contract_size) || 50;
+    const priceForConfirm = orderType === 'limit' && limitPrice > 0
+      ? limitPrice
+      : Number(ctx.price) || 0;
+    const notional = priceForConfirm * contractSize * qty;
+    const intradayRate = Number(ctx.intraday_margin_rate) || 0;
+    const liveCfg = ctx._live_tenant
+      ? (currentStore?.[ctx._live_tenant]?.[ctx.product_id]?.config || {})
+      : {};
+    const storedMarginPer = Number(liveCfg.margin_per_contract) || 0;
+    const marginRequired = intradayRate > 0
+      ? notional * intradayRate
+      : (storedMarginPer > 0 ? storedMarginPer * qty : 0);
+    const rowPerFill = Number(ctx.fee_per_fill) || 0;
+    const cfgRt = Number(liveCfg.fee_per_contract_roundtrip) || 0;
+    const perFillFee = rowPerFill > 0 ? rowPerFill : (cfgRt > 0 ? cfgRt / 2 : 2.34);
+    const feeEst = perFillFee * qty;
+    const feeIsEstimate = !(rowPerFill > 0 || cfgRt > 0);
+    const fmt2 = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    const costLines = [
+      marginRequired > 0
+        ? `Margin required: $${fmt2(marginRequired)}`
+        : `Notional: $${fmt2(notional)}  (margin unknown)`,
+      `Est. fee: ~$${feeEst.toFixed(2)}${feeIsEstimate ? ' (silver-tier estimate)' : ''}`,
+      `Notional: $${fmt2(notional)}`,
+    ];
+    const ok = confirm(
+      `REAL MONEY\n\n` +
+      `${verb} ${qty} × ${symbol} contract${qty > 1 ? 's' : ''}\n` +
+      `${detail}\n\n` +
+      costLines.join('\n') + `\n\n` +
+      `Proceed?`
+    );
     if (!ok) return;
   }
   const originalLabel = scannerBuyBtn.textContent;
