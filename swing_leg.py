@@ -873,6 +873,131 @@ class SwingTrader:
 
     # ---- rolling price range for volatility detection ---------------------
 
+    def _prepare_post_trail_wait(self, sc, ss) -> None:
+        """Called at the moment a trail-based sell fires. If the sleeve is
+        configured for post-trail re-entry gating (Flavor 3 or Stage-A-only),
+        set the state machine into 'wait_volatility' so the next ARMED_BUY
+        cycle refuses to re-arm until the wait conditions are satisfied.
+
+        Captures the *current* recent range as the baseline — the wait is
+        against contraction below (range × reentry_range_contraction), so a
+        big pre-exit range = tolerating a bigger consolidation before
+        deciding it's calm. No-op when the mode is 'off'."""
+        if getattr(sc, "post_trail_reentry_mode", "off") == "off":
+            return
+        import time as _time
+        ss.post_trail_stage = "wait_volatility"
+        ss.post_trail_exit_ts = _time.time()
+        ss.post_trail_pre_range = self._sleeve_recent_range(sc)
+        ss.post_trail_stage_b_ts = None
+        ss.post_trail_stage_b_ref_high = 0.0
+        self._record(
+            "sleeve_post_trail_wait_armed",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            mode=sc.post_trail_reentry_mode,
+            pre_range=round(ss.post_trail_pre_range, 4),
+        )
+
+    def _sleeve_check_post_trail(self, sc, ss, last_price: float) -> bool:
+        """Advance the post-trail re-entry state machine. Returns True if the
+        sleeve should NOT arm this tick (still waiting for a stage to satisfy).
+        Returns False when the wait is over (either satisfied or timed out),
+        clearing the state to 'off' so the normal ARMED_BUY flow can proceed.
+
+        Two-stage sequential ('sequential' mode):
+          A: recent range ≤ pre_range × reentry_range_contraction, after
+             at least reentry_min_wait_secs of elapsed time.
+          B: last_price > post_trail_stage_b_ref_high (a NEW high above the
+             price at the moment Stage A satisfied). Also fires on
+             post_trail_stage_b_max_wait_secs timeout as a safety valve.
+
+        Stage-A-only ('volatility' mode): completes after A satisfies.
+        """
+        stage = getattr(ss, "post_trail_stage", "off")
+        if stage == "off":
+            return False
+        import time as _time
+        now = _time.time()
+
+        if stage == "wait_volatility":
+            elapsed = now - float(ss.post_trail_exit_ts or now)
+            min_wait = float(sc.reentry_min_wait_secs or 30.0)
+            if elapsed < min_wait:
+                return True
+            pre_range = float(ss.post_trail_pre_range or 0.0)
+            current_range = self._sleeve_recent_range(sc)
+            # If we have no pre-exit baseline (edge case), fall back to
+            # time-only after 5× the min wait so the sleeve doesn't stall.
+            if pre_range <= 0:
+                if elapsed < min_wait * 5:
+                    return True
+            else:
+                target = pre_range * float(sc.reentry_range_contraction or 0.5)
+                if current_range > target:
+                    return True
+            # Stage A satisfied.
+            mode = getattr(sc, "post_trail_reentry_mode", "off")
+            if mode == "volatility":
+                ss.post_trail_stage = "off"
+                ss.post_trail_exit_ts = None
+                ss.post_trail_pre_range = 0.0
+                self._record(
+                    "sleeve_post_trail_wait_cleared",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    stage="A", mode="volatility",
+                    elapsed_secs=round(elapsed, 1),
+                    current_range=round(current_range, 4),
+                )
+                return False
+            # Sequential → transition to Stage B, lock the reference high.
+            ss.post_trail_stage = "wait_new_high"
+            ss.post_trail_stage_b_ts = now
+            ss.post_trail_stage_b_ref_high = float(last_price)
+            self._record(
+                "sleeve_post_trail_stage_a_satisfied",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                elapsed_secs=round(elapsed, 1),
+                current_range=round(current_range, 4),
+                stage_b_ref_high=round(float(last_price), 4),
+            )
+            return True
+
+        if stage == "wait_new_high":
+            stage_b_elapsed = now - float(ss.post_trail_stage_b_ts or now)
+            max_wait = float(sc.post_trail_stage_b_max_wait_secs or 3600.0)
+            if stage_b_elapsed >= max_wait > 0:
+                self._record(
+                    "sleeve_post_trail_stage_b_timeout",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    elapsed_secs=round(stage_b_elapsed, 1),
+                    max_wait_secs=max_wait,
+                    ref_high=round(float(ss.post_trail_stage_b_ref_high or 0.0), 4),
+                )
+                ss.post_trail_stage = "off"
+                ss.post_trail_exit_ts = None
+                ss.post_trail_pre_range = 0.0
+                ss.post_trail_stage_b_ts = None
+                ss.post_trail_stage_b_ref_high = 0.0
+                return False
+            ref = float(ss.post_trail_stage_b_ref_high or 0.0)
+            if ref > 0 and last_price > ref:
+                self._record(
+                    "sleeve_post_trail_stage_b_satisfied",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    new_high=round(float(last_price), 4),
+                    ref_high=round(ref, 4),
+                    elapsed_secs=round(stage_b_elapsed, 1),
+                )
+                ss.post_trail_stage = "off"
+                ss.post_trail_exit_ts = None
+                ss.post_trail_pre_range = 0.0
+                ss.post_trail_stage_b_ts = None
+                ss.post_trail_stage_b_ref_high = 0.0
+                return False
+            return True
+
+        return False
+
     def _sleeve_trend_ok_for_buy(self, sc, last_price: float) -> bool:
         """Trend gate on the BUY arm. Returns False (block the buy) when the
         filter is enabled AND last_price < the M-bar SMA of the sleeve's
@@ -1308,6 +1433,7 @@ class SwingTrader:
                     # until HWM rises enough to lock in at least the target.
                     if not self._sleeve_lockin_ok(sc, ss, stop):
                         return
+                    self._prepare_post_trail_wait(sc, ss)
                     self._sleeve_market_sell(sc, ss, last_price, trail_exit=True)
                 elif sc.exit_mode == "hybrid":
                     self._sleeve_hybrid_step(sc, ss, last_price)
@@ -1317,6 +1443,13 @@ class SwingTrader:
                         return  # microstructure gate said pause
                     self._sleeve_arm(sc, ss, "SELL", ms_qty, ms_px)
             else:  # ARMED_BUY
+                # Post-trail re-entry gate (Flavor 3). If a trail exit just
+                # fired and the sleeve is configured to wait for volatility
+                # contraction + a new high before re-arming, this returns True
+                # until both stages satisfy (or Stage B times out). Skips
+                # everything below — no reanchor walk, no buy arm.
+                if self._sleeve_check_post_trail(sc, ss, last_price):
+                    return
                 # Auto-reanchor: if silver has run more than reanchor_threshold
                 # above buy_px while we've been waiting, the buy target is stale
                 # — silver isn't going to dip back down to fill it. Walk both
@@ -1549,6 +1682,7 @@ class SwingTrader:
             # Spec §5A: hybrid → trailing inherits the min lock-in rule.
             if not self._sleeve_lockin_ok(sc, ss, stop):
                 return
+            self._prepare_post_trail_wait(sc, ss)
             self._sleeve_market_sell(sc, ss, last_price, trail_exit=True)
             return
 

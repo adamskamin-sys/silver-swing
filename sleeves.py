@@ -142,6 +142,20 @@ class SleeveConfig:
     entry_trend_filter_enabled: bool = False
     entry_trend_sma_window: int = 20
 
+    # Post-trail re-entry gate (Flavor 3). After a hybrid trail exit fires a
+    # sell, the sleeve enters a two-stage wait before it will re-arm a buy.
+    # Modes:
+    #   off        — no wait, re-arm on next tick (current pre-Flavor-3 behavior)
+    #   volatility — Stage A only: wait until recent range contracts below
+    #                pre_stop_range × reentry_range_contraction
+    #   sequential — Flavor 3: Stage A (volatility contracts), THEN Stage B
+    #                (new high above the price at Stage A satisfaction).
+    #                Turtle's "wait for new breakout after consolidation."
+    # Stage B has a max_wait timeout so a sleeve doesn't sit forever if the
+    # market never breaks out again — after that it re-arms unconditionally.
+    post_trail_reentry_mode: str = "off"
+    post_trail_stage_b_max_wait_secs: float = 3600.0
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -190,6 +204,8 @@ class SleeveConfig:
             stop_loss_protect_realized_frac=float(d.get("stop_loss_protect_realized_frac") or 0.5),
             entry_trend_filter_enabled=bool(d.get("entry_trend_filter_enabled") or False),
             entry_trend_sma_window=int(d.get("entry_trend_sma_window") or 20),
+            post_trail_reentry_mode=str(d.get("post_trail_reentry_mode") or "off"),
+            post_trail_stage_b_max_wait_secs=float(d.get("post_trail_stage_b_max_wait_secs") or 3600.0),
         )
 
 
@@ -268,6 +284,21 @@ class SleeveState:
     # this session (legacy state).
     armed_buy_since_ts: Optional[float] = None
 
+    # Post-trail re-entry state machine (Flavor 3). Set at the moment a
+    # hybrid trail exit fires a sell. Values:
+    #   off              — no wait; sleeve re-arms buy on next tick
+    #   wait_volatility  — Stage A: watching for recent range to contract
+    #                      below post_trail_pre_range × reentry_range_contraction
+    #   wait_new_high    — Stage B (sequential mode only): Stage A completed;
+    #                      now watching for last_price > post_trail_stage_b_ref_high
+    # While non-off, the ARMED_BUY step skips reanchor and arm until the state
+    # returns to off (either by satisfying the wait, or by Stage B timeout).
+    post_trail_stage: str = "off"
+    post_trail_exit_ts: Optional[float] = None
+    post_trail_pre_range: float = 0.0
+    post_trail_stage_b_ts: Optional[float] = None
+    post_trail_stage_b_ref_high: float = 0.0
+
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
         return cls(
@@ -295,6 +326,11 @@ class SleeveState:
             reentry_stage_1_price=d.get("reentry_stage_1_price"),
             blackout_until_ts=d.get("blackout_until_ts"),
             armed_buy_since_ts=d.get("armed_buy_since_ts"),
+            post_trail_stage=str(d.get("post_trail_stage") or "off"),
+            post_trail_exit_ts=d.get("post_trail_exit_ts"),
+            post_trail_pre_range=float(d.get("post_trail_pre_range") or 0.0),
+            post_trail_stage_b_ts=d.get("post_trail_stage_b_ts"),
+            post_trail_stage_b_ref_high=float(d.get("post_trail_stage_b_ref_high") or 0.0),
         )
 
     def to_dict(self) -> dict:

@@ -3068,6 +3068,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore / Turtles.',
@@ -3093,6 +3094,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
@@ -3118,6 +3120,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       newsBlackout: { enabled: true, tier: 2 },
@@ -3144,6 +3147,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
       volReanchorWindow: 60,         // over the last ~60 bars of price history
       reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       newsBlackout: { enabled: true, tier: 2 },
@@ -3582,6 +3586,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const etf = p.entryTrendFilter || {};
     draft.entry_trend_filter_enabled = !!etf.enabled;
     draft.entry_trend_sma_window = etf.sma_window ?? 20;
+    // Post-trail re-entry (Flavor 3): after a trail-based sell, wait for
+    // volatility to contract THEN a new high before re-arming buys. Sequential
+    // Kaufman-then-Turtle gating. 'off' = no wait, 'volatility' = Stage A only,
+    // 'sequential' = both stages.
+    const ptr = p.postTrailReentry || {};
+    draft.post_trail_reentry_mode = String(ptr.mode || 'off');
+    draft.post_trail_stage_b_max_wait_secs = Number(ptr.stage_b_max_wait_secs) || 3600;
     const re = p.reentry || {};
     draft.reentry_mode = re.mode || 'off';
     draft.reentry_range_contraction = re.range_contraction ?? 0.5;
@@ -3969,6 +3980,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       stop_loss_protect_realized_frac: Number(draft.stop_loss_protect_realized_frac) || 0.5,
       entry_trend_filter_enabled: !!draft.entry_trend_filter_enabled,
       entry_trend_sma_window: parseInt(draft.entry_trend_sma_window || 20, 10),
+      post_trail_reentry_mode: String(draft.post_trail_reentry_mode || 'off'),
+      post_trail_stage_b_max_wait_secs: Number(draft.post_trail_stage_b_max_wait_secs) || 3600,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
