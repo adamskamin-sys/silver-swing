@@ -545,8 +545,14 @@ export function makeApp({
       // these into force_include for that scan.
       const include = req.body && req.body.include;
       if (include && typeof include === 'string') {
-        await r.set('silver-swing:scanner:refresh_include',
-                    include, 'EX', 300);
+        // Use a Redis SET so multiple concurrent Scan-Now clicks accumulate
+        // instead of overwriting each other. Previous SET-based code caused
+        // e.g. "click Scan on NOL, then NER" to drop NOL from the next
+        // scanner run.
+        for (const pid of include.split(',').map(s => s.trim()).filter(Boolean)) {
+          await r.sAdd('silver-swing:scanner:refresh_include_set', pid);
+        }
+        await r.expire('silver-swing:scanner:refresh_include_set', 300);
       }
       res.json({ ok: true, requested_at: Math.floor(Date.now() / 1000) });
     } catch (err) {

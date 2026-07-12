@@ -882,16 +882,28 @@ def run_paper_mode() -> int:
                                         forced.add(sym)
                         except Exception as e:
                             _log(f"scanner: force-include gather failed: {type(e).__name__}: {e}")
-                        # Also honor an explicit include list from the dashboard
+                        # Also honor explicit include list(s) from the dashboard
                         # (Add Strategy modal for a brand-new product without
-                        # an existing sleeve). Consumed once per scan.
+                        # an existing sleeve). Uses a Redis set so successive
+                        # Scan-Now clicks accumulate instead of overwriting.
+                        # Consumed once per scan (deleted after read).
                         try:
                             import redis as _redis
                             _r = _redis.from_url(redis_url)
-                            extra = _r.get("silver-swing:scanner:refresh_include")
-                            if extra:
-                                extra = extra.decode() if isinstance(extra, bytes) else extra
-                                for pid in str(extra).split(","):
+                            members = _r.smembers("silver-swing:scanner:refresh_include_set") or set()
+                            for m in members:
+                                pid = m.decode() if isinstance(m, bytes) else str(m)
+                                pid = pid.strip()
+                                if pid:
+                                    forced.add(pid)
+                            if members:
+                                _r.delete("silver-swing:scanner:refresh_include_set")
+                            # Legacy key from earlier a47a094 deploy — read + delete
+                            # once so any stale requests still count.
+                            legacy = _r.get("silver-swing:scanner:refresh_include")
+                            if legacy:
+                                legacy = legacy.decode() if isinstance(legacy, bytes) else legacy
+                                for pid in str(legacy).split(","):
                                     pid = pid.strip()
                                     if pid:
                                         forced.add(pid)
