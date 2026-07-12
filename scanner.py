@@ -354,9 +354,17 @@ def fetch_and_rank(
                                           granularity="ONE_HOUR",
                                           lookback_secs=7 * 24 * 3600)
             fallback_used = bool(closes)
-        swing = score_product_swings(closes, tick, csize, swing_fee_per_contract_roundtrip)
+        # Use the REAL per-product round-trip fee for scoring — otherwise the
+        # hardcoded $0.50 default overstates net for anything with expensive
+        # fills (XLP: $1.42/RT). Adam clicked BEST expecting "$2 net" and got
+        # $1.08 real because the tile lied. Fetch once here, use for both
+        # scoring and the modal's fee callout below.
+        per_fill_fee = _fetch_per_fill_commission(coinbase_client, pid)
+        effective_fee_rt = (per_fill_fee * 2) if (per_fill_fee and per_fill_fee > 0) \
+            else float(swing_fee_per_contract_roundtrip or 0.0)
+        swing = score_product_swings(closes, tick, csize, effective_fee_rt)
         if fallback_used and swing.get("candidates"):
-            fee_rt = float(swing_fee_per_contract_roundtrip or 0.0)
+            fee_rt = effective_fee_rt
             for c in swing["candidates"]:
                 rt7 = int(c.get("roundtrips", 0) or 0)
                 rt_daily = max(1, round(rt7 / 7.0)) if rt7 > 0 else 0
@@ -393,7 +401,7 @@ def fetch_and_rank(
             )
             time.sleep(0.03)
             gross_per_rt = best_spread_for_periods * csize
-            net_per_rt = gross_per_rt - float(swing_fee_per_contract_roundtrip or 0.0)
+            net_per_rt = gross_per_rt - effective_fee_rt
             if weekly_closes:
                 weekly_rt, _, _ = compute_roundtrip_metric(weekly_closes, best_spread_for_periods)
                 weekly_score_val = max(0.0, weekly_rt * net_per_rt)
@@ -408,7 +416,7 @@ def fetch_and_rank(
         # I'd actually set" (what my presets would have caught).
         target = float(default_target_net_per_contract or 0.0)
         if target > 0 and csize > 0:
-            default_spread = (target + float(swing_fee_per_contract_roundtrip or 0.0)) / csize
+            default_spread = (target + effective_fee_rt) / csize
             # Snap up to a whole number of ticks so the spread is achievable.
             if tick and tick > 0:
                 default_spread = max(tick, round(default_spread / tick) * tick)
@@ -423,7 +431,7 @@ def fetch_and_rank(
         monthly_default_score = 0.0
         if default_spread > 0 and csize > 0:
             gross_per_default_rt = default_spread * csize
-            net_per_default_rt = gross_per_default_rt - float(swing_fee_per_contract_roundtrip or 0.0)
+            net_per_default_rt = gross_per_default_rt - effective_fee_rt
             if best_spread_for_periods > 0:
                 # Reuse the same weekly/monthly closes we already fetched.
                 if weekly_score_val > 0 or weekly_rt > 0:
@@ -434,9 +442,9 @@ def fetch_and_rank(
                     monthly_default_score = max(0.0, monthly_default_rt * net_per_default_rt)
         weekly_score = weekly_score_val
         monthly_score = monthly_score_val
-        # Per-product fee lookup — so the scanner-buy preview and confirm can
-        # show the ACTUAL cost per trade instead of a hardcoded silver number.
-        per_fill_fee = _fetch_per_fill_commission(coinbase_client, pid)
+        # per_fill_fee already fetched above (used for effective_fee_rt so the
+        # score/net numbers in the tiles match reality). Cached, so no extra
+        # API call here.
         entry.update({
             "best_score": swing["best_score"],
             "best_roundtrips": swing["best_roundtrips"],
