@@ -3966,11 +3966,19 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // below it so the expert choice isn't clamped away.
       if (Number.isFinite(netPerRt) && netPerRt > 0) {
         const qtyLive = Math.max(1, Number(qtyEl?.value) || 1);
-        const target = Math.max(1, Math.round(netPerRt * qtyLive));
-        if (target < Number(profitEl.min || 0)) profitEl.min = String(target);
-        if (target < Number(profitValEl.min || 0)) profitValEl.min = String(target);
-        profitEl.value = String(target);
-        profitValEl.value = String(target);
+        // Preserve the tile's exact net (e.g. $3.92). Range slider default
+        // step is 10 which would snap $3.92 → $3 (wrong). Number-input default
+        // step is 1 which truncates to "3". Use 0.01 step + toFixed(2) so both
+        // controls represent the tile-derived net faithfully. Also lower the
+        // min if BEST is below the current floor so the value isn't clamped.
+        const totalNet = Number((netPerRt * qtyLive).toFixed(2));
+        const displayVal = totalNet.toFixed(2);
+        if (totalNet < Number(profitEl.min || 0)) profitEl.min = displayVal;
+        if (totalNet < Number(profitValEl.min || 0)) profitValEl.min = displayVal;
+        profitEl.step = '0.01';
+        profitValEl.step = '0.01';
+        profitEl.value = displayVal;
+        profitValEl.value = displayVal;
       }
       updatePreview();
     }
