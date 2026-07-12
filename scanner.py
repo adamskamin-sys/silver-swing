@@ -269,8 +269,13 @@ def _fetch_recent_closes(coinbase_client, product_id: str, granularity: str = "F
                 closes.append(float(c))
             except (TypeError, ValueError):
                 continue
+        if not closes:
+            print(f"[scanner] no candles returned for {product_id} @ {granularity} over {lookback_secs}s",
+                  flush=True)
         return closes
-    except Exception:
+    except Exception as e:
+        print(f"[scanner] candle fetch failed for {product_id} @ {granularity}: "
+              f"{type(e).__name__}: {e}", flush=True)
         return []
 
 
