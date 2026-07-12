@@ -833,6 +833,24 @@ class SwingTrader:
         effective_stop = self._sleeve_effective_stop(sc, ss)
         if effective_stop <= 0 or last_price > effective_stop:
             return False
+        # Market-hours gate: even if the mark shows below the stop, don't
+        # attempt to sell during a closed CFM session. The sell would fail,
+        # sell_ok would guard against phantom halts, but we'd still burn
+        # Coinbase API budget and log noise every tick. Only checks the
+        # spec when we're about to fire — not every tick — so the cost
+        # is bounded to actual stop-crossing events.
+        try:
+            spec = self.b.contract_spec() if hasattr(self.b, "contract_spec") else {}
+            session_open = spec.get("session_open")
+            if session_open is False:
+                # Log once per firing attempt so post-mortem can see we
+                # correctly declined to sell during closure.
+                self._record("sleeve_stop_loss_skipped_closed_market",
+                             sleeve_id=sc.id, price=last_price,
+                             trigger=effective_stop)
+                return False
+        except Exception:
+            pass  # broker unavailable → fall through to old behavior
         try:
             pos = int(self.b.position_qty() or 0)
         except Exception as e:
