@@ -3035,6 +3035,11 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   const contractSize = Number(cfg.contract_size);
   const feeRt = Number(cfg.fee_per_contract_roundtrip);
   const specMissing = !(contractSize > 0) || !(feeRt > 0);
+  // Precision for price inputs — tick-driven so low-priced perps (XLP at
+  // $0.186 with $0.0001 tick) don't collapse Sell/Buy-back to the same
+  // 3-decimal number and swallow the actual spread.
+  const pricePrec = pricePrecisionFor(anchor, cfg);
+  const tickStep = Number(cfg?.tick_size) > 0 ? Number(cfg.tick_size) : 0.005;
   const sleeves = Array.isArray(cfg.sleeves) ? [...cfg.sleeves] : [];
   const existing = sleeveId ? sleeves.find(s => s.id === sleeveId) : null;
 
@@ -3339,10 +3344,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       <!-- Explicit sell/buy target inputs — always visible so you can override the slider -->
       <div class="target-inputs">
         <label>Sell target
-          <input type="number" id="sl-sell-target" step="0.005" value="${existing?.sell_px ?? (anchor + 0.5).toFixed(3)}">
+          <input type="number" id="sl-sell-target" step="${tickStep}" value="${existing?.sell_px ?? (anchor + 0.5).toFixed(pricePrec)}">
         </label>
         <label>Buy-back target
-          <input type="number" id="sl-buy-target" step="0.005" value="${existing?.buy_px ?? (anchor - 0.5).toFixed(3)}">
+          <input type="number" id="sl-buy-target" step="${tickStep}" value="${existing?.buy_px ?? (anchor - 0.5).toFixed(pricePrec)}">
         </label>
       </div>
 
@@ -3702,12 +3707,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const prevActivation = Number(trailActivationEl?.value) || prevSellPx;
     const activationOffset = Math.max(0.005, prevActivation - prevSellPx || 0.10);
     const newSellPx = currentAnchor + spread / 2;
-    sellTargetEl.value = newSellPx.toFixed(3);
-    buyTargetEl.value = (currentAnchor - spread / 2).toFixed(3);
+    sellTargetEl.value = newSellPx.toFixed(pricePrec);
+    buyTargetEl.value = (currentAnchor - spread / 2).toFixed(pricePrec);
     // Auto-slide trail activation up with the sell target so the invariant
     // "activation > sell target" always holds — no manual re-edit needed.
     if (trailActivationEl) {
-      trailActivationEl.value = (newSellPx + activationOffset).toFixed(3);
+      trailActivationEl.value = (newSellPx + activationOffset).toFixed(pricePrec);
     }
   }
 
@@ -3949,8 +3954,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // current anchor. Same math as syncTargetsFromSlider so the values
       // stay consistent with everything else in the form.
       const halfSpread = spread / 2;
-      const newSell = Number((currentAnchor + halfSpread).toFixed(3));
-      const newBuy = Number((currentAnchor - halfSpread).toFixed(3));
+      const newSell = Number((currentAnchor + halfSpread).toFixed(pricePrec));
+      const newBuy = Number((currentAnchor - halfSpread).toFixed(pricePrec));
       sellTargetEl.value = newSell;
       buyTargetEl.value = newBuy;
       updatePreview();
