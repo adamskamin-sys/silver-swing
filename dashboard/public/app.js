@@ -739,6 +739,11 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           title="Click to attach a Model / strategy">
         <td><b>${displayName}</b></td>
         <td class="mono">${pnlText}</td>
+        <td class="mono dim">${(() => {
+          if (r.kind !== 'futures') return '—';
+          const cs = Number(currentStore[liveTenant]?.[r.product]?.config?.contract_size) || 0;
+          return cs > 0 ? cs.toLocaleString('en-US') : '<span class="dim">—</span>';
+        })()}</td>
         <td class="mono dim">${escapeHtml(r.side || '')}</td>
         <td class="mono">${qtyText}</td>
         <td class="mono">${avgText}</td>
@@ -772,6 +777,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td></td>
         <td></td>
         <td></td>
+        <td></td>
         <td class="mono"><b>${totalCyclesSum}</b></td>
         <td class="mono ${footClass(totalRealizedSum)}">${fmtSigned(totalRealizedSum)}</td>
         <td class="mono ${footClass(grandTotal)}">${fmtSigned(grandTotal)}</td>
@@ -783,7 +789,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     ${cashLine}
     <table class="pf-table-compact">
       <thead><tr>
-        <th>Name</th><th title="Unrealized (mark-to-market on open position)">Unrealized</th><th>Side</th><th>Qty</th>
+        <th>Name</th><th title="Unrealized (mark-to-market on open position)">Unrealized</th><th title="Contract size — units of the underlying per contract (e.g., 50 for silver, 2000 for copper, 10 for oil/platinum). Straight from Coinbase spec.">Size</th><th>Side</th><th>Qty</th>
         <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized + Realized">Unrealized + Realized</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
