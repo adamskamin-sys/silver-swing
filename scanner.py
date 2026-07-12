@@ -338,7 +338,34 @@ def fetch_and_rank(
         closes = _fetch_recent_closes(coinbase_client, pid,
                                       granularity=swing_granularity,
                                       lookback_secs=swing_lookback_secs)
+        # Weekend / closed-market fallback: CFM futures are shut Fri 5pm ET
+        # → Sun 6pm ET, so a 24h/15-min pull returns 0 bars. Fall back to
+        # 1H candles over 7 days so the sleeve editor still gets BEST tiles.
+        # Normalize roundtrip counts to per-day (÷7) so the UI's daily×7 /
+        # daily×30 weekly/monthly extrapolation stays honest.
+        fallback_used = False
+        if not closes:
+            closes = _fetch_recent_closes(coinbase_client, pid,
+                                          granularity="ONE_HOUR",
+                                          lookback_secs=7 * 24 * 3600)
+            fallback_used = bool(closes)
         swing = score_product_swings(closes, tick, csize, swing_fee_per_contract_roundtrip)
+        if fallback_used and swing.get("candidates"):
+            fee_rt = float(swing_fee_per_contract_roundtrip or 0.0)
+            for c in swing["candidates"]:
+                rt7 = int(c.get("roundtrips", 0) or 0)
+                rt_daily = max(1, round(rt7 / 7.0)) if rt7 > 0 else 0
+                c["roundtrips"] = rt_daily
+                net = float(c.get("net_per_rt", 0.0) or 0.0)
+                c["score"] = round(rt_daily * max(0.0, net), 4)
+            best = max(swing["candidates"], key=lambda c: c.get("score", 0.0), default=None)
+            if best:
+                swing["best_spread"] = best["spread"]
+                swing["best_spread_mult"] = best.get("spread_mult")
+                swing["best_roundtrips"] = best["roundtrips"]
+                swing["best_net_per_rt"] = best["net_per_rt"]
+                swing["best_score"] = best["score"]
+                swing["best_avg_swing"] = best.get("avg_swing", 0.0)
         # Real-data weekly + monthly: fetch 7d and 30d of hourly candles
         # per product and count roundtrips at the same best spread. Costs a
         # few extra API calls per product per scan but avoids the naive
