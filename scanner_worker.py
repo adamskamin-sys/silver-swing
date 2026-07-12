@@ -28,12 +28,26 @@ class ScannerWorker:
         self.scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "30.0"))
         self.scanner_auto_interval = float(os.getenv("SWING_SCANNER_AUTO_INTERVAL", "900.0"))
         self._coinbase_client = None
+        self._logged_no_redis = False
+        # Startup log so we can see in bot-live's logs whether Redis is wired.
+        # Without REDIS_URL the tick returns silently; Adam would just see
+        # "scanning..." spin forever with no obvious cause.
+        if redis_url:
+            _log(f"initialized with Redis, symbol_hint={symbol_hint}, "
+                 f"scanner_interval={self.scanner_interval}s, "
+                 f"scanner_auto_interval={self.scanner_auto_interval}s")
+        else:
+            _log("initialized WITHOUT Redis — set REDIS_URL env var to enable "
+                 "scanner tile refresh. Tick() will be a no-op.")
 
     def tick(self) -> None:
         """One scanner check — either a full scan or a no-op depending on
         rate gates. Safe to call every main-loop iteration; internally
         capped by scanner_interval (30s floor)."""
         if not self.redis_url:
+            if not self._logged_no_redis:
+                _log("tick: no REDIS_URL — skipping scanner refresh forever")
+                self._logged_no_redis = True
             return
         now = time.time()
         if now - self.last_scanner < self.scanner_interval:
