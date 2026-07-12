@@ -26,6 +26,7 @@ const cardsEl = document.getElementById('instrument-cards');
 const tradeLogEl = document.getElementById('trade-log');
 const haltBanner = document.getElementById('halt-banner');
 const killBanner = document.getElementById('kill-banner');
+const stopLossBanner = document.getElementById('stop-loss-banner');
 const killBtn = document.getElementById('kill-switch-btn');
 const resetPaperBtn = document.getElementById('reset-paper-btn');
 const stopLossToggleBtn = document.getElementById('stop-loss-toggle-btn');
@@ -147,6 +148,21 @@ function refreshStopLossToggleUi() {
   stopLossToggleBtn.classList.toggle('ghost', !disabled);
   stopLossToggleBtn.dataset.currentlyDisabled = disabled ? '1' : '0';
   stopLossToggleBtn.dataset.tenant = liveTenant || '';
+  // Persistent banner while global override is in effect — the sleeve modals
+  // still show per-sleeve stop_loss.enabled checked (that's saved intent, not
+  // current state), which was confusing without this reminder.
+  if (stopLossBanner) {
+    if (disabled) {
+      stopLossBanner.hidden = false;
+      stopLossBanner.innerHTML = '🛑 <b>Stop-loss globally OFF</b> — bot is ignoring every stop-loss trigger on live sleeves. Click "Stop-loss: OFF" in the header to flip back ON.';
+    } else {
+      stopLossBanner.hidden = true;
+    }
+  }
+  // If a sleeve modal is currently open, refresh its inline warning too so
+  // Adam sees the override without having to close/reopen.
+  const inlineWarn = document.getElementById('sl-stoploss-global-warn');
+  if (inlineWarn) inlineWarn.hidden = !disabled;
 }
 
 async function toggleStopLoss() {
@@ -3477,6 +3493,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
 
       <!-- Per-sleeve stop-loss. Fires independently — only this sleeve halts. -->
       <div class="accumulate-block">
+        <div id="sl-stoploss-global-warn" class="halt-banner" style="margin:6px 0;padding:8px 12px;font-size:13px;" ${
+          currentStore[Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live')]?.['__stop_loss_disabled__']?.config?.disabled ? '' : 'hidden'
+        }>🛑 Global stop-loss is currently OFF — the checkbox + trigger below stay saved but the bot will NOT fire this stop until you flip the header button back ON.</div>
         <label class="accumulate-toggle">
           <input type="checkbox" id="sl-stoploss" ${draft.stop_loss_enabled ? 'checked' : ''}>
           <b>Stop-loss (protects during a crash)</b>
