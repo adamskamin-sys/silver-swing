@@ -639,7 +639,11 @@ def _discover_tracked_symbols(store, tenant: str, primary_symbol: str) -> list[s
         found = []
     # Primary first, others alphabetical after — order matters for consistent
     # log output but no functional dependency.
-    extras = [s for s in found if s and s != primary_symbol]
+    # Skip control keys — __account_kill_switch__, __portfolio__ etc. are not
+    # real Coinbase products; treating them as symbols causes 404s from
+    # Coinbase's get_product endpoint every discover tick.
+    extras = [s for s in found
+              if s and s != primary_symbol and not s.startswith("__")]
     return [primary_symbol] + sorted(extras)
 
 
