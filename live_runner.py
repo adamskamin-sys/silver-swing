@@ -235,6 +235,12 @@ def run() -> int:
     trader = SwingTrader(broker, store, TENANT, SYMBOL,
                          trade_log=log, kill_switch=ks, notifier=notifier)
 
+    # Scanner tick shared with paper mode — keeps Edit Strategy tiles fresh
+    # even when bot-paper isn't running (Adam retired it). Reuses the same
+    # cadence (30s floor, 15 min auto) and force_include semantics.
+    from scanner_worker import ScannerWorker
+    scanner_worker = ScannerWorker(store, os.getenv("REDIS_URL") or None, SYMBOL)
+
     feed = LiveTickerFeed(SYMBOL)
     stopping = False
 
@@ -289,6 +295,7 @@ def run() -> int:
                         break
                 except Exception as e:
                     _log(f"front-month recheck failed ({type(e).__name__}: {e})")
+            scanner_worker.tick()
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()
