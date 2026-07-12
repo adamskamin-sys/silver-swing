@@ -785,6 +785,12 @@ def run_paper_mode() -> int:
         # Scanner is on-demand now, but 30s floor keeps us under API limits
         # if two browsers open at once or someone clicks refresh in a loop.
         scanner_interval = float(os.getenv("SWING_SCANNER_INTERVAL", "30.0"))
+        # Auto-refresh interval: even without a user clicking refresh, run
+        # a scan every N seconds so the Edit modal always has fresh BEST
+        # tiles. Default 900s (15 min) — balances Coinbase API budget
+        # against staleness. Set to 0 to disable auto-run.
+        scanner_auto_interval = float(os.getenv("SWING_SCANNER_AUTO_INTERVAL", "900.0"))
+        last_scanner_auto = 0.0
         symbol_discover_interval = float(os.getenv("SWING_SYMBOL_DISCOVER_INTERVAL", "10.0"))
         # 15s = near real-time refresh of the Live tab's portfolio view
         # (positions, marks, specs). Set higher via SWING_LIVE_PORTFOLIO_INTERVAL
@@ -834,18 +840,23 @@ def run_paper_mode() -> int:
                 _maybe_run_tuner(store, live_tenant)
                 last_live_portfolio = now
 
-            # Scanner is on-demand only: paper worker runs a scan only when the
-            # dashboard requests one (user opened the scanner tab). Saves the
-            # Coinbase API budget of ~30 candle fetches/scan when nobody's
-            # looking. Rate-limit at min-interval so a spammy click can't hose
-            # us either.
+            # Scanner runs on TWO triggers:
+            #   1. User-requested refresh (dashboard click sets Redis flag)
+            #   2. Auto-refresh every SWING_SCANNER_AUTO_INTERVAL seconds so
+            #      Edit modal BEST tiles stay fresh without a click. Costs
+            #      ~30 candle fetches/scan; at 15 min default that's ~120/hr
+            #      — well within Coinbase's budget.
+            # Both paths are rate-limited by scanner_interval (30s floor).
             if redis_url and now - last_scanner >= scanner_interval:
                 try:
                     from scanner import (
                         fetch_and_rank, write_ranking_to_redis,
                         check_and_clear_refresh_request,
                     )
-                    if check_and_clear_refresh_request(redis_url):
+                    requested = check_and_clear_refresh_request(redis_url)
+                    auto_due = (scanner_auto_interval > 0
+                                and now - last_scanner_auto >= scanner_auto_interval)
+                    if requested or auto_due:
                         if _coinbase_for_scanner is None:
                             from broker import BrokerConfig, CoinbaseBroker
                             _coinbase_for_scanner = CoinbaseBroker(
@@ -867,13 +878,19 @@ def run_paper_mode() -> int:
                                         forced.add(sym)
                         except Exception as e:
                             _log(f"scanner: force-include gather failed: {type(e).__name__}: {e}")
-                        _log(f"scanner: refresh requested — running one scan (force_include={sorted(forced)})")
+                        trigger = "user request" if requested else "auto interval"
+                        _log(f"scanner: running one scan ({trigger}, force_include={sorted(forced)})")
                         ranking = fetch_and_rank(
                             _coinbase_for_scanner, top_n=10,
                             force_include=list(forced),
                         )
                         write_ranking_to_redis(redis_url, ranking, generated_at=now)
                         last_scanner = now
+                        if auto_due and not requested:
+                            last_scanner_auto = now
+                        elif requested:
+                            # User request also counts as a fresh auto tick.
+                            last_scanner_auto = now
                 except Exception as e:
                     _log(f"scanner refresh failed: {type(e).__name__}: {e}")
                     last_scanner = now  # back off on repeated failure
