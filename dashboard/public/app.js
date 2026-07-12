@@ -922,13 +922,11 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     const csize = row ? Number(row.contract_size) || 0 : 0;
     if (!row || !candidates || !candidates.length || csize <= 0) {
       container.hidden = false;
-      body.innerHTML = `
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <span class="dim">no scanner data for ${escapeHtml(productId)} yet.</span>
-          <button type="button" class="small primary" id="sleeve-scan-now">Scan this product now</button>
-        </div>`;
-      const scanBtn = body.querySelector('#sleeve-scan-now');
-      if (scanBtn) scanBtn.onclick = triggerScanAndPoll;
+      // No cached tiles — auto-kick the scan so every strategy modal ends up
+      // with product-specific BEST tiles without the user having to click.
+      // triggerScanAndPoll() renders its own "scanning..." state and re-calls
+      // this function when data lands.
+      triggerScanAndPoll();
       return;
     }
     // Rank recs by score (best-first). Fee-adjusted net per roundtrip is
