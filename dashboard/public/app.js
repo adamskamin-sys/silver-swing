@@ -941,7 +941,7 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       const net = Number(c.net_per_rt) || 0;
       const bestBadge = i === 0 ? '<span class="spread-rec-badge">BEST</span>' : '';
       return `
-        <button type="button" class="spread-rec-tile" data-spread="${spread}">
+        <button type="button" class="spread-rec-tile" data-spread="${spread}" data-net="${net}">
           <div class="spread-rec-head">
             $${fmtNum(spread, 4)} ${bestBadge}
             <span class="dim">· ${rt} roundtrips/day · $${fmtNum(net, 2)} net each</span>
@@ -958,8 +958,9 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     body.querySelectorAll('.spread-rec-tile').forEach(btn => {
       btn.onclick = () => {
         const spread = Number(btn.dataset.spread) || 0;
+        const net = Number(btn.dataset.net) || 0;
         if (spread > 0 && opts && typeof opts.onApply === 'function') {
-          opts.onApply(spread);
+          opts.onApply(spread, net);
           // Highlight selection.
           body.querySelectorAll('.spread-rec-tile').forEach(b => b.classList.remove('active'));
           btn.classList.add('active');
@@ -3949,7 +3950,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // clickable tiles with daily/weekly/monthly projections. Non-blocking —
   // editor is fully usable while this loads.
   loadSpreadRecommendations(symbol, m, {
-    onApply: (spread) => {
+    onApply: (spread, netPerRt) => {
       // Apply the picked spread as sell_px/buy_px centered around the
       // current anchor. Same math as syncTargetsFromSlider so the values
       // stay consistent with everything else in the form.
@@ -3958,6 +3959,19 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       const newBuy = Number((currentAnchor - halfSpread).toFixed(pricePrec));
       sellTargetEl.value = newSell;
       buyTargetEl.value = newBuy;
+      // Also snap the "net take-home per swing" slider to match the tile's
+      // expert-computed net × current qty. Otherwise the slider keeps its
+      // pre-existing value ($20 for XLP editing) and disagrees with the
+      // BEST tile ($2). Lower the slider min/floor if the picked net is
+      // below it so the expert choice isn't clamped away.
+      if (Number.isFinite(netPerRt) && netPerRt > 0) {
+        const qtyLive = Math.max(1, Number(qtyEl?.value) || 1);
+        const target = Math.max(1, Math.round(netPerRt * qtyLive));
+        if (target < Number(profitEl.min || 0)) profitEl.min = String(target);
+        if (target < Number(profitValEl.min || 0)) profitValEl.min = String(target);
+        profitEl.value = String(target);
+        profitValEl.value = String(target);
+      }
       updatePreview();
     }
   });
