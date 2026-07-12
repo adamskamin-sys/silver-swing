@@ -877,6 +877,31 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
   const container = modalEl.querySelector('#sleeve-spread-recs');
   const body = container && container.querySelector('.sleeve-spread-recs-body');
   if (!container || !body) return;
+
+  // Trigger a scanner refresh and poll for this product's swing_candidates
+  // to land. Bounded ~90s (30 polls × 3s). Used both by the "Scan now" button
+  // and (if you want) auto-called on missing data.
+  async function triggerScanAndPoll() {
+    body.innerHTML = `<span class="dim">scanning ${escapeHtml(productId)}… this takes ~30–60s.</span>`;
+    try {
+      await fetch('/api/scanner/refresh', { method: 'POST' });
+    } catch { /* ignore — user will see empty state and can retry */ }
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const r2 = await fetch('/api/scanner');
+        if (!r2.ok) continue;
+        const d2 = await r2.json();
+        const rows2 = Array.isArray(d2.top) ? d2.top : [];
+        const row2 = rows2.find(x => x.product_id === productId);
+        if (row2 && Array.isArray(row2.swing_candidates) && row2.swing_candidates.length && Number(row2.contract_size) > 0) {
+          return loadSpreadRecommendations(productId, modalEl, opts);
+        }
+      } catch { /* keep polling */ }
+    }
+    body.innerHTML = `<span class="dim">scan did not return spreads for ${escapeHtml(productId)}. Try the Scanner tab or check bot logs.</span>`;
+  }
+
   try {
     const resp = await fetch('/api/scanner');
     if (!resp.ok) return;
@@ -887,7 +912,13 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     const csize = row ? Number(row.contract_size) || 0 : 0;
     if (!row || !candidates || !candidates.length || csize <= 0) {
       container.hidden = false;
-      body.innerHTML = `<span class="dim">no scanner data for ${escapeHtml(productId)} yet — open the Scanner tab to run one.</span>`;
+      body.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="dim">no scanner data for ${escapeHtml(productId)} yet.</span>
+          <button type="button" class="small primary" id="sleeve-scan-now">Scan this product now</button>
+        </div>`;
+      const scanBtn = body.querySelector('#sleeve-scan-now');
+      if (scanBtn) scanBtn.onclick = triggerScanAndPoll;
       return;
     }
     // Rank recs by score (best-first). Fee-adjusted net per roundtrip is
