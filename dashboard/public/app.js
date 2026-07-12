@@ -28,6 +28,7 @@ const haltBanner = document.getElementById('halt-banner');
 const killBanner = document.getElementById('kill-banner');
 const killBtn = document.getElementById('kill-switch-btn');
 const resetPaperBtn = document.getElementById('reset-paper-btn');
+const stopLossToggleBtn = document.getElementById('stop-loss-toggle-btn');
 const assetTabs = document.getElementById('asset-tabs');
 const modeTabs = document.getElementById('mode-tabs');
 
@@ -130,8 +131,51 @@ function showDashboard(authRequired) {
   logoutBtn.hidden = !authRequired;
   killBtn.hidden = false;
   resetPaperBtn.hidden = false;  // paper mode only — hidden in live mode by check below
+  stopLossToggleBtn.hidden = false;
   refreshOnce();
   pollHandle = setInterval(refreshOnce, POLL_MS);
+}
+
+// Global stop-loss toggle — reads current state from the live tenant's
+// __stop_loss_disabled__ control scope and paints the header button.
+function refreshStopLossToggleUi() {
+  if (!stopLossToggleBtn) return;
+  const liveTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
+  const disabled = !!(liveTenant && currentStore[liveTenant]?.['__stop_loss_disabled__']?.config?.disabled);
+  stopLossToggleBtn.textContent = disabled ? 'Stop-loss: OFF' : 'Stop-loss: ON';
+  stopLossToggleBtn.classList.toggle('danger', disabled);
+  stopLossToggleBtn.classList.toggle('ghost', !disabled);
+  stopLossToggleBtn.dataset.currentlyDisabled = disabled ? '1' : '0';
+  stopLossToggleBtn.dataset.tenant = liveTenant || '';
+}
+
+async function toggleStopLoss() {
+  const tenant = stopLossToggleBtn.dataset.tenant;
+  if (!tenant) return alert('No live tenant found — refresh and try again.');
+  const currentlyDisabled = stopLossToggleBtn.dataset.currentlyDisabled === '1';
+  const nextDisabled = !currentlyDisabled;
+  if (nextDisabled) {
+    if (!confirm('Turn STOP-LOSS OFF for all live sleeves?\n\nBot will ignore every stop-loss trigger until you flip this back ON.')) return;
+  }
+  try {
+    const res = await fetchJson('/api/stop-loss/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenant, disabled: nextDisabled, reason: nextDisabled ? 'dashboard toggle (pre-market whiplash guard)' : undefined }),
+    });
+    if (res._unauthorized || !res.ok) {
+      alert('Toggle failed: ' + (res.error || 'unknown error'));
+      return;
+    }
+    // Optimistic UI — next poll will confirm from currentStore.
+    stopLossToggleBtn.dataset.currentlyDisabled = nextDisabled ? '1' : '0';
+    stopLossToggleBtn.textContent = nextDisabled ? 'Stop-loss: OFF' : 'Stop-loss: ON';
+    stopLossToggleBtn.classList.toggle('danger', nextDisabled);
+    stopLossToggleBtn.classList.toggle('ghost', !nextDisabled);
+    refreshOnce();
+  } catch (err) {
+    alert('Toggle failed: ' + String(err));
+  }
 }
 
 // ---- formatting ---------------------------------------------------------
@@ -278,6 +322,7 @@ function renderBanners(store) {
         if (c.active) killActive = { tenant, reason: c.reason, ts: c.activated_ts };
         continue;
       }
+      if (symbol === '__stop_loss_disabled__') continue;
       const s = block.state || {};
       if (s.state === 'HALTED') haltedInstruments.push({ tenant, symbol, mode: modeOfTenant(tenant) });
     }
@@ -371,6 +416,7 @@ function renderModeTabs(store) {
       if (symbol === '__account_kill_switch__') continue;
       if (symbol === '__portfolio__') continue;
       if (symbol === '__tuned_params__') continue;
+      if (symbol === '__stop_loss_disabled__') continue;
       counts[m] = (counts[m] || 0) + 1;
     }
   }
@@ -434,6 +480,7 @@ function renderAssetTabs(store) {
       if (symbol === '__account_kill_switch__') continue;
       if (symbol === '__portfolio__') continue;
       if (symbol === '__tuned_params__') continue;
+      if (symbol === '__stop_loss_disabled__') continue;
       const c = assetClassOf(symbol);
       counts[c] = (counts[c] || 0) + 1;
     }
@@ -2280,6 +2327,7 @@ async function refreshOnce() {
   ]);
   if (status._unauthorized || trades._unauthorized) { showLogin(); return; }
   currentStore = status.store || {};
+  refreshStopLossToggleUi();
   renderBanners(currentStore);
   renderModeTabs(currentStore);
   renderAssetTabs(currentStore);
@@ -2354,6 +2402,7 @@ async function refreshOnce() {
       if (symbol === '__account_kill_switch__') continue;
       if (symbol === '__portfolio__') continue;
       if (symbol === '__tuned_params__') continue;
+      if (symbol === '__stop_loss_disabled__') continue;
       if (activeAssetClass && assetClassOf(symbol) !== activeAssetClass) continue;
       // Live + Paper tabs: drop the per-symbol cards from the flat render.
       // The portfolio table is the entry point; drilling into a specific
@@ -5573,6 +5622,7 @@ loginForm.addEventListener('submit', async (e) => {
 });
 logoutBtn.addEventListener('click', logout);
 resetPaperBtn.addEventListener('click', resetPaperTrading);
+stopLossToggleBtn.addEventListener('click', toggleStopLoss);
 
 // ---- boot ---------------------------------------------------------------
 

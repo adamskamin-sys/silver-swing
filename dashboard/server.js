@@ -179,6 +179,42 @@ export function makeApp({
     }
   });
 
+  // --- global stop-loss toggle (Adam's "pause SL before market open" button) ---
+  // Writes a control scope (__stop_loss_disabled__) on the given tenant that
+  // the bot reads before firing ANY stop-loss trigger. Sleeve stop-loss config
+  // stays intact — this just gates the firing globally.
+  app.get('/api/stop-loss/status', requireAuth, async (req, res) => {
+    const tenant = String(req.query.tenant || '').trim();
+    if (!tenant) return res.status(400).json({ error: 'tenant required' });
+    try {
+      const store = await readStore(storePath);
+      const cfg = store?.[tenant]?.['__stop_loss_disabled__']?.config || {};
+      res.json({ ok: true, disabled: !!cfg.disabled, reason: cfg.reason || null });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  app.post('/api/stop-loss/toggle', requireAuth, async (req, res) => {
+    const { tenant, disabled, reason } = req.body || {};
+    if (!tenant) return res.status(400).json({ error: 'tenant required' });
+    if (typeof disabled !== 'boolean') return res.status(400).json({ error: 'disabled (boolean) required' });
+    try {
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant]['__stop_loss_disabled__'] = store[tenant]['__stop_loss_disabled__'] || {};
+      store[tenant]['__stop_loss_disabled__'].config = {
+        disabled: disabled,
+        reason: disabled ? (reason || 'toggled from dashboard') : null,
+        ts: Date.now() / 1000,
+      };
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, disabled: disabled });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
   app.post('/api/kill-switch/clear', requireAuth, async (req, res) => {
     const { tenant, confirm, cleared_by } = req.body || {};
     if (!tenant) return res.status(400).json({ error: 'tenant required' });

@@ -819,6 +819,17 @@ class SwingTrader:
             candidates.append(float(ss.own_avg_entry) - price_move)
         return max(candidates)
 
+    def _stop_loss_globally_disabled(self) -> bool:
+        """Adam-triggered dashboard toggle: pause ALL stop-loss triggers on
+        this tenant without editing per-sleeve config. Used before market
+        open to avoid whiplash stop-outs. Stored under a well-known control
+        scope (same pattern as __account_kill_switch__)."""
+        try:
+            cfg = self.store.get_config(self.tenant_id, "__stop_loss_disabled__") or {}
+            return bool(cfg.get("disabled"))
+        except Exception:
+            return False
+
     def _maybe_trigger_sleeve_stop_loss(self, sc, ss, last_price: float) -> bool:
         """Per-sleeve stop-loss. Fires either from fixed floor OR from a
         ratcheted stop that walks up with the HWM to preserve gains. On
@@ -832,6 +843,11 @@ class SwingTrader:
             return False
         effective_stop = self._sleeve_effective_stop(sc, ss)
         if effective_stop <= 0 or last_price > effective_stop:
+            return False
+        if self._stop_loss_globally_disabled():
+            self._record("sleeve_stop_loss_skipped_globally_disabled",
+                         sleeve_id=sc.id, price=last_price,
+                         trigger=effective_stop)
             return False
         # Market-hours gate: even if the mark shows below the stop, don't
         # attempt to sell during a closed CFM session. The sell would fail,
@@ -1297,6 +1313,10 @@ class SwingTrader:
             return False
         trigger = float(getattr(self.cfg, "stop_loss_px", 0.0) or 0.0)
         if trigger <= 0 or last_price > trigger:
+            return False
+        if self._stop_loss_globally_disabled():
+            self._record("stop_loss_skipped_globally_disabled",
+                         price=last_price, trigger=trigger)
             return False
         try:
             pos = int(self.b.position_qty() or 0)
