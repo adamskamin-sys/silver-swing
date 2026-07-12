@@ -539,6 +539,15 @@ export function makeApp({
       await r.set('silver-swing:scanner:refresh_requested',
                   String(Math.floor(Date.now() / 1000)),
                   'EX', 300);
+      // Optional include list: comma-separated product_ids the caller wants
+      // to guarantee are in the next scan (e.g., Add Strategy modal for a
+      // brand-new product with no existing sleeve). Paper worker unions
+      // these into force_include for that scan.
+      const include = req.body && req.body.include;
+      if (include && typeof include === 'string') {
+        await r.set('silver-swing:scanner:refresh_include',
+                    include, 'EX', 300);
+      }
       res.json({ ok: true, requested_at: Math.floor(Date.now() / 1000) });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });

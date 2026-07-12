@@ -884,7 +884,11 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
   async function triggerScanAndPoll() {
     body.innerHTML = `<span class="dim">scanning ${escapeHtml(productId)}… this takes ~30–60s.</span>`;
     try {
-      await fetch('/api/scanner/refresh', { method: 'POST' });
+      await fetch('/api/scanner/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ include: productId }),
+      });
     } catch { /* ignore — user will see empty state and can retry */ }
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 3000));

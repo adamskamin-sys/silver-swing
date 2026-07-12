@@ -878,6 +878,22 @@ def run_paper_mode() -> int:
                                         forced.add(sym)
                         except Exception as e:
                             _log(f"scanner: force-include gather failed: {type(e).__name__}: {e}")
+                        # Also honor an explicit include list from the dashboard
+                        # (Add Strategy modal for a brand-new product without
+                        # an existing sleeve). Consumed once per scan.
+                        try:
+                            import redis as _redis
+                            _r = _redis.from_url(redis_url)
+                            extra = _r.get("silver-swing:scanner:refresh_include")
+                            if extra:
+                                extra = extra.decode() if isinstance(extra, bytes) else extra
+                                for pid in str(extra).split(","):
+                                    pid = pid.strip()
+                                    if pid:
+                                        forced.add(pid)
+                                _r.delete("silver-swing:scanner:refresh_include")
+                        except Exception as e:
+                            _log(f"scanner: refresh_include read failed: {type(e).__name__}: {e}")
                         trigger = "user request" if requested else "auto interval"
                         _log(f"scanner: running one scan ({trigger}, force_include={sorted(forced)})")
                         ranking = fetch_and_rank(
