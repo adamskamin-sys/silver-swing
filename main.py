@@ -392,14 +392,32 @@ def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:
         # on 2026-07-07) and Adam's fee tier can shift as his 30d volume grows
         # — hardcoding any single value silently drifts against reality.
         try:
+            # Derive limit prices near current market — extreme values
+            # (0.001 / 999999.99) get rejected by Coinbase's tick/price bands
+            # for some products (PT at $1640, etc.) which causes preview_order
+            # to fail silently, leaving stored fees at $0. Use market ±50%
+            # instead: far enough from mid to guarantee the preview isn't a
+            # crossing order that would fill, close enough that Coinbase
+            # accepts it. Snap to the product's tick grid so preview doesn't
+            # reject on precision either.
+            live_price = float(spec.get("current_price") or 0.0)
+            live_tick = float(spec.get("tick_size") or 0.0)
+
+            def _snap(px: float) -> float:
+                if live_tick <= 0:
+                    return round(px, 4)
+                return round(round(px / live_tick) * live_tick, 8)
+
             def _preview_side_commission(side: str) -> float:
                 if side == "BUY":
+                    buy_px = _snap(live_price * 0.5) if live_price > 0 else 0.001
                     preview = broker.client.preview_limit_order_gtc_buy(
-                        product_id=symbol, base_size="1", limit_price="0.001",
+                        product_id=symbol, base_size="1", limit_price=str(buy_px),
                     )
                 else:
+                    sell_px = _snap(live_price * 1.5) if live_price > 0 else 999999.99
                     preview = broker.client.preview_limit_order_gtc_sell(
-                        product_id=symbol, base_size="1", limit_price="999999.99",
+                        product_id=symbol, base_size="1", limit_price=str(sell_px),
                     )
                 pd = preview.to_dict() if hasattr(preview, "to_dict") else preview
                 return float(pd.get("commission_total") or 0.0)
