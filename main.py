@@ -882,6 +882,21 @@ def run_paper_mode() -> int:
                                         forced.add(sym)
                         except Exception as e:
                             _log(f"scanner: force-include gather failed: {type(e).__name__}: {e}")
+                        # Also force-include every product Adam actually holds
+                        # a live futures position in — even without a strategy
+                        # attached yet. Newly-bought contracts (via scanner-buy
+                        # or Coinbase directly) don't have sleeves yet, so
+                        # without this they'd drop out of the scan and the
+                        # Add Strategy modal would open with no tiles.
+                        try:
+                            resp = _coinbase_for_scanner.list_futures_positions()
+                            positions = (resp.to_dict() if hasattr(resp, "to_dict") else resp).get("positions") or []
+                            for p in positions:
+                                pid = p.get("product_id")
+                                if pid:
+                                    forced.add(pid)
+                        except Exception as e:
+                            _log(f"scanner: live position gather failed: {type(e).__name__}: {e}")
                         # Also honor explicit include list(s) from the dashboard
                         # (Add Strategy modal for a brand-new product without
                         # an existing sleeve). Uses a Redis set so successive
