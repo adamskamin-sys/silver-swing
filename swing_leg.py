@@ -2258,6 +2258,42 @@ class SwingTrader:
             except Exception as e:
                 self._record("funding_check_failed",
                              sleeve_id=sc.id, error=str(e))
+        # MOP time-series-momentum entry filter (Moskowitz-Ooi-Pedersen 2012).
+        # BLOCK new BUY arms when the last N bars of price history show a
+        # strongly-negative log return. Closes Kaminski-Lo (2014) gap:
+        # stops only work when combined with a trend filter. Permissive
+        # default when snapshot history is thin.
+        if side == "BUY" and getattr(sc, "ts_momentum_filter_enabled", False):
+            try:
+                import trend_filter as _tf
+                snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+                history = snap.get("price_history") or []
+                prices = []
+                lookback = int(getattr(sc, "ts_momentum_lookback_bars", 30) or 30)
+                # Take at least `lookback + 1` most-recent samples
+                for entry in history[-(lookback + 100):]:
+                    try:
+                        px = float(entry[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if px > 0:
+                        prices.append(px)
+                ok, lr = _tf.ts_momentum_ok_for_buy(
+                    prices,
+                    lookback_bars=lookback,
+                    neutral_band=float(getattr(sc, "ts_momentum_neutral_band", 0.001) or 0.001),
+                )
+                if not ok:
+                    self._record(
+                        "sleeve_arm_skipped_ts_momentum",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        side=side, qty=qty, price=price,
+                        log_return=lr, lookback_bars=lookback,
+                    )
+                    return
+            except Exception as e:
+                self._record("ts_momentum_check_failed",
+                             sleeve_id=sc.id, error=str(e))
         # Cross-exchange fair-value gate (Binance reference for crypto).
         # Refuse arms when Coinbase price diverges too far from Binance mid.
         if getattr(sc, "crossex_gate_enabled", False):

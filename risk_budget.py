@@ -165,6 +165,41 @@ def sleeve_carver_qty(
     return contracts_for_risk_target(tv, per_ct_vol, minimum=1)
 
 
+def turtle_unit_size(
+    account_equity: float,
+    atr: float,
+    contract_size: float,
+    unit_pct: float = 0.01,
+) -> Optional[int]:
+    """Turtle 'Unit' sizing (Faith, Way of the Turtle). Every trade sized
+    to risk exactly `unit_pct` of the account (1% by default) at a distance
+    of N × dollar-per-point, where N is the ATR-based Turtle notation.
+
+    Formula:  Unit_contracts = (account_equity × unit_pct) / (N × contract_size)
+    where N = ATR.
+
+    This is the canonical Dennis/Faith Turtle rule that produced their
+    ~80% annualized returns. Cleaner than Kelly (no cycle stats needed)
+    and cleaner than Carver (no target $ vol needed) — pure ATR × account
+    math. But Turtle Unit is AGGRESSIVE by design — Faith ran significant
+    leverage. Default unit_pct=1% is the "safe" version; the Turtle
+    original was ~2%.
+
+    Returns None if inputs are unusable. Floor at 1 (never zero — halt
+    logic owns 0-size decisions).
+    """
+    if account_equity is None or account_equity <= 0:
+        return None
+    if atr is None or atr <= 0:
+        return None
+    if contract_size is None or contract_size <= 0:
+        return None
+    if unit_pct is None or unit_pct <= 0:
+        return None
+    raw = (account_equity * unit_pct) / (atr * contract_size)
+    return max(1, int(round(raw)))
+
+
 def sleeve_risk_contribution(
     qty: int,
     snapshot: Optional[dict],

@@ -301,6 +301,24 @@ class SleeveConfig:
     execution_slicing_enabled: bool = False
     execution_slicing_urgency_secs: float = 30.0
 
+    # Moskowitz-Ooi-Pedersen — Time Series Momentum (JFE 2012) — trend
+    # entry filter. When enabled, BLOCK BUY arms if the last N bars of
+    # price history show a strongly-negative log return. Closes the
+    # Kaminski-Lo (2014) gap: stops only work with a trend filter.
+    # Default ON per Adam's expert-stack default pattern; internally
+    # data-gated (permissive when history is thin).
+    ts_momentum_filter_enabled: bool = True
+    ts_momentum_lookback_bars: int = 30
+    ts_momentum_neutral_band: float = 0.001  # |log return| below this = noise
+
+    # Turtle Unit sizing (Faith, Way of the Turtle) — the canonical
+    # Dennis/Faith rule that produced their ~80% annualized returns.
+    # Unit_contracts = (account_equity × unit_pct) / (ATR × contract_size)
+    # AGGRESSIVE by design — default OFF. When enabled, replaces Kelly/
+    # Carver sizing (Turtle Unit takes precedence in _kelly_adjusted_qty).
+    turtle_unit_enabled: bool = False
+    turtle_unit_pct: float = 0.01  # 1% per trade — safe Turtle version
+
     # Rob Carver — Systematic Trading — portfolio-level risk budgeting.
     # When enabled, effective arm qty is the MIN of (cfg.qty, Carver
     # target qty). Prevents accidental over-exposure to high-vol products
@@ -438,6 +456,11 @@ class SleeveConfig:
             ml_signal_threshold=float(d.get("ml_signal_threshold") or 0.3),
             risk_budget_enabled=bool(d.get("risk_budget_enabled") or False),
             risk_budget_target_dollar_vol=float(d.get("risk_budget_target_dollar_vol") or 50.0),
+            ts_momentum_filter_enabled=bool(d.get("ts_momentum_filter_enabled", True)),
+            ts_momentum_lookback_bars=int(d.get("ts_momentum_lookback_bars") or 30),
+            ts_momentum_neutral_band=float(d.get("ts_momentum_neutral_band") or 0.001),
+            turtle_unit_enabled=bool(d.get("turtle_unit_enabled") or False),
+            turtle_unit_pct=float(d.get("turtle_unit_pct") or 0.01),
             regime_adaptive_enabled=bool(d.get("regime_adaptive_enabled") or False),
             execution_slicing_enabled=bool(d.get("execution_slicing_enabled") or False),
             execution_slicing_urgency_secs=float(d.get("execution_slicing_urgency_secs") or 30.0),
