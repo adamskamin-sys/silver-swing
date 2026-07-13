@@ -1869,6 +1869,23 @@ class SwingTrader:
         # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
         # spins forever emitting sleeve_arm_failed with no order on the book.
         price = self._snap_to_tick(price)
+        # Portfolio circuit breaker (Van Tharp rule: 'stop trading when things
+        # go wrong'). If aggregate swing P&L across the tenant drops below the
+        # configured drawdown threshold, block all new arms until it recovers.
+        # Existing orders keep processing — never abandon a live order midflight.
+        try:
+            import portfolio_risk
+            if portfolio_risk.is_halted(self.store, self.tenant_id):
+                self._record(
+                    "sleeve_arm_skipped_portfolio_halt",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    side=side, qty=qty, price=price,
+                    reason=portfolio_risk.halt_reason(self.store, self.tenant_id),
+                )
+                return
+        except Exception as e:
+            self._record("portfolio_risk_check_failed",
+                         sleeve_id=sc.id, error=str(e))
         # News blackout (Van Tharp / Cartea-Jaimungal rule): scheduled
         # macro events (FOMC, CPI, NFP) whipsaw silver/futures ±$1 in 30s.
         # Any sleeve with news_blackout_enabled respects its configured tier:
@@ -2057,6 +2074,27 @@ class SwingTrader:
             # moment this cycle finished the sell leg.
             import time as _time
             ss.armed_buy_since_ts = _time.time()
+            # Cycle P&L tracking (for loss-streak auto-disable + TCA display).
+            # A cycle "won" if this fill's realized delta > 0; "lost" if <= 0.
+            cycle_pnl = float(ss.realized_pnl) - float(ss.last_cycle_realized or 0.0)
+            ss.last_cycle_realized = float(ss.realized_pnl)
+            recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
+            recent.append(round(cycle_pnl, 4))
+            if len(recent) > 20:
+                recent = recent[-20:]
+            ss.recent_cycle_pnls = recent
+            if cycle_pnl > 0:
+                ss.cycles_losing_streak = 0
+            else:
+                ss.cycles_losing_streak = int(getattr(ss, "cycles_losing_streak", 0) or 0) + 1
+            # TCA slippage: compare fill price to sell_px (what we ARMED at).
+            # Positive slippage = we filled BETTER than target (rare on limit).
+            # Negative = we filled WORSE (market sell during a drop, penny-inside
+            # sacrifice, etc.). Logged in the cycle_completed event so post-mortem
+            # can spot sleeves consistently getting bad fills.
+            expected_px = float(sc.sell_px or 0)
+            slippage_price = fill - expected_px if expected_px > 0 else 0.0
+            slippage_dollars = slippage_price * self.cfg.contract_size * sc.qty
             self._record(
                 "sleeve_cycle_completed",
                 sleeve_id=sc.id, sleeve_name=sc.name,
@@ -2064,7 +2102,26 @@ class SwingTrader:
                 cost_basis=basis, fill_price=fill,
                 gross=gross, fees=half_fee,
                 realized_pnl_total=ss.realized_pnl,
+                cycle_pnl=round(cycle_pnl, 4),
+                cycles_losing_streak=ss.cycles_losing_streak,
+                expected_sell_px=expected_px,
+                slippage_price=round(slippage_price, 4),
+                slippage_dollars=round(slippage_dollars, 2),
             )
+            # Auto-disable: N losing cycles in a row → halt the sleeve. Van
+            # Tharp: stop trading when things go wrong. Prevents watching a
+            # broken strategy bleed for weeks.
+            auto_disable_thr = int(getattr(sc, "auto_disable_after_losses", 0) or 0)
+            if auto_disable_thr > 0 and ss.cycles_losing_streak >= auto_disable_thr:
+                reason = (f"auto-disabled after {ss.cycles_losing_streak} losing "
+                          f"cycles in a row (config threshold {auto_disable_thr})")
+                self._sleeve_halt(sc, ss, reason)
+                self._record("sleeve_auto_disabled_loss_streak",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             streak=ss.cycles_losing_streak,
+                             threshold=auto_disable_thr,
+                             recent_pnls=recent)
+                return
             # Per-sleeve accumulation. Grow this sleeve's qty (up to max_qty)
             # off its OWN banked profit — each sleeve compounds independently.
             self._maybe_scale_up_sleeve(sc, ss)

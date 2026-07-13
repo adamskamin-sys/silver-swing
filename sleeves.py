@@ -190,6 +190,14 @@ class SleeveConfig:
     book_imbalance_sell_threshold: float = 0.65
     book_imbalance_buy_threshold: float = 0.65
 
+    # Loss-streak auto-disable — the #1 killer of retail bots is watching a
+    # broken strategy bleed for weeks. Van Tharp's rule: after N consecutive
+    # losing cycles, stop and review. This auto-halts the sleeve (sets
+    # HALTED with halt_reason so it surfaces on the dashboard) once
+    # cycles_losing_streak crosses the threshold. Winning cycles reset the
+    # streak. 0 = disabled.
+    auto_disable_after_losses: int = 0
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -247,6 +255,7 @@ class SleeveConfig:
             book_imbalance_depth_levels=int(d.get("book_imbalance_depth_levels") or 5),
             book_imbalance_sell_threshold=float(d.get("book_imbalance_sell_threshold") or 0.65),
             book_imbalance_buy_threshold=float(d.get("book_imbalance_buy_threshold") or 0.65),
+            auto_disable_after_losses=int(d.get("auto_disable_after_losses") or 0),
         )
 
 
@@ -299,6 +308,18 @@ class SleeveState:
     # Number of stop-out cycles in a row without a completed winning cycle in
     # between. Reset to 0 on a successful SELL fill at target.
     consecutive_stops: int = 0
+    # Loss-streak counter for auto_disable_after_losses. Increments when a
+    # cycle completes with realized_pnl LOWER than the previous cycle
+    # (i.e., this cycle lost money). Resets on a winning cycle. Purely
+    # informational — the check itself lives in swing_leg.
+    cycles_losing_streak: int = 0
+    # Realized_pnl at the moment the LAST cycle completed, so we can compute
+    # each new cycle's delta and know whether it won or lost.
+    last_cycle_realized: float = 0.0
+    # Rolling per-cycle P&Ls (most recent last, capped at 20). Powers the
+    # TCA display and the auto-disable decision — a sleeve losing 5 in a
+    # row is much more obvious than eyeballing totals.
+    recent_cycle_pnls: list = field(default_factory=list)
 
     # Post-stop re-entry state — only used when reentry_mode = 'volatility'.
     # reentry_pending = True while watching for volatility contraction after
@@ -372,6 +393,9 @@ class SleeveState:
             post_trail_pre_range=float(d.get("post_trail_pre_range") or 0.0),
             post_trail_stage_b_ts=d.get("post_trail_stage_b_ts"),
             post_trail_stage_b_ref_high=float(d.get("post_trail_stage_b_ref_high") or 0.0),
+            cycles_losing_streak=int(d.get("cycles_losing_streak") or 0),
+            last_cycle_realized=float(d.get("last_cycle_realized") or 0.0),
+            recent_cycle_pnls=list(d.get("recent_cycle_pnls") or []),
         )
 
     def to_dict(self) -> dict:

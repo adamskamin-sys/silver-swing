@@ -355,6 +355,20 @@ def run() -> int:
                     _log(f"periodic spec refresh: {n} product(s) refreshed")
                 except Exception as e:
                     _log(f"periodic spec refresh failed: {type(e).__name__}: {e}")
+            # Portfolio circuit breaker — Van Tharp 'stop trading when things
+            # go wrong'. Runs on the same cadence as snapshot so it can see
+            # fresh mark prices when computing unrealized. Cheap: single
+            # aggregation over all sleeves in this tenant.
+            if now - last_snapshot >= SNAPSHOT_INTERVAL:
+                try:
+                    import portfolio_risk
+                    change = portfolio_risk.tick(store, TENANT, trade_log=log)
+                    if change:
+                        _log(f"portfolio_risk: {change.get('kind')} — "
+                             f"drawdown {change.get('drawdown_pct', 0):.1f}% "
+                             f"(${change.get('drawdown_dollars', 0):.2f})")
+                except Exception as e:
+                    _log(f"portfolio_risk tick failed: {type(e).__name__}: {e}")
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()
