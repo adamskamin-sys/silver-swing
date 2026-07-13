@@ -2683,6 +2683,21 @@ class SwingTrader:
                 best_wall_px = px
         return best_wall_px
 
+    def _refresh_portfolio_after_fill(self) -> None:
+        # Adam's rule (2026-07-13): portfolio + sleeve numbers must always
+        # reflect Coinbase's authoritative state within seconds. Periodic
+        # 5s poll is the safety net; this hook fires on every fill so the
+        # dashboard reflects the new position/avg/mark within one HTTP
+        # round-trip. No-op for non-live tenants (paper/lab own their own
+        # snapshot). Wrapped so refresh failure never disrupts fill flow.
+        try:
+            if not str(self.tenant_id).endswith("-live"):
+                return
+            from main import refresh_portfolio_snapshot
+            refresh_portfolio_snapshot(self.store, self.tenant_id)
+        except Exception:
+            pass
+
     def _sleeve_on_fill(self, sc: SleeveConfig, ss: SleeveState, fill_price) -> None:
         # Capture order_id BEFORE clearing so the fill event carries it — makes
         # repair scripts (find unclaimed order_ids) trivial to write.
@@ -2797,6 +2812,7 @@ class SwingTrader:
                 realized_pnl_total=ss.realized_pnl,
                 own_avg_entry=ss.own_avg_entry,
             )
+        self._refresh_portfolio_after_fill()
 
     def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:
         if ss.live_order_id:
@@ -2867,6 +2883,7 @@ class SwingTrader:
                 swing_qty=self.s.swing_qty,
             )
         self._save_state()
+        self._refresh_portfolio_after_fill()
 
     def _halt(self, reason: str = "") -> None:
         if self.s.live_order_id:

@@ -5219,8 +5219,13 @@ function openScannerDetail(row) {
           // multiple sleeves on the same position show DIFFERENT numbers,
           // reflecting each strategy's own attach point. Falling back to
           // pos_avg would make every sleeve identical.
+          const cycles = Number(ss.cycles) || 0;
           let unrealized = 0;
-          if (state === 'ARMED_SELL') {
+          // Rule (Adam 2026-07-13): sleeve UNREALIZED is $0 until cycles > 0.
+          // A freshly-attached sleeve inherits its contracts from the parent
+          // position; the paper move on those pre-attach lots belongs to the
+          // position, not the sleeve — never double-counted on the sleeve row.
+          if (state === 'ARMED_SELL' && cycles > 0) {
             const sell = Number(s.sell_px) || 0;
             const buy = Number(s.buy_px) || 0;
             const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
@@ -5490,15 +5495,16 @@ function refreshScannerDetailLive() {
       const ss = sleeveStates[s.id] || {};
       const state = String(ss.state || 'ARMED_SELL');
       const realized = Number(ss.realized_pnl) || 0;
+      const cycles = Number(ss.cycles) || 0;
       let unrealized = 0;
-      if (state === 'ARMED_SELL') {
+      // Rule (Adam 2026-07-13): sleeve UNREALIZED is $0 until the sleeve has
+      // completed at least one buy cycle. A freshly-attached sleeve inherits
+      // its contracts from the parent position — the paper move on those
+      // pre-attach lots belongs to the position, not the sleeve.
+      if (state === 'ARMED_SELL' && cycles > 0) {
         const sell = Number(s.sell_px) || 0;
         const buy = Number(s.buy_px) || 0;
         const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
-        // Precedence: sleeve's own filled basis → attach-time mark → midpoint
-        // → position avg. entry_mark differs per sleeve so two co-attached
-        // strategies show DIFFERENT unrealized values rather than identical
-        // pos_avg-based numbers.
         const basis = Number(ss.own_avg_entry)
           || Number(s.entry_mark)
           || midpoint

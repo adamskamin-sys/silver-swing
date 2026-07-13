@@ -75,7 +75,7 @@ RECONCILE_INTERVAL_SECS = float(os.getenv("SWING_RECONCILE_INTERVAL_SECS", "60.0
 # breaker aggregate math, and Carver risk-contribution reads. 30s is a
 # safe cadence: negligible Coinbase API cost, aggressive enough that stale
 # marks never lag by more than ~30s. Env override for tuning.
-PORTFOLIO_REFRESH_SECS = float(os.getenv("SWING_PORTFOLIO_REFRESH_SECS", "30.0"))
+PORTFOLIO_REFRESH_SECS = float(os.getenv("SWING_PORTFOLIO_REFRESH_SECS", "5.0"))
 # [crew] How often to verify the live config is still tracking the EXPERT params
 # (expert_params × Layer-2 tuned multipliers). Alerts if silver's actual
 # trail/stop/reanchor levels have drifted off the expert data. Read-only. 5 min.
