@@ -848,11 +848,17 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
       ? `<span class="${realizedCls}" title="Sum of primary + sleeve realized_pnl across all tenants">${realized > 0 ? '+' : ''}${fmtMoney(realized)}</span>`
       : '<span class="dim">$0</span>';
     // Combined P/L: unrealized (mark-to-market) + realized (closed trades).
-    // The full profit picture per product without eyeballing two columns.
-    const totalPnl = (Number(r.pnl) || 0) + realized;
+    // Adam explicitly asked (2026-07-13): "we were going to make the sum of
+    // realized and unrealized based off the number of contracts with
+    // strategies not the total number of contracts. oil is wrong it should
+    // be around 50". Root cause: this column was using r.pnl (raw
+    // Coinbase position pnl, ALL contracts) while the UNREALIZED column
+    // to its left already switched to effectivePnl (sleeve-only). The two
+    // columns must be internally consistent — use effectivePnl for both.
+    const totalPnl = (Number(effectivePnl) || 0) + realized;
     const totalCls = totalPnl > 0 ? 'pos' : (totalPnl < 0 ? 'neg' : '');
     const totalText = totalPnl !== 0
-      ? `<span class="${totalCls}" title="Unrealized P/L + Realized gains — total banked + open">${arrow(totalPnl)} ${fmtMoney(Math.abs(totalPnl))}</span>`
+      ? `<span class="${totalCls}" title="Strategy-only unrealized + strategy-only realized. Matches the UNREALIZED column to the left (only counts contracts attached to sleeves).">${arrow(totalPnl)} ${fmtMoney(Math.abs(totalPnl))}</span>`
       : '<span class="dim">$0</span>';
     return `
       <tr class="pf-row" data-action="open-live-strategy"
