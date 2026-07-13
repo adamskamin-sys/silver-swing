@@ -1235,7 +1235,7 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       // real value from Coinbase every 6h + startup, but if a value ever
       // drifted (BIT was 0.04 vs 0.01, etc.) the tile's $ projections would
       // silently mis-scale by that factor. Making it visible closes the gap.
-      const csizeDisplay = Number(cfg?.contract_size) || 0;
+      const csizeDisplay = Number(row?.contract_size) || csize || 0;
       const grossPerCt = csizeDisplay > 0 ? (spread * csizeDisplay) : 0;
       const csizeNote = csizeDisplay > 0
         ? ` · leverage = ${csizeDisplay.toLocaleString('en-US')} × spread = $${grossPerCt.toFixed(2)} gross/swing`
