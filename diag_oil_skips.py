@@ -17,9 +17,27 @@ from safety import make_trade_log
 
 
 def main() -> None:
-    symbol = sys.argv[1] if len(sys.argv) > 1 else "OIL-20JUL26-CDE"
+    needle = (sys.argv[1] if len(sys.argv) > 1 else "OIL").upper()
     log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
-    events = [e for e in log.tail(5000) if e.get("symbol") == symbol]
+    all_events = log.tail(5000)
+    events = [e for e in all_events
+              if needle in (e.get("symbol") or "").upper()]
+
+    if not events:
+        symbols = Counter((e.get("symbol") or "-") for e in all_events)
+        print(f"No events match '{needle}'. Symbols in log ({len(symbols)} unique):")
+        for sym, n in symbols.most_common():
+            print(f"  {n:5d}  {sym}")
+        return
+
+    matched_symbols = Counter((e.get("symbol") or "-") for e in events)
+    if len(matched_symbols) > 1:
+        print(f"'{needle}' matches {len(matched_symbols)} symbols:")
+        for sym, n in matched_symbols.most_common():
+            print(f"  {n:5d}  {sym}")
+        print()
+    symbol = matched_symbols.most_common(1)[0][0]
+    print(f"Analyzing {symbol}:")
 
     def is_block(e: dict) -> bool:
         et = e.get("event_type", "")
@@ -29,7 +47,11 @@ def main() -> None:
                 or "gate" in et)
 
     blocked = [e for e in events if is_block(e)]
-    print(f"{symbol}: {len(events)} events, {len(blocked)} entry-blocked")
+    print(f"  {len(events)} events, {len(blocked)} entry-blocked")
+
+    print("\nAll event types (for context):")
+    for et, n in Counter(e.get("event_type") for e in events).most_common(20):
+        print(f"  {n:4d}  {et}")
 
     if not blocked:
         print("  (no entry-block events — check state, not gates)")
