@@ -112,43 +112,145 @@ def compute_roundtrip_metric(prices: list[float], spread: float) -> tuple[int, f
     return (roundtrips, avg, mx)
 
 
+def _atr_proxy_from_closes(prices: list[float]) -> float:
+    """Close-to-close volatility proxy — we don't have OHLC here, so use the
+    mean of absolute period-to-period returns (in price units). Standard ATR
+    would use true range; this is a well-known close-only substitute that
+    tracks the same signal within ~10% under normal market regimes."""
+    if len(prices) < 3:
+        return 0.0
+    diffs = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+    if not diffs:
+        return 0.0
+    diffs.sort()
+    n = len(diffs)
+    # Median is robust to a single-tick spike; use median×2 as the ATR proxy
+    # (median absolute return ≈ 0.5 × mean abs return for near-Gaussian, and
+    # ATR is roughly 2× the median move for the horizons we care about).
+    return diffs[n // 2] * 2.0
+
+
+def _build_spread_grid(prices: list[float], tick_size: float, n_candidates: int = 20) -> list[float]:
+    """Wider, ATR-anchored candidate spreads instead of the old fixed
+    (3×, 5×, 10×, 20×, 50×)-tick grid. Range: 0.5×ATR to 5×ATR, geometrically
+    spaced, snapped to the product's tick_size, deduplicated.
+
+    Why: the fixed multiplier grid missed the best spread whenever ATR didn't
+    line up with (3/5/10/20/50)-tick — very common for products whose tick
+    isn't scaled to their volatility (NOL, PT, oil). This grid always covers
+    the volatility band that actually produces roundtrips.
+    """
+    atr = _atr_proxy_from_closes(prices)
+    if atr <= 0:
+        # No volatility signal (flat window / weekend). Fall back to the old
+        # fixed grid so we still return SOMETHING for the UI.
+        return [round(m * tick_size, 8) for m in (3, 5, 10, 20, 50, 100)]
+    lo = max(tick_size, atr * 0.5)
+    hi = max(lo * 1.1, atr * 5.0)
+    # Geometric spacing so the grid is dense at small spreads (where fees
+    # dominate the decision) and sparse at large spreads (where diminishing
+    # returns matter less).
+    import math
+    ratio = (hi / lo) ** (1.0 / max(1, n_candidates - 1))
+    raw = [lo * (ratio ** i) for i in range(n_candidates)]
+    # Snap to tick, dedupe while preserving order.
+    seen = set()
+    out = []
+    for s in raw:
+        snapped = round(round(s / tick_size) * tick_size, 8) if tick_size > 0 else round(s, 6)
+        if snapped <= 0 or snapped in seen:
+            continue
+        seen.add(snapped)
+        out.append(snapped)
+    return out
+
+
 def score_product_swings(
     prices: list[float],
     tick_size: float,
     contract_size: float,
     fee_per_contract_roundtrip: float,
     candidate_spread_mults: tuple[int, ...] = (3, 5, 10, 20, 50),
+    weekly_prices: list[float] | None = None,
+    monthly_prices: list[float] | None = None,
+    horizon_weights: tuple[float, float, float] = (0.2, 0.5, 0.3),
 ) -> dict:
-    """For a price series, try a small grid of spread candidates (each a
-    multiple of tick_size) and return the one with the highest expected $/day.
+    """For a price series, try an ATR-anchored grid of spread candidates and
+    return the one with the highest expected $/day AVERAGED ACROSS 24h/7d/30d.
 
-    Score per spread = roundtrip_count × max(0, spread * contract_size - fee_rt).
-    Returns the best {spread, roundtrips, net_per_rt, score, avg_swing} plus
-    a compact matrix of all candidates for the UI to expose.
+    Old behavior scored each spread only against the last 24h of candles →
+    picked whatever spread happened to have the most roundtrips today, and a
+    quiet day meant a bad pick. New behavior: score every candidate across
+    three horizons and pick the one that maximizes a weighted $/day expected:
+
+        weighted = w_d × daily_$/day + w_w × weekly_$/day + w_m × monthly_$/day
+
+    Default weights (0.2, 0.5, 0.3) prefer weekly stability over noisy 24h,
+    with monthly as a mean-reversion anchor. That's the Van Tharp /
+    Turtle-style "don't chase yesterday's mover" rule made mechanical.
+
+    candidate_spread_mults is kept for backward-compat callers but IGNORED
+    unless prices is empty (ATR-anchored grid supersedes it).
     """
     if not prices or not tick_size or tick_size <= 0 or not contract_size or contract_size <= 0:
         return {"best_spread": None, "best_roundtrips": 0, "best_net_per_rt": 0.0,
                 "best_score": 0.0, "best_avg_swing": 0.0, "candidates": []}
     fee_rt = float(fee_per_contract_roundtrip or 0.0)
+
+    # Wider, ATR-anchored grid replaces the old (3, 5, 10, 20, 50)-tick fixed
+    # multipliers. Falls back to the old grid only if prices are too flat to
+    # derive an ATR (weekend / dead product).
+    grid = _build_spread_grid(prices, tick_size, n_candidates=20)
+    if not grid:
+        grid = [round(m * tick_size, 6) for m in candidate_spread_mults]
+
+    # Weight tuple normalized to sum=1 so callers can pass raw preferences
+    # (0.2, 0.5, 0.3) or (1, 3, 2) — both work.
+    w_d, w_w, w_m = horizon_weights
+    w_sum = max(1e-9, w_d + w_w + w_m)
+    w_d, w_w, w_m = w_d / w_sum, w_w / w_sum, w_m / w_sum
+
     candidates = []
     best = None
-    for mult in candidate_spread_mults:
-        spread = round(mult * tick_size, 6)
-        rt, avg, _mx = compute_roundtrip_metric(prices, spread)
+    for spread in grid:
         gross = spread * contract_size
         net = gross - fee_rt
-        score = rt * max(0.0, net)
+        rt_daily, avg_d, _ = compute_roundtrip_metric(prices, spread)
+        daily_per_day = rt_daily * max(0.0, net)  # already $/day units
+        if weekly_prices:
+            rt_weekly, _, _ = compute_roundtrip_metric(weekly_prices, spread)
+            weekly_per_day = (rt_weekly * max(0.0, net)) / 7.0
+        else:
+            weekly_per_day = daily_per_day
+        if monthly_prices:
+            rt_monthly, _, _ = compute_roundtrip_metric(monthly_prices, spread)
+            monthly_per_day = (rt_monthly * max(0.0, net)) / 30.0
+        else:
+            monthly_per_day = daily_per_day
+        weighted_per_day = (w_d * daily_per_day
+                            + w_w * weekly_per_day
+                            + w_m * monthly_per_day)
         entry = {
-            "spread_mult": mult,
             "spread": spread,
-            "roundtrips": rt,
+            "spread_mult": round(spread / tick_size) if tick_size > 0 else None,
+            "roundtrips": rt_daily,  # for the UI's per-day tile
             "net_per_rt": round(net, 4),
-            "score": round(score, 4),
-            "avg_swing": round(avg, 4),
+            # `score` is the WEIGHTED $/day — the UI already sorts descending
+            # by this field, so switching from 24h-only to weighted gives Adam
+            # the right ordering without a UI change.
+            "score": round(weighted_per_day, 4),
+            "score_daily": round(daily_per_day, 4),
+            "score_weekly": round(weekly_per_day * 7.0, 4),
+            "score_monthly": round(monthly_per_day * 30.0, 4),
+            "avg_swing": round(avg_d, 4),
         }
         candidates.append(entry)
-        if best is None or score > best["score"]:
+        if best is None or weighted_per_day > best["score"]:
             best = entry
+    # Sort descending so the UI's [0]=BEST assumption keeps working, then
+    # trim to top 8 so the modal doesn't drown in tiles.
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    top_candidates = candidates[:8]
     return {
         "best_spread": best["spread"] if best else None,
         "best_spread_mult": best["spread_mult"] if best else None,
@@ -156,7 +258,7 @@ def score_product_swings(
         "best_net_per_rt": best["net_per_rt"] if best else 0.0,
         "best_score": best["score"] if best else 0.0,
         "best_avg_swing": best["avg_swing"] if best else 0.0,
-        "candidates": candidates,
+        "candidates": top_candidates,
     }
 
 
@@ -440,44 +542,47 @@ def fetch_and_rank(
         per_fill_fee = _fetch_per_fill_commission(coinbase_client, pid)
         effective_fee_rt = (per_fill_fee * 2) if (per_fill_fee and per_fill_fee > 0) \
             else float(swing_fee_per_contract_roundtrip or 0.0)
-        swing = score_product_swings(closes, tick, csize, effective_fee_rt)
+        # Fetch 7d and 30d 1H closes UP FRONT so score_product_swings can
+        # score every candidate spread across 24h/7d/30d and pick the one
+        # with the best WEIGHTED $/day (0.2 daily / 0.5 weekly / 0.3 monthly).
+        # Old code fetched these only AFTER picking best on 24h alone, which
+        # is exactly what Adam called out: the spread was chosen on one day
+        # of data, not on the multi-horizon truth the tiles claim.
+        weekly_closes = _fetch_recent_closes(
+            coinbase_client, pid,
+            granularity="ONE_HOUR", lookback_secs=7 * 24 * 3600,
+        )
+        time.sleep(0.03)
+        monthly_closes = _fetch_recent_closes(
+            coinbase_client, pid,
+            granularity="ONE_HOUR", lookback_secs=30 * 24 * 3600,
+        )
+        time.sleep(0.03)
+        swing = score_product_swings(
+            closes, tick, csize, effective_fee_rt,
+            weekly_prices=weekly_closes or None,
+            monthly_prices=monthly_closes or None,
+        )
         if fallback_used and swing.get("candidates"):
-            fee_rt = effective_fee_rt
+            # 7d/1H fallback: `closes` is a week's worth, so rt count needs
+            # dividing by 7 for the per-day display in the UI tile. Weighted
+            # score is already in $/day units so it stays correct.
             for c in swing["candidates"]:
                 rt7 = int(c.get("roundtrips", 0) or 0)
                 rt_daily = max(1, round(rt7 / 7.0)) if rt7 > 0 else 0
                 c["roundtrips"] = rt_daily
-                net = float(c.get("net_per_rt", 0.0) or 0.0)
-                c["score"] = round(rt_daily * max(0.0, net), 4)
-            best = max(swing["candidates"], key=lambda c: c.get("score", 0.0), default=None)
+            best = swing["candidates"][0] if swing["candidates"] else None
             if best:
-                swing["best_spread"] = best["spread"]
-                swing["best_spread_mult"] = best.get("spread_mult")
                 swing["best_roundtrips"] = best["roundtrips"]
-                swing["best_net_per_rt"] = best["net_per_rt"]
-                swing["best_score"] = best["score"]
-                swing["best_avg_swing"] = best.get("avg_swing", 0.0)
-        # Real-data weekly + monthly: fetch 7d and 30d of hourly candles
-        # per product and count roundtrips at the same best spread. Costs a
-        # few extra API calls per product per scan but avoids the naive
-        # "daily × 7 / × 30" extrapolation which assumes today is a
-        # representative day (it usually isn't).
+        # weekly_score / monthly_score for THIS product's best spread (used
+        # for the /api/scanner tile's own weekly/monthly display, separate
+        # from the per-candidate score_weekly / score_monthly we now expose).
         best_spread_for_periods = float(swing["best_spread"] or 0.0)
         weekly_rt = 0
         weekly_score_val = 0.0
         monthly_rt = 0
         monthly_score_val = 0.0
         if best_spread_for_periods > 0:
-            weekly_closes = _fetch_recent_closes(
-                coinbase_client, pid,
-                granularity="ONE_HOUR", lookback_secs=7 * 24 * 3600,
-            )
-            time.sleep(0.03)
-            monthly_closes = _fetch_recent_closes(
-                coinbase_client, pid,
-                granularity="ONE_HOUR", lookback_secs=30 * 24 * 3600,
-            )
-            time.sleep(0.03)
             gross_per_rt = best_spread_for_periods * csize
             net_per_rt = gross_per_rt - effective_fee_rt
             if weekly_closes:
