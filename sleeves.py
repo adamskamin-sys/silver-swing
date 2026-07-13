@@ -258,6 +258,18 @@ class SleeveConfig:
     ml_shadow_enabled: bool = False
     ml_signal_threshold: float = 0.3
 
+    # Rob Carver — Systematic Trading — portfolio-level risk budgeting.
+    # When enabled, effective arm qty is the MIN of (cfg.qty, Carver
+    # target qty). Prevents accidental over-exposure to high-vol products
+    # (e.g., 1 contract of BTC-PERP contributing 100× the daily $ vol of
+    # 1 contract of SLR). Target is expressed as daily $ vol; the module
+    # computes contracts to hit that target via ATR × contract_size.
+    #
+    # DEFAULT OFF (opt-in). Enabling this can widely change contract
+    # counts on high-vol products — advise users to test in Lab first.
+    risk_budget_enabled: bool = False
+    risk_budget_target_dollar_vol: float = 50.0  # per-sleeve daily $ vol budget
+
     # Trade-tape OFI gate — mirror of book_imbalance_gate but reads the
     # EXECUTED trade tape instead of resting depth. Cont-Kukanov-Stoikov
     # (2014) + Cartea-Jaimungal find trade OFI is a stronger short-term
@@ -378,6 +390,8 @@ class SleeveConfig:
             correlation_dynamic_threshold=float(d.get("correlation_dynamic_threshold") or 0.6),
             ml_shadow_enabled=bool(d.get("ml_shadow_enabled") or False),
             ml_signal_threshold=float(d.get("ml_signal_threshold") or 0.3),
+            risk_budget_enabled=bool(d.get("risk_budget_enabled") or False),
+            risk_budget_target_dollar_vol=float(d.get("risk_budget_target_dollar_vol") or 50.0),
         )
 
 

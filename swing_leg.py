@@ -2242,21 +2242,58 @@ class SwingTrader:
         return True
 
     def _kelly_adjusted_qty(self, sc, ss) -> int:
-        """Apply Kelly-fraction sizing if enabled. Never sizes UP (only ≤ cfg.qty)."""
-        if not getattr(sc, "kelly_enabled", False):
-            return int(sc.qty)
-        try:
-            import kelly
-            recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
-            mult = kelly.compute_kelly_multiplier(
-                recent,
-                kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
-                min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
-            )
-            return kelly.size_from_qty(int(sc.qty), mult)
-        except Exception as e:
-            self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
-            return int(sc.qty)
+        """Apply Kelly-fraction sizing if enabled. Never sizes UP (only ≤ cfg.qty).
+
+        When BOTH Kelly and Carver risk-budget are enabled, take the MIN
+        of the two — always the more conservative sizing wins. This is the
+        Van Tharp / Carver combined philosophy: Kelly says "size to your
+        edge estimate," Carver says "size to a fixed portfolio risk
+        budget," neither is right in isolation, the MIN is the safe choice.
+        """
+        kelly_qty = int(sc.qty)
+        if getattr(sc, "kelly_enabled", False):
+            try:
+                import kelly
+                recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
+                mult = kelly.compute_kelly_multiplier(
+                    recent,
+                    kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
+                    min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
+                )
+                kelly_qty = kelly.size_from_qty(int(sc.qty), mult)
+            except Exception as e:
+                self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
+                kelly_qty = int(sc.qty)
+        carver_qty = int(sc.qty)
+        if getattr(sc, "risk_budget_enabled", False):
+            try:
+                import risk_budget
+                snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+                # expert_params lives on the __portfolio__ snap (per product).
+                pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
+                derivs = pf.get("derivatives") or []
+                expert_params = None
+                for d in derivs:
+                    if d.get("product_id") == self.symbol:
+                        expert_params = d.get("expert_params")
+                        break
+                # Enrich snap with product spec so risk_budget can read it.
+                cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+                snap_view = dict(snap)
+                if "contract_size" not in snap_view and cfg.get("contract_size"):
+                    snap_view["contract_size"] = cfg["contract_size"]
+                carver_target = float(getattr(sc, "risk_budget_target_dollar_vol", 50.0) or 50.0)
+                carver_qty_raw = risk_budget.sleeve_carver_qty(
+                    sc, ss, snap_view, expert_params, target_dollar_vol=carver_target,
+                )
+                if carver_qty_raw is not None:
+                    # Cap at cfg.qty — never sizes UP. Matches Kelly semantics.
+                    carver_qty = min(int(sc.qty), int(carver_qty_raw))
+            except Exception as e:
+                self._record("risk_budget_compute_failed", sleeve_id=sc.id, error=str(e))
+                carver_qty = int(sc.qty)
+        # More-conservative wins — safety-first when combining sizing rules.
+        return max(1, min(kelly_qty, carver_qty))
 
     def _adaptive_spread_price(self, sc, side: str, arm_price: float) -> float:
         """When adaptive spread is enabled, widen the arm price to account

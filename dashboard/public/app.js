@@ -3593,6 +3593,22 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     ml_signal_threshold: 0.3,
   };
 
+  // Coerce falling-knife protection to ON for EXISTING sleeves too if the
+  // field is missing (never saved) OR undefined. Adam's durable rule:
+  // "Turn them all on by default." A sleeve that predates the falling-
+  // knife feature has draft.buy_trail_enabled === undefined; we treat
+  // that as "user hasn't decided, apply the default (ON)". Explicit
+  // false stays false so users who deliberately turned it off aren't
+  // silently re-enabled.
+  if (existing && draft.buy_trail_enabled === undefined) {
+    draft.buy_trail_enabled = true;
+    if (!draft.buy_trail_distance) {
+      draft.buy_trail_distance = expertDollars?.buy_trail_distance
+        || (draft.trail_distance ? Number(draft.trail_distance) * 0.5 : 0)
+        || (cfg?.tick_size ? Number(cfg.tick_size) * 20 : 0.05);
+    }
+  }
+
   // Distance from anchor to current mark — surface a warning when the anchor
   // (typically a lot's old entry price) is far from where the market is now.
   const anchorToMarketDist = anchor && mark ? Math.abs(mark - anchor) : 0;
