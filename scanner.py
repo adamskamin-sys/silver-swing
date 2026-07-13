@@ -63,46 +63,93 @@ def _fetch_per_fill_commission(coinbase_client, product_id: str) -> Optional[flo
     return per_fill
 
 
-def compute_roundtrip_metric(prices: list[float], spread: float) -> tuple[int, float, float]:
+def compute_roundtrip_metric(prices: list[float], spread: float,
+                             timestamps: list[float] | None = None,
+                             active_hours_utc: tuple[int, int] | None = None,
+                             active_weight: float = 1.0,
+                             offhours_weight: float = 0.5) -> tuple[int, float, float]:
     """Zig-zag swing detection: walk the price series, count reversals of
     amplitude >= spread. Returns (roundtrip_count, avg_swing_amp, max_swing_amp).
 
     A "swing leg" = a directional move that reverses by >= spread from its
     extreme. A "roundtrip" = 2 legs (one up + one down), the pattern a swing
     trader completes to pocket one gross spread of profit.
+
+    Optional session-hour weighting: if `timestamps` (unix seconds, same
+    length as prices) and `active_hours_utc` (start_hour, end_hour) are
+    given, each roundtrip is weighted by whether it COMPLETED during
+    active hours. Active roundtrips count as `active_weight` (default 1.0);
+    off-hours ones as `offhours_weight` (default 0.5). Returns a FLOAT for
+    roundtrip_count in that case — the Livermore rule "trade when the
+    professionals are trading" made mechanical.
+
+    Backward-compat: without timestamps/active_hours, roundtrip_count is an
+    integer count exactly as before.
     """
     if len(prices) < 2 or spread <= 0:
         return (0, 0.0, 0.0)
+    use_session_weight = (
+        timestamps is not None
+        and len(timestamps) == len(prices)
+        and active_hours_utc is not None
+    )
     pivot = prices[0]
     extreme = pivot
+    extreme_idx = 0
     direction = 0  # 0=undecided, 1=up-leg in progress, -1=down-leg in progress
     swings: list[float] = []
-    for p in prices[1:]:
+    swing_end_idx: list[int] = []
+    for i, p in enumerate(prices[1:], start=1):
         if direction == 0:
             if p >= pivot + spread:
                 direction = 1
                 extreme = p
+                extreme_idx = i
             elif p <= pivot - spread:
                 direction = -1
                 extreme = p
+                extreme_idx = i
             continue
         if direction == 1:
             if p > extreme:
                 extreme = p
+                extreme_idx = i
             elif p <= extreme - spread:
                 swings.append(extreme - pivot)
+                swing_end_idx.append(i)
                 pivot = extreme
                 extreme = p
+                extreme_idx = i
                 direction = -1
         else:
             if p < extreme:
                 extreme = p
+                extreme_idx = i
             elif p >= extreme + spread:
                 swings.append(pivot - extreme)
+                swing_end_idx.append(i)
                 pivot = extreme
                 extreme = p
+                extreme_idx = i
                 direction = 1
-    roundtrips = len(swings) // 2
+    n_leg_pairs = len(swings) // 2
+    if use_session_weight and n_leg_pairs > 0:
+        import datetime as _dt
+        active_start, active_end = active_hours_utc
+        weighted = 0.0
+        for k in range(n_leg_pairs):
+            # A roundtrip is 2 legs. Count it at the completion of the
+            # second leg (the sell that pockets profit).
+            end_idx = swing_end_idx[2 * k + 1]
+            ts = float(timestamps[end_idx])
+            hour = _dt.datetime.utcfromtimestamp(ts).hour
+            in_session = (active_start <= hour < active_end
+                          if active_start < active_end
+                          else (hour >= active_start or hour < active_end))
+            weighted += active_weight if in_session else offhours_weight
+        roundtrips = weighted
+    else:
+        roundtrips = n_leg_pairs
     if swings:
         avg = sum(swings) / len(swings)
         mx = max(swings)
@@ -110,6 +157,33 @@ def compute_roundtrip_metric(prices: list[float], spread: float) -> tuple[int, f
         avg = 0.0
         mx = 0.0
     return (roundtrips, avg, mx)
+
+
+def _regime_robust_score(prices: list[float], spread: float,
+                         chunks: int = 3) -> float:
+    """Split the price series into equal chunks, count roundtrips in each,
+    return the MINIMUM per-chunk roundtrip count (as fraction of total).
+    A spread that only works during one lucky window scores 0 here even if
+    its total is high — enforces the Turtle rule 'the system must work
+    across regimes, not just yesterday's'."""
+    if len(prices) < chunks * 5 or spread <= 0:
+        return 1.0  # not enough data to judge — don't penalize
+    total_rt, _, _ = compute_roundtrip_metric(prices, spread)
+    if total_rt == 0:
+        return 0.0
+    chunk_size = len(prices) // chunks
+    per_chunk = []
+    for i in range(chunks):
+        chunk = prices[i * chunk_size:(i + 1) * chunk_size if i < chunks - 1 else None]
+        rt, _, _ = compute_roundtrip_metric(chunk, spread)
+        per_chunk.append(rt)
+    # Robustness = (min chunk RT) / (average chunk RT). 1.0 = perfectly
+    # even distribution; 0.0 = all RTs in a single chunk. Prefer spreads
+    # where robustness ≥ 0.5 (no chunk has less than half the average).
+    avg_chunk = sum(per_chunk) / chunks if per_chunk else 0
+    if avg_chunk == 0:
+        return 0.0
+    return min(per_chunk) / avg_chunk
 
 
 def _atr_proxy_from_closes(prices: list[float]) -> float:
@@ -174,6 +248,11 @@ def score_product_swings(
     weekly_prices: list[float] | None = None,
     monthly_prices: list[float] | None = None,
     horizon_weights: tuple[float, float, float] = (0.2, 0.5, 0.3),
+    weekly_timestamps: list[float] | None = None,
+    monthly_timestamps: list[float] | None = None,
+    active_hours_utc: tuple[int, int] | None = (13, 21),
+    offhours_weight: float = 0.5,
+    regime_penalty_weight: float = 0.3,
 ) -> dict:
     """For a price series, try an ATR-anchored grid of spread candidates and
     return the one with the highest expected $/day AVERAGED ACROSS 24h/7d/30d.
@@ -215,34 +294,64 @@ def score_product_swings(
     for spread in grid:
         gross = spread * contract_size
         net = gross - fee_rt
+        # 24h roundtrip count — no session weighting on this window (too
+        # short for the hourly weighting to converge). Just a headline count.
         rt_daily, avg_d, _ = compute_roundtrip_metric(prices, spread)
-        daily_per_day = rt_daily * max(0.0, net)  # already $/day units
+        daily_per_day = rt_daily * max(0.0, net)
+        # 7d / 30d: apply session-hour weighting (Livermore rule) — cycles
+        # that COMPLETE during CFM's active US session count full weight;
+        # off-hours cycles count `offhours_weight` (default 0.5) because
+        # we probably won't be watching (or the fill quality is worse).
         if weekly_prices:
-            rt_weekly, _, _ = compute_roundtrip_metric(weekly_prices, spread)
+            rt_weekly, _, _ = compute_roundtrip_metric(
+                weekly_prices, spread,
+                timestamps=weekly_timestamps,
+                active_hours_utc=active_hours_utc,
+                offhours_weight=offhours_weight,
+            )
             weekly_per_day = (rt_weekly * max(0.0, net)) / 7.0
         else:
+            rt_weekly = 0.0
             weekly_per_day = daily_per_day
         if monthly_prices:
-            rt_monthly, _, _ = compute_roundtrip_metric(monthly_prices, spread)
+            rt_monthly, _, _ = compute_roundtrip_metric(
+                monthly_prices, spread,
+                timestamps=monthly_timestamps,
+                active_hours_utc=active_hours_utc,
+                offhours_weight=offhours_weight,
+            )
             monthly_per_day = (rt_monthly * max(0.0, net)) / 30.0
         else:
+            rt_monthly = 0.0
             monthly_per_day = daily_per_day
-        weighted_per_day = (w_d * daily_per_day
-                            + w_w * weekly_per_day
-                            + w_m * monthly_per_day)
+        # Regime robustness (Turtle rule): the monthly window is long enough
+        # to split into thirds. A spread whose profit only comes from ONE
+        # third gets penalized — we want spreads that work across market
+        # regimes, not just the one that happened this week.
+        robustness = _regime_robust_score(monthly_prices or prices, spread)
+        # Blend: expected $/day × (1 - penalty × (1 - robustness)). Perfectly
+        # even distribution → no penalty. All-in-one-third → up to
+        # regime_penalty_weight% cut. Default 0.3 means the worst-regime
+        # spread loses up to 30% of its expected $/day, which is enough to
+        # tip the pick to a more robust alternative when close.
+        base = (w_d * daily_per_day + w_w * weekly_per_day + w_m * monthly_per_day)
+        weighted_per_day = base * (1.0 - regime_penalty_weight * (1.0 - robustness))
         entry = {
             "spread": spread,
             "spread_mult": round(spread / tick_size) if tick_size > 0 else None,
-            "roundtrips": rt_daily,  # for the UI's per-day tile
+            "roundtrips": rt_daily,  # for the UI's per-day tile (24h count)
             "net_per_rt": round(net, 4),
-            # `score` is the WEIGHTED $/day — the UI already sorts descending
-            # by this field, so switching from 24h-only to weighted gives Adam
-            # the right ordering without a UI change.
+            # `score` is now the FULL weighted $/day: horizon-weighted +
+            # session-hour-weighted + regime-robustness-penalized. This is
+            # the number the UI sorts by, so 'BEST' reflects the full stack.
             "score": round(weighted_per_day, 4),
             "score_daily": round(daily_per_day, 4),
             "score_weekly": round(weekly_per_day * 7.0, 4),
             "score_monthly": round(monthly_per_day * 30.0, 4),
             "avg_swing": round(avg_d, 4),
+            "regime_robustness": round(robustness, 3),
+            "session_weighted_weekly_rt": round(rt_weekly, 2),
+            "session_weighted_monthly_rt": round(rt_monthly, 2),
         }
         candidates.append(entry)
         if best is None or weighted_per_day > best["score"]:
@@ -379,6 +488,56 @@ def _fetch_recent_closes(coinbase_client, product_id: str, granularity: str = "F
         print(f"[scanner] candle fetch failed for {product_id} @ {granularity}: "
               f"{type(e).__name__}: {e}", flush=True)
         return []
+
+
+def _fetch_recent_candles_ts(coinbase_client, product_id: str,
+                              granularity: str = "ONE_HOUR",
+                              lookback_secs: int = 7 * 24 * 3600
+                              ) -> tuple[list[float], list[float]]:
+    """Same as _fetch_recent_closes but returns (timestamps, closes) so the
+    session-hour weighting in score_product_swings has the data it needs to
+    tell 'active US hours' from 'sleeping 3am'. Timestamps are unix seconds
+    of the candle START (Coinbase's convention).
+    """
+    try:
+        per = _GRANULARITY_SECS.get(granularity, 3600)
+        page_seconds = per * 300
+        end = int(time.time())
+        start = end - lookback_secs
+        all_raws: list[dict] = []
+        cursor = start
+        while cursor < end:
+            page_end = min(cursor + page_seconds, end)
+            resp = coinbase_client.get_candles(
+                product_id=product_id,
+                start=str(cursor), end=str(page_end),
+                granularity=granularity,
+            )
+            d = resp.to_dict() if hasattr(resp, "to_dict") else resp
+            for r in (d.get("candles") or []):
+                all_raws.append(r)
+            cursor = page_end
+            if cursor < end:
+                time.sleep(0.02)
+        seen: set = set()
+        rows: list[tuple[float, float]] = []
+        for r in sorted(all_raws, key=lambda x: float(x.get("start", 0))):
+            ts = float(r.get("start", 0))
+            if ts in seen or ts <= 0:
+                continue
+            seen.add(ts)
+            c = r.get("close")
+            if c is None:
+                continue
+            try:
+                rows.append((ts, float(c)))
+            except (TypeError, ValueError):
+                continue
+        return ([ts for ts, _ in rows], [c for _, c in rows])
+    except Exception as e:
+        print(f"[scanner] ts-candle fetch failed for {product_id} @ {granularity}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return ([], [])
 
 
 def fetch_and_rank(
@@ -542,18 +701,18 @@ def fetch_and_rank(
         per_fill_fee = _fetch_per_fill_commission(coinbase_client, pid)
         effective_fee_rt = (per_fill_fee * 2) if (per_fill_fee and per_fill_fee > 0) \
             else float(swing_fee_per_contract_roundtrip or 0.0)
-        # Fetch 7d and 30d 1H closes UP FRONT so score_product_swings can
-        # score every candidate spread across 24h/7d/30d and pick the one
-        # with the best WEIGHTED $/day (0.2 daily / 0.5 weekly / 0.3 monthly).
-        # Old code fetched these only AFTER picking best on 24h alone, which
-        # is exactly what Adam called out: the spread was chosen on one day
-        # of data, not on the multi-horizon truth the tiles claim.
-        weekly_closes = _fetch_recent_closes(
+        # Fetch 7d and 30d 1H candles WITH timestamps so score_product_swings
+        # can apply session-hour weighting (Livermore rule: cycles that fire
+        # during the active US session count full weight; 3am dead-zone
+        # cycles count half). Old code fetched closes-only and couldn't
+        # distinguish "10 profitable RTs during peak hours" from "10 RTs
+        # scattered across the overnight nobody-trading window."
+        weekly_ts, weekly_closes = _fetch_recent_candles_ts(
             coinbase_client, pid,
             granularity="ONE_HOUR", lookback_secs=7 * 24 * 3600,
         )
         time.sleep(0.03)
-        monthly_closes = _fetch_recent_closes(
+        monthly_ts, monthly_closes = _fetch_recent_candles_ts(
             coinbase_client, pid,
             granularity="ONE_HOUR", lookback_secs=30 * 24 * 3600,
         )
@@ -562,6 +721,8 @@ def fetch_and_rank(
             closes, tick, csize, effective_fee_rt,
             weekly_prices=weekly_closes or None,
             monthly_prices=monthly_closes or None,
+            weekly_timestamps=weekly_ts or None,
+            monthly_timestamps=monthly_ts or None,
         )
         if fallback_used and swing.get("candidates"):
             # 7d/1H fallback: `closes` is a week's worth, so rt count needs
