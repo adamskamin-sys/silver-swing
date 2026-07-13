@@ -2319,11 +2319,12 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     //   - state must be ARMED_SELL (holds contracts)
     //   - ownEntrySource must be a REAL cost basis (not buy_px_target, not none)
     //   - snapshot.position_qty must be > 0 (physically holds contracts)
-    //   - cycles > 0 (sleeve has bought contracts via its own state machine).
-    //     Adam 2026-07-13: "there is no unrealized in my silver sleeve." A
-    //     freshly-attached sleeve inherits its qty from the parent position;
-    //     the pre-attach paper move belongs to the position, not the sleeve,
-    //     and shows on the position row instead — never double-counted here.
+    //   Adam 2026-07-13 (updated): a sleeve HOLDING a position shows THAT
+    //   position's unrealized even if it inherited the contracts — matches
+    //   Coinbase and the portfolio table. The old cycles>0 gate was removed:
+    //   it hid a real -$53 on a freshly-attached PLAT sleeve (cycles=0). The
+    //   remaining guards still force $0 whenever the sleeve isn't actually
+    //   holding contracts with a real cost basis.
     // Any one of these failing → unrealized is $0.
     const positionQty = Number(snapshot?.position_qty) || 0;
     const isRealCostBasis = ownEntrySource !== 'none' && ownEntrySource !== 'buy_px_target';
@@ -2332,7 +2333,6 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
       && sState === 'ARMED_SELL'
       && isRealCostBasis
       && positionQty > 0
-      && cycles > 0
     ) ? (mark - ownEntry) * contractSize * sleeveQty : 0;
     const paramsHtml = fmtTrailingParams(
       s.exit_mode || 'fixed_limit',
@@ -5428,20 +5428,21 @@ function openScannerDetail(row) {
           // multiple sleeves on the same position show DIFFERENT numbers,
           // reflecting each strategy's own attach point. Falling back to
           // pos_avg would make every sleeve identical.
-          const cycles = Number(ss.cycles) || 0;
           let unrealized = 0;
-          // Rule (Adam 2026-07-13): sleeve UNREALIZED is $0 until cycles > 0.
-          // A freshly-attached sleeve inherits its contracts from the parent
-          // position; the paper move on those pre-attach lots belongs to the
-          // position, not the sleeve — never double-counted on the sleeve row.
-          if (state === 'ARMED_SELL' && cycles > 0) {
+          // Rule (Adam 2026-07-13, updated): sleeve UNREALIZED reflects the
+          // actual MTM on contracts the sleeve is holding, regardless of
+          // cycles. Earlier rule ("$0 until cycles > 0") hid PLAT's -$146 on
+          // a freshly-attached sleeve — Adam explicitly asked to see that.
+          // A holding sleeve now always shows its current MTM. Fresh sleeves
+          // (cycles=0) inherit basis from position avg via the fallback chain.
+          if (state === 'ARMED_SELL') {
             const sell = Number(s.sell_px) || 0;
             const buy = Number(s.buy_px) || 0;
             const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
             const basis = Number(ss.own_avg_entry)
               || Number(s.entry_mark)
-              || midpoint
               || Number(row._live_avg)
+              || midpoint
               || 0;
             if (basis > 0 && liveMarkForSleeves > 0) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
@@ -5711,20 +5712,20 @@ function refreshScannerDetailLive() {
       const ss = sleeveStates[s.id] || {};
       const state = String(ss.state || 'ARMED_SELL');
       const realized = Number(ss.realized_pnl) || 0;
-      const cycles = Number(ss.cycles) || 0;
       let unrealized = 0;
-      // Rule (Adam 2026-07-13): sleeve UNREALIZED is $0 until the sleeve has
-      // completed at least one buy cycle. A freshly-attached sleeve inherits
-      // its contracts from the parent position — the paper move on those
-      // pre-attach lots belongs to the position, not the sleeve.
-      if (state === 'ARMED_SELL' && cycles > 0) {
+      // Rule (Adam 2026-07-13, updated): sleeve UNREALIZED reflects the actual
+      // MTM on contracts the sleeve is holding, regardless of cycles. Earlier
+      // rule ("$0 until cycles > 0") hid PLAT's -$146 on a freshly-attached
+      // sleeve — Adam explicitly asked to see that. Fresh sleeves inherit
+      // basis from position avg via the fallback chain.
+      if (state === 'ARMED_SELL') {
         const sell = Number(s.sell_px) || 0;
         const buy = Number(s.buy_px) || 0;
         const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
         const basis = Number(ss.own_avg_entry)
           || Number(s.entry_mark)
-          || midpoint
           || Number(avg)
+          || midpoint
           || 0;
         if (basis > 0 && markForSleeves > 0) {
           unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
