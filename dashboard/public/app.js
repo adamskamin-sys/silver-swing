@@ -24,6 +24,10 @@ const logoutBtn = document.getElementById('logout-btn');
 const lastUpdated = document.getElementById('last-updated');
 const cardsEl = document.getElementById('instrument-cards');
 let lastTradeEvents = []; // [crew] recent trade events, for the cockpit reversal/crash indicator
+// [crew] Hamburger menu open state — preserved across renders so the 2s
+// refresh cycle doesn't snap it closed while the user is picking an item.
+let modeMenuOpen = false;
+let modeMenuOutsideHandlerAttached = false;
 const tradeLogEl = document.getElementById('trade-log');
 const haltBanner = document.getElementById('halt-banner');
 const killBanner = document.getElementById('kill-banner');
@@ -609,7 +613,10 @@ function renderModeTabs(store) {
   menuBtn.innerHTML = '<span></span><span></span><span></span>';
   const menuDrop = document.createElement('div');
   menuDrop.className = 'mode-menu-drop';
-  menuDrop.hidden = true;
+  // Preserve open/closed state across refresh renders. Without this, the 2s
+  // POLL_MS render would drop a fresh hidden=true menuDrop over the one the
+  // user just opened, killing the click before it lands on Scanner/etc.
+  menuDrop.hidden = !modeMenuOpen;
   const modes = [
     ['live',    'Live',    'real money · your portfolio',  counts.live || 0, 'mode-live'],
     ['paper',   'Paper',   'simulated fills',              counts.paper || 0, 'mode-paper'],
@@ -626,6 +633,7 @@ function renderModeTabs(store) {
     `;
     row.onclick = () => {
       activeMode = mode;
+      modeMenuOpen = false;
       menuDrop.hidden = true;
       refreshOnce();
     };
@@ -633,11 +641,25 @@ function renderModeTabs(store) {
   }
   menuBtn.onclick = (e) => {
     e.stopPropagation();
-    menuDrop.hidden = !menuDrop.hidden;
+    modeMenuOpen = !modeMenuOpen;
+    menuDrop.hidden = !modeMenuOpen;
   };
-  document.addEventListener('click', (e) => {
-    if (!menuWrap.contains(e.target)) menuDrop.hidden = true;
-  });
+  // Attach the outside-click closer ONCE (not per-render). Prior code
+  // leaked one listener per 2s refresh tick. This handler reads the
+  // module-level modeMenuOpen state and finds the current .mode-menu-wrap
+  // in the DOM each time — safe across rebuilds.
+  if (!modeMenuOutsideHandlerAttached) {
+    document.addEventListener('click', (e) => {
+      if (!modeMenuOpen) return;
+      const wrap = document.querySelector('.mode-menu-wrap');
+      if (wrap && !wrap.contains(e.target)) {
+        modeMenuOpen = false;
+        const drop = wrap.querySelector('.mode-menu-drop');
+        if (drop) drop.hidden = true;
+      }
+    });
+    modeMenuOutsideHandlerAttached = true;
+  }
   menuWrap.appendChild(menuBtn);
   menuWrap.appendChild(menuDrop);
   modeTabs.appendChild(menuWrap);
