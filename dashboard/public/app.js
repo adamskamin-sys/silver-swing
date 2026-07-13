@@ -3554,7 +3554,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     id: `s${Date.now().toString(36)}`,
     name: nextAuthorName(),
     qty: 1,
-    exit_mode: 'fixed_limit',
+    // Hybrid mode ON by default (Adam 2026-07-13): "just [like] trail
+    // stopping so we can maximize profit on breakouts." Hybrid = sell at
+    // target (Path A, normal cycle) OR trail on breakout confirmation
+    // (Path B, upside capture). Strictly better than pure trailing_stop
+    // for cycle-focused strategies — normal cycles hit the target cleanly,
+    // breakouts get ridden. See the mode comparison in the exit dropdown.
+    exit_mode: 'hybrid',
     reanchor_threshold: 2.0,
     // Full expert stack ON by default for NEW sleeves (Adam: "turn them all
     // on by default"). Every feature is internally data-gated: Kelly waits
