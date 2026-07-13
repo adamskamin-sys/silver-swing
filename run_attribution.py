@@ -27,31 +27,32 @@ import sys
 from typing import Iterable
 
 
-def _load_events(log_path: str, tail: int) -> list[dict]:
-    """Read the last `tail` events from a jsonl trade log. Missing file → []."""
-    if not os.path.exists(log_path):
-        return []
+def _load_all_events(data_dir: str, tail_total: int) -> list[dict]:
+    """Read the last `tail_total` events from the unified trade log. On Render
+    (REDIS_URL set) this reads from Redis; locally it reads trades.jsonl.
+    Adam's setup on Render 2026-07-13: RedisTradeLog on key silver-swing:trades.
+    Earlier version tried per-(tenant,symbol) files which don't exist under
+    this store."""
+    from safety import make_trade_log
+    log = make_trade_log(data_dir)
     try:
-        with open(log_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            # 4KB per event is generous; grab a chunk that will cover `tail`
-            # events, then split. Small files: read the whole thing.
-            chunk = min(size, max(64 * 1024, tail * 512))
-            f.seek(max(0, size - chunk))
-            data = f.read().decode("utf-8", errors="replace")
+        return log.tail(tail_total)
     except Exception:
         return []
-    events: list[dict] = []
-    for line in data.splitlines():
-        line = line.strip()
-        if not line:
+
+
+def _filter_events(events: list[dict], tenant: str, symbol: str) -> list[dict]:
+    """Subset events for one (tenant, symbol). safety.TradeLog stores every
+    event across every product in one log; swing_leg._record injects tenant +
+    symbol on every entry."""
+    out = []
+    for e in events:
+        if str(e.get("tenant")) != tenant:
             continue
-        try:
-            events.append(json.loads(line))
-        except Exception:
+        if str(e.get("symbol")) != symbol:
             continue
-    return events[-tail:]
+        out.append(e)
+    return out
 
 
 def _pick_tenant(store) -> str:
@@ -69,22 +70,6 @@ def _list_tracked_symbols(store, tenant: str) -> list[str]:
     except Exception:
         raw = []
     return sorted({s for s in raw if not s.startswith("__")})
-
-
-def _find_log_path(data_dir: str, tenant: str, symbol: str) -> str:
-    """The bot writes per-(tenant, symbol) event logs. Filename convention lives
-    in safety.TradeLog; the plumbing here mirrors what the live loop uses."""
-    # Common patterns tried in order — first hit wins.
-    candidates = [
-        os.path.join(data_dir, f"{tenant}_{symbol}.jsonl"),
-        os.path.join(data_dir, "logs", f"{tenant}_{symbol}.jsonl"),
-        os.path.join(data_dir, tenant, f"{symbol}.jsonl"),
-        os.path.join(data_dir, "events", f"{tenant}_{symbol}.jsonl"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return candidates[0]  # nonexistent — caller handles missing gracefully
 
 
 def main() -> int:
@@ -109,15 +94,19 @@ def main() -> int:
         print(f"No products for tenant {tenant!r}.")
         return 1
 
+    # One big log read up front; filter per-symbol below. Cheap because Redis
+    # LRANGE is O(N) once, then we slice in memory. Beats N queries.
+    print(f"Loading trade log (up to {tail * len(symbols)} events) ...")
+    all_events = _load_all_events(data_dir, tail * len(symbols))
+    print(f"[diag] loaded {len(all_events)} events")
     print(f"Attribution sweep: {len(symbols)} product(s), tail={tail} events each")
     print("=" * 100)
 
     table: list[dict] = []
     for i, sym in enumerate(symbols, 1):
-        path = _find_log_path(data_dir, tenant, sym)
-        events = _load_events(path, tail)
+        events = _filter_events(all_events, tenant, sym)[-tail:]
         if not events:
-            print(f"[{i}/{len(symbols)}] {sym}: no events at {path}")
+            print(f"[{i}/{len(symbols)}] {sym}: no events for this (tenant, symbol)")
             table.append({"symbol": sym, "status": "no_events"})
             continue
         pnl = attr.attribute_pnl(events)
