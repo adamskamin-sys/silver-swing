@@ -1422,11 +1422,14 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
 function productAvgDownLight(tenant, productId) {
   const events = (lastTradeEvents || []);
   if (!events.length) return null;
-  // Track latest light per sleeve on this product.
+  // Match by SYMBOL only, not tenant. Adam has multiple tenants (adam-live,
+  // adam-live-live, adam-paper) and events may be tagged with any of them
+  // depending on where the sleeve runs. For the LIVE portfolio row, if any
+  // sleeve on that symbol has a green signal, show it — the user cares about
+  // the SIGNAL for THIS contract, not which tenant reported it.
   const latestBySleeve = {};
   for (const e of events) {
     if (!e || e.event_type !== 'avg_down_light') continue;
-    if (String(e.tenant) !== String(tenant)) continue;
     if (String(e.symbol) !== String(productId)) continue;
     if (!e.sleeve_id) continue;
     latestBySleeve[e.sleeve_id] = e.light;
@@ -4110,9 +4113,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
            Le Beau (ATR entry filter). Default distance = 0.5×ATR from
            expert_params. -->
       <div class="accumulate-block">
-        <label class="accumulate-toggle">
-          <input type="checkbox" id="sl-buy-trail" ${draft.buy_trail_enabled ? 'checked' : ''}>
-          <b>Wait for bounce before rebuying (don't catch a falling knife)</b>
+        <label class="accumulate-toggle" title="Don't buy into a fast/forced drop. The buy fills at your target normally, but is held while price is dropping too fast for this instrument's own volatility (Lee-Mykland jump) or into toxic / one-sided flow (VPIN/OFI/Kyle/OBI) — then released. Self-scaling: near-transparent on slow movers like copper, strict on fast crypto. Replaces the old bounce-wait.">
+          <input type="checkbox" id="sl-velocity-gate" ${draft.velocity_gate_enabled ? 'checked' : ''}>
+          <b>Velocity guard — don't buy into a fast drop (academic, self-scaling)</b>
         </label>
         <div class="accumulate-fields" id="sl-buy-trail-fields" ${draft.buy_trail_enabled ? '' : 'hidden'}>
           <div class="target-inputs">
@@ -5026,7 +5029,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       book_imbalance_buy_threshold: Number(draft.book_imbalance_buy_threshold) || 0.65,
       // Trailing buy (Livermore / Turtle / Le Beau) — don't grab a falling
       // knife. See swing_leg._trailing_buy_ready for the state machine.
-      buy_trail_enabled: !!(m.querySelector('#sl-buy-trail')?.checked),
+      buy_trail_enabled: false,
+      velocity_gate_enabled: !!(m.querySelector('#sl-velocity-gate')?.checked),
       crash_guard_enabled: !!(m.querySelector('#sl-crashguard')?.checked),
       reversal_enabled: !!(m.querySelector('#sl-reversal')?.checked),
       avg_down_alert_enabled: !!(m.querySelector('#sl-avgdown')?.checked),
