@@ -2095,3 +2095,29 @@ header { padding: 20px 32px; }
   max-height: 96vh; height: 96vh;
   min-width: 0;
 }
+
+/* Twitter shadow signal viewer. SHADOW MODE — no trades ever executed by
+   this tab; the banner is load-bearing on the UX so Adam always sees it. */
+#signals-section .shadow-banner {
+  background: linear-gradient(90deg, rgba(212, 160, 23, 0.12), rgba(212, 160, 23, 0.04));
+  border: 1px solid rgba(212, 160, 23, 0.35);
+  color: var(--text);
+  padding: 10px 14px; border-radius: 6px; margin-bottom: 14px;
+  font-size: 12px; line-height: 1.5;
+}
+#signals-section .signals-summary {
+  display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px;
+}
+#signals-section .signals-total { font-size: 13px; font-weight: 600; }
+#signals-section .signals-tallies { display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--mono); font-size: 11px; }
+#signals-section .signals-tally { }
+#signals-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+#signals-table th, #signals-table td {
+  padding: 6px 8px; border-bottom: 1px solid var(--panel-3);
+  text-align: left; vertical-align: top;
+}
+#signals-table th { color: var(--dim); font-weight: 500; letter-spacing: 0.4px; text-transform: uppercase; font-size: 10px; }
+#signals-table .signal-would { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; letter-spacing: 0.4px; }
+#signals-table .signal-would.neg { background: rgba(220, 60, 60, 0.15); color: var(--bad); }
+#signals-table .signal-would.warn { background: rgba(212, 160, 23, 0.15); color: var(--warn, #d4a017); }
+#signals-table .signal-would.pos { background: rgba(76, 205, 138, 0.15); color: var(--good); }

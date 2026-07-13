@@ -444,7 +444,7 @@ function renderModeTabs(store) {
 
   const currentBadge = document.createElement('div');
   currentBadge.className = 'mode-current-badge mode-' + activeMode;
-  const modeLabels = { live: 'live · real money', paper: 'paper · simulated', lab: 'lab · $100k sandbox', scanner: 'scanner · derivatives' };
+  const modeLabels = { live: 'live · real money', paper: 'paper · simulated', lab: 'lab · $100k sandbox', scanner: 'scanner · derivatives', signals: 'signals · twitter (shadow)' };
   currentBadge.textContent = modeLabels[activeMode] || activeMode;
   modeTabs.appendChild(currentBadge);
 
@@ -462,6 +462,7 @@ function renderModeTabs(store) {
     ['paper',   'Paper',   'simulated fills',              counts.paper || 0, 'mode-paper'],
     ['lab',     'Lab',     '$100k sandbox · Models A-E',   counts.lab || 0, 'mode-lab'],
     ['scanner', 'Scanner', 'top derivatives by volatility', 0, 'mode-scanner'],
+    ['signals', 'Signals', 'twitter · SHADOW (no trades)',  0, 'mode-signals'],
   ];
   for (const [mode, label, sub, count, cls] of modes) {
     const row = document.createElement('button');
@@ -2508,6 +2509,97 @@ async function refreshScanner() {
   }
 }
 
+// Twitter shadow signal viewer. Reads /api/twitter-signals which returns
+// {entries: [...], summary: {total_signals, shadow_mode, by_horizon}}.
+// Renders a header with total + per-horizon accuracy tally, then a table
+// of every "would-have-decided" entry. Nothing here triggers or references
+// trade execution — this is purely a validation harness.
+async function refreshSignals() {
+  const summaryEl = document.getElementById('signals-summary');
+  const tbody = document.querySelector('#signals-table tbody');
+  if (!summaryEl || !tbody) return;
+  try {
+    const r = await fetch('/api/twitter-signals');
+    if (!r.ok) {
+      summaryEl.textContent = 'signals API unavailable';
+      tbody.innerHTML = '';
+      return;
+    }
+    const data = await r.json();
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    const summary = data.summary || {};
+    const tally = summary.by_horizon || {};
+    const horizonCell = (h) => {
+      const t = tally[h] || {};
+      const c = t.correct || 0, w = t.wrong || 0, f = t.flat || 0, u = t.unknown || 0;
+      const n = c + w + f;
+      const acc = n > 0 ? Math.round(100 * c / n) : null;
+      return `<span class="signals-tally"><b>${h}</b>: `
+        + `<span class="pos">${c}✓</span> `
+        + `<span class="neg">${w}✗</span> `
+        + `<span class="dim">${f} flat · ${u} unk</span>`
+        + (acc !== null ? ` · <b>${acc}% accurate</b>` : '')
+        + `</span>`;
+    };
+    summaryEl.innerHTML = `
+      <div class="signals-total">${entries.length} shadow signal${entries.length === 1 ? '' : 's'} logged</div>
+      <div class="signals-tallies">
+        ${horizonCell('1h')} ${horizonCell('6h')} ${horizonCell('24h')}
+      </div>
+    `;
+    tbody.innerHTML = '';
+    if (!entries.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="10" class="dim">no signals yet — the scanner polls every 5 min; check back after the next tick</td>`;
+      tbody.appendChild(tr);
+      return;
+    }
+    for (const e of entries) {
+      const tr = document.createElement('tr');
+      const ts = new Date((Number(e.ts) || 0) * 1000).toLocaleString();
+      const src = e.source || '';
+      const family = e.family || '';
+      const wa = e.would_action || '';
+      const waClass = wa === 'EXIT_HINT' ? 'neg'
+                    : wa === 'BLOCK_ARM' ? 'warn'
+                    : wa === 'ALERT_ARM' ? 'pos' : 'dim';
+      const kw = Array.isArray(e.keywords_matched) ? e.keywords_matched.join(', ') : '';
+      const prods = Array.isArray(e.products_affected) ? e.products_affected : [];
+      const prodDisplay = prods.length ? `${prods.length} product${prods.length === 1 ? '' : 's'}` : '—';
+      const outs = e.outcomes || {};
+      const outCell = (h) => {
+        const o = outs[h];
+        if (!o) return '<span class="dim">pending</span>';
+        const v = o.verdict || 'unknown';
+        const p = o.pct_avg;
+        const pctStr = (p !== null && p !== undefined) ? `${p >= 0 ? '+' : ''}${Number(p).toFixed(2)}%` : '—';
+        const cls = v === 'correct' ? 'pos' : v === 'wrong' ? 'neg' : 'dim';
+        const label = v === 'correct' ? '✓' : v === 'wrong' ? '✗' : v === 'flat' ? '·' : '?';
+        return `<span class="${cls}">${label} ${pctStr}</span>`;
+      };
+      const tweetLink = e.tweet_url
+        ? `<a href="${escapeHtml(e.tweet_url)}" target="_blank" rel="noopener" class="dim">view</a>`
+        : '<span class="dim">—</span>';
+      tr.innerHTML = `
+        <td class="dim" title="${escapeHtml(new Date((Number(e.ts) || 0) * 1000).toISOString())}">${escapeHtml(ts)}</td>
+        <td>${escapeHtml(src)}</td>
+        <td>${escapeHtml(family)}</td>
+        <td><span class="signal-would ${waClass}">${escapeHtml(wa)}</span></td>
+        <td class="dim" title="${escapeHtml(kw)}">${escapeHtml(kw.slice(0, 40))}${kw.length > 40 ? '…' : ''}</td>
+        <td class="dim" title="${escapeHtml(prods.join(', '))}">${prodDisplay}</td>
+        <td>${outCell('1h')}</td>
+        <td>${outCell('6h')}</td>
+        <td>${outCell('24h')}</td>
+        <td>${tweetLink}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (err) {
+    console.error('signals refresh failed', err);
+    if (summaryEl) summaryEl.textContent = `signals refresh failed: ${err.message}`;
+  }
+}
+
 async function refreshOnce() {
   const [status, trades] = await Promise.all([
     fetchJson('/api/status'),
@@ -2521,13 +2613,23 @@ async function refreshOnce() {
   renderAssetTabs(currentStore);
 
   const scannerSection = document.getElementById('scanner-section');
+  const signalsSection = document.getElementById('signals-section');
   const showScanner = activeMode === 'scanner';
+  const showSignals = activeMode === 'signals';
   if (scannerSection) scannerSection.hidden = !showScanner;
-  cardsEl.hidden = showScanner;
-  document.getElementById('asset-tabs').hidden = showScanner;
+  if (signalsSection) signalsSection.hidden = !showSignals;
+  cardsEl.hidden = showScanner || showSignals;
+  document.getElementById('asset-tabs').hidden = showScanner || showSignals;
 
   if (showScanner) {
     refreshScanner();
+    cardsEl.innerHTML = '';
+    tradeLogEl.innerHTML = '';
+    lastUpdated.textContent = `updated ${new Date().toLocaleTimeString()}`;
+    return;
+  }
+  if (showSignals) {
+    refreshSignals();
     cardsEl.innerHTML = '';
     tradeLogEl.innerHTML = '';
     lastUpdated.textContent = `updated ${new Date().toLocaleTimeString()}`;

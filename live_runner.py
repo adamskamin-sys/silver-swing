@@ -52,6 +52,9 @@ FAMILY_RECHECK_SECS = float(os.getenv("SWING_FAMILY_RECHECK_SECS", "3600.0"))
 # until we overwrite it. 6h is a fine tradeoff: 4 refreshes/day, negligible
 # Coinbase API budget, and no product can drift for more than 6h.
 SPEC_REFRESH_SECS = float(os.getenv("SWING_SPEC_REFRESH_SECS", "21600.0"))
+# Twitter shadow scanner poll interval. 5 min balances freshness against
+# Nitter instance rate limits and RSS parse cost. Env override for tests.
+TWITTER_POLL_SECS = float(os.getenv("SWING_TWITTER_POLL_SECS", "300.0"))
 
 
 def _log(msg: str) -> None:
@@ -284,6 +287,9 @@ def run() -> int:
     except Exception as e:
         _log(f"WARN: startup spec refresh failed: {type(e).__name__}: {e}")
     last_spec_refresh = time.time()
+    # Offset the first twitter poll by 60s so bot startup isn't dominated by
+    # a slow RSS fetch across ~15 handles.
+    last_twitter_poll = time.time() - TWITTER_POLL_SECS + 60.0
 
     # Scanner tick shared with paper mode — keeps Edit Strategy tiles fresh
     # even when bot-paper isn't running (Adam retired it). Reuses the same
@@ -369,6 +375,22 @@ def run() -> int:
                              f"(${change.get('drawdown_dollars', 0):.2f})")
                 except Exception as e:
                     _log(f"portfolio_risk tick failed: {type(e).__name__}: {e}")
+            # Twitter shadow scanner — polls a curated watchlist, detects
+            # would-block / would-alert signals, evaluates outcomes at
+            # 1h/6h/24h. Runs every TWITTER_POLL_SECS. SHADOW ONLY: the
+            # module has a hardcoded EXECUTE_TRADES=False; nothing in this
+            # loop passes a Twitter signal to any order path. Adam's ask:
+            # "give it a try but don't execute any trades with it. I want
+            # to see if it works first."
+            if now - last_twitter_poll >= TWITTER_POLL_SECS:
+                last_twitter_poll = now
+                try:
+                    import twitter_scanner
+                    telem = twitter_scanner.tick(store, TENANT)
+                    if telem.get("signals_new", 0) or telem.get("outcomes_updated", 0):
+                        _log(f"twitter_scanner: {telem}")
+                except Exception as e:
+                    _log(f"twitter_scanner tick failed: {type(e).__name__}: {e}")
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()

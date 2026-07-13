@@ -48,6 +48,33 @@
           <tbody></tbody>
         </table>
       </section>
+      <section id="signals-section" hidden>
+        <div class="shadow-banner">
+          SHADOW MODE — no trades executed. This is a validation harness for
+          Twitter signals. Every entry below is a decision the bot WOULD have
+          made if it were live-trading these signals. Outcomes at 1h/6h/24h
+          score the signal's accuracy so you can decide whether to promote
+          the source out of shadow mode.
+        </div>
+        <div id="signals-summary" class="signals-summary"></div>
+        <table id="signals-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Source</th>
+              <th>Family</th>
+              <th>Would</th>
+              <th>Keywords</th>
+              <th>Products</th>
+              <th title="1h outcome — did the signal direction match the average product move?">1h</th>
+              <th title="6h outcome">6h</th>
+              <th title="24h outcome">24h</th>
+              <th>Tweet</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
       <section id="trades-section">
         <h2>recent events</h2>
         <ol id="trade-log"></ol>

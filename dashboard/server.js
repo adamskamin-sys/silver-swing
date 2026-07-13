@@ -46,6 +46,7 @@ const REDIS_URL = process.env.REDIS_URL || null;
 const REDIS_STORE_KEY = 'silver-swing:store';
 const REDIS_TRADES_KEY = 'silver-swing:trades';
 const REDIS_SCANNER_KEY = 'silver-swing:scanner';
+const REDIS_TWITTER_LOG_KEY = 'silver-swing:twitter-signals';
 
 if (!DASHBOARD_PASSWORD) {
   console.warn('WARNING: DASHBOARD_PASSWORD not set. Login is disabled — dev mode only.');
@@ -560,6 +561,47 @@ export function makeApp({
       const raw = await r.get(REDIS_SCANNER_KEY);
       if (!raw) return res.json({ top: [], generated_at: null });
       res.json(JSON.parse(raw));
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+    }
+  });
+
+  // Twitter shadow signal log — read-only. The scanner runs in the bot loop
+  // (live_runner calls twitter_scanner.tick every TWITTER_POLL_SECS) and
+  // writes entries to REDIS_TWITTER_LOG_KEY as JSON strings. Frontmost entry
+  // is the newest. Shadow-mode invariant: `shadow_mode` and
+  // `trades_executed: false` are set by the Python side; the dashboard
+  // surfaces them so the user always sees "not executing" front-and-center.
+  app.get('/api/twitter-signals', requireAuth, async (req, res) => {
+    const r = await getRedis();
+    if (!r) return res.json({ entries: [], summary: { total_signals: 0, shadow_mode: true } });
+    try {
+      const raws = await r.lRange(REDIS_TWITTER_LOG_KEY, 0, 199) || [];
+      const entries = [];
+      for (const raw of raws) {
+        try { entries.push(JSON.parse(raw)); } catch { /* skip malformed */ }
+      }
+      // Aggregate hit rate for the header. Cheap: N ≤ 200.
+      const tally = { '1h': { correct: 0, wrong: 0, flat: 0, unknown: 0 },
+                      '6h': { correct: 0, wrong: 0, flat: 0, unknown: 0 },
+                      '24h': { correct: 0, wrong: 0, flat: 0, unknown: 0 } };
+      for (const e of entries) {
+        const outs = e.outcomes || {};
+        for (const h of ['1h', '6h', '24h']) {
+          const res = outs[h];
+          if (!res) continue;
+          const v = res.verdict || 'unknown';
+          if (tally[h][v] !== undefined) tally[h][v]++;
+        }
+      }
+      res.json({
+        entries,
+        summary: {
+          total_signals: entries.length,
+          shadow_mode: true,
+          by_horizon: tally,
+        },
+      });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }
