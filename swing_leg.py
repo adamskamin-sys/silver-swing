@@ -1956,6 +1956,41 @@ class SwingTrader:
         if callable(set_src):
             set_src("strategy", strategy_id=sc.id)
         post_only = bool(getattr(sc, "post_only_enabled", False))
+        # Post-only would-cross guard. Adam hit this on OIL Model B: sell fired
+        # at $75.02, buy target set at $74.76. Market later dropped to $74.30
+        # (below the buy target). A limit BUY at $74.76 with market at $74.30
+        # would be a TAKER order (crosses the ask to grab liquidity) — Coinbase
+        # rejects post-only takers. The sleeve then spun in ARMED_BUY, retrying
+        # forever, never completing the cycle. Fix: peek at the book, and if
+        # our limit would cross, drop post_only for THIS arm so we take the
+        # (better-than-limit) fill and complete the cycle. Losing the maker
+        # rebate on one rebuy is far better than a dead cycle. Same guard for
+        # SELL: if sell price is below best bid, we'd take liquidity → drop
+        # post_only rather than infinite-spin.
+        if post_only:
+            get_book = getattr(self.b, "get_orderbook", None)
+            if callable(get_book):
+                try:
+                    book = get_book(limit=1)
+                except Exception:
+                    book = None
+                if book:
+                    bids = book.get("bids") or []
+                    asks = book.get("asks") or []
+                    best_bid = float(bids[0][0]) if bids else 0.0
+                    best_ask = float(asks[0][0]) if asks else 0.0
+                    would_cross = (
+                        (side == "BUY" and best_ask > 0 and price >= best_ask)
+                        or (side == "SELL" and best_bid > 0 and price <= best_bid)
+                    )
+                    if would_cross:
+                        self._record(
+                            "post_only_dropped_would_cross",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            side=side, price=price,
+                            best_bid=best_bid, best_ask=best_ask,
+                        )
+                        post_only = False
         try:
             # Not every broker signature supports post_only (paper backtest
             # broker fixtures, etc.). Try with, fall back without.
@@ -1965,9 +2000,39 @@ class SwingTrader:
             except TypeError:
                 ss.live_order_id = self.b.place_limit(side, qty, price)
         except Exception as e:
-            self._record("sleeve_arm_failed", sleeve_id=sc.id, error=str(e),
-                         side=side, qty=qty, price=price, post_only=post_only)
-            return
+            # Post-only rejection safety net. If the book peek above missed a
+            # would-cross (race between book snapshot and order submission,
+            # or non-standard error) and Coinbase rejected the post-only
+            # order, retry once WITHOUT post_only so the cycle can complete.
+            err = str(e)
+            looks_like_post_only_reject = post_only and (
+                "post" in err.lower() and ("only" in err.lower() or "cross" in err.lower())
+                or "would cross" in err.lower()
+                or "immediate" in err.lower() and "reject" in err.lower()
+            )
+            if looks_like_post_only_reject:
+                try:
+                    try:
+                        ss.live_order_id = self.b.place_limit(side, qty, price,
+                                                             post_only=False)
+                    except TypeError:
+                        ss.live_order_id = self.b.place_limit(side, qty, price)
+                    self._record(
+                        "post_only_retried_without",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        side=side, qty=qty, price=price,
+                        original_error=err,
+                    )
+                    post_only = False  # for the sleeve_order_placed record below
+                except Exception as e2:
+                    self._record("sleeve_arm_failed", sleeve_id=sc.id, error=str(e2),
+                                 side=side, qty=qty, price=price, post_only=False,
+                                 post_only_retry_after=err)
+                    return
+            else:
+                self._record("sleeve_arm_failed", sleeve_id=sc.id, error=err,
+                             side=side, qty=qty, price=price, post_only=post_only)
+                return
         self._record(
             "sleeve_order_placed",
             sleeve_id=sc.id, sleeve_name=sc.name,
