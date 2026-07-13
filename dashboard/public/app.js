@@ -411,17 +411,29 @@ function renderCockpit(store) {
     ? `${revCount}↺${crashExits ? ` <span class="ck-chip ck-warn" style="font-size:var(--fs-xs)" title="crash-guard flatten exits">🛡${crashExits}</span>` : ''}${shadowRev ? ` <span class="ck-chip" style="font-size:var(--fs-xs)" title="shadow reversal signals — hypothetical short flips logged for paper/backtest, no live order placed">👻${shadowRev}</span>` : ''}${haveRevPnl ? ` <span class="${classForValue(revPnl)}">${revPnl >= 0 ? '+' : '-'}${fmtMoney(Math.abs(revPnl))}</span>` : ''}`
     : '<span class="ck-chip ck-ok">0</span>';
 
-  // [crew] latest average-down light per sleeve (from the event feed)
+  // [crew] latest average-down light per sleeve (from the event feed). Track
+  // the product symbol alongside so the cockpit tile's tooltip can NAME which
+  // contract has the green light — Adam 2026-07-13: "how do i know which one
+  // to average down?" The row-level 🟢 badge (see productAvgDownLight above)
+  // is the primary answer; this tooltip is the secondary "which one" view.
   const _adLatest = {};
   for (const e of (lastTradeEvents || [])) {
-    if (e && e.event_type === 'avg_down_light' && e.sleeve_id) _adLatest[e.sleeve_id] = e.light;
+    if (e && e.event_type === 'avg_down_light' && e.sleeve_id) {
+      _adLatest[e.sleeve_id] = { light: e.light, symbol: e.symbol, sleeve_name: e.sleeve_name };
+    }
   }
   const _adLights = Object.values(_adLatest);
-  const adGreen = _adLights.filter(l => l === 'green').length;
-  const adAmber = _adLights.filter(l => l === 'amber').length;
+  const _adGreenList = _adLights.filter(x => x.light === 'green');
+  const _adAmberList = _adLights.filter(x => x.light === 'amber');
+  const adGreen = _adGreenList.length;
+  const adAmber = _adAmberList.length;
+  const _adTip = (list, headline) => {
+    const names = list.map(x => `${x.symbol}${x.sleeve_name ? ' / ' + x.sleeve_name : ''}`);
+    return names.length ? `${headline}: ${names.join(', ')}` : headline;
+  };
   const avgDownValue = adGreen
-    ? `<span class="ck-chip ck-ok" title="experts say a disciplined average-down is on the table right now">🟢 ${adGreen}</span>`
-    : (adAmber ? `<span class="ck-chip" style="font-size:var(--fs-xs)" title="watching — conditions not all met yet">🟡 ${adAmber}</span>`
+    ? `<span class="ck-chip ck-ok" title="${escapeHtml(_adTip(_adGreenList, 'AVG-DOWN GREEN'))}">🟢 ${adGreen}</span>`
+    : (adAmber ? `<span class="ck-chip" style="font-size:var(--fs-xs)" title="${escapeHtml(_adTip(_adAmberList, 'AVG-DOWN AMBER (watching)'))}">🟡 ${adAmber}</span>`
                : '<span class="ck-chip ck-ok">—</span>');
 
   // [crew] latest entry-quality light per sleeve (from the event feed)
@@ -1026,7 +1038,17 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           const revBadge = revArmed
             ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="Reversal watch armed — a crash flatten would log a shadow short signal (paper-only, no live order)">↺</span>`
             : '';
-          return sideText + revBadge;
+          // Average-down signal — 🟢 when the expert stack says "this is the
+          // one to add to." 🟡 when watching but not all conditions met. See
+          // avg_down_signal.py — requires mean-revert regime + at channel
+          // floor + calm flow + volatility settled + below your avg + margin.
+          const adLight = r.kind === 'futures' ? productAvgDownLight(liveTenant, r.product) : null;
+          const adBadge = adLight === 'green'
+            ? ` <span class="ck-chip ck-ok" style="font-size:0.7em;padding:1px 4px" title="AVG-DOWN GREEN — expert stack says a disciplined scale-in near support is on the table right now. Notification only; you still pull the trigger.">🟢</span>`
+            : adLight === 'amber'
+              ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="AVG-DOWN AMBER — watching, but not all conditions met yet (regime, floor, calm, or below-avg missing)">🟡</span>`
+              : '';
+          return sideText + revBadge + adBadge;
         })()}</td>
         <td class="mono">${qtyText}</td>
         <td class="mono">${avgText}</td>
@@ -1390,6 +1412,32 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
 // strategy on it — primary state.realized_pnl + every sleeve's realized_pnl.
 // Used by the Live/Paper positions table so the user can see "this product
 // has banked $X so far" without opening the drill-down.
+// Latest average-down light for a product across all its sleeves. Reads the
+// per-sleeve `avg_down_light` events from lastTradeEvents (populated by the
+// bot). Returns 'green', 'amber', or null if no signal. If ANY sleeve on the
+// product is green, the product is green — that's the actionable one Adam can
+// actually average down on. Adam 2026-07-13: "how do i know which one to
+// average down?" — the cockpit tile shows count; this puts the light on the
+// actual row.
+function productAvgDownLight(tenant, productId) {
+  const events = (lastTradeEvents || []);
+  if (!events.length) return null;
+  // Track latest light per sleeve on this product.
+  const latestBySleeve = {};
+  for (const e of events) {
+    if (!e || e.event_type !== 'avg_down_light') continue;
+    if (String(e.tenant) !== String(tenant)) continue;
+    if (String(e.symbol) !== String(productId)) continue;
+    if (!e.sleeve_id) continue;
+    latestBySleeve[e.sleeve_id] = e.light;
+  }
+  const lights = Object.values(latestBySleeve);
+  if (!lights.length) return null;
+  if (lights.includes('green')) return 'green';
+  if (lights.includes('amber')) return 'amber';
+  return null;
+}
+
 // True if ANY sleeve on this product has reversal_enabled=true. Adam 2026-07-13
 // asked for a dashboard notation when reversal is "armed." Reversal is currently
 // SHADOW-only (sleeves.py:384-390 comment) — a crash logs a `reversal_signal`
