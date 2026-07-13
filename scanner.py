@@ -326,16 +326,33 @@ def fetch_and_rank(
             # Find the raw Coinbase product dict and score it.
             raw = next((p for p in products if (p.get("product_id") or p.get("product_type_id")) == pid), None)
             if not raw:
-                continue
+                # Fallback: the initial get_products() call may have missed
+                # this product (paginated, expired-looking to Coinbase's
+                # filter, wrong product_type, etc.). Try a direct product
+                # fetch so held/user-strategy products still get scanned
+                # instead of silently dropping.
+                try:
+                    resp = coinbase_client.get_product(product_id=pid)
+                    raw = resp.to_dict() if hasattr(resp, "to_dict") else resp
+                except Exception as e:
+                    print(f"[scanner] force_include: direct get_product failed for {pid}: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                    continue
             forced = compute_ranking([raw], top_n=1)
             if forced:
                 ranking.extend(forced)
                 ranked_ids.add(pid)
+            else:
+                print(f"[scanner] force_include: compute_ranking dropped {pid} "
+                      f"(missing tick_size / contract_size / price?)", flush=True)
     for entry in ranking:
         pid = entry.get("product_id")
         tick = entry.get("tick_size")
         csize = entry.get("contract_size")
         if not pid or not tick or not csize:
+            print(f"[scanner] {pid}: skipping swing scoring — missing tick={tick} "
+                  f"or contract_size={csize} (modal will show 'no scanner data')",
+                  flush=True)
             entry.update({"best_score": 0.0, "best_roundtrips": 0,
                           "best_spread": None, "best_net_per_rt": 0.0,
                           "swing_candidates": [], "swing_lookback_secs": swing_lookback_secs})

@@ -714,6 +714,48 @@ export function makeApp({
     }
   });
 
+  // Filtered fills for chart annotation. Returns each sleeve_order_filled
+  // (or primary order_filled) event for a specific product, mapped to
+  // {ts, side, price, qty}. Side derived from the leg field: ARMED_SELL →
+  // SELL fill (we sold), ARMED_BUY → BUY fill (we bought back).
+  app.get('/api/fills', requireAuth, async (req, res) => {
+    const symbol = String(req.query.symbol || '').trim();
+    if (!symbol) return res.status(400).json({ ok: false, error: 'symbol required' });
+    const limit = Math.min(parseInt(req.query.limit || '500', 10), 2000);
+    try {
+      const events = await tailJsonl(tradeLogPath, limit);
+      const fills = [];
+      for (const e of events) {
+        if (!e || e.symbol !== symbol) continue;
+        const t = e.event_type;
+        // sleeve_order_filled: every fill on a sleeve arm.
+        if (t === 'sleeve_order_filled') {
+          const leg = String(e.leg || '').toUpperCase();
+          const side = leg.includes('SELL') ? 'SELL' : (leg.includes('BUY') ? 'BUY' : null);
+          if (!side) continue;
+          const price = Number(e.average_filled_price);
+          if (!Number.isFinite(price) || price <= 0) continue;
+          fills.push({ ts: Number(e.ts) || 0, side, price, qty: Number(e.filled_qty) || 0,
+                       kind: 'sleeve', sleeve: e.sleeve_name || e.sleeve_id });
+          continue;
+        }
+        // sleeve_stop_loss_triggered: forced SELL from stop-loss.
+        if (t === 'sleeve_stop_loss_triggered' || t === 'stop_loss_triggered') {
+          const price = Number(e.price);
+          if (!Number.isFinite(price) || price <= 0) continue;
+          fills.push({ ts: Number(e.ts) || 0, side: 'SELL', price, qty: Number(e.sold) || 0,
+                       kind: 'stop_loss', sleeve: e.sleeve_name || e.sleeve_id || null });
+          continue;
+        }
+      }
+      // Sort ascending by ts so pairing buy→sell in order works client-side.
+      fills.sort((a, b) => a.ts - b.ts);
+      res.json({ ok: true, fills });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   return app;
 }
 

@@ -5238,70 +5238,221 @@ async function loadScannerChart() {
   scannerDetailChart.innerHTML = '<div class="chart-status">loading candles…</div>';
   try {
     const rangeParam = minutes != null ? `minutes=${minutes}` : `days=${days}`;
-    const resp = await fetch(`/api/candles?product_id=${encodeURIComponent(product_id)}&${rangeParam}&granularity=${granularity}`, { credentials: 'same-origin' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    // Fetch candles + fills in parallel — fills are annotated on the chart
+    // so Adam can see where the strategy actually bought/sold and connect
+    // each completed cycle with a line.
+    const [candleResp, fillsResp] = await Promise.all([
+      fetch(`/api/candles?product_id=${encodeURIComponent(product_id)}&${rangeParam}&granularity=${granularity}`, { credentials: 'same-origin' }),
+      fetch(`/api/fills?symbol=${encodeURIComponent(product_id)}&limit=500`, { credentials: 'same-origin' }),
+    ]);
+    if (!candleResp.ok) throw new Error(`HTTP ${candleResp.status}`);
+    const data = await candleResp.json();
     if (!data.ok) throw new Error(data.error || 'unknown error');
-    renderCandleChart(data.candles || [], scannerDetailChart);
+    let fills = [];
+    try {
+      const fj = await fillsResp.json();
+      if (fj && fj.ok && Array.isArray(fj.fills)) fills = fj.fills;
+    } catch { /* fills are optional — chart still renders without them */ }
+    // Pull sleeve targets (sell/buy/stop) for reference lines so Adam can
+    // see at a glance where the current strategy would fire.
+    const liveTenant = Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
+    const cfg = liveTenant ? (currentStore[liveTenant]?.[product_id]?.config || {}) : {};
+    const sleeves = Array.isArray(cfg.sleeves) ? cfg.sleeves : [];
+    const targetLines = [];
+    for (const s of sleeves) {
+      if (Number(s.sell_px) > 0) targetLines.push({ price: Number(s.sell_px), label: `sell (${s.name || s.id})`, color: '#22c55e' });
+      if (Number(s.buy_px) > 0) targetLines.push({ price: Number(s.buy_px), label: `buy (${s.name || s.id})`, color: '#3b82f6' });
+      if (s.stop_loss_enabled && Number(s.stop_loss_px) > 0) targetLines.push({ price: Number(s.stop_loss_px), label: `stop (${s.name || s.id})`, color: '#ef4444' });
+    }
+    renderCandleChart(data.candles || [], scannerDetailChart, {
+      fills,
+      targetLines,
+      tickSize: Number(cfg.tick_size) || 0,
+      contractSize: Number(cfg.contract_size) || 0,
+    });
   } catch (err) {
     scannerDetailChart.innerHTML = `<div class="chart-status error">chart failed: ${escapeHtml(String(err.message || err))}</div>`;
   }
 }
 
-// Compact SVG candlestick chart. Candles are [ts, open, high, low, close].
+// SVG candlestick chart. Candles are [ts, open, high, low, close].
 // No external charting lib — keeps the dashboard tiny and avoids CSP hassle.
-function renderCandleChart(candles, container) {
+//
+// opts (all optional):
+//   fills:        [{ts, side ('BUY'|'SELL'), price, qty, kind, sleeve}]
+//                 → renders arrow markers + connects each BUY→SELL as a
+//                   dashed cycle line labeled with the per-contract gain.
+//   targetLines:  [{price, label, color}]
+//                 → horizontal reference lines for current sell/buy/stop
+//                   so Adam sees where the live strategy would fire.
+//   tickSize:     product tick_size → drives Y-axis label precision.
+//   contractSize: for annotating cycle profit in $ (spread × contract_size).
+function renderCandleChart(candles, container, opts = {}) {
   if (!candles.length) {
     container.innerHTML = '<div class="chart-status">no candles in window.</div>';
     return;
   }
-  const W = container.clientWidth || 800;
-  const H = 340;
-  const padL = 60, padR = 12, padT = 14, padB = 28;
+  const fills = Array.isArray(opts.fills) ? opts.fills : [];
+  const targetLines = Array.isArray(opts.targetLines) ? opts.targetLines : [];
+  const tickSize = Number(opts.tickSize) || 0;
+  const csize = Number(opts.contractSize) || 0;
+  const W = container.clientWidth || 900;
+  const H = 480;
+  const padL = 80, padR = 20, padT = 20, padB = 40;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
 
+  // Include fills in Y-axis range so markers are always visible even if
+  // they're outside the recent candle range (e.g., an old stop-loss below
+  // today's low).
   let lo = Infinity, hi = -Infinity;
   for (const c of candles) {
     if (c[3] < lo) lo = c[3];
     if (c[2] > hi) hi = c[2];
   }
+  const firstTs = Number(candles[0][0]) || 0;
+  const lastTs = Number(candles[candles.length - 1][0]) || 0;
+  for (const f of fills) {
+    if (!(Number(f.ts) >= firstTs && Number(f.ts) <= lastTs)) continue;
+    if (f.price < lo) lo = f.price;
+    if (f.price > hi) hi = f.price;
+  }
+  for (const t of targetLines) {
+    if (t.price < lo) lo = t.price;
+    if (t.price > hi) hi = t.price;
+  }
   if (lo === hi) { lo -= 0.5; hi += 0.5; }
   const range = hi - lo;
-  const y = (p) => padT + plotH * (1 - (p - lo) / range);
+  // Pad top/bottom 5% so nothing sits flush against the axis.
+  lo -= range * 0.05;
+  hi += range * 0.05;
+  const paddedRange = hi - lo;
+  const y = (p) => padT + plotH * (1 - (p - lo) / paddedRange);
+  const x = (ts) => padL + plotW * ((ts - firstTs) / Math.max(1, lastTs - firstTs));
+
+  // Y-axis precision from tick_size (matches Sell/Buy input display).
+  let yDec = 3;
+  if (tickSize > 0) {
+    const parts = tickSize.toString().split('.');
+    yDec = parts.length > 1 ? Math.min(8, parts[1].length) : 0;
+  } else if (hi < 1) yDec = 5;
+  else if (hi < 10) yDec = 4;
 
   const n = candles.length;
   const stepW = plotW / n;
-  const bodyW = Math.max(1, Math.min(6, stepW * 0.7));
+  const bodyW = Math.max(2, Math.min(10, stepW * 0.7));
 
   const parts = [];
   parts.push(`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">`);
-  // Y-axis gridlines and price labels — 5 ticks across the range
-  for (let i = 0; i <= 4; i++) {
-    const p = lo + (range * i / 4);
+
+  // Y-axis: 7 gridlines with tick-precision labels.
+  for (let i = 0; i <= 6; i++) {
+    const p = lo + (paddedRange * i / 6);
     const yy = y(p);
     parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="#1e2a3a" stroke-width="1" />`);
-    parts.push(`<text x="${padL - 6}" y="${yy.toFixed(1) + 4}" fill="#7a8899" font-size="10" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(3)}</text>`);
+    parts.push(`<text x="${padL - 8}" y="${(yy + 4).toFixed(1)}" fill="#8a99ac" font-size="12" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(yDec)}</text>`);
   }
-  // X-axis: first and last timestamps
-  const first = new Date(candles[0][0] * 1000);
-  const last = new Date(candles[n - 1][0] * 1000);
-  parts.push(`<text x="${padL}" y="${H - 8}" fill="#7a8899" font-size="10" font-family="ui-monospace,monospace">${first.toLocaleDateString()} ${first.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</text>`);
-  parts.push(`<text x="${W - padR}" y="${H - 8}" fill="#7a8899" font-size="10" text-anchor="end" font-family="ui-monospace,monospace">${last.toLocaleDateString()} ${last.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</text>`);
 
+  // X-axis: 5 evenly-spaced time labels across the window.
+  const xTickCount = 5;
+  for (let i = 0; i < xTickCount; i++) {
+    const frac = i / (xTickCount - 1);
+    const ts = firstTs + (lastTs - firstTs) * frac;
+    const xx = padL + plotW * frac;
+    const d = new Date(ts * 1000);
+    const anchor = i === 0 ? 'start' : (i === xTickCount - 1 ? 'end' : 'middle');
+    const dateStr = d.toLocaleDateString([], { month: 'numeric', day: 'numeric' });
+    const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    parts.push(`<line x1="${xx.toFixed(1)}" y1="${padT}" x2="${xx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="#0f1720" stroke-width="1"/>`);
+    parts.push(`<text x="${xx.toFixed(1)}" y="${(H - 20).toFixed(1)}" fill="#8a99ac" font-size="11" text-anchor="${anchor}" font-family="ui-monospace,monospace">${dateStr}</text>`);
+    parts.push(`<text x="${xx.toFixed(1)}" y="${(H - 6).toFixed(1)}" fill="#8a99ac" font-size="11" text-anchor="${anchor}" font-family="ui-monospace,monospace">${timeStr}</text>`);
+  }
+
+  // Candles.
   for (let i = 0; i < n; i++) {
-    const [, o, h, l, c] = candles[i];
-    const x = padL + i * stepW + stepW / 2;
+    const [ts, o, h, l, c] = candles[i];
+    const xc = x(Number(ts));
     const up = c >= o;
     const color = up ? '#22c55e' : '#ef4444';
     const yh = y(h), yl = y(l), yo = y(o), yc = y(c);
     const top = Math.min(yo, yc);
     const bh = Math.max(1, Math.abs(yc - yo));
-    parts.push(`<line x1="${x.toFixed(1)}" y1="${yh.toFixed(1)}" x2="${x.toFixed(1)}" y2="${yl.toFixed(1)}" stroke="${color}" stroke-width="1"/>`);
-    parts.push(`<rect x="${(x - bodyW/2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill="${color}"/>`);
+    parts.push(`<line x1="${xc.toFixed(1)}" y1="${yh.toFixed(1)}" x2="${xc.toFixed(1)}" y2="${yl.toFixed(1)}" stroke="${color}" stroke-width="1"/>`);
+    parts.push(`<rect x="${(xc - bodyW/2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill="${color}"/>`);
   }
+
+  // Target reference lines (current sell / buy / stop from live sleeves).
+  for (const t of targetLines) {
+    const yy = y(t.price);
+    if (yy < padT || yy > padT + plotH) continue;
+    parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="${t.color}" stroke-width="1" stroke-dasharray="4 3" opacity="0.75"/>`);
+    parts.push(`<text x="${(W - padR - 4).toFixed(1)}" y="${(yy - 3).toFixed(1)}" fill="${t.color}" font-size="10" text-anchor="end" font-family="ui-monospace,monospace" opacity="0.9">${escapeHtml(t.label)} $${t.price.toFixed(yDec)}</text>`);
+  }
+
+  // Fill markers + cycle-connecting dashed lines.
+  // Pair each BUY with the next SELL to form a cycle (walk fills in order).
+  const visibleFills = fills.filter(f => Number(f.ts) >= firstTs && Number(f.ts) <= lastTs);
+  const cycles = [];
+  let openBuy = null;
+  for (const f of visibleFills) {
+    if (f.side === 'BUY') {
+      openBuy = f;  // most recent open buy — replace if two buys in a row
+    } else if (f.side === 'SELL' && openBuy) {
+      cycles.push({ buy: openBuy, sell: f });
+      openBuy = null;
+    }
+  }
+  // Draw cycle lines UNDER markers so triangles pop on top.
+  for (const c of cycles) {
+    const x1 = x(Number(c.buy.ts));
+    const y1 = y(c.buy.price);
+    const x2 = x(Number(c.sell.ts));
+    const y2 = y(c.sell.price);
+    const won = c.sell.price > c.buy.price;
+    const lineColor = won ? '#22c55e' : '#ef4444';
+    parts.push(`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${lineColor}" stroke-width="1.5" stroke-dasharray="5 3" opacity="0.85"/>`);
+    // Label at midpoint: $/contract gain (or loss).
+    if (csize > 0) {
+      const midX = (x1 + x2) / 2;
+      const midY = (y1 + y2) / 2 - 6;
+      const gain = (c.sell.price - c.buy.price) * csize;
+      const sign = gain >= 0 ? '+' : '';
+      parts.push(`<text x="${midX.toFixed(1)}" y="${midY.toFixed(1)}" fill="${lineColor}" font-size="11" text-anchor="middle" font-family="ui-monospace,monospace" font-weight="bold">${sign}$${gain.toFixed(2)}</text>`);
+    }
+  }
+  // Markers.
+  for (const f of visibleFills) {
+    const xc = x(Number(f.ts));
+    const yc = y(f.price);
+    if (f.side === 'BUY') {
+      // Blue up-triangle below the fill price.
+      const tri = `${xc},${(yc + 4).toFixed(1)} ${(xc - 6).toFixed(1)},${(yc + 14).toFixed(1)} ${(xc + 6).toFixed(1)},${(yc + 14).toFixed(1)}`;
+      parts.push(`<polygon points="${tri}" fill="#3b82f6" stroke="#dbeafe" stroke-width="1"/>`);
+      parts.push(`<title>BUY ${f.qty} @ $${Number(f.price).toFixed(yDec)}</title>`);
+    } else {
+      // Red down-triangle above the fill price. Stop-loss gets a bolder
+      // outline so a forced exit stands out from a target-fired sell.
+      const tri = `${xc},${(yc - 4).toFixed(1)} ${(xc - 6).toFixed(1)},${(yc - 14).toFixed(1)} ${(xc + 6).toFixed(1)},${(yc - 14).toFixed(1)}`;
+      const stroke = f.kind === 'stop_loss' ? '#facc15' : '#fee2e2';
+      const strokeW = f.kind === 'stop_loss' ? 2 : 1;
+      parts.push(`<polygon points="${tri}" fill="#ef4444" stroke="${stroke}" stroke-width="${strokeW}"/>`);
+    }
+  }
+
   parts.push(`</svg>`);
-  container.innerHTML = parts.join('');
+
+  // Legend below chart so Adam can decode markers without hovering.
+  const cycleWon = cycles.filter(c => c.sell.price > c.buy.price).length;
+  const cycleLost = cycles.length - cycleWon;
+  const legend = `
+    <div style="display:flex;gap:16px;flex-wrap:wrap;padding:8px 12px;font-size:12px;color:#8a99ac;font-family:ui-monospace,monospace;">
+      <span><span style="color:#3b82f6;">▲</span> BUY fill</span>
+      <span><span style="color:#ef4444;">▼</span> SELL fill</span>
+      <span><span style="color:#facc15;">◆</span> stop-loss fired</span>
+      ${targetLines.length ? '<span style="border-top:1px dashed #8a99ac;padding-top:1px;">current target lines</span>' : ''}
+      ${cycles.length ? `<span>· <b style="color:#22c55e;">${cycleWon}</b> winning · <b style="color:#ef4444;">${cycleLost}</b> losing cycle${cycles.length === 1 ? '' : 's'} on chart</span>` : ''}
+    </div>`;
+  container.innerHTML = parts.join('') + legend;
 }
 
 // ---- delegated events ---------------------------------------------------
