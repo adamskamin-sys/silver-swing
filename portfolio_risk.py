@@ -38,7 +38,19 @@ from typing import Optional
 DEFAULT_CONFIG = {
     "enabled": True,
     "max_drawdown_pct": 5.0,          # 5% drawdown from peak → halt
-    "min_drawdown_dollars": 50.0,     # ...but only if >= $50 absolute (noise floor)
+    # Noise floor: was $50, raised 2026-07-13 after portfolio locked out on a
+    # $50.60 give-back that read as 61% against a tiny $82 swing-P&L peak. A
+    # $50 fluctuation is genuine noise on any live account, not a portfolio
+    # crisis.
+    "min_drawdown_dollars": 250.0,
+    # Denominator floor for drawdown_pct. Fixes the "small peak → giant %"
+    # pathology: with peak=$82 and a $50 give-back, the old math read 61%.
+    # Denominator is now max(abs(peak_pnl), peak_pnl_floor,
+    # account_equity * account_equity_frac). Rob Carver / Van Tharp
+    # definition — drawdown as % of capital at risk, not % of a running-P&L
+    # high water mark that can sit near zero.
+    "peak_pnl_floor": 1000.0,
+    "account_equity_frac": 0.02,      # 2% of account equity as an alt denominator
     # [crew:#2] Absolute-dollar hard breaker. The percentage breaker above is
     # blind whenever peak P&L sits near $0 (a fresh or oscillating account):
     # abs(peak) <= 1.0 forces drawdown_pct to 0, so a large DOLLAR loss produces
@@ -50,6 +62,33 @@ DEFAULT_CONFIG = {
     "resume_threshold_pct": 0.5,      # resume when drawdown < 2.5% (half of 5%)
     "peak_lookback_secs": 24 * 3600,  # rolling 24h peak
 }
+
+
+def _drawdown_denominator(cfg: dict, peak: float, account_equity: float) -> float:
+    """Denominator for drawdown_pct.
+    max(abs(peak_pnl), peak_pnl_floor, account_equity * account_equity_frac).
+    Guards against small-peak explosion of the percentage while keeping the
+    dollar guard untouched."""
+    floor = float(cfg.get("peak_pnl_floor") or 0.0)
+    frac = float(cfg.get("account_equity_frac") or 0.0)
+    account_floor = float(account_equity or 0.0) * frac if frac > 0 else 0.0
+    return max(abs(peak), floor, account_floor)
+
+
+def _get_account_equity(store, tenant: str) -> float:
+    """Read account equity from the __portfolio__ snapshot. Returns 0 if
+    unavailable — falls back cleanly to peak_pnl_floor in that case."""
+    if not hasattr(store, "get_snapshot"):
+        return 0.0
+    snap = store.get_snapshot(tenant, "__portfolio__") or {}
+    for key in ("account_equity", "total_equity", "equity", "portfolio_value"):
+        v = snap.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
 
 
 def _load_config(store, tenant: str) -> dict:
@@ -128,7 +167,13 @@ def tick(store, tenant: str, trade_log=None) -> Optional[dict]:
         peak = current_pnl
         peak_ts = now
     drawdown = peak - current_pnl
-    drawdown_pct = (drawdown / abs(peak) * 100.0) if abs(peak) > 1.0 else 0.0
+    # Denominator uses max(abs(peak), peak_pnl_floor, account_equity * frac).
+    # Old formula (abs(peak) alone) produced 61% on a $50.60 give-back against
+    # an $82 peak — locking the portfolio out on noise. Rob Carver / Van Tharp
+    # canon: drawdown is % of capital at risk, not % of running-P&L peak.
+    account_equity = _get_account_equity(store, tenant)
+    denom = _drawdown_denominator(cfg, peak, account_equity)
+    drawdown_pct = (drawdown / denom * 100.0) if denom > 1.0 else 0.0
     was_halted = bool(st.get("halted", False))
     change = None
     max_dd_dollars = float(cfg.get("max_drawdown_dollars") or 0.0)
