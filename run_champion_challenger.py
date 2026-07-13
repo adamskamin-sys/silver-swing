@@ -6,8 +6,10 @@ Usage (from the repo root):
     # sweep every tracked product on the tenant
     python3 run_champion_challenger.py --days 30
 
-    # or scope to one symbol
-    SWING_SYMBOL=SLR-27AUG26-CDE python3 run_champion_challenger.py --days 30
+    # or scope to one symbol via CLI flag (NOT via SWING_SYMBOL env — that
+    # env var is set on the Render bot service for the live loop, and if the
+    # sweep honored it, it would silently collapse to that one product)
+    python3 run_champion_challenger.py --symbol SLR-27AUG26-CDE --days 30
 
 What it does per symbol:
   - reads the LIVE config as the "champion"
@@ -144,7 +146,14 @@ def main() -> int:
     if "--days" in sys.argv:
         days = int(sys.argv[sys.argv.index("--days") + 1])
 
-    single_symbol = os.getenv("SWING_SYMBOL")
+    # Only scope to a single symbol if EXPLICITLY passed via --symbol.
+    # SWING_SYMBOL env var is set on the Render bot service for the live loop,
+    # and if we honor it here, the sweep silently collapses to that one product
+    # (Adam's 18-symbol adam-live tenant → "1 symbol(s)" runs). CC needs its
+    # own opt-in flag.
+    single_symbol = None
+    if "--symbol" in sys.argv:
+        single_symbol = sys.argv[sys.argv.index("--symbol") + 1]
     data_dir = os.getenv("SWING_DATA_DIR", "data")
 
     from state_store import make_store
