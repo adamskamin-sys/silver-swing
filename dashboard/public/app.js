@@ -664,15 +664,11 @@ function sleeveOnlyUnrealized(tenant, product, mark, coinbasePnl, positionQty, p
   const contractSize = Number(cfg.contract_size) || 0;
   if (contractSize <= 0 || !(mark > 0)) return null;
   const sleeveStates = (block.state || {}).sleeves || {};
-  const posQty = Number(positionQty) || 0;
-  const posAvg = Number(positionAvg) || 0;
-  const cbPnl = Number(coinbasePnl);
-  const cbPnlValid = Number.isFinite(cbPnl) && posQty > 0;
-  // Match against position avg to within a tick ($0.005). If the sleeve's
-  // cost basis equals the position blend, Coinbase's own unrealized (already
-  // in the row) is authoritative — it uses Coinbase's mark, our mark can
-  // drift a few cents from theirs. Apportion by qty share.
-  const AVG_TOL = 0.005;
+  // Rule (Adam 2026-07-13): portfolio row UNREALIZED must EQUAL the sum of
+  // per-sleeve UNREALIZEDs — same formula, same cycles>0 gate. Fresh
+  // sleeves (cycles=0) contribute $0 because the pre-attach paper move
+  // belongs to the position, not to any sleeve. This keeps row totals in
+  // sync with the sleeve-editor drilldown.
   let pnl = 0;
   let qty = 0;
   for (const s of sleeves) {
@@ -682,19 +678,11 @@ function sleeveOnlyUnrealized(tenant, product, mark, coinbasePnl, positionQty, p
     const sq = Number(s.qty) || 0;
     if (sq <= 0) continue;
     const cycles = Number(ss.cycles) || 0;
-    // Fresh sleeve (cycles=0) inherits position avg. Traded sleeve keeps
-    // its own_avg_entry (may diverge from position blend after cycling).
-    const rawOwn = ss.own_avg_entry != null && ss.own_avg_entry > 0
+    if (cycles === 0) continue;
+    const ownEntry = ss.own_avg_entry != null && ss.own_avg_entry > 0
       ? Number(ss.own_avg_entry) : Number(s.buy_px);
-    const ownEntry = (cycles === 0 && posAvg > 0) ? posAvg : rawOwn;
     if (!(ownEntry > 0)) continue;
-    // Use Coinbase's own unrealized (apportioned) when sleeve avg matches
-    // position avg. Otherwise fall back to local (mark − own_avg) × size.
-    if (cbPnlValid && Math.abs(ownEntry - posAvg) < AVG_TOL) {
-      pnl += cbPnl * (sq / posQty);
-    } else {
-      pnl += (mark - ownEntry) * contractSize * sq;
-    }
+    pnl += (mark - ownEntry) * contractSize * sq;
     qty += sq;
   }
   return { pnl, qty };
@@ -854,7 +842,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     const cyclesText = cycles > 0
       ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
       : '<span class="dim">0</span>';
-    const realized = r.kind === 'futures' ? totalRealizedForProduct(r.product) : 0;
+    const realized = r.kind === 'futures' ? totalRealizedForProduct(r.product, liveTenant) : 0;
     const realizedCls = realized > 0 ? 'pos' : (realized < 0 ? 'neg' : '');
     const realizedText = realized !== 0
       ? `<span class="${realizedCls}" title="Sum of primary + sleeve realized_pnl across all tenants">${realized > 0 ? '+' : ''}${fmtMoney(realized)}</span>`
@@ -934,7 +922,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
   const totalCyclesSum = filteredRows.reduce((a, r) =>
     a + (r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0), 0);
   const totalRealizedSum = filteredRows.reduce((a, r) =>
-    a + (r.kind === 'futures' ? totalRealizedForProduct(r.product) : 0), 0);
+    a + (r.kind === 'futures' ? totalRealizedForProduct(r.product, liveTenant) : 0), 0);
   const grandTotal = totalPnlSum + totalRealizedSum;
   const footClass = (v) => v > 0 ? 'pos' : v < 0 ? 'neg' : 'dim';
   const fmtSigned = (v) => v === 0 ? '$0' : `${v > 0 ? '+' : '-'}${fmtMoney(Math.abs(v))}`;
@@ -1246,10 +1234,11 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
 // strategy on it — primary state.realized_pnl + every sleeve's realized_pnl.
 // Used by the Live/Paper positions table so the user can see "this product
 // has banked $X so far" without opening the drill-down.
-function totalRealizedForProduct(productId) {
+function totalRealizedForProduct(productId, tenantFilter) {
   let total = 0;
   const store = currentStore || {};
   for (const tenant of Object.keys(store)) {
+    if (tenantFilter && tenant !== tenantFilter) continue;
     const entry = store[tenant] && store[tenant][productId];
     if (!entry) continue;
     total += Number((entry.state && entry.state.realized_pnl) || 0);
