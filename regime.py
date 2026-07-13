@@ -72,6 +72,22 @@ def autocorrelation(series: list[float], lag: int = 1) -> Optional[float]:
     return num / den
 
 
+def efficiency_ratio(prices: list[float], period: int = 30) -> Optional[float]:
+    """Kaufman's Efficiency Ratio: |net move| / sum(|bar moves|) over `period`.
+    ~1.0 = a clean directional trend (every step in the same direction), ~0.0 =
+    chop (lots of motion, no progress). This is the robust trend/chop
+    discriminator — unlike the diffs-Hurst, it fires on deterministic trends."""
+    p = [float(x) for x in prices if x]
+    if len(p) < period + 1:
+        return None
+    seg = p[-(period + 1):]
+    net = abs(seg[-1] - seg[0])
+    path = sum(abs(seg[i] - seg[i - 1]) for i in range(1, len(seg)))
+    if path <= 0:
+        return None
+    return net / path
+
+
 def _returns(prices: list[float]) -> list[float]:
     return [(prices[i] - prices[i - 1]) / prices[i - 1]
             for i in range(1, len(prices)) if prices[i - 1]]
@@ -93,27 +109,35 @@ def classify_regime(candles, vol_lookback: int = 200) -> dict:
     vol_ratio = (recent_vol / hist_vol) if hist_vol > 0 else 1.0
     vol_state = "stressed" if vol_ratio >= 1.5 else ("calm" if vol_ratio <= 0.6 else "normal")
 
-    # Regime from Hurst + autocorrelation agreement.
+    # Efficiency Ratio (Kaufman) — the primary trend/chop discriminator.
+    er = efficiency_ratio(closes, min(len(closes) - 1, 30))
+
+    # Regime from Efficiency Ratio + Hurst + autocorrelation agreement.
     trend_votes = 0
+    if er is not None and er >= 0.40:      # clean directional move
+        trend_votes += 2                   # ER is the strongest single signal
     if h is not None and h >= 0.55:
         trend_votes += 1
     if ac1 is not None and ac1 >= 0.05:
         trend_votes += 1
     revert_votes = 0
+    if er is not None and er <= 0.20:      # lots of motion, no progress
+        revert_votes += 1
     if h is not None and h <= 0.45:
         revert_votes += 1
     if ac1 is not None and ac1 <= -0.05:
         revert_votes += 1
 
-    if trend_votes >= 1 and revert_votes == 0:
+    if trend_votes >= 2 and trend_votes > revert_votes:
         regime = "trend"
-    elif revert_votes >= 1 and trend_votes == 0:
+    elif revert_votes >= 1 and revert_votes >= trend_votes:
         regime = "mean_revert"
     else:
         regime = "chop"
 
     return {
         "regime": regime,
+        "efficiency_ratio": round(er, 3) if er is not None else None,
         "hurst": round(h, 3) if h is not None else None,
         "autocorr_lag1": round(ac1, 4) if ac1 is not None else None,
         "vol_state": vol_state,
