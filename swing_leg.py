@@ -1918,6 +1918,29 @@ class SwingTrader:
                     side=side, qty=qty, price=price,
                 )
                 return
+        # Cross-asset correlation gate: don't fresh-long silver into a
+        # copper crash (or oil into a natgas dump). Only gates BUY arms —
+        # SELL arms must always be allowed so we can exit into a crash
+        # instead of being blocked from cutting risk.
+        if getattr(sc, "correlation_gate_enabled", False):
+            try:
+                import correlation
+                crash = correlation.peer_crash_check(
+                    self.store, self.tenant_id, self.symbol, side,
+                    window_secs=float(getattr(sc, "correlation_window_secs", 3600.0)),
+                    crash_threshold_pct=float(getattr(sc, "correlation_crash_pct", 3.0)),
+                )
+                if crash:
+                    self._record(
+                        "sleeve_arm_skipped_peer_crash",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        side=side, qty=qty, price=price,
+                        **crash,
+                    )
+                    return
+            except Exception as e:
+                self._record("correlation_check_failed",
+                             sleeve_id=sc.id, error=str(e))
         # For SELL: capture cost basis of the contracts we're about to sell so
         # realized P/L on the fill uses the ACTUAL price paid, not sc.buy_px.
         if side == "SELL" and ss.sell_entry_avg is None:

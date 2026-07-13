@@ -198,6 +198,15 @@ class SleeveConfig:
     # streak. 0 = disabled.
     auto_disable_after_losses: int = 0
 
+    # Cross-asset correlation gate: don't fresh-long silver into a copper
+    # crash. Reads correlation.CORRELATION_FAMILIES; if any peer in the
+    # same family (metals, energy, crypto_major, crypto_perp) has dropped
+    # more than correlation_crash_pct in the last correlation_window_secs,
+    # BUY arms are blocked. SELL arms always allowed — never block exits.
+    correlation_gate_enabled: bool = False
+    correlation_window_secs: float = 3600.0    # look-back window (1h default)
+    correlation_crash_pct: float = 3.0         # peer drop that triggers block
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -256,6 +265,9 @@ class SleeveConfig:
             book_imbalance_sell_threshold=float(d.get("book_imbalance_sell_threshold") or 0.65),
             book_imbalance_buy_threshold=float(d.get("book_imbalance_buy_threshold") or 0.65),
             auto_disable_after_losses=int(d.get("auto_disable_after_losses") or 0),
+            correlation_gate_enabled=bool(d.get("correlation_gate_enabled") or False),
+            correlation_window_secs=float(d.get("correlation_window_secs") or 3600.0),
+            correlation_crash_pct=float(d.get("correlation_crash_pct") or 3.0),
         )
 
 

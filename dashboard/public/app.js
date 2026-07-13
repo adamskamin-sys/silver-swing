@@ -2003,13 +2003,32 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     // from before this field was tracked), use the sleeve's buy_px — a limit
     // buy fills exactly at buy_px so it's the closest we can reconstruct.
     const sleeveUnits = allocation.bySleeve[s.id] || [];
-    const ownEntry = ss.own_avg_entry != null ? Number(ss.own_avg_entry) : Number(s.buy_px);
-    const unreal = (ownEntry > 0 && sleeveQty > 0 && sState === 'ARMED_SELL')
-      ? (mark - ownEntry) * contractSize * sleeveQty
-      : 0;
-
     const sleeveAvgEntry = sleeveUnits.length > 0
       ? sleeveUnits.reduce((n, u) => n + u.entry_price, 0) / sleeveUnits.length
+      : 0;
+    // Cost-basis hierarchy (most accurate → least). Adam saw $0 unrealized
+    // on a sleeve that clearly held ITM contracts and rightly asked to
+    // 'make sure the numbers reconcile'. Fallback chain: sleeve's own_avg
+    // (bought via its own cycle) → sell_entry_avg (captured at arm time via
+    // FIFO) → sleeveAvgEntry (lot allocation) → position avg (inherited
+    // contracts pre-any-sleeve-cycle) → buy_px (last resort; the FUTURE
+    // rebuy target, not real cost).
+    const positionAvg = Number(snapshot?.position_avg_entry) || 0;
+    let ownEntry = 0;
+    let ownEntrySource = 'none';
+    if (ss.own_avg_entry != null && Number(ss.own_avg_entry) > 0) {
+      ownEntry = Number(ss.own_avg_entry); ownEntrySource = 'own_avg_entry';
+    } else if (ss.sell_entry_avg != null && Number(ss.sell_entry_avg) > 0) {
+      ownEntry = Number(ss.sell_entry_avg); ownEntrySource = 'sell_entry_avg';
+    } else if (sleeveAvgEntry > 0) {
+      ownEntry = sleeveAvgEntry; ownEntrySource = 'lot_alloc';
+    } else if (positionAvg > 0) {
+      ownEntry = positionAvg; ownEntrySource = 'position_avg';
+    } else if (Number(s.buy_px) > 0) {
+      ownEntry = Number(s.buy_px); ownEntrySource = 'buy_px_target';
+    }
+    const unreal = (ownEntry > 0 && sleeveQty > 0 && sState === 'ARMED_SELL')
+      ? (mark - ownEntry) * contractSize * sleeveQty
       : 0;
     const paramsHtml = fmtTrailingParams(
       s.exit_mode || 'fixed_limit',
