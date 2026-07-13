@@ -4404,7 +4404,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     // Toggle .active across all anchor choice buttons so the user can see
     // which one is in play. All remain visible so the choice is reversible.
     for (const b of anchorChoiceBtns) b.classList.toggle('active', b === activeBtn);
-    syncTargetsFromSlider();
+    // Durable rule (Adam 2026-07-13): anchor change must re-apply expert
+    // canon so every anchor-relative field (sell/buy around anchor, stop
+    // loss = anchor − 1R, trail activation = sell + Le Beau buffer)
+    // updates automatically. Never leave a stale value that no longer
+    // matches the anchor the user just picked.
+    const currentSpread = Number(sellTargetEl.value) - Number(buyTargetEl.value);
+    if (currentSpread > 0) {
+      applyExpertCanonToForm(currentSpread, newAnchor);
+    } else {
+      syncTargetsFromSlider();
+    }
     updatePreview();
   }
   for (const b of anchorChoiceBtns) {
@@ -4452,34 +4462,23 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // editor is fully usable while this loads.
   loadSpreadRecommendations(symbol, m, {
     onApply: (spread, netPerRt) => {
-      // Respect the user's chosen anchor. Prior behavior force-reanchored
-      // to current market on tile click — Adam correctly pushed back:
-      // "I try to use my contract average and when I click the expert tile
-      // it reverts to current market. I wanted to use my contract average
-      // because I don't want to make any sales until I am above water."
+      // Durable rule (Adam 2026-07-13): "Everything should auto adjust to
+      // whatever tile I choose and what entry price I choose." Tile click
+      // must recompute EVERY expert-derived field from expertATR × class
+      // multiplier — never leave a stale saved value. This is the single
+      // source of truth for the Van Tharp / Livermore / Turtle / Le Beau /
+      // Kaufman formulas we ship. Saving them in memory is meaningless if
+      // we don't apply them on every user interaction.
       //
-      // The tile picks a SPREAD (independent of anchor). The anchor is
-      // WHERE to center that spread. If the user picked Your Contract Avg
-      // above the current mark, the resulting sell/buy stay above water —
-      // which is exactly what they want. Silently overriding that choice
-      // was the wrong call. Keep whatever anchor the user selected.
-      const halfSpread = spread / 2;
-      const newSell = Number((currentAnchor + halfSpread).toFixed(pricePrec));
-      const newBuy = Number((currentAnchor - halfSpread).toFixed(pricePrec));
-      sellTargetEl.value = newSell;
-      buyTargetEl.value = newBuy;
-      // Also snap the "net take-home per swing" slider to match the tile's
-      // expert-computed net × current qty. Otherwise the slider keeps its
-      // pre-existing value ($20 for XLP editing) and disagrees with the
-      // BEST tile ($2). Lower the slider min/floor if the picked net is
-      // below it so the expert choice isn't clamped away.
+      // Anchor choice (currentAnchor) is respected — the user picks WHERE
+      // to center the spread (Your Contract Avg to stay above cost, or
+      // Current Market to trade around now). Only the SPREAD and ATR-
+      // derived params update automatically.
+      applyExpertCanonToForm(spread, currentAnchor);
+      // Slider snap to tile's expert-computed net × current qty — preserves
+      // exact net (0.01 step) so tile ↔ slider reconciles.
       if (Number.isFinite(netPerRt) && netPerRt > 0) {
         const qtyLive = Math.max(1, Number(qtyEl?.value) || 1);
-        // Preserve the tile's exact net (e.g. $3.92). Range slider default
-        // step is 10 which would snap $3.92 → $3 (wrong). Number-input default
-        // step is 1 which truncates to "3". Use 0.01 step + toFixed(2) so both
-        // controls represent the tile-derived net faithfully. Also lower the
-        // min if BEST is below the current floor so the value isn't clamped.
         const totalNet = Number((netPerRt * qtyLive).toFixed(2));
         const displayVal = totalNet.toFixed(2);
         if (totalNet < Number(profitEl.min || 0)) profitEl.min = displayVal;
@@ -4492,6 +4491,72 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       updatePreview();
     }
   });
+
+  // Expert-canon auto-apply. Called by tile click AND by anchor change.
+  // Recomputes every ATR-derived field from expertDollars — the pure
+  // expert stack — so the form stays true to the chosen tile + anchor.
+  // If expertATR isn't loaded (no ATR for this product yet), only the
+  // spread-dependent fields update; ATR-dependent fields keep the last
+  // known value and updatePreview() will show the "approximate" warning.
+  function applyExpertCanonToForm(spread, anchorPx) {
+    // Spread + anchor → sell / buy targets (Van Tharp midpoint math)
+    if (spread > 0 && anchorPx > 0) {
+      const halfSpread = spread / 2;
+      const newSell = Number((anchorPx + halfSpread).toFixed(pricePrec));
+      const newBuy = Number((anchorPx - halfSpread).toFixed(pricePrec));
+      sellTargetEl.value = newSell;
+      buyTargetEl.value = newBuy;
+    }
+    const currentSell = Number(sellTargetEl.value) || 0;
+    // ATR-derived fields — only if we have expert ATR for this product.
+    if (expertDollars) {
+      // Trail distance (Turtle 2N / Kaufman crypto bump)
+      if (tdSliderEl && expertDollars.trail_distance > 0) {
+        tdSliderEl.value = expertDollars.trail_distance.toFixed(pricePrec);
+        if (tdValEl) tdValEl.textContent = `$${fmtPrice(expertDollars.trail_distance)}`;
+      }
+      // Trail activation offset (Le Beau breakout buffer) — activation
+      // sits above the sell target by activation_offset.
+      if (trailActivationEl && expertDollars.activation_offset > 0 && currentSell > 0) {
+        const newAct = Number((currentSell + expertDollars.activation_offset).toFixed(pricePrec));
+        trailActivationEl.value = newAct;
+      }
+      // Stop loss (Van Tharp 1R below anchor — the entry price)
+      const stopPxEl = m.querySelector('#sl-stop-px');
+      if (stopPxEl && expertDollars.stop_loss_distance > 0 && anchorPx > 0) {
+        const newStop = Number((anchorPx - expertDollars.stop_loss_distance).toFixed(pricePrec));
+        // Only update if stop-loss is enabled (otherwise leave user's
+        // manual value alone — they've opted out of the ATR-derived stop).
+        if (stopLossToggle && stopLossToggle.checked) {
+          stopPxEl.value = newStop;
+        }
+      }
+      // Ratchet distance + activation (Le Beau chandelier + Van Tharp 0.5R)
+      // Only affects hidden `draft` fields (no UI element); we mutate
+      // draft directly so the save payload picks them up.
+      if (expertDollars.ratchet_distance > 0) {
+        draft.stop_loss_ratchet_distance = expertDollars.ratchet_distance;
+      }
+      if (expertDollars.ratchet_activation > 0) {
+        draft.stop_loss_ratchet_activation = expertDollars.ratchet_activation;
+      }
+      // Reanchor threshold (Van Tharp SafeZone)
+      if (expertDollars.reanchor_threshold > 0) {
+        draft.reanchor_threshold = expertDollars.reanchor_threshold;
+      }
+      // Buy-trail distance (Le Beau 0.5×ATR / Kaufman 0.75×ATR)
+      const btDistEl = m.querySelector('#sl-buy-trail-distance');
+      if (btDistEl && expertDollars.buy_trail_distance > 0) {
+        btDistEl.value = expertDollars.buy_trail_distance;
+      }
+      draft.buy_trail_distance = expertDollars.buy_trail_distance || draft.buy_trail_distance;
+    }
+    // Nudge the slider fills so anything watching them updates.
+    if (typeof updateFillPct === 'function') {
+      updateFillPct(profitEl);
+      updateFillPct(tdSliderEl);
+    }
+  }
 
   m.querySelector('#sleeve-save-btn').onclick = async () => {
     const errEl = m.querySelector('#sleeve-error');
