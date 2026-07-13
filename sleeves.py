@@ -175,6 +175,21 @@ class SleeveConfig:
     penny_inside_enabled: bool = False
     penny_inside_max_ticks: int = 5
 
+    # Book-imbalance gate: when True, refuse to arm a leg whose expected
+    # direction fights the current top-N book imbalance.
+    #   Arming SELL + buy pressure > book_imbalance_sell_threshold
+    #     (default 0.65 = 65% of top-N depth is on the bid side)
+    #     → skip this tick, price is likely to push through target
+    #   Arming BUY + sell pressure > book_imbalance_buy_threshold
+    #     (default 0.65 = 65% of top-N depth is on the ask side)
+    #     → skip this tick, don't catch a falling knife
+    # Reads broker.get_orderbook(). Cached 5s so this costs ~1 book fetch
+    # per product per 5s regardless of tick cadence.
+    book_imbalance_gate_enabled: bool = False
+    book_imbalance_depth_levels: int = 5
+    book_imbalance_sell_threshold: float = 0.65
+    book_imbalance_buy_threshold: float = 0.65
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -228,6 +243,10 @@ class SleeveConfig:
             post_only_enabled=bool(d.get("post_only_enabled") or False),
             penny_inside_enabled=bool(d.get("penny_inside_enabled") or False),
             penny_inside_max_ticks=int(d.get("penny_inside_max_ticks") or 5),
+            book_imbalance_gate_enabled=bool(d.get("book_imbalance_gate_enabled") or False),
+            book_imbalance_depth_levels=int(d.get("book_imbalance_depth_levels") or 5),
+            book_imbalance_sell_threshold=float(d.get("book_imbalance_sell_threshold") or 0.65),
+            book_imbalance_buy_threshold=float(d.get("book_imbalance_buy_threshold") or 0.65),
         )
 
 

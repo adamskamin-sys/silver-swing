@@ -1869,6 +1869,17 @@ class SwingTrader:
         # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
         # spins forever emitting sleeve_arm_failed with no order on the book.
         price = self._snap_to_tick(price)
+        # Book-imbalance gate (Chan/Harris rule): refuse to arm a leg whose
+        # expected direction fights the current book pressure. Cheap: reads
+        # a 5s-cached top-25 snapshot from Coinbase.
+        if getattr(sc, "book_imbalance_gate_enabled", False):
+            if not self._book_imbalance_ok_for(sc, side):
+                self._record(
+                    "sleeve_arm_skipped_book_imbalance",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    side=side, qty=qty, price=price,
+                )
+                return
         # For SELL: capture cost basis of the contracts we're about to sell so
         # realized P/L on the fill uses the ACTUAL price paid, not sc.buy_px.
         if side == "SELL" and ss.sell_entry_avg is None:
@@ -1904,6 +1915,52 @@ class SwingTrader:
             **({"penny_inside_from": original_px} if price != original_px else {}),
             **({"cost_basis": ss.sell_entry_avg} if side == "SELL" else {}),
         )
+
+    def _book_imbalance_ok_for(self, sc, side: str) -> bool:
+        """Return False if the current top-N book imbalance strongly opposes
+        this side (Chan/Harris: don't fight the tape). Cached 5s so this
+        costs at most ~1 book fetch per product per 5s under heavy tick
+        load. Returns True (permissive) on any error — the gate should
+        NEVER block trading when the book fetch fails, only when the book
+        actively opposes us.
+        """
+        get_book = getattr(self.b, "get_orderbook", None)
+        if not callable(get_book):
+            return True
+        import time as _time
+        now = _time.time()
+        cache = getattr(self, "_book_cache", None)
+        if cache and (now - cache["ts"]) < 5.0:
+            book = cache["book"]
+        else:
+            try:
+                book = get_book(limit=25)
+            except Exception:
+                return True
+            self._book_cache = {"ts": now, "book": book}
+        levels = max(1, int(getattr(sc, "book_imbalance_depth_levels", 5)))
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        if not bids or not asks:
+            return True  # empty book (session closed / broker error) → don't gate
+        bid_size = sum(s for _, s in bids[:levels])
+        ask_size = sum(s for _, s in asks[:levels])
+        total = bid_size + ask_size
+        if total <= 0:
+            return True
+        bid_ratio = bid_size / total
+        # bid_ratio > threshold means buy pressure dominant → sellers about
+        # to get run through. Refuse to arm a SELL right now — wait for the
+        # imbalance to normalize. Symmetrical for BUYs on ask pressure.
+        if side == "SELL":
+            thr = float(getattr(sc, "book_imbalance_sell_threshold", 0.65) or 0.65)
+            if bid_ratio > thr:
+                return False
+        else:  # BUY
+            thr = float(getattr(sc, "book_imbalance_buy_threshold", 0.65) or 0.65)
+            if (1.0 - bid_ratio) > thr:  # ask pressure = 1 - bid pressure
+                return False
+        return True
 
     def _penny_inside_price(self, sc, side: str, target_price: float) -> float:
         """If the target is within pennyinside_max_ticks of the current best

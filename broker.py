@@ -256,6 +256,44 @@ class CoinbaseBroker:
         blended avg entry per position. Return empty list for API parity."""
         return []
 
+    # ---- Order book depth --------------------------------------------------
+
+    def get_orderbook(self, limit: int = 25) -> dict:
+        """Fetch top-N levels of the current order book from Coinbase.
+        Returns {"bids": [(price, size), ...], "asks": [(price, size), ...]}
+        sorted best-first on each side. Empty lists on any error — callers
+        must handle that (falls back to no-op signal, don't crash the tick).
+
+        Used by book-imbalance / wall-detection gates in swing_leg. Cached
+        upstream (5-second TTL) so this is called at most ~1×/product/5s
+        even under heavy tick load.
+        """
+        try:
+            resp = _dump(self.client.get_product_book(
+                product_id=self.cfg.product_id, limit=limit,
+            ))
+            book = resp.get("pricebook") or resp
+            bids_raw = book.get("bids") or []
+            asks_raw = book.get("asks") or []
+            def _rows(raw):
+                out = []
+                for r in raw:
+                    try:
+                        p = float(r.get("price"))
+                        s = float(r.get("size"))
+                        if p > 0 and s > 0:
+                            out.append((p, s))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                return out
+            bids = _rows(bids_raw)
+            asks = _rows(asks_raw)
+            bids.sort(key=lambda r: -r[0])  # highest bid first
+            asks.sort(key=lambda r: r[0])   # lowest ask first
+            return {"bids": bids, "asks": asks}
+        except Exception:
+            return {"bids": [], "asks": []}
+
     # ---- §2A fee gate ----------------------------------------------------
 
     def preview_order(self, side: str, qty: int, price: float) -> dict:

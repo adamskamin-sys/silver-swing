@@ -3283,6 +3283,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
       postOnly: true,
       pennyInside: { enabled: true, max_ticks: 5 },
+      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
+      // fights current top-5 book pressure. Same 65% threshold both ways.
+      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
       note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore / Turtles.',
     },
     'Model C — Microstructure-informed': {
@@ -3313,6 +3316,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
       postOnly: true,
       pennyInside: { enabled: true, max_ticks: 5 },
+      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
+      // fights current top-5 book pressure. Same 65% threshold both ways.
+      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
       note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
     },
     'Model D — News-aware': {
@@ -3343,6 +3349,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
       postOnly: true,
       pennyInside: { enabled: true, max_ticks: 5 },
+      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
+      // fights current top-5 book pressure. Same 65% threshold both ways.
+      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
     },
@@ -3374,6 +3383,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
       postOnly: true,
       pennyInside: { enabled: true, max_ticks: 5 },
+      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
+      // fights current top-5 book pressure. Same 65% threshold both ways.
+      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Everything combined: Model B + microstructure gates + news blackout. Highest theoretical EV. Also highest complexity — a good win here vs Model B tells you the microstructure + news signals add real edge; a small/negative delta means those signals are noise for your timescale.',
     },
@@ -3860,6 +3872,11 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const pi = p.pennyInside || {};
     draft.penny_inside_enabled = !!pi.enabled;
     draft.penny_inside_max_ticks = pi.max_ticks ?? 5;
+    const bi = p.bookImbalance || {};
+    draft.book_imbalance_gate_enabled = !!bi.enabled;
+    draft.book_imbalance_depth_levels = bi.depth ?? 5;
+    draft.book_imbalance_sell_threshold = bi.sell_threshold ?? 0.65;
+    draft.book_imbalance_buy_threshold = bi.buy_threshold ?? 0.65;
     applyModeVisibility();
   }
 
@@ -4267,6 +4284,11 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       post_only_enabled: !!draft.post_only_enabled,
       penny_inside_enabled: !!draft.penny_inside_enabled,
       penny_inside_max_ticks: parseInt(draft.penny_inside_max_ticks || 5, 10),
+      // Book-imbalance gate (Chan/Harris): don't fight the tape.
+      book_imbalance_gate_enabled: !!draft.book_imbalance_gate_enabled,
+      book_imbalance_depth_levels: parseInt(draft.book_imbalance_depth_levels || 5, 10),
+      book_imbalance_sell_threshold: Number(draft.book_imbalance_sell_threshold) || 0.65,
+      book_imbalance_buy_threshold: Number(draft.book_imbalance_buy_threshold) || 0.65,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
