@@ -1710,6 +1710,47 @@ class SwingTrader:
             cfg["sleeves"] = sleeves
             self.store.put_config(self.tenant_id, self.symbol, cfg)
 
+    def _clamp_buy_below_last_sale(self, sc, ss,
+                                   new_buy_px: float, new_sell_px: float,
+                                   source: str) -> tuple[float, float]:
+        """Invariant guard: buy_px must never sit above the sleeve's last
+        sell fill price. Applied to every upward-chase reanchor path
+        (price-threshold / time / vol-percentile). Without this, the three
+        priced-out reanchors reintroduce the "buy above last sale" bug
+        that _maybe_expert_reanchor_after_sell fixes for the transition
+        point. If the market has walked up past where we sold, we hold —
+        we don't chase up above our own exit.
+
+        Returns possibly-clamped (new_buy_px, new_sell_px). Preserves the
+        spread when clamping."""
+        last_sale = getattr(ss, "last_sell_fill_price", None)
+        try:
+            last_sale = float(last_sale) if last_sale is not None else None
+        except (TypeError, ValueError):
+            last_sale = None
+        if last_sale is None or last_sale <= 0:
+            return new_buy_px, new_sell_px
+        if new_buy_px < last_sale:
+            return new_buy_px, new_sell_px
+        # Clamp buy to just below last sale; preserve the spread on sell.
+        spread = float(new_sell_px) - float(new_buy_px)
+        try:
+            clamped_buy = self._snap_to_tick(float(last_sale) - max(spread / 4.0,
+                                                                    float(last_sale) * 0.0005))
+        except Exception:
+            clamped_buy = float(last_sale) - max(spread / 4.0,
+                                                 float(last_sale) * 0.0005)
+        clamped_sell = clamped_buy + spread
+        self._record(
+            "sleeve_reanchor_clamped_below_last_sale",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            source=source,
+            requested_buy=round(float(new_buy_px), 6),
+            clamped_buy=round(float(clamped_buy), 6),
+            last_sale=round(float(last_sale), 6),
+        )
+        return clamped_buy, clamped_sell
+
     def _maybe_expert_reanchor_after_sell(self, sc: "SleeveConfig",
                                           ss: "SleeveState",
                                           sold_price: float) -> None:
@@ -2194,6 +2235,10 @@ class SwingTrader:
                     # move.
                     if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
                         return
+                    new_buy_px, new_sell_px = self._clamp_buy_below_last_sale(
+                        sc, ss, new_buy_px, new_sell_px, source="price_threshold_reanchor")
+                    if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
+                        return
                     self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
                     return  # next tick uses the new targets
                 # Time-based reanchor: if we've been waiting to rebuy for
@@ -2210,6 +2255,10 @@ class SwingTrader:
                         # No-op guard (same rationale as the price-threshold path
                         # above): if tick-snap produces the same buy/sell we
                         # already have, don't fire.
+                        if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
+                            return
+                        new_buy_px, new_sell_px = self._clamp_buy_below_last_sale(
+                            sc, ss, new_buy_px, new_sell_px, source="time_reanchor")
                         if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
                             return
                         self._record(
@@ -2241,6 +2290,10 @@ class SwingTrader:
                             # No-op guard (same rationale as the price-threshold
                             # path above): if tick-snap produces the same
                             # buy/sell we already have, don't fire.
+                            if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
+                                return
+                            new_buy_px, new_sell_px = self._clamp_buy_below_last_sale(
+                                sc, ss, new_buy_px, new_sell_px, source="vol_reanchor")
                             if new_buy_px == sc.buy_px and new_sell_px == sc.sell_px:
                                 return
                             self._record(
