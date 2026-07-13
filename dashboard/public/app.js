@@ -648,6 +648,48 @@ function renderLabComparison() {
 // directly if the sync hasn't populated yet, so you still see something.
 // Optionally accepts a specific tenant + mode so paper can share the same
 // Portfolio → Open Orders → Add-a-Position layout as live.
+// Sum of (mark - own_avg_entry) × contract_size × qty across ALL sleeves on
+// this product that CURRENTLY OWN contracts (state=ARMED_SELL). Returns null
+// if the product has no sleeve config — signals the caller to fall back to
+// position-level unrealized. Adam's ask: portfolio Unrealized column should
+// reflect only the contracts a strategy is actively exposing him to, not
+// the un-attached "core" contracts that would show up in position-level pnl.
+function sleeveOnlyUnrealized(tenant, product, mark) {
+  const block = currentStore?.[tenant]?.[product];
+  if (!block) return null;
+  const cfg = block.config || {};
+  const sleeves = Array.isArray(cfg.sleeves) ? cfg.sleeves : [];
+  if (!sleeves.length) return null;
+  const contractSize = Number(cfg.contract_size) || 0;
+  if (contractSize <= 0 || !(mark > 0)) return null;
+  const sleeveStates = (block.state || {}).sleeves || {};
+  let pnl = 0;
+  let qty = 0;
+  for (const s of sleeves) {
+    const ss = sleeveStates[s.id] || {};
+    const sleeveState = String(ss.state || 'ARMED_SELL');
+    // ARMED_SELL sleeves hold sc.qty contracts. ARMED_BUY sleeves already
+    // sold and are waiting to rebuy — no held contracts, no unrealized.
+    // HALTED could be either; skip to be safe.
+    if (sleeveState !== 'ARMED_SELL') continue;
+    const sq = Number(s.qty) || 0;
+    if (sq <= 0) continue;
+    // Prefer own_avg_entry (the sleeve's actual paid price during its cycle).
+    // Fall back to buy_px (a limit buy fills exactly at buy_px) — matches
+    // the drilldown table's math.
+    const ownEntry = ss.own_avg_entry != null && ss.own_avg_entry > 0
+      ? Number(ss.own_avg_entry)
+      : Number(s.buy_px);
+    if (!(ownEntry > 0)) continue;
+    pnl += (mark - ownEntry) * contractSize * sq;
+    qty += sq;
+  }
+  // If sleeves exist but none are currently ARMED_SELL, return 0 (not null):
+  // the correct answer is "no strategy exposure right now" — don't fall
+  // back to showing the full position's pnl.
+  return { pnl, qty };
+}
+
 function renderLivePortfolio(tenantOverride, modeOverride) {
   const liveTenant = tenantOverride
     || Object.keys(currentStore || {}).find(t => modeOfTenant(t) === 'live');
@@ -770,10 +812,27 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     const displayName = escapeHtml(r.kind === 'futures'
       ? prettyProductName(r.product || '')
       : (r.display || r.product || ''));
-    const dcls = cls(r.pnl || 0);
+    // Sleeve-only unrealized: for products with strategies attached, ignore
+    // the un-attached contracts (e.g., core hold). Adam wants Unrealized to
+    // reflect only what the STRATEGY is exposing him to, not the whole
+    // position. Falls through to position-level pnl if no sleeves are on
+    // this product.
+    let effectivePnl = r.pnl;
+    let sleeveContractsShown = 0;
+    if (r.kind === 'futures') {
+      const so = sleeveOnlyUnrealized(liveTenant, r.product, Number(r.mark) || 0);
+      if (so !== null) {
+        effectivePnl = so.pnl;
+        sleeveContractsShown = so.qty;
+      }
+    }
+    const dcls = cls(effectivePnl || 0);
+    const pnlTooltip = (r.kind === 'futures' && sleeveContractsShown > 0 && sleeveContractsShown !== Number(r.qty))
+      ? ` title="Strategy-only unrealized on ${sleeveContractsShown} of ${r.qty} contracts. Position-level was ${arrow(r.pnl)} ${fmtMoney(Math.abs(r.pnl || 0))}."`
+      : '';
     const pnlText = r.kind === 'spot'
       ? `<span class="dim">${fmtMoney(r.value || 0)}</span>`
-      : `<span class="${dcls}">${arrow(r.pnl)} ${fmtMoney(Math.abs(r.pnl || 0))}</span>`;
+      : `<span class="${dcls}"${pnlTooltip}>${arrow(effectivePnl)} ${fmtMoney(Math.abs(effectivePnl || 0))}</span>`;
     const qtyText = r.kind === 'spot' ? fmtNum(r.qty, 6) : r.qty;
     const avgText = r.avg > 0 ? '$' + fmtPrice(r.avg) : '—';
     const markText = r.mark > 0 ? '$' + fmtPrice(r.mark) : '—';
@@ -822,8 +881,14 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
   // Realized, and P/L + Realized across every futures row. Skip Qty / Avg
   // / Mark / Liq since those don't sum across products with different
   // contract sizes.
-  const totalPnlSum = filteredRows.reduce((a, r) =>
-    a + (r.kind === 'futures' ? (Number(r.pnl) || 0) : 0), 0);
+  const totalPnlSum = filteredRows.reduce((a, r) => {
+    if (r.kind !== 'futures') return a;
+    // Match the row-level display: sleeve-only unrealized if a strategy is
+    // attached, else fall through to the raw position pnl.
+    const so = sleeveOnlyUnrealized(liveTenant, r.product, Number(r.mark) || 0);
+    const rowPnl = so !== null ? so.pnl : (Number(r.pnl) || 0);
+    return a + rowPnl;
+  }, 0);
   const totalCyclesSum = filteredRows.reduce((a, r) =>
     a + (r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0), 0);
   const totalRealizedSum = filteredRows.reduce((a, r) =>
