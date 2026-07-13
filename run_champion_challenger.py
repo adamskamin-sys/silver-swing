@@ -52,7 +52,10 @@ def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
     except Exception:
         pass
     tick = float(champion.get("tick_size") or spec.get("price_increment") or 0.005)
-    contract_size = float(champion.get("contract_size") or 50)
+    # contract_size: prefer champion cfg → spec from Coinbase → 50 last resort.
+    # Sleeve-heavy configs often lack top-level contract_size; spec has it for
+    # every product (verified in broker.contract_spec:349).
+    contract_size = float(champion.get("contract_size") or spec.get("contract_size") or 50)
     paper_cfg = PaperConfig(
         product_id=symbol,
         contract_size=contract_size,
@@ -117,8 +120,13 @@ def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
 
 
 def _list_tracked_symbols(store, tenant: str) -> list[str]:
-    """Every symbol in the tenant with a real config (not meta keys). Includes
-    futures + perps + anything the user tracks."""
+    """Every non-meta symbol in the tenant. We don't require product_id/
+    contract_size at the top level — sleeve-heavy configs put those inside
+    the sleeve dicts. Per-symbol backtest failures surface in the SWEEP
+    SUMMARY (status='error') rather than being silently dropped, which is
+    the honest way to expose configs that need attention.
+    Adam 2026-07-13: filter was too strict; adam-live had 18 products but
+    only 1 (SLR) had contract_size at the config root."""
     out = []
     try:
         symbols = store.list_symbols(tenant) or []
@@ -127,9 +135,7 @@ def _list_tracked_symbols(store, tenant: str) -> list[str]:
     for sym in symbols:
         if sym.startswith("__"):
             continue
-        cfg = store.get_config(tenant, sym) or {}
-        if cfg.get("product_id") or cfg.get("contract_size"):
-            out.append(sym)
+        out.append(sym)
     return sorted(set(out))
 
 
