@@ -1072,10 +1072,19 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     const ranked = [...candidates].sort((a, b) => (b.score || 0) - (a.score || 0));
     const rowsHtml = ranked.map((c) => {
       const spread = Number(c.spread) || 0;
+      // dailyPerCt = weighted expected $/day (the scanner's headline number,
+      // blends 24h/7d/30d per its horizon weights). ALL projections below
+      // derive from this single rate so the tile reconciles: user sees
+      // "0.68 rt/day × $18.60/swing" and expects day×7=week, day×30=month.
+      // Prior version pulled week/month from the raw per-horizon RT rates,
+      // which meant a hot 7d window made week read higher than day×7 —
+      // Adam saw $12.22/day, $120.90/week and rightly said the numbers
+      // don't add up. Fixed: one rate, multiply out.
       const dailyPerCt = Number(c.score) || 0;
-      const weeklyPerCt = Number(c.score_weekly) || dailyPerCt * 7;
-      const monthlyPerCt = Number(c.score_monthly) || dailyPerCt * 30;
       const netPerCt = Number(c.net_per_rt) || 0;
+      const rtPerDay = (netPerCt > 0) ? (dailyPerCt / netPerCt) : 0;
+      const weeklyPerCt = dailyPerCt * 7;
+      const monthlyPerCt = dailyPerCt * 30;
       // Multiply to per-swing / total qty units so tile ↔ slider reconciles.
       const daily = dailyPerCt * qtyLive;
       const weekly = weeklyPerCt * qtyLive;
@@ -1086,14 +1095,6 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       const robustness = Number(c.regime_robustness) || 0;
       const weeklyRtSess = Number(c.session_weighted_weekly_rt) || 0;
       const monthlyRtSess = Number(c.session_weighted_monthly_rt) || 0;
-      // RT/day derived from per-CONTRACT scores — count doesn't change with qty.
-      let rtPerDay = 0;
-      const monthly30dRt = (netPerCt > 0) ? (monthlyPerCt / netPerCt) : 0;
-      const weekly7dRt = (netPerCt > 0) ? (weeklyPerCt / netPerCt) : 0;
-      const daily24hRt = Number(c.roundtrips) || 0;
-      if (monthly30dRt > 0) rtPerDay = monthly30dRt / 30;
-      else if (weekly7dRt > 0) rtPerDay = weekly7dRt / 7;
-      else rtPerDay = daily24hRt;
       const rtLabel = rtPerDay >= 1
         ? `${Math.round(rtPerDay)} roundtrips/day`
         : `${rtPerDay.toFixed(2)} roundtrips/day avg`;
