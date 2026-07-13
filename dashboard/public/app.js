@@ -4184,9 +4184,28 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // editor is fully usable while this loads.
   loadSpreadRecommendations(symbol, m, {
     onApply: (spread, netPerRt) => {
+      // Auto re-anchor to CURRENT MARKET on tile click. Adam caught the
+      // footgun where a stale anchor (e.g., Your Contract Avg from an
+      // older price) combined with the tile's spread produced a sell
+      // target BELOW current mark — the sleeve would then fire the sell
+      // immediately at a worse-than-intended price. Tiles now always
+      // center their spread around the LATEST market price so the pick
+      // is always symmetric around 'now', not around a stale reference.
+      // Also flip the anchor-choice UI to Current market so it's obvious
+      // what happened.
+      if (mark > 0) {
+        currentAnchor = mark;
+        const marketBtn = anchorChoiceBtns.find(
+          b => b.dataset.anchor
+               && Math.abs(Number(b.dataset.anchor) - mark) < 0.001
+        );
+        if (marketBtn) {
+          for (const b of anchorChoiceBtns) b.classList.toggle('active', b === marketBtn);
+        }
+      }
       // Apply the picked spread as sell_px/buy_px centered around the
-      // current anchor. Same math as syncTargetsFromSlider so the values
-      // stay consistent with everything else in the form.
+      // (now re-anchored) current mark. Same math as syncTargetsFromSlider
+      // so the values stay consistent with everything else in the form.
       const halfSpread = spread / 2;
       const newSell = Number((currentAnchor + halfSpread).toFixed(pricePrec));
       const newBuy = Number((currentAnchor - halfSpread).toFixed(pricePrec));
@@ -4327,6 +4346,19 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
+    // Off-market sell guard: refuse to save a sleeve whose sell target is
+    // BELOW current mark by more than 2 ticks — that sleeve fires the sell
+    // immediately at the wrong side of the intended spread. Confirmable
+    // via a second click if the user really means it (e.g., 'sell now
+    // regardless' style config).
+    const tickForGuard = Number(cfg?.tick_size) || 0.005;
+    if (mark > 0 && sellPx < (mark - 2 * tickForGuard) && !m.dataset.confirmOffMarket) {
+      errEl.hidden = false;
+      errEl.innerHTML = `Sell target $${fmtPrice(sellPx)} is below current market $${fmtPrice(mark)} — sleeve will fire sell immediately at a worse price than intended. Click Save again to confirm.`;
+      m.dataset.confirmOffMarket = '1';
+      return;
+    }
+    delete m.dataset.confirmOffMarket;
     if (usesTrail && !(trailDistance > 0)) { errEl.hidden = false; errEl.innerHTML = 'Trail distance must be > 0'; return; }
     if (exitEl.value === 'hybrid') {
       // trail_activation is auto-lifted above sell_px in the patch above, so
