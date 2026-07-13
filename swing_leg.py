@@ -1710,6 +1710,90 @@ class SwingTrader:
             cfg["sleeves"] = sleeves
             self.store.put_config(self.tenant_id, self.symbol, cfg)
 
+    def _maybe_expert_reanchor_after_sell(self, sc: "SleeveConfig",
+                                          ss: "SleeveState",
+                                          sold_price: float) -> None:
+        """After a normal sell (ARMED_SELL → ARMED_BUY), run the expert chain
+        to pick a buy_px that is regime/cycle/microstructure-aware — instead
+        of leaving the OLD buy_px in place. Solves the "buy back above the
+        last sale" bug (2026-07-13 OIL round-trip lost $15 that way).
+
+        Opt-out: set sleeve.expert_reentry_enabled = False in config.
+
+        Fail-safe: any error and we leave the sleeve's buy_px unchanged
+        (legacy behavior) so this never worsens the state machine."""
+        if getattr(sc, "expert_reentry_enabled", True) is False:
+            return
+        try:
+            import experts_reentry as _er
+        except Exception:
+            return
+        prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+        if len(prices) < 40:
+            return
+        spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
+        # Account equity for Vince — pull from portfolio_risk which already
+        # knows how to read the __portfolio__ snapshot. Fail-safe to 0.
+        account_equity = 0.0
+        try:
+            import portfolio_risk as _pr
+            account_equity = _pr._get_account_equity(self.store, self.tenant_id)
+        except Exception:
+            pass
+        # Worst 1-contract loss for Vince — use the largest historical
+        # single-cycle loss * contract_size, guarded to a floor so we don't
+        # divide by tiny numbers on a fresh sleeve.
+        recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
+        worst_loss = 0.0
+        if recent:
+            worst_cycle = min(recent)
+            if worst_cycle < 0 and sc.qty > 0:
+                worst_loss = abs(worst_cycle) / max(1, sc.qty)
+        worst_loss_per_contract = max(worst_loss, spread * self.cfg.contract_size)
+        # Microstructure snap for VPIN gate — best-effort, may be absent.
+        ms = None
+        try:
+            ms = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+        except Exception:
+            ms = None
+        decision = _er.compute_reentry(
+            prices=prices,
+            sold_price=float(sold_price),
+            spread=spread,
+            strategy_qty=int(sc.qty),
+            account_equity=float(account_equity or 0.0),
+            worst_loss_per_contract=float(worst_loss_per_contract or 0.0),
+            recent_cycle_pnls=recent,
+            ms=ms,
+        )
+        # Log the decision regardless of arm — audit trail for the algo.
+        self._record(
+            "sleeve_expert_reentry_decision",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            sold_price=round(float(sold_price), 6),
+            should_arm=bool(decision.get("should_arm")),
+            buy_px=decision.get("buy_px"),
+            sell_px=decision.get("sell_px"),
+            capped_qty=decision.get("qty"),
+            reasons=decision.get("reasons"),
+            expert_snapshot=decision.get("expert_snapshot"),
+        )
+        if not decision.get("should_arm"):
+            return
+        new_buy = decision.get("buy_px")
+        new_sell = decision.get("sell_px")
+        if new_buy is None or new_sell is None or new_sell <= new_buy:
+            return
+        # Snap to tick and reanchor. The reanchor helper handles both the
+        # in-memory sc and the persisted config.
+        try:
+            new_buy = self._snap_to_tick(float(new_buy))
+            new_sell = self._snap_to_tick(float(new_sell))
+        except Exception:
+            pass
+        self._reanchor_sleeve(sc, ss, float(new_buy), float(new_sell),
+                              float(sold_price))
+
     def _reanchor_sleeve(self, sc: "SleeveConfig", ss: "SleeveState",
                          new_buy_px: float, new_sell_px: float,
                          current_price: float) -> None:
@@ -3001,6 +3085,17 @@ class SwingTrader:
             if len(recent) > 20:
                 recent = recent[-20:]
             ss.recent_cycle_pnls = recent
+            # Expert-driven re-entry (2026-07-13). After a sell, compute a
+            # buy_px that respects regime (Kaufman), cycle phase (Ehlers),
+            # higher-TF direction (Elder), OU mean-reversion band (Chan),
+            # statistical oversold (Connors), and cap qty by risk-of-ruin
+            # (Vince). Fail-safe — falls back to legacy behavior on any error.
+            try:
+                self._maybe_expert_reanchor_after_sell(sc, ss, fill)
+            except Exception as _e:
+                self._record("expert_reanchor_error",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e))
             if cycle_pnl > 0:
                 ss.cycles_losing_streak = 0
             else:
