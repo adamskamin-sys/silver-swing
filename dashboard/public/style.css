@@ -2133,3 +2133,36 @@ header { padding: 20px 32px; }
   font-size: 12px; line-height: 1.5;
 }
 .preview-below-cost b { color: var(--bad); }
+
+/* ── [crew] cockpit strip ─────────────────────────────────────────────── */
+.cockpit { margin: var(--s3) 0 var(--s4); }
+.cockpit-row {
+  display: flex; flex-wrap: wrap; gap: var(--s3);
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--s3) var(--s4);
+  box-shadow: var(--shadow-1);
+}
+.ck-tile { display: flex; flex-direction: column; gap: 2px; min-width: 120px; flex: 1 1 120px; }
+.ck-tile.ck-health { flex: 2 1 200px; }
+.ck-label { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.ck-value { font-size: var(--fs-lg); font-weight: 700; font-family: var(--mono);
+  line-height: var(--lh-tight); display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
+.ck-value.pos { color: var(--good); }
+.ck-value.neg { color: var(--bad); }
+.ck-chip { font-size: var(--fs-sm); font-weight: 600; font-family: var(--sans);
+  padding: 2px 10px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+.ck-ok     { background: rgba(5,177,105,.14);   color: var(--good); border-color: rgba(5,177,105,.35); }
+.ck-warn   { background: rgba(212,154,122,.16); color: var(--warn); border-color: rgba(212,154,122,.40); }
+.ck-danger { background: rgba(239,68,68,.16);   color: var(--bad);  border-color: rgba(239,68,68,.45); }
+.ck-paused { background: rgba(239,68,68,.16);   color: var(--bad);  border-color: rgba(239,68,68,.45); }
+
+@media (max-width: 700px) {
+  .cockpit-row { gap: var(--s2); padding: var(--s2) var(--s3); }
+  .ck-tile { min-width: 44%; flex: 1 1 44%; }
+  .ck-tile.ck-health { flex: 1 1 100%; }
+  .ck-value { font-size: var(--fs-md); }
+  /* let wide tables scroll instead of overflowing the viewport on phones */
+  #scanner-section, #signals-section, .sleeves-table-wrap, .live-portfolio {
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+}

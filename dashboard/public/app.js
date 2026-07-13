@@ -327,6 +327,64 @@ function iconForAssetClass(c) {
 
 // ---- HALT + kill banners ------------------------------------------------
 
+// [crew] At-a-glance cockpit strip. Aggregates the active mode's tenant into a
+// single glanceable row: status, unrealized P&L, cash, open positions, and a
+// health readout (nearest-to-liquidation + halts) — the margin sentinel's
+// headline surfaced in the UI. Computed from currentStore; no backend change.
+function renderCockpit(store) {
+  if (activeMode === 'scanner' || activeMode === 'signals') return '';
+  const tenant = Object.keys(store || {}).find(t => modeOfTenant(t) === activeMode);
+  if (!tenant) return '';
+  const block = store[tenant] || {};
+  const ks = block['__account_kill_switch__']?.config || {};
+  const paused = !!ks.active;
+
+  let unreal = 0, cash = 0, openPos = 0, halts = 0, nearestLiqPct = null;
+  const considerLiq = (mk, liq, qty) => {
+    if (qty && liq > 0 && mk > 0) {
+      const d = Math.abs(mk - liq) / mk * 100;
+      if (nearestLiqPct === null || d < nearestLiqPct) nearestLiqPct = d;
+    }
+  };
+  const pf = block['__portfolio__']?.config;
+  if (pf && pf.cash) {
+    cash = Number(pf.cash.total) || 0;
+    for (const d of pf.derivatives || []) {
+      unreal += Number(d.unrealized) || 0;
+      if (Number(d.qty)) openPos++;
+      considerLiq(Number(d.mark) || 0, Number(d.liquidation_price) || 0, Number(d.qty) || 0);
+    }
+  }
+  for (const sym of Object.keys(block)) {
+    if (sym.startsWith('__')) continue;
+    const s = block[sym]?.snapshot || {};
+    const st = block[sym]?.state || {};
+    if (st.state === 'HALTED') halts++;
+    if (!pf || !pf.cash) {
+      const q = Number(s.position_qty) || 0;
+      if (q) { openPos++; unreal += Number(s.unrealized_pnl) || 0; }
+      considerLiq(Number(s.last_mark) || 0, Number(s.liquidation_price) || 0, q);
+    }
+  }
+
+  const statusChip = paused
+    ? `<span class="ck-chip ck-paused">⏸ PAUSED</span>`
+    : (halts > 0 ? `<span class="ck-chip ck-warn">▲ ${halts} halted</span>`
+                 : `<span class="ck-chip ck-ok">● running</span>`);
+  const liqCls = nearestLiqPct === null ? '' : (nearestLiqPct <= 15 ? 'ck-danger' : (nearestLiqPct <= 30 ? 'ck-warn' : 'ck-ok'));
+  const liqChip = nearestLiqPct === null ? '' :
+    `<span class="ck-chip ${liqCls}" title="Nearest position's adverse % move to a forced liquidation (margin sentinel)">liq&nbsp;${nearestLiqPct.toFixed(1)}%</span>`;
+  const healthClear = !liqChip && halts === 0 && !paused;
+
+  return `<div class="cockpit-row">
+    <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
+    <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
+    <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
+    <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
+    <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${healthClear ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
+  </div>`;
+}
+
 function renderBanners(store) {
   const haltedInstruments = [];
   let killActive = null;
@@ -2741,6 +2799,14 @@ async function refreshOnce() {
   if (signalsSection) signalsSection.hidden = !showSignals;
   cardsEl.hidden = showScanner || showSignals;
   document.getElementById('asset-tabs').hidden = showScanner || showSignals;
+
+  // [crew] at-a-glance cockpit strip (hidden in scanner/signals views)
+  const cockpitEl = document.getElementById('cockpit');
+  if (cockpitEl) {
+    const ckHtml = renderCockpit(currentStore);
+    cockpitEl.innerHTML = ckHtml;
+    cockpitEl.hidden = !ckHtml;
+  }
 
   if (showScanner) {
     refreshScanner();
