@@ -655,7 +655,7 @@ function renderLabComparison() {
 // position-level unrealized. Adam's ask: portfolio Unrealized column should
 // reflect only the contracts a strategy is actively exposing him to, not
 // the un-attached "core" contracts that would show up in position-level pnl.
-function sleeveOnlyUnrealized(tenant, product, mark) {
+function sleeveOnlyUnrealized(tenant, product, mark, coinbasePnl, positionQty, positionAvg) {
   const block = currentStore?.[tenant]?.[product];
   if (!block) return null;
   const cfg = block.config || {};
@@ -664,30 +664,39 @@ function sleeveOnlyUnrealized(tenant, product, mark) {
   const contractSize = Number(cfg.contract_size) || 0;
   if (contractSize <= 0 || !(mark > 0)) return null;
   const sleeveStates = (block.state || {}).sleeves || {};
+  const posQty = Number(positionQty) || 0;
+  const posAvg = Number(positionAvg) || 0;
+  const cbPnl = Number(coinbasePnl);
+  const cbPnlValid = Number.isFinite(cbPnl) && posQty > 0;
+  // Match against position avg to within a tick ($0.005). If the sleeve's
+  // cost basis equals the position blend, Coinbase's own unrealized (already
+  // in the row) is authoritative — it uses Coinbase's mark, our mark can
+  // drift a few cents from theirs. Apportion by qty share.
+  const AVG_TOL = 0.005;
   let pnl = 0;
   let qty = 0;
   for (const s of sleeves) {
     const ss = sleeveStates[s.id] || {};
     const sleeveState = String(ss.state || 'ARMED_SELL');
-    // ARMED_SELL sleeves hold sc.qty contracts. ARMED_BUY sleeves already
-    // sold and are waiting to rebuy — no held contracts, no unrealized.
-    // HALTED could be either; skip to be safe.
     if (sleeveState !== 'ARMED_SELL') continue;
     const sq = Number(s.qty) || 0;
     if (sq <= 0) continue;
-    // Prefer own_avg_entry (the sleeve's actual paid price during its cycle).
-    // Fall back to buy_px (a limit buy fills exactly at buy_px) — matches
-    // the drilldown table's math.
-    const ownEntry = ss.own_avg_entry != null && ss.own_avg_entry > 0
-      ? Number(ss.own_avg_entry)
-      : Number(s.buy_px);
+    const cycles = Number(ss.cycles) || 0;
+    // Fresh sleeve (cycles=0) inherits position avg. Traded sleeve keeps
+    // its own_avg_entry (may diverge from position blend after cycling).
+    const rawOwn = ss.own_avg_entry != null && ss.own_avg_entry > 0
+      ? Number(ss.own_avg_entry) : Number(s.buy_px);
+    const ownEntry = (cycles === 0 && posAvg > 0) ? posAvg : rawOwn;
     if (!(ownEntry > 0)) continue;
-    pnl += (mark - ownEntry) * contractSize * sq;
+    // Use Coinbase's own unrealized (apportioned) when sleeve avg matches
+    // position avg. Otherwise fall back to local (mark − own_avg) × size.
+    if (cbPnlValid && Math.abs(ownEntry - posAvg) < AVG_TOL) {
+      pnl += cbPnl * (sq / posQty);
+    } else {
+      pnl += (mark - ownEntry) * contractSize * sq;
+    }
     qty += sq;
   }
-  // If sleeves exist but none are currently ARMED_SELL, return 0 (not null):
-  // the correct answer is "no strategy exposure right now" — don't fall
-  // back to showing the full position's pnl.
   return { pnl, qty };
 }
 
@@ -821,7 +830,10 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     let effectivePnl = r.pnl;
     let sleeveContractsShown = 0;
     if (r.kind === 'futures') {
-      const so = sleeveOnlyUnrealized(liveTenant, r.product, Number(r.mark) || 0);
+      const so = sleeveOnlyUnrealized(
+        liveTenant, r.product, Number(r.mark) || 0,
+        Number(r.pnl) || 0, Number(r.qty) || 0, Number(r.avg) || 0,
+      );
       if (so !== null) {
         effectivePnl = so.pnl;
         sleeveContractsShown = so.qty;
@@ -912,7 +924,10 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     if (r.kind !== 'futures') return a;
     // Match the row-level display: sleeve-only unrealized if a strategy is
     // attached, else fall through to the raw position pnl.
-    const so = sleeveOnlyUnrealized(liveTenant, r.product, Number(r.mark) || 0);
+    const so = sleeveOnlyUnrealized(
+      liveTenant, r.product, Number(r.mark) || 0,
+      Number(r.pnl) || 0, Number(r.qty) || 0, Number(r.avg) || 0,
+    );
     const rowPnl = so !== null ? so.pnl : (Number(r.pnl) || 0);
     return a + rowPnl;
   }, 0);
@@ -2119,6 +2134,11 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     //   - state must be ARMED_SELL (holds contracts)
     //   - ownEntrySource must be a REAL cost basis (not buy_px_target, not none)
     //   - snapshot.position_qty must be > 0 (physically holds contracts)
+    //   - cycles > 0 (sleeve has bought contracts via its own state machine).
+    //     Adam 2026-07-13: "there is no unrealized in my silver sleeve." A
+    //     freshly-attached sleeve inherits its qty from the parent position;
+    //     the pre-attach paper move belongs to the position, not the sleeve,
+    //     and shows on the position row instead — never double-counted here.
     // Any one of these failing → unrealized is $0.
     const positionQty = Number(snapshot?.position_qty) || 0;
     const isRealCostBasis = ownEntrySource !== 'none' && ownEntrySource !== 'buy_px_target';
@@ -2127,6 +2147,7 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
       && sState === 'ARMED_SELL'
       && isRealCostBasis
       && positionQty > 0
+      && cycles > 0
     ) ? (mark - ownEntry) * contractSize * sleeveQty : 0;
     const paramsHtml = fmtTrailingParams(
       s.exit_mode || 'fixed_limit',
