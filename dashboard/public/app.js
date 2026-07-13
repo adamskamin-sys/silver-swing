@@ -992,27 +992,42 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       triggerScanAndPoll();
       return;
     }
-    // Rank recs by score (best-first). Fee-adjusted net per roundtrip is
-    // already baked into `score`, so weekly/monthly = score × 7 / × 30.
+    // Rank recs by score (best-first). Score is now WEIGHTED $/day across
+    // 24h + 7d + 30d (see scanner.py:score_product_swings), not raw 24h. Use
+    // the real per-horizon scores from the candidate instead of naive daily
+    // × 7 / × 30 extrapolation so the tile numbers actually reconcile.
     const ranked = [...candidates].sort((a, b) => (b.score || 0) - (a.score || 0));
     const rowsHtml = ranked.map((c, i) => {
       const spread = Number(c.spread) || 0;
-      const rt = Number(c.roundtrips) || 0;
-      const daily = Number(c.score) || 0;
-      const weekly = daily * 7;
-      const monthly = daily * 30;
+      const daily = Number(c.score) || 0;                    // weighted $/day
+      const weekly = Number(c.score_weekly) || daily * 7;    // real 7d $
+      const monthly = Number(c.score_monthly) || daily * 30; // real 30d $
       const net = Number(c.net_per_rt) || 0;
+      // Prefer monthly RT count / 30 for the "per day" tile display — one
+      // day of data is noise; a month is a signal. Falls back to 7d avg
+      // then 24h count if the deeper horizons weren't scored.
+      let rtPerDay = 0;
+      const monthly30dRt = (net > 0) ? (monthly / net) : 0;
+      const weekly7dRt = (net > 0) ? (weekly / net) : 0;
+      const daily24hRt = Number(c.roundtrips) || 0;
+      if (monthly30dRt > 0) rtPerDay = monthly30dRt / 30;
+      else if (weekly7dRt > 0) rtPerDay = weekly7dRt / 7;
+      else rtPerDay = daily24hRt;
+      const rtLabel = rtPerDay >= 1
+        ? `${Math.round(rtPerDay)} roundtrips/day`
+        : `${rtPerDay.toFixed(2)} roundtrips/day avg`;
       const bestBadge = i === 0 ? '<span class="spread-rec-badge">BEST</span>' : '';
       return `
-        <button type="button" class="spread-rec-tile" data-spread="${spread}" data-net="${net}">
+        <button type="button" class="spread-rec-tile" data-spread="${spread}" data-net="${net}"
+                title="Weighted score across 24h + 7d + 30d. Today: ${daily24hRt} RT · This week: ${Math.round(weekly7dRt)} RT · This month: ${Math.round(monthly30dRt)} RT">
           <div class="spread-rec-head">
             $${fmtNum(spread, 4)} ${bestBadge}
-            <span class="dim">· ${rt} roundtrips/day · $${fmtNum(net, 2)} net each</span>
+            <span class="dim">· ${rtLabel} · $${fmtNum(net, 2)} net each</span>
           </div>
           <div class="spread-rec-grid">
-            <div><span class="dim">$/day</span> <b class="pos">$${fmtNum(daily, 2)}</b></div>
-            <div><span class="dim">$/week</span> <b class="pos">$${fmtNum(weekly, 2)}</b></div>
-            <div><span class="dim">$/month</span> <b class="pos">$${fmtNum(monthly, 2)}</b></div>
+            <div><span class="dim">$/day (wtd)</span> <b class="pos">$${fmtNum(daily, 2)}</b></div>
+            <div><span class="dim">$/week (7d)</span> <b class="pos">$${fmtNum(weekly, 2)}</b></div>
+            <div><span class="dim">$/month (30d)</span> <b class="pos">$${fmtNum(monthly, 2)}</b></div>
           </div>
         </button>`;
     }).join('');
