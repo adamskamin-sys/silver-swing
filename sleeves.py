@@ -371,6 +371,25 @@ class SleeveConfig:
     buy_trail_enabled: bool = False
     buy_trail_distance: float = 0.0
 
+    # [crew] DEFENSIVE crash guard (crash_guard.py). When on, the sleeve
+    # flattens at market the instant a toxic liquidation cascade runs AGAINST
+    # the long (VPIN/OFI/Kyle/OBI + Lee-Mykland jump) — faster than the
+    # trailing stop for a gap-through; the "couldn't get out in time" fix.
+    # Enabling it ALSO turns on the cascade re-entry gate (cascade_state.py):
+    # after a crash the sleeve refuses to rebuy into an active crash or a
+    # dead-cat bounce, waiting for a signal-based all-clear (VPIN subsided +
+    # volatility contracting) before re-arming the buy. OFF by default — no
+    # behavior change until enabled per-sleeve.
+    crash_guard_enabled: bool = False
+    # [crew] OFFENSIVE reversal — SHADOW ONLY. When on, a crash that flattens
+    # the long ALSO records a `reversal_signal` telemetry event (the
+    # hypothetical short entry) so paper/backtest can score the flip and feed
+    # the go-live gauntlet. It does NOT place a live short: the sleeve has no
+    # short-holding state machine yet, and per the safety rules that execution
+    # engine must be built + paper-validated before any real order. OFF by
+    # default.
+    reversal_enabled: bool = False
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -437,6 +456,8 @@ class SleeveConfig:
             correlation_crash_pct=float(d.get("correlation_crash_pct") or 3.0),
             buy_trail_enabled=bool(d.get("buy_trail_enabled") or False),
             buy_trail_distance=float(d.get("buy_trail_distance") or 0.0),
+            crash_guard_enabled=bool(d.get("crash_guard_enabled") or False),
+            reversal_enabled=bool(d.get("reversal_enabled") or False),
             trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
             trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
             trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),

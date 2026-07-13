@@ -1,3 +1,4 @@
+import random
 import crash_guard as cg
 cfg = {"guard_enabled": True}
 # toxic DOWN cascade while LONG -> FLATTEN (defensive, get out now)

@@ -154,6 +154,26 @@ class SwingTrader:
         # strategies (mean reversion, Bollinger). Empty for now; will be
         # populated the same commit those exit_modes are wired in.
         self._sleeve_price_history: dict = {}
+        # [crew] Per-sleeve cascade-lifecycle observations (price + VPIN/OFI +
+        # per-tick vol proxy) for the crash-guard re-entry gate. Only populated
+        # when a sleeve has crash_guard_enabled — zero cost otherwise.
+        self._sleeve_ms_history: dict = {}
+        # [crew] Roll-awareness for the crash guard. Near a dated contract's
+        # expiry the microstructure signals (VPIN/OFI + basis convergence +
+        # thinning book) stop being reliable proxies for a liquidation cascade,
+        # so we suppress the microstructure guard inside a blackout window to
+        # avoid a false flatten on roll/convergence noise. The price-based
+        # stop-loss / trailing stop / abort bands still protect, and Coinbase
+        # auto-rolls the position. Hours come from env; 0 = disabled (default,
+        # no behavior change). Expiry is cached to avoid a per-tick API call.
+        import os as _os
+        try:
+            self._roll_guard_blackout_hours = float(
+                _os.getenv("SWING_ROLL_GUARD_BLACKOUT_HOURS", "0") or 0)
+        except (TypeError, ValueError):
+            self._roll_guard_blackout_hours = 0.0
+        self._roll_expiry_ts: Optional[float] = None
+        self._roll_expiry_checked: float = 0.0
 
     def _snap_to_tick(self, price: float) -> float:
         """Snap a price to the product's tick_size. Coinbase rejects orders
@@ -1282,6 +1302,81 @@ class SwingTrader:
             return 0.0
         return max(recent) - min(recent)
 
+    def _parse_expiry(self, exp) -> Optional[float]:
+        """Best-effort parse of a contract_expiry value (ISO-8601 str / epoch)
+        into epoch seconds. Returns None on anything it can't read — the caller
+        treats None as 'expiry unknown' and keeps the guard active."""
+        if exp is None:
+            return None
+        try:
+            if isinstance(exp, (int, float)):
+                v = float(exp)
+                return v / 1000.0 if v > 1e12 else v  # tolerate ms epochs
+            s = str(exp).strip()
+            if not s:
+                return None
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    def _within_roll_blackout(self) -> bool:
+        """True ONLY when we affirmatively know we're within
+        SWING_ROLL_GUARD_BLACKOUT_HOURS of the contract's expiry. Fail-safe:
+        unknown expiry, no broker spec, or hours<=0 all return False so the
+        crash guard stays active — never weakening protection on missing data.
+        contract_spec() is a live API call, so the expiry is cached and
+        refreshed at most every ~15 minutes."""
+        hours = getattr(self, "_roll_guard_blackout_hours", 0.0) or 0.0
+        if hours <= 0:
+            return False
+        import time as _time
+        now = _time.time()
+        if now - float(getattr(self, "_roll_expiry_checked", 0.0)) >= 900:
+            self._roll_expiry_checked = now
+            try:
+                spec_fn = getattr(self.b, "contract_spec", None)
+                spec = spec_fn() if callable(spec_fn) else None
+                self._roll_expiry_ts = self._parse_expiry((spec or {}).get("contract_expiry"))
+            except Exception:
+                pass  # keep last-known; unknown stays unknown
+        ts = getattr(self, "_roll_expiry_ts", None)
+        if not ts:
+            return False
+        secs_left = ts - now
+        # Within the blackout window ahead of expiry. Guard against a stale
+        # far-past timestamp (a wrongly-parsed old contract) firing forever.
+        return -86400 < secs_left <= hours * 3600
+
+    def _reversal_position_safe(self, sc, ss):
+        """Guard for the OFFENSIVE reversal (flip long->short). On Coinbase
+        ONE-WAY netting the account holds a single net position, so flipping a
+        sleeve to short would sell straight THROUGH any contracts that sleeve
+        does not own — the protected core (core_qty) and any manually-held /
+        orphan contracts. Adam's rule: never reverse when contracts exist
+        outside this sleeve. Returns (ok, reason). Fail-safe: any error returns
+        (False, ...) so an accounting hiccup can never let a flip run over
+        un-sleeved size."""
+        try:
+            core = int(getattr(self.cfg, "core_qty", 0) or 0)
+            if core > 0:
+                return False, f"protected core of {core} present — a reversal would sell the core"
+            pos = int(self.b.position_qty() or 0)
+            held = int(getattr(ss, "current_qty", 0) or 0) or int(getattr(sc, "qty", 0) or 0)
+            if held <= 0:
+                return False, "sleeve holds nothing to reverse"
+            if pos > held:
+                return False, (f"un-sleeved contracts present (net {pos} > this sleeve's {held}) "
+                               "— a reversal would net against them")
+            return True, ""
+        except Exception as e:
+            return False, f"reversal safety check failed: {e}"
+
     def _sleeve_track_price(self, sc, last_price: float) -> None:
         """Append last_price to the sleeve's rolling window. Kept short so
         memory is bounded — window * 4 keeps enough history for pre-stop
@@ -1289,7 +1384,35 @@ class SwingTrader:
         from collections import deque as _deque
         if sc.id not in self._sleeve_price_history:
             self._sleeve_price_history[sc.id] = _deque(maxlen=int(sc.reentry_range_window or 60) * 4)
-        self._sleeve_price_history[sc.id].append(float(last_price))
+        _ph = self._sleeve_price_history[sc.id]
+        prev = _ph[-1] if _ph else None
+        _ph.append(float(last_price))
+        # [crew] Cascade-lifecycle observations for the crash-guard re-entry
+        # gate. Only maintained when the guard is on (zero cost otherwise).
+        # Captures the microstructure trajectory (VPIN/OFI + a per-tick vol
+        # proxy) so cascade_state can tell a real all-clear from a dead-cat
+        # bounce. Fail-safe: a snapshot error just yields Nones (assess ignores
+        # missing keys and stays permissive).
+        if getattr(sc, "crash_guard_enabled", False):
+            hist = self._sleeve_ms_history.get(sc.id)
+            if hist is None:
+                hist = self._sleeve_ms_history[sc.id] = _deque(maxlen=64)
+            try:
+                snap = self.ms.snapshot() if self.ms else {}
+            except Exception:
+                snap = {}
+            vol = None
+            try:
+                if prev:
+                    vol = abs(float(last_price) - float(prev)) / float(prev)
+            except (TypeError, ValueError, ZeroDivisionError):
+                vol = None
+            hist.append({
+                "price": float(last_price),
+                "vpin": snap.get("vpin") if isinstance(snap, dict) else None,
+                "ofi": (snap.get("trade_ofi_60s") or snap.get("ofi")) if isinstance(snap, dict) else None,
+                "vol": vol,
+            })
 
     def _maybe_trigger_sleeve_reentry(self, sc, ss, last_price: float) -> bool:
         """Volatility-contraction re-entry after a stop. When current range
@@ -1621,23 +1744,49 @@ class SwingTrader:
         # running against the long, flatten at market NOW via the tested
         # _sleeve_market_sell path — this is the "couldn't get out in time" fix.
         # Reuses microstructure.py's VPIN/OFI/Kyle/OBI sensors + a jump test.
-        if getattr(sc, "crash_guard_enabled", False) and ss.state == SleeveStateEnum.ARMED_SELL:
+        if (getattr(sc, "crash_guard_enabled", False)
+                and ss.state == SleeveStateEnum.ARMED_SELL
+                and not self._within_roll_blackout()):
             try:
                 import crash_guard
                 ms_snap = self.ms.snapshot() if self.ms else {}
                 hist = list(self._sleeve_price_history.get(sc.id, []) or [])
                 rets = [(hist[i] - hist[i - 1]) / hist[i - 1]
                         for i in range(1, len(hist)) if hist[i - 1]]
+                # flip_enabled only makes the assessment COMPUTE the
+                # would-flip direction for shadow telemetry — the live sell
+                # below still only FLATTENS. No short order is ever placed here.
+                flip_on = bool(getattr(sc, "reversal_enabled", False))
                 assess = crash_guard.crash_assessment(
                     ms_snap, rets, "LONG",
-                    {"guard_enabled": True, "flip_enabled": False})  # defensive only
+                    {"guard_enabled": True, "flip_enabled": flip_on})
                 if assess.get("action") in ("FLATTEN", "FLATTEN_AND_FLIP"):
                     self._record("crash_guard_flatten", sleeve_id=sc.id, sleeve_name=sc.name,
                                  severity=assess.get("severity"), direction=assess.get("direction"),
                                  fired=assess.get("fired"))
+                    # [crew] OFFENSIVE reversal — SHADOW telemetry only. Record
+                    # the hypothetical short entry so paper/backtest can score
+                    # the flip's P&L (feeds the reversals tile + go-live
+                    # gauntlet). NO live short is placed: the short-holding
+                    # state machine doesn't exist yet and must be paper-
+                    # validated before any real order.
+                    if flip_on and assess.get("action") == "FLATTEN_AND_FLIP":
+                        rev_ok, rev_reason = self._reversal_position_safe(sc, ss)
+                        # reversal_signal = a flip that COULD execute (shadow
+                        # P&L counts it); reversal_blocked = a flip refused
+                        # because un-sleeved/core contracts are present, so the
+                        # short is NOT counted — keeps the shadow evidence honest.
+                        self._record(
+                            "reversal_signal" if rev_ok else "reversal_blocked",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            shadow=True, would_flip_to=assess.get("flip_to"),
+                            price=round(float(last_price), 6),
+                            severity=assess.get("severity"),
+                            direction=assess.get("direction"),
+                            reason=(assess.get("reason") if rev_ok else rev_reason))
                     try:
                         self._notify(f"CRASH-GUARD flatten: {self.symbol} / {sc.name}",
-                                     assess.get("reason", ""), Priority.CRIT)
+                                    assess.get("reason", ""), Priority.CRIT)
                     except Exception:
                         pass
                     self._sleeve_market_sell(sc, ss, last_price)
@@ -1825,6 +1974,32 @@ class SwingTrader:
                 # the "priced-out to the upside" case.
                 if not self._sleeve_trend_ok_for_buy(sc, last_price):
                     return
+                # [crew] Cascade re-entry gate. When the crash guard is on, do
+                # NOT rebuy into an active crash or a dead-cat bounce — the
+                # "short uptick then another big crash" trap Adam keeps hitting.
+                # cascade_state waits for a SIGNAL-BASED all-clear (VPIN
+                # subsided + volatility contracting), not a fixed clock
+                # (Lehmann short-term reversal is real but short-lived;
+                # Lillo-Farmer long-memory flow + Engle/Bollerslev vol
+                # clustering say the selling usually isn't done). Fail-safe:
+                # permissive on thin history / errors so it never stalls a
+                # sleeve in normal markets.
+                if getattr(sc, "crash_guard_enabled", False) and not self._within_roll_blackout():
+                    try:
+                        import cascade_state
+                        obs = list(self._sleeve_ms_history.get(sc.id, []) or [])
+                        casc = cascade_state.assess(obs)
+                        if casc.get("phase") == "crashing" or casc.get("second_leg_risk"):
+                            self._record(
+                                "cascade_reentry_hold",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                phase=casc.get("phase"),
+                                vpin_now=casc.get("vpin_now"),
+                                reason=casc.get("reason"),
+                            )
+                            return
+                    except Exception as e:
+                        self._record("cascade_reentry_error", sleeve_id=sc.id, error=str(e))
                 # Trailing-buy (Livermore / Turtle / Le Beau). When enabled,
                 # returns None until mark bounces buy_trail_distance above the
                 # local low — otherwise returns sc.buy_px (identical to legacy

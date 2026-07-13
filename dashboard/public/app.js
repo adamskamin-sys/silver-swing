@@ -378,15 +378,16 @@ function renderCockpit(store) {
   const healthClear = !liqChip && halts === 0 && !paused;
 
   // [crew] reversal / crash-exit telemetry from the recent event feed
-  let revCount = 0, crashExits = 0, revPnl = 0, haveRevPnl = false;
+  let revCount = 0, crashExits = 0, revPnl = 0, haveRevPnl = false, shadowRev = 0;
   for (const e of (lastTradeEvents || [])) {
     const et = e && e.event_type;
     if (et === 'position_reversed') revCount++;
     if (et === 'crash_guard_flatten') crashExits++;
+    if (et === 'reversal_signal') shadowRev++; // shadow (paper) would-be short flips
     if (e && e.via_reversal && typeof e.gross === 'number') { revPnl += e.gross; haveRevPnl = true; }
   }
-  const revValue = (revCount || crashExits)
-    ? `${revCount}↺${crashExits ? ` <span class="ck-chip ck-warn" style="font-size:var(--fs-xs)" title="crash-guard flatten exits">🛡${crashExits}</span>` : ''}${haveRevPnl ? ` <span class="${classForValue(revPnl)}">${revPnl >= 0 ? '+' : '-'}${fmtMoney(Math.abs(revPnl))}</span>` : ''}`
+  const revValue = (revCount || crashExits || shadowRev)
+    ? `${revCount}↺${crashExits ? ` <span class="ck-chip ck-warn" style="font-size:var(--fs-xs)" title="crash-guard flatten exits">🛡${crashExits}</span>` : ''}${shadowRev ? ` <span class="ck-chip" style="font-size:var(--fs-xs)" title="shadow reversal signals — hypothetical short flips logged for paper/backtest, no live order placed">👻${shadowRev}</span>` : ''}${haveRevPnl ? ` <span class="${classForValue(revPnl)}">${revPnl >= 0 ? '+' : '-'}${fmtMoney(Math.abs(revPnl))}</span>` : ''}`
     : '<span class="ck-chip ck-ok">0</span>';
 
   return `<div class="cockpit-row">
@@ -394,7 +395,7 @@ function renderCockpit(store) {
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
-    <div class="ck-tile" title="Reversals + crash-guard exits in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
+    <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
     <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${healthClear ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
   </div>`;
 }
@@ -4067,9 +4068,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           <input type="checkbox" id="sl-stoploss" ${draft.stop_loss_enabled ? 'checked' : ''}>
           <b>Stop-loss (protects during a crash)</b>
         </label>
-        <label class="accumulate-toggle" title="Flatten this sleeve at market the instant a toxic liquidation cascade (VPIN / order-flow / Kyle-λ + jump) runs against the long — faster than the stop for a gap-through. Off by default.">
+        <label class="accumulate-toggle" title="Flatten this sleeve at market the instant a toxic liquidation cascade (VPIN / order-flow / Kyle-λ + jump) runs against the long — faster than the stop for a gap-through. Also gates re-entry: won't rebuy into an active crash or a dead-cat bounce until the flow normalizes. Off by default.">
           <input type="checkbox" id="sl-crashguard" ${draft.crash_guard_enabled ? 'checked' : ''}>
-          <b>Crash guard — flatten fast on a liquidation cascade</b>
+          <b>Crash guard — flatten fast + smart re-entry on a liquidation cascade</b>
+        </label>
+        <label class="accumulate-toggle" title="SHADOW ONLY. When a crash flattens this long, also log the hypothetical short entry so paper/backtest can measure the P&L of flipping. Does NOT place a live short yet — that execution engine is built + validated in paper before any real order. Requires crash guard on.">
+          <input type="checkbox" id="sl-reversal" ${draft.reversal_enabled ? 'checked' : ''}>
+          <b>Reversal signals (shadow — records would-be short, no live order)</b>
         </label>
         <div class="accumulate-fields" id="sl-stoploss-fields" ${draft.stop_loss_enabled ? '' : 'hidden'}>
           <div class="target-inputs">
@@ -4890,6 +4895,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // knife. See swing_leg._trailing_buy_ready for the state machine.
       buy_trail_enabled: !!(m.querySelector('#sl-buy-trail')?.checked),
       crash_guard_enabled: !!(m.querySelector('#sl-crashguard')?.checked),
+      reversal_enabled: !!(m.querySelector('#sl-reversal')?.checked),
       buy_trail_distance: (m.querySelector('#sl-buy-trail')?.checked
         ? Number(m.querySelector('#sl-buy-trail-distance')?.value || 0)
         : 0),
