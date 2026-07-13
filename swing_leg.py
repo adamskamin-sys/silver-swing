@@ -605,8 +605,14 @@ class SwingTrader:
         try:
             preview = preview_fn(side, qty, price)
         except Exception as e:
+            # [crew:#7] Fail CLOSED. This previously returned True, so a preview
+            # API glitch silently DISABLED the fee sanity ceiling and let the arm
+            # go through unchecked — exactly when a bad quote could make you
+            # overpay. Skip this arm instead; the next tick retries once preview
+            # works again. (A sustained outage pauses new arms, which is the safe
+            # failure mode for a cost guard.)
             self._record("fee_gate_preview_failed", side=side, qty=qty, price=price, error=str(e))
-            return True  # don't block on a preview API glitch; log for followup
+            return False
         commission = preview.get("commission_total") if isinstance(preview, dict) else None
         if commission is None:
             return True
@@ -636,6 +642,39 @@ class SwingTrader:
         if not self._fee_gate_ok(side, qty, price):
             return
         if self.s.live_order_id:
+            # [crew:#3] Before cancelling the resting order to re-arm, check what
+            # actually filled. Blindly cancelling + resetting filled_qty=0 (below)
+            # silently ABANDONS any contracts that already filled — the bot's
+            # belief then diverges from the real exchange position, which on a
+            # leveraged futures account is how you drift into a margin surprise.
+            try:
+                _st = self.b.order_status(self.s.live_order_id)
+            except Exception as e:
+                # Can't confirm the order's fill state — do NOT cancel blindly.
+                # Halt so a human reconciles rather than risking abandoned fills.
+                return self._halt(
+                    f"cannot read order {self.s.live_order_id} status before re-arm "
+                    f"({type(e).__name__}: {e}) — halting to avoid abandoning a possible fill"
+                )
+            _filled = int(_st.get("filled_qty", 0) or 0)
+            _status = _st.get("status")
+            if _status == "FILLED" or (self.s.swing_qty > 0 and _filled >= self.s.swing_qty):
+                # It actually filled — credit it through the normal path instead
+                # of cancelling. Don't re-arm the same leg here; the next tick's
+                # _ensure_armed places the correct next-leg order.
+                self.s.filled_qty = _filled or self.s.swing_qty
+                self._on_fill(fill_price=_st.get("average_filled_price"))
+                return
+            if _filled > 0:
+                # PARTIAL fill: real contracts we must not silently drop. Halt
+                # for human reconciliation (matches reconcile()'s policy: on a
+                # mismatch, HALT — never silently correct).
+                return self._halt(
+                    f"partial fill on order {self.s.live_order_id}: "
+                    f"{_filled}/{self.s.swing_qty} filled before re-arm — halting "
+                    f"to avoid abandoning filled contracts"
+                )
+            # Unfilled → safe to cancel and re-arm at the new price.
             try:
                 self.b.cancel(self.s.live_order_id)
                 self._record("order_cancelled_for_rearm", order_id=self.s.live_order_id)
@@ -755,8 +794,20 @@ class SwingTrader:
             return
         free = self.s.realized_pnl - self.s.reserved_margin
         need = self.cfg.margin_per_contract * self.cfg.scale_up_buffer_mult
+        # [crew:#6] Don't ratchet to max size off ONE profit chunk. reserved_margin
+        # only grows when the buy leg actually fills, so during an ARMED_BUY
+        # trailing-wait `free` stays constant and this used to bump swing_qty on
+        # EVERY tick until max_swing_qty. Require realized_pnl to have grown since
+        # the last scale-up, so one banked profit adds at most one contract before
+        # it's committed as margin on the next fill. (Safe: touches no P&L/margin
+        # math — the sleeve twin decrements realized_pnl instead, which would
+        # double-count against the primary's separate reserved_margin accounting.)
+        last = getattr(self, "_last_scaleup_pnl", None)
+        if last is not None and self.s.realized_pnl <= last:
+            return
         if free >= need:
             self.s.swing_qty += 1
+            self._last_scaleup_pnl = self.s.realized_pnl
             self._record(
                 "scaled_up",
                 new_swing_qty=self.s.swing_qty,
@@ -766,64 +817,25 @@ class SwingTrader:
             self._save_state()
 
     def _maybe_scale_up_sleeve(self, sc, ss) -> None:
-        """Per-sleeve accumulation. Threshold: realized_pnl >=
-        margin_per_contract × scale_up_buffer_mult. On trigger, one of two
-        actions depending on sc.accumulate_mode:
+        """Per-sleeve accumulation. Same logic as _maybe_scale_up but scoped
+        to this sleeve's own realized_pnl and its own max_qty ceiling. That
+        way each sleeve compounds independently — a winning sleeve grows,
+        a losing sleeve stays at its starting size.
 
-          - 'qty' (legacy): sc.qty += 1. Same sleeve, more contracts. All
-            future cycles use the SAME sell/buy/trail as the parent — the
-            new contract inherits stale parameters if the market has
-            moved. This is the pre-2026-07-13 default.
-
-          - 'spawn' (Adam's rule, new default): CREATE A NEW SIBLING sleeve
-            with fresh expert-derived parameters anchored to the CURRENT
-            market. New sleeve gets its own state machine, its own
-            entry_mark, sell/buy/trail/stop all recomputed from expert
-            canon at spawn time. Winning sleeves compound as a FAMILY of
-            expert-tuned sleeves each optimized for the market at the
-            moment they were spawned.
-
-        Both modes decrement the parent's realized_pnl by the margin so
-        the same profit can't fund two contracts.
+        Bumps sc.qty in memory AND writes the new qty back to the store so a
+        restart preserves the accumulated size.
         """
         if not getattr(sc, "accumulate_enabled", False):
             return
         max_qty = int(getattr(sc, "max_qty", 0) or 0)
-        # For spawn mode, max_qty caps total FAMILY size (parent + all children).
-        # For qty mode, it caps the parent's own qty. Both semantics land at
-        # the same numeric ceiling.
-        family_size = self._sleeve_family_size(sc.id)
-        if max_qty <= family_size:
+        if max_qty <= sc.qty:
             return
         need = self.cfg.margin_per_contract * float(getattr(sc, "scale_up_buffer_mult", 1.5) or 1.5)
         if ss.realized_pnl < need:
             return
-        mode = str(getattr(sc, "accumulate_mode", "spawn") or "spawn").lower()
-        if mode == "spawn":
-            spawned_id = self._spawn_child_sleeve(sc, ss)
-            if spawned_id is None:
-                # Spawn failed for some data reason — fall back to qty bump so
-                # profit isn't wasted. Better than silently dropping.
-                sc.qty += 1
-                ss.realized_pnl -= need
-                self._persist_sleeve_qty(sc.id, sc.qty)
-                self._record(
-                    "sleeve_scaled_up_fallback_qty",
-                    sleeve_id=sc.id, sleeve_name=sc.name,
-                    new_qty=sc.qty, consumed=need,
-                    reason="spawn returned None",
-                )
-                return
-            ss.realized_pnl -= need
-            self._record(
-                "sleeve_spawned_child",
-                parent_sleeve_id=sc.id, parent_sleeve_name=sc.name,
-                child_sleeve_id=spawned_id,
-                consumed=need, max_family_qty=max_qty,
-                family_size_after=family_size + 1,
-            )
-            return
-        # Legacy 'qty' mode
+        # Enough banked to add one contract. Bump in memory, persist to store,
+        # and decrement the sleeve's own realized so the same profit can't be
+        # counted twice next cycle. Matches the primary's semantics.
         sc.qty += 1
         ss.realized_pnl -= need
         self._persist_sleeve_qty(sc.id, sc.qty)
@@ -833,133 +845,6 @@ class SwingTrader:
             new_qty=sc.qty, max_qty=max_qty,
             consumed=need,
         )
-
-    def _sleeve_family_size(self, root_or_parent_id: str) -> int:
-        """Sum of qty across the sleeve identified by root_or_parent_id AND
-        every descendant (any sleeve with spawned_from tracing back to it).
-        Used as the accumulation ceiling in spawn mode."""
-        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
-        sleeves = list(cfg.get("sleeves") or [])
-        by_id = {s.get("id"): s for s in sleeves if s.get("id")}
-        # Ancestor lookup: walk spawned_from until we hit the root.
-        def root_of(sid):
-            seen = set()
-            cur = sid
-            while cur and cur not in seen:
-                seen.add(cur)
-                parent = (by_id.get(cur) or {}).get("spawned_from")
-                if not parent:
-                    return cur
-                cur = parent
-            return cur
-        my_root = root_of(root_or_parent_id)
-        total = 0
-        for s in sleeves:
-            if root_of(s.get("id")) == my_root:
-                total += int(s.get("qty") or 0)
-        return total
-
-    def _spawn_child_sleeve(self, parent_sc, parent_ss) -> Optional[str]:
-        """Create a new sibling sleeve with FRESH expert-derived parameters
-        anchored to the current market. Returns the new sleeve id, or None
-        if we couldn't compute expert params (spawn is silently skipped —
-        caller falls back to qty mode).
-
-        Every parameter is recomputed from CURRENT ATR and CURRENT mark:
-          sell_px, buy_px  — mark ± (expert spread / 2)
-          trail_distance   — expertATR × trail_x_atr (Turtle 2N / Kaufman)
-          stop_loss_px     — entry − (expertATR × stop_x_atr) (Van Tharp 1R)
-          activation_px    — sell_px + expertATR × 0.5 (Le Beau)
-          reanchor_threshold — expertATR × reanchor_x_atr
-          buy_trail_distance — expertATR × buy_trail_x_atr
-
-        Feature toggles are copied from parent (falling knife, Kelly,
-        adaptive spread, book imbalance, etc.) — the child inherits the
-        parent's strategy stack, only price levels are fresh.
-        """
-        import uuid as _uuid
-        snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
-        mark = float(snap.get("last_mark") or 0)
-        if mark <= 0:
-            return None
-        # Pull expert params for THIS product from the __portfolio__ snap.
-        pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
-        expert = None
-        for d in (pf.get("derivatives") or []):
-            if d.get("product_id") == self.symbol:
-                expert = d.get("expert_params")
-                break
-        if not expert:
-            return None
-        try:
-            atr = float(expert.get("atr") or 0)
-        except (TypeError, ValueError):
-            return None
-        if atr <= 0:
-            return None
-        mults = expert.get("multipliers") or {}
-        # Fresh spread: use the parent's saved spread as a reasonable seed
-        # scaled by CURRENT ATR / parent's implied ATR ratio. If the parent's
-        # spread was already ATR-derived, this preserves the same character;
-        # if the market vol has doubled, spread widens accordingly.
-        parent_spread = max(0.0, float(parent_sc.sell_px) - float(parent_sc.buy_px))
-        # If parent spread is unreasonable (0 or wildly different from ATR-
-        # implied), fall back to ATR × trail_x_atr as a default spread.
-        atr_implied_spread = atr * float(mults.get("trail_x_atr") or 2.0)
-        if parent_spread <= 0 or parent_spread > 20 * atr_implied_spread:
-            spread = atr_implied_spread
-        else:
-            spread = parent_spread
-        half = spread / 2.0
-        new_sell = round(mark + half, 6)
-        new_buy = round(mark - half, 6)
-        new_trail = atr * float(mults.get("trail_x_atr") or 2.0)
-        new_stop_distance = atr * float(mults.get("stop_x_atr") or 2.0)
-        new_activation_offset = atr * float(mults.get("activation_offset_x_atr") or 0.5)
-        new_reanchor = atr * float(mults.get("reanchor_x_atr") or 1.0)
-        new_buy_trail = atr * float(mults.get("buy_trail_x_atr") or 0.5)
-        new_ratchet = atr * float(mults.get("ratchet_x_atr") or 3.0)
-        new_ratchet_act = atr * float(mults.get("ratchet_activation_x_atr") or 0.5)
-        child_id = f"s{_uuid.uuid4().hex[:8]}"
-        generation = int(getattr(parent_sc, "spawn_generation", 0) or 0) + 1
-        child_name = f"{parent_sc.name} · Gen {generation}"
-        import time as _t
-        # Copy the parent's dict-serialized config as a starting template,
-        # then override the fields that need to be fresh. This preserves
-        # every feature toggle without listing them exhaustively.
-        parent_dict = None
-        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
-        for s in (cfg.get("sleeves") or []):
-            if s.get("id") == parent_sc.id:
-                parent_dict = dict(s)
-                break
-        if parent_dict is None:
-            return None
-        child_dict = dict(parent_dict)
-        child_dict.update({
-            "id": child_id,
-            "name": child_name,
-            "qty": 1,   # Van Tharp: always start a new position at 1 R-unit
-            "sell_px": new_sell,
-            "buy_px": new_buy,
-            "trail_trigger": new_sell,
-            "trail_distance": round(new_trail, 6),
-            "trail_activation_px": round(new_sell + new_activation_offset, 6),
-            "reanchor_threshold": round(new_reanchor, 6),
-            "buy_trail_distance": round(new_buy_trail, 6),
-            "stop_loss_px": round(new_buy - new_stop_distance, 6) if float(parent_dict.get("stop_loss_px") or 0) > 0 else 0.0,
-            "stop_loss_ratchet_distance": round(new_ratchet, 6),
-            "stop_loss_ratchet_activation": round(new_ratchet_act, 6),
-            "entry_mark": mark,
-            "entry_ts": _t.time(),
-            "spawned_from": parent_sc.id,
-            "spawn_generation": generation,
-        })
-        sleeves_list = list(cfg.get("sleeves") or [])
-        sleeves_list.append(child_dict)
-        cfg["sleeves"] = sleeves_list
-        self.store.put_config(self.tenant_id, self.symbol, cfg)
-        return child_id
 
     def _compute_sleeve_stop_loss_qty(self, sc, position_qty: int) -> int:
         """Same rules as _compute_stop_loss_qty but scoped to a sleeve. Always
@@ -1801,10 +1686,7 @@ class SwingTrader:
                     self._sleeve_hybrid_step(sc, ss, last_price)
                 else:
                     self._maybe_emit_ml_shadow(sc)
-                    self._maybe_emit_classic_shadows(sc)
-                    reg = self._regime_multipliers(sc)
-                    eff_qty = max(1, int(round(self._kelly_adjusted_qty(sc, ss) * reg["size_multiplier"])))
-                    eff_qty = self._maybe_slice_arm(sc, "SELL", eff_qty, sc.sell_px)
+                    eff_qty = self._kelly_adjusted_qty(sc, ss)
                     eff_price = self._adaptive_spread_price(sc, "SELL", sc.sell_px)
                     ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "SELL", eff_qty, eff_price, last_price)
                     if ms_qty is None:
@@ -1914,10 +1796,7 @@ class SwingTrader:
                 if arm_price is None:
                     return  # still tracking the low, don't arm this tick
                 self._maybe_emit_ml_shadow(sc)
-                self._maybe_emit_classic_shadows(sc)
-                reg = self._regime_multipliers(sc)
-                eff_qty = max(1, int(round(self._kelly_adjusted_qty(sc, ss) * reg["size_multiplier"])))
-                eff_qty = self._maybe_slice_arm(sc, "BUY", eff_qty, arm_price)
+                eff_qty = self._kelly_adjusted_qty(sc, ss)
                 eff_price = self._adaptive_spread_price(sc, "BUY", arm_price)
                 ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", eff_qty, eff_price, last_price)
                 if ms_qty is None:
@@ -2414,58 +2293,21 @@ class SwingTrader:
         return True
 
     def _kelly_adjusted_qty(self, sc, ss) -> int:
-        """Apply Kelly-fraction sizing if enabled. Never sizes UP (only ≤ cfg.qty).
-
-        When BOTH Kelly and Carver risk-budget are enabled, take the MIN
-        of the two — always the more conservative sizing wins. This is the
-        Van Tharp / Carver combined philosophy: Kelly says "size to your
-        edge estimate," Carver says "size to a fixed portfolio risk
-        budget," neither is right in isolation, the MIN is the safe choice.
-        """
-        kelly_qty = int(sc.qty)
-        if getattr(sc, "kelly_enabled", False):
-            try:
-                import kelly
-                recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
-                mult = kelly.compute_kelly_multiplier(
-                    recent,
-                    kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
-                    min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
-                )
-                kelly_qty = kelly.size_from_qty(int(sc.qty), mult)
-            except Exception as e:
-                self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
-                kelly_qty = int(sc.qty)
-        carver_qty = int(sc.qty)
-        if getattr(sc, "risk_budget_enabled", False):
-            try:
-                import risk_budget
-                snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
-                # expert_params lives on the __portfolio__ snap (per product).
-                pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
-                derivs = pf.get("derivatives") or []
-                expert_params = None
-                for d in derivs:
-                    if d.get("product_id") == self.symbol:
-                        expert_params = d.get("expert_params")
-                        break
-                # Enrich snap with product spec so risk_budget can read it.
-                cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
-                snap_view = dict(snap)
-                if "contract_size" not in snap_view and cfg.get("contract_size"):
-                    snap_view["contract_size"] = cfg["contract_size"]
-                carver_target = float(getattr(sc, "risk_budget_target_dollar_vol", 50.0) or 50.0)
-                carver_qty_raw = risk_budget.sleeve_carver_qty(
-                    sc, ss, snap_view, expert_params, target_dollar_vol=carver_target,
-                )
-                if carver_qty_raw is not None:
-                    # Cap at cfg.qty — never sizes UP. Matches Kelly semantics.
-                    carver_qty = min(int(sc.qty), int(carver_qty_raw))
-            except Exception as e:
-                self._record("risk_budget_compute_failed", sleeve_id=sc.id, error=str(e))
-                carver_qty = int(sc.qty)
-        # More-conservative wins — safety-first when combining sizing rules.
-        return max(1, min(kelly_qty, carver_qty))
+        """Apply Kelly-fraction sizing if enabled. Never sizes UP (only ≤ cfg.qty)."""
+        if not getattr(sc, "kelly_enabled", False):
+            return int(sc.qty)
+        try:
+            import kelly
+            recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
+            mult = kelly.compute_kelly_multiplier(
+                recent,
+                kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
+                min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
+            )
+            return kelly.size_from_qty(int(sc.qty), mult)
+        except Exception as e:
+            self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
+            return int(sc.qty)
 
     def _adaptive_spread_price(self, sc, side: str, arm_price: float) -> float:
         """When adaptive spread is enabled, widen the arm price to account
@@ -2502,135 +2344,6 @@ class SwingTrader:
         except Exception as e:
             self._record("adaptive_spread_failed", sleeve_id=sc.id, error=str(e))
             return arm_price
-
-    def _current_regime(self):
-        """Andrew Lo — Adaptive Markets. Classify current regime from
-        snapshot price_history + expert_params ATR. Returns one of
-        mean_reversion / momentum / chop / unknown. Cached ~5s to bound
-        cost."""
-        import time as _t
-        cache = getattr(self, "_regime_cache", None)
-        now = _t.time()
-        if cache and now - cache["ts"] < 5.0:
-            return cache["regime"]
-        regime = "unknown"
-        try:
-            import regime_detector
-            snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
-            history = snap.get("price_history") or []
-            prices = []
-            for entry in history[-200:]:
-                try:
-                    px = float(entry[1])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                if px > 0:
-                    prices.append(px)
-            pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
-            derivs = pf.get("derivatives") or []
-            atr = 0.0
-            for d in derivs:
-                if d.get("product_id") == self.symbol:
-                    atr = float((d.get("expert_params") or {}).get("atr") or 0)
-                    break
-            if prices and atr > 0:
-                regime = regime_detector.classify_regime(prices, atr)
-        except Exception:
-            regime = "unknown"
-        self._regime_cache = {"ts": now, "regime": regime}
-        return regime
-
-    def _regime_multipliers(self, sc) -> dict:
-        """Return spread/size/buy-trail multipliers for the current regime
-        IF the sleeve has regime_adaptive_enabled. Otherwise all 1.0."""
-        if not getattr(sc, "regime_adaptive_enabled", False):
-            return {"spread_multiplier": 1.0, "size_multiplier": 1.0,
-                    "buy_trail_multiplier": 1.0}
-        try:
-            import regime_detector
-            return regime_detector.regime_adjustments(self._current_regime())
-        except Exception:
-            return {"spread_multiplier": 1.0, "size_multiplier": 1.0,
-                    "buy_trail_multiplier": 1.0}
-
-    def _maybe_slice_arm(self, sc, side, qty, price):
-        """Almgren-Chriss slicing. Returns the FIRST slice qty to arm now;
-        remaining slices are logged as intent for the next tick to pick up
-        (we don't have a real timer — we approximate by cycling through
-        the ARMED_SELL/ARMED_BUY step at each tick). If disabled or
-        single-contract, returns qty unchanged.
-
-        The simplification vs pure Almgren-Chriss: we don't fire multiple
-        orders at once — instead we place the first slice as the arm,
-        and the remaining contracts join on subsequent cycles' arms. That
-        matches our maker-only + post-only constraint (only one live order
-        per sleeve at a time) while still front-loading exposure per the
-        schedule."""
-        if not getattr(sc, "execution_slicing_enabled", False):
-            return int(qty)
-        if int(qty) <= 1:
-            return int(qty)
-        try:
-            import execution
-            kyle_l = None
-            if getattr(self, "ms", None) is not None:
-                try:
-                    kyle_l = self.ms.kyle.value()
-                except Exception:
-                    kyle_l = None
-            schedule = execution.optimal_slice_schedule(
-                int(qty),
-                urgency_secs=float(getattr(sc, "execution_slicing_urgency_secs", 30.0) or 30.0),
-                kyle_lambda=kyle_l,
-            )
-            first_slice_qty = schedule[0][1] if schedule else int(qty)
-            if first_slice_qty < int(qty):
-                self._record(
-                    "execution_slice_partial",
-                    sleeve_id=sc.id, sleeve_name=sc.name,
-                    side=side, price=price,
-                    total_qty=int(qty), first_slice_qty=first_slice_qty,
-                    schedule=schedule, kyle_lambda=kyle_l,
-                )
-            return max(1, int(first_slice_qty))
-        except Exception:
-            return int(qty)
-
-    def _maybe_emit_classic_shadows(self, sc) -> None:
-        """RSI + Bollinger + MACD shadow signal emission. Reads price_history
-        from the snapshot, computes each indicator, emits to the shared
-        Signals tab log via classic_shadow. Never gates arms."""
-        if not getattr(sc, "classic_indicators_shadow_enabled", False):
-            return
-        try:
-            snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
-            history = snap.get("price_history") or []
-            prices = []
-            for entry in history[-200:]:
-                try:
-                    px = float(entry[1])
-                except (TypeError, ValueError, IndexError):
-                    continue
-                if px > 0:
-                    prices.append(px)
-            if len(prices) < 30:
-                return  # not enough for MACD (needs 26 + 9)
-            mark = prices[-1]
-            import classic_indicators
-            import classic_shadow
-            rsi = classic_indicators.compute_rsi(prices)
-            if rsi is not None:
-                classic_shadow.emit_rsi_signal(self.store, self.symbol, rsi, mark)
-            bands = classic_indicators.compute_bollinger_bands(prices)
-            if bands is not None:
-                classic_shadow.emit_bollinger_signal(self.store, self.symbol,
-                                                    mark, bands, mark)
-            mtup = classic_indicators.compute_macd(prices)
-            if mtup is not None:
-                classic_shadow.emit_macd_signal(self.store, self.symbol, mtup, mark)
-        except Exception as e:
-            self._record("classic_indicators_shadow_failed",
-                         sleeve_id=sc.id, error=str(e))
 
     def _maybe_emit_ml_shadow(self, sc) -> None:
         """If ml_shadow_enabled, extract features + run predictor + log signal.
