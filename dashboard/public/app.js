@@ -1115,9 +1115,19 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       const kind = String(c.tile_label || c.tile_kind || 'EXPERT').toUpperCase();
       const isFrontrun = kind === 'FRONT-RUN' || kind === 'FRONTRUN';
       const badgeClass = isFrontrun ? 'spread-rec-badge frontrun' : 'spread-rec-badge';
+      // Adam's rule (2026-07-13): always show contract_size × spread on the
+      // tile so contract_size drift is instantly visible. The bot pulls the
+      // real value from Coinbase every 6h + startup, but if a value ever
+      // drifted (BIT was 0.04 vs 0.01, etc.) the tile's $ projections would
+      // silently mis-scale by that factor. Making it visible closes the gap.
+      const csizeDisplay = Number(cfg?.contract_size) || 0;
+      const grossPerCt = csizeDisplay > 0 ? (spread * csizeDisplay) : 0;
+      const csizeNote = csizeDisplay > 0
+        ? ` · leverage = ${csizeDisplay.toLocaleString('en-US')} × spread = $${grossPerCt.toFixed(2)} gross/swing`
+        : '';
       const subtitle = isFrontrun
-        ? `<span class="dim">requires post-only + penny-inside (maker fees $${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)</span>`
-        : `<span class="dim">full expert stack at real fees ($${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)</span>`;
+        ? `<span class="dim">requires post-only + penny-inside (maker fees $${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)${csizeNote}</span>`
+        : `<span class="dim">full expert stack at real fees ($${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)${csizeNote}</span>`;
       // Raw per-horizon signals — what the algo actually observed before
       // blending. Surfaced on the tile so the user can judge the pick's
       // confidence, not just the output. The main grid stays reconciled

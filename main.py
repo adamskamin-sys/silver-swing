@@ -348,10 +348,24 @@ def _refresh_contract_spec_into_config(store, tenant: str, symbol: str) -> None:
         broker = CoinbaseBroker(BrokerConfig(product_id=symbol))
         spec = broker.contract_spec()
         dirty = False
+        # Contract-size drift audit (Adam durable rule 2026-07-13). Every
+        # $-denominated calc downstream — tile scores, sleeve slider net,
+        # realized P/L, Kelly/Carver sizing — multiplies by contract_size.
+        # A stale cached value silently corrupts all of them. Emit an
+        # explicit divergence event when Coinbase reports different than
+        # what we had stored, so post-mortems + the dashboard can see the
+        # correction happen instead of overwriting silently.
         for k in ("contract_size", "tick_size", "contract_expiry",
                   "intraday_margin_rate", "overnight_margin_rate"):
             v = spec.get(k)
             if v is not None and cfg.get(k) != v:
+                if k == "contract_size" and cfg.get(k) is not None:
+                    print(
+                        f"[spec-drift] {tenant}/{symbol} contract_size drift: "
+                        f"stored={cfg.get(k)} → coinbase={v}. All downstream "
+                        f"$-projections will scale accordingly.",
+                        flush=True,
+                    )
                 cfg[k] = v
                 dirty = True
 
