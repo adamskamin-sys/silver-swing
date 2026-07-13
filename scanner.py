@@ -254,6 +254,7 @@ def score_product_swings(
     offhours_weight: float = 0.5,
     regime_penalty_weight: float = 0.3,
     maker_fee_multiplier: float = 0.5,
+    toxicity_penalty: float = 0.0,
 ) -> dict:
     """For a price series, try an ATR-anchored grid of spread candidates and
     return the one with the highest expected $/day AVERAGED ACROSS 24h/7d/30d.
@@ -327,6 +328,12 @@ def score_product_swings(
             robustness = _regime_robust_score(monthly_prices or prices, spread)
             base = (w_d * daily_per_day + w_w * weekly_per_day + w_m * monthly_per_day)
             weighted_per_day = base * (1.0 - regime_penalty_weight * (1.0 - robustness))
+            # Toxicity penalty (VPIN / Kyle λ): informed trade flow means
+            # passive limits get adverse-selected. Scale the expected $/day
+            # DOWN by the toxicity penalty (already clamped 0..1 by caller).
+            # Easley-López de Prado-O'Hara 2012 (VPIN paper), Kyle 1985.
+            if toxicity_penalty > 0:
+                weighted_per_day = weighted_per_day * max(0.0, 1.0 - toxicity_penalty)
             entry = {
                 "spread": spread,
                 "spread_mult": round(spread / tick_size) if tick_size > 0 else None,
@@ -342,6 +349,7 @@ def score_product_swings(
                 "session_weighted_monthly_rt": round(rt_monthly, 2),
                 "tile_kind": tile_kind,
                 "fee_rt_used": round(fee_rt_use, 4),
+                "toxicity_penalty": round(float(toxicity_penalty), 3),
             }
             out.append(entry)
             if top is None or weighted_per_day > top["score"]:
@@ -564,6 +572,7 @@ def fetch_and_rank(
     default_target_net_per_contract: float = 10.0,
     force_include: list[str] | None = None,
     spec_fallbacks: dict[str, dict] | None = None,
+    toxicity_lookup: dict[str, float] | None = None,
 ) -> list[dict]:
     """Fetch all CFM futures from Coinbase, score each on both amplitude
     (24h range %) AND swing frequency (roundtrips per lookback window at a
@@ -732,12 +741,23 @@ def fetch_and_rank(
             granularity="ONE_HOUR", lookback_secs=30 * 24 * 3600,
         )
         time.sleep(0.03)
+        # Toxicity penalty derived from the bot's live microstructure snapshot
+        # for THIS product (VPIN + Kyle-λ-normalized). Range 0..1. High values
+        # (informed / one-sided flow) scale the tile's expected $/day DOWN.
+        # If no live snapshot exists yet, penalty is 0 (permissive).
+        product_toxicity = 0.0
+        if toxicity_lookup:
+            try:
+                product_toxicity = float(toxicity_lookup.get(pid) or 0.0)
+            except (TypeError, ValueError):
+                product_toxicity = 0.0
         swing = score_product_swings(
             closes, tick, csize, effective_fee_rt,
             weekly_prices=weekly_closes or None,
             monthly_prices=monthly_closes or None,
             weekly_timestamps=weekly_ts or None,
             monthly_timestamps=monthly_ts or None,
+            toxicity_penalty=max(0.0, min(1.0, product_toxicity)),
         )
         if fallback_used and swing.get("candidates"):
             # 7d/1H fallback: `closes` is a week's worth, so rt count needs

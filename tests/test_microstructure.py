@@ -175,7 +175,12 @@ def test_filter_disabled_by_default(monkeypatch):
         if key.startswith("SWING_MS_"):
             monkeypatch.delenv(key, raising=False)
     f = MicrostructureFilter()
-    assert not f.any_enabled()
+    # any_enabled() is now True unconditionally — tape signals (OFI +
+    # AggressorRun) are always warm-cached for the trade-OFI gate and
+    # aggressor-run shadow harness, independent of the SWING_MS_* flags.
+    # The env-gated pause/scale behavior is unchanged, which is what
+    # this test actually cares about.
+    assert f.any_enabled()
     assert f.should_pause_arm("BUY") is None
     assert f.size_scale() == 1.0
 

@@ -74,6 +74,11 @@ class ScannerWorker:
             # salvage force_include products whose Coinbase raw response is
             # missing contract_size / tick_size (nano futures often are).
             spec_fallbacks = {}
+            # Toxicity lookup — for each product, read the live microstructure
+            # snapshot's VPIN + Kyle-λ ratio from the store. Combined into a
+            # single 0..1 penalty passed to the scanner. VPIN alone is bounded
+            # 0..1 (Easley-López de Prado); we cap at 1.0 for safety.
+            toxicity_lookup: dict[str, float] = {}
             try:
                 for t in self.store.list_tenants():
                     for sym in self.store.list_symbols(t):
@@ -84,12 +89,21 @@ class ScannerWorker:
                             "tick_size": c.get("tick_size"),
                             "contract_size": c.get("contract_size"),
                         }
+                        snap = self.store.get_snapshot(t, sym) or {}
+                        ms = snap.get("microstructure") or {}
+                        vpin_v = ms.get("vpin")
+                        if vpin_v is not None:
+                            try:
+                                toxicity_lookup[sym] = max(0.0, min(1.0, float(vpin_v)))
+                            except (TypeError, ValueError):
+                                pass
             except Exception as e:
-                _log(f"spec_fallbacks gather failed: {type(e).__name__}: {e}")
+                _log(f"spec_fallbacks / toxicity gather failed: {type(e).__name__}: {e}")
             ranking = fetch_and_rank(
                 self._coinbase_client, top_n=10,
                 force_include=list(forced),
                 spec_fallbacks=spec_fallbacks,
+                toxicity_lookup=toxicity_lookup,
             )
             write_ranking_to_redis(self.redis_url, ranking, generated_at=now)
             self.last_scanner = now

@@ -571,6 +571,26 @@ class _Track:
         self.ms = MicrostructureFilter() if is_primary_track else None
         if self.ms and not self.ms.any_enabled():
             self.ms = None
+        # Wire the aggressor-run shadow-signal callback. Fires from
+        # MicrostructureFilter.on_trade when the run detector crosses its
+        # threshold. Shadow ONLY: emit_aggressor_run_signal only writes to
+        # the shadow log — never touches the broker. Guarded in
+        # tape_shadow.py via EXECUTE_TRADES=False + a test suite that
+        # asserts no broker imports in that module.
+        if self.ms is not None:
+            try:
+                from tape_shadow import emit_aggressor_run_signal
+                def _on_agg(crossing, _filter, _store=store, _t=tenant, _s=symbol):
+                    try:
+                        emit_aggressor_run_signal(
+                            _store, _t, _s, crossing,
+                            baseline_mark=float(crossing.get("price") or 0.0),
+                        )
+                    except Exception:
+                        pass
+                self.ms.on_aggressor_run_crossing = _on_agg
+            except Exception as e:
+                _log(f"tape_shadow wiring failed: {type(e).__name__}: {e}")
 
         self.trader = SwingTrader(self.broker, store, tenant, symbol,
                                   trade_log=log, kill_switch=ks, microstructure=self.ms)

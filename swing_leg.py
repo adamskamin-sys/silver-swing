@@ -1994,6 +1994,30 @@ class SwingTrader:
                     side=side, qty=qty, price=price,
                 )
                 return
+        # Trade-tape OFI gate: refuse to arm when the EXECUTED trade tape
+        # (last N seconds of signed prints) opposes our direction. Stronger
+        # signal than book OBI per Cont-Kukanov-Stoikov 2014 — resting depth
+        # can be spoofed, executed volume can't. Zero cost if the
+        # MicrostructureFilter isn't wired (permissive-default).
+        if getattr(sc, "trade_ofi_gate_enabled", False):
+            if not self._trade_ofi_ok_for(sc, side):
+                ms = getattr(self, "ms", None)
+                ofi_val = None
+                if ms is not None:
+                    try:
+                        ofi_val = ms.trade_ofi.ofi(
+                            float(getattr(sc, "trade_ofi_window_secs", 60.0) or 60.0)
+                        )
+                    except Exception:
+                        pass
+                self._record(
+                    "sleeve_arm_skipped_trade_ofi",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    side=side, qty=qty, price=price,
+                    trade_ofi=ofi_val,
+                    threshold=float(getattr(sc, "trade_ofi_threshold", 0.65) or 0.65),
+                )
+                return
         # Cross-asset correlation gate: don't fresh-long silver into a
         # copper crash (or oil into a natgas dump). Only gates BUY arms —
         # SELL arms must always be allowed so we can exit into a crash
@@ -2162,6 +2186,40 @@ class SwingTrader:
             thr = float(getattr(sc, "book_imbalance_buy_threshold", 0.65) or 0.65)
             if (1.0 - bid_ratio) > thr:  # ask pressure = 1 - bid pressure
                 return False
+        return True
+
+    def _trade_ofi_ok_for(self, sc, side: str) -> bool:
+        """Trade-tape OFI gate. Mirror of _book_imbalance_ok_for but reads
+        the EXECUTED trade tape via microstructure.trade_ofi. Cont-Kukanov-
+        Stoikov (2014) + Cartea-Jaimungal: trade OFI is a stronger short-
+        term direction predictor than book OBI because resting orders can
+        be spoofed but executed trades cannot.
+
+        Returns False (BLOCK the arm) when the OFI magnitude exceeds the
+        threshold AND the sign opposes the intended arm side:
+          SELL + OFI > +threshold → refuse (buyers dominant, price likely
+            to keep rising through our sell target)
+          BUY  + OFI < -threshold → refuse (sellers dominant, don't fill
+            into continued weakness)
+
+        Permissive-default: True when MicrostructureFilter isn't wired or
+        the trade tape hasn't accumulated enough samples yet.
+        """
+        ms = getattr(self, "ms", None)
+        if ms is None:
+            return True
+        try:
+            window = float(getattr(sc, "trade_ofi_window_secs", 60.0) or 60.0)
+            ofi = ms.trade_ofi.ofi(window)
+        except Exception:
+            return True
+        if ofi is None:
+            return True
+        thr = float(getattr(sc, "trade_ofi_threshold", 0.65) or 0.65)
+        if side.upper() == "SELL" and ofi > thr:
+            return False
+        if side.upper() == "BUY" and ofi < -thr:
+            return False
         return True
 
     def _penny_inside_price(self, sc, side: str, target_price: float) -> float:

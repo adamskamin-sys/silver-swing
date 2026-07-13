@@ -207,6 +207,20 @@ class SleeveConfig:
     correlation_window_secs: float = 3600.0    # look-back window (1h default)
     correlation_crash_pct: float = 3.0         # peer drop that triggers block
 
+    # Trade-tape OFI gate — mirror of book_imbalance_gate but reads the
+    # EXECUTED trade tape instead of resting depth. Cont-Kukanov-Stoikov
+    # (2014) + Cartea-Jaimungal find trade OFI is a stronger short-term
+    # direction predictor than book OBI because resting orders can be
+    # spoofed. When enabled:
+    #   Arming SELL + trade OFI > +threshold → refuse (aggressive buying
+    #     dominant, price is more likely to keep rising through target)
+    #   Arming BUY + trade OFI < -threshold → refuse (aggressive selling
+    #     dominant, don't catch the tape)
+    # Threshold is on the |ofi| value; both sides use the same magnitude.
+    trade_ofi_gate_enabled: bool = False
+    trade_ofi_window_secs: float = 60.0
+    trade_ofi_threshold: float = 0.65
+
     # Trailing buy — mirror of trailing_stop for the rebuy leg. When True,
     # the sleeve does NOT rest a limit BUY at buy_px. Instead: when mark
     # crosses buy_px downward, it starts tracking the running low; only
@@ -296,6 +310,9 @@ class SleeveConfig:
             correlation_crash_pct=float(d.get("correlation_crash_pct") or 3.0),
             buy_trail_enabled=bool(d.get("buy_trail_enabled") or False),
             buy_trail_distance=float(d.get("buy_trail_distance") or 0.0),
+            trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
+            trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
+            trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),
         )
 
 

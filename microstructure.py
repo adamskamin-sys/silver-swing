@@ -339,6 +339,124 @@ class KylesLambda:
 
 
 # ============================================================================
+# Signal 6: Trade-tape OFI (executed prints, not resting book)
+# ============================================================================
+
+
+class TradeTapeOFI:
+    """Rolling-window signed trade volume from the EXECUTED trade tape.
+
+    Different from OrderBookImbalance (which reads resting L2 depth) — this
+    reads what actually crossed the market. Academic finding (Cont-Kukanov-
+    Stoikov 2014, Cartea-Jaimungal ch.5): trade OFI is a stronger short-term
+    directional predictor than book OBI, because resting orders can be
+    spoofed but executed trades cannot.
+
+    Range: [-1, +1]. Positive = buyer-aggressors dominant, upward pressure.
+    Negative = seller-aggressors dominant.
+    """
+
+    def __init__(self, max_window_secs: float = 300.0):
+        self.max_window_secs = max_window_secs
+        # (ts, signed_size) — positive for buyer-lifted, negative for hit-bid
+        self._samples: deque[tuple[float, float]] = deque()
+
+    def update(self, price: float, size: float, side: Optional[str],
+               ts: Optional[float] = None) -> None:
+        if price <= 0 or size <= 0:
+            return
+        now = ts if ts is not None else time.time()
+        signed = size if (side and side.lower().startswith("b")) else -size
+        self._samples.append((now, signed))
+        cutoff = now - self.max_window_secs
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def ofi(self, window_secs: float) -> Optional[float]:
+        """(buy_vol - sell_vol) / (buy_vol + sell_vol) in the last window."""
+        if not self._samples:
+            return None
+        cutoff = time.time() - window_secs
+        buy_vol = 0.0
+        sell_vol = 0.0
+        for ts, sv in reversed(self._samples):
+            if ts < cutoff:
+                break
+            if sv > 0:
+                buy_vol += sv
+            else:
+                sell_vol += -sv
+        total = buy_vol + sell_vol
+        if total <= 0:
+            return None
+        return (buy_vol - sell_vol) / total
+
+
+# ============================================================================
+# Signal 7: Aggressor-run detector (Livermore tape-reading)
+# ============================================================================
+
+
+class AggressorRunDetector:
+    """Counts consecutive same-side aggressor trades. When the run length
+    hits `threshold`, the tape is one-sided — Livermore's 'read the tape':
+    persistent aggressive buying signals continuation; persistent hitting
+    the bid signals continued weakness.
+
+    Every trade classified 'buy' → run in +direction; 'sell' → -direction.
+    A trade in the opposite direction resets the run.
+
+    on_run_threshold() is invoked once per crossing (edge-triggered), not
+    once per further same-side trade. So we don't spam shadow signals.
+    """
+
+    def __init__(self, threshold: int = 8):
+        self.threshold = int(threshold)
+        self._current_run = 0
+        self._current_side: Optional[str] = None  # 'buy' or 'sell'
+        self._crossed_this_run = False
+        self._last_crossing: Optional[dict] = None
+
+    def update(self, price: float, size: float, side: Optional[str],
+               ts: Optional[float] = None) -> Optional[dict]:
+        """Feed one trade. Returns the crossing record if the run just hit
+        the threshold on this update, else None.
+
+        Crossing record: {ts, side, run_length, price}
+        """
+        if size <= 0 or price <= 0:
+            return None
+        if side is None:
+            return None  # can't classify → skip
+        s = side.lower()
+        s = "buy" if s.startswith("b") else "sell"
+        if s == self._current_side:
+            self._current_run += 1
+        else:
+            self._current_side = s
+            self._current_run = 1
+            self._crossed_this_run = False
+        if self._current_run >= self.threshold and not self._crossed_this_run:
+            self._crossed_this_run = True
+            self._last_crossing = {
+                "ts": ts if ts is not None else time.time(),
+                "side": s,
+                "run_length": self._current_run,
+                "price": float(price),
+            }
+            return dict(self._last_crossing)
+        return None
+
+    def state(self) -> dict:
+        return {
+            "current_run": self._current_run,
+            "current_side": self._current_side,
+            "threshold": self.threshold,
+            "crossed": self._crossed_this_run,
+        }
+
+
+# ============================================================================
 # Aggregator
 # ============================================================================
 
@@ -389,6 +507,21 @@ class MicrostructureFilter:
         )
         self.lambda_max = _envf("SWING_MS_LAMBDA_MAX", 0.001)
 
+        # Trade-tape signals — always ON when the feed subscribes to trades.
+        # These power the trade-OFI gate (per-sleeve opt-in) and the aggressor-
+        # run shadow signal. They're cheap to maintain (small ring buffers)
+        # and having them warm-cached lets the sleeve decide to use them.
+        self.trade_ofi = TradeTapeOFI(
+            max_window_secs=_envf("SWING_MS_TAPE_OFI_MAX_WINDOW", 300.0),
+        )
+        self.aggressor_run = AggressorRunDetector(
+            threshold=_envi("SWING_MS_AGGRESSOR_RUN_THRESHOLD", 8),
+        )
+        # Callback set by main.py to emit shadow signals when a run crosses
+        # the threshold. Signature: (crossing: dict, filter: MicrostructureFilter)
+        # Left None until the tick loop attaches it — safe no-op default.
+        self.on_aggressor_run_crossing = None
+
     # ---- data ingress ---------------------------------------------------
 
     def on_ticker(self, best_bid: float, best_ask: float, price: float) -> None:
@@ -405,6 +538,17 @@ class MicrostructureFilter:
                  ts: Optional[float] = None) -> None:
         self.vpin.update(price, size, side)
         self.kyle.update(price, size, side, ts)
+        # Trade-tape signals are always maintained (no env gate) so that the
+        # per-sleeve trade OFI gate and the aggressor-run shadow harness can
+        # read them regardless of the SWING_MS_* env flags.
+        self.trade_ofi.update(price, size, side, ts)
+        crossing = self.aggressor_run.update(price, size, side, ts)
+        if crossing and callable(self.on_aggressor_run_crossing):
+            try:
+                self.on_aggressor_run_crossing(crossing, self)
+            except Exception:
+                # Never let a shadow-signal callback break the trade path.
+                pass
 
     # ---- decisions ------------------------------------------------------
 
@@ -488,14 +632,26 @@ class MicrostructureFilter:
             out["kyle_lambda"] = self.kyle.value()
             out["lambda_max"] = self.lambda_max
             out["size_scale"] = self.size_scale()
+        # Trade-tape signals are always in the snapshot (not gated by
+        # SWING_MS_*), so the scanner + tape shadow harness can read them
+        # via store.get_snapshot even when the per-arm gates are off.
+        out["trade_ofi_60s"] = self.trade_ofi.ofi(60.0)
+        out["trade_ofi_300s"] = self.trade_ofi.ofi(300.0)
+        out["aggressor_run"] = self.aggressor_run.state()
         return out
 
     def any_enabled(self) -> bool:
+        # Trade-tape signals always want trades subscribed so the OFI gate
+        # and aggressor-run shadow harness stay warm-cached.
         return any((self.enable_spread, self.enable_autocorr, self.enable_obi,
-                    self.enable_vpin, self.enable_lambda))
+                    self.enable_vpin, self.enable_lambda)) or True
 
     def needs_l2(self) -> bool:
         return self.enable_obi
 
     def needs_trades(self) -> bool:
-        return self.enable_vpin or self.enable_lambda
+        # Always True — trade-tape signals (OFI + AggressorRun) are always
+        # maintained so the per-sleeve trade-OFI gate and aggressor-run
+        # shadow harness stay warm-cached, independent of the SWING_MS_*
+        # opt-in env flags.
+        return True
