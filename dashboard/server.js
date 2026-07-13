@@ -197,20 +197,64 @@ export function makeApp({
   });
 
   app.post('/api/stop-loss/toggle', requireAuth, async (req, res) => {
-    const { tenant, disabled, reason } = req.body || {};
+    const { tenant, disabled, reason, recalibrate } = req.body || {};
     if (!tenant) return res.status(400).json({ error: 'tenant required' });
     if (typeof disabled !== 'boolean') return res.status(400).json({ error: 'disabled (boolean) required' });
     try {
       const store = await readStore(storePath);
       store[tenant] = store[tenant] || {};
+
+      // Adam 2026-07-13: turning stop-loss back ON can immediately fire every
+      // sleeve whose stop_loss_px is now ABOVE current mark (a stop set at
+      // attach-time no longer reflects reality after mark drifted below it).
+      // Client passes recalibrate=true to recalculate any such stops to a safe
+      // level (1% below current mark) BEFORE flipping the switch back on.
+      // Sleeves whose stops are already below mark are untouched.
+      const recalibrations = [];
+      if (!disabled && recalibrate) {
+        const tenantBlock = store[tenant] || {};
+        const portfolioSnap = tenantBlock['__portfolio__']?.config || {};
+        const marksByProduct = {};
+        for (const d of (portfolioSnap.derivatives || [])) {
+          if (d?.product_id && Number(d.mark) > 0) marksByProduct[d.product_id] = Number(d.mark);
+        }
+        for (const symbol of Object.keys(tenantBlock)) {
+          if (symbol.startsWith('__')) continue;
+          const block = tenantBlock[symbol];
+          if (!block?.config?.sleeves) continue;
+          const snapMark = Number(block.snapshot?.last_mark) || 0;
+          const mark = marksByProduct[symbol] || snapMark;
+          if (mark <= 0) continue;
+          const sleeveStates = block.state?.sleeves || {};
+          for (const sleeve of block.config.sleeves) {
+            if (!sleeve.stop_loss_enabled) continue;
+            const ss = sleeveStates[sleeve.id] || {};
+            if (String(ss.state) !== 'ARMED_SELL') continue;
+            const currentStop = Number(sleeve.stop_loss_px) || 0;
+            if (currentStop <= 0) continue;
+            if (currentStop < mark) continue;   // already safe
+            const safeStop = Math.round(mark * 0.99 * 100000) / 100000;
+            recalibrations.push({
+              symbol, sleeve_id: sleeve.id, sleeve_name: sleeve.name,
+              old_stop: currentStop, new_stop: safeStop, mark,
+            });
+            sleeve.stop_loss_px = safeStop;
+            // Reset ratchet HWM so it starts tracking from the new safe stop,
+            // not from the pre-recalibration high water.
+            if (sleeveStates[sleeve.id]) sleeveStates[sleeve.id].stop_loss_hwm = null;
+          }
+        }
+      }
+
       store[tenant]['__stop_loss_disabled__'] = store[tenant]['__stop_loss_disabled__'] || {};
       store[tenant]['__stop_loss_disabled__'].config = {
         disabled: disabled,
         reason: disabled ? (reason || 'toggled from dashboard') : null,
         ts: Date.now() / 1000,
+        recalibrated: recalibrations.length > 0 ? recalibrations : undefined,
       };
       await writeStoreAtomic(storePath, store);
-      res.json({ ok: true, disabled: disabled });
+      res.json({ ok: true, disabled: disabled, recalibrations });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }

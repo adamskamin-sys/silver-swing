@@ -171,18 +171,39 @@ async function toggleStopLoss() {
   if (!tenant) return alert('No live tenant found — refresh and try again.');
   const currentlyDisabled = stopLossToggleBtn.dataset.currentlyDisabled === '1';
   const nextDisabled = !currentlyDisabled;
+  let recalibrate = false;
   if (nextDisabled) {
     if (!confirm('Turn STOP-LOSS OFF for all live sleeves?\n\nBot will ignore every stop-loss trigger until you flip this back ON.')) return;
+  } else {
+    // Turning stop-loss ON — offer to recalibrate any stop that's now above
+    // current mark (would fire immediately if left as-is). Adam 2026-07-13:
+    // this is exactly the trap that made him turn stops off in the first
+    // place — mark drifted below the static stop-loss level.
+    recalibrate = confirm(
+      'Turn STOP-LOSS ON for all live sleeves?\n\n' +
+      'RECOMMENDED: recalibrate any stop that\'s currently ABOVE mark to a safe level (1% below mark) BEFORE re-enabling.\n\n' +
+      '  OK = recalibrate first, then enable (safe)\n' +
+      '  Cancel this dialog to abort\n\n' +
+      'Any stops already below mark are untouched.'
+    );
+    if (!recalibrate) return;
   }
   try {
     const res = await fetchJson('/api/stop-loss/toggle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tenant, disabled: nextDisabled, reason: nextDisabled ? 'dashboard toggle (pre-market whiplash guard)' : undefined }),
+      body: JSON.stringify({ tenant, disabled: nextDisabled, recalibrate,
+        reason: nextDisabled ? 'dashboard toggle (pre-market whiplash guard)' : undefined }),
     });
     if (res._unauthorized || !res.ok) {
       alert('Toggle failed: ' + (res.error || 'unknown error'));
       return;
+    }
+    if (res.recalibrations && res.recalibrations.length) {
+      const lines = res.recalibrations.map(r =>
+        `  ${r.symbol} ${r.sleeve_name || r.sleeve_id}: stop ${r.old_stop} → ${r.new_stop} (mark ${r.mark})`
+      );
+      alert(`Recalibrated ${res.recalibrations.length} stop(s) before enabling:\n\n${lines.join('\n')}`);
     }
     // Optimistic UI — next poll will confirm from currentStore.
     stopLossToggleBtn.dataset.currentlyDisabled = nextDisabled ? '1' : '0';
@@ -5407,7 +5428,14 @@ function openScannerDetail(row) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
             }
           }
-          const entryPx = Number(s.entry_mark) || 0;
+          // ENTRY should show the SAME basis UNREALIZED is calculated from —
+          // otherwise the row doesn't add up. If cycles>0 and own_avg_entry
+          // exists (sleeve has actually bought), that's the true cost basis.
+          // Fall back to entry_mark (attach-time mark) for fresh sleeves.
+          // Adam 2026-07-13: ZEC showed ENTRY=$519.80, UNREALIZED=-$2.70,
+          // math didn't work because UNREALIZED used own_avg ($514.25) but
+          // ENTRY displayed the attach-time mark.
+          const entryPx = Number(ss.own_avg_entry) || Number(s.entry_mark) || 0;
           const posAvgPx = Number(row._live_avg) || 0;
           // Effective stop-loss: base is stop_loss_px, but if the ratchet is
           // enabled AND armed (hwm exists), the floor lifts to hwm − distance.
@@ -5683,7 +5711,7 @@ function refreshScannerDetailLive() {
           unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
         }
       }
-      const entryPx = Number(s.entry_mark) || 0;
+      const entryPx = Number(ss.own_avg_entry) || Number(s.entry_mark) || 0;
       const posAvgPx = Number(avg) || 0;
       // Stop-loss cell — mirrors the initial-render logic so column stays
       // consistent across ticks. Without this the price-tick rebuild produced
