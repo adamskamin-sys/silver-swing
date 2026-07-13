@@ -70,9 +70,26 @@ class ScannerWorker:
             forced = self._gather_forced()
             trigger = "user request" if requested else "auto interval"
             _log(f"running one scan ({trigger}, force_include={sorted(forced)})")
+            # Build spec fallbacks from stored config so the scanner can
+            # salvage force_include products whose Coinbase raw response is
+            # missing contract_size / tick_size (nano futures often are).
+            spec_fallbacks = {}
+            try:
+                for t in self.store.list_tenants():
+                    for sym in self.store.list_symbols(t):
+                        if sym.startswith("__") or sym in spec_fallbacks:
+                            continue
+                        c = self.store.get_config(t, sym) or {}
+                        spec_fallbacks[sym] = {
+                            "tick_size": c.get("tick_size"),
+                            "contract_size": c.get("contract_size"),
+                        }
+            except Exception as e:
+                _log(f"spec_fallbacks gather failed: {type(e).__name__}: {e}")
             ranking = fetch_and_rank(
                 self._coinbase_client, top_n=10,
                 force_include=list(forced),
+                spec_fallbacks=spec_fallbacks,
             )
             write_ranking_to_redis(self.redis_url, ranking, generated_at=now)
             self.last_scanner = now

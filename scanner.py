@@ -287,6 +287,7 @@ def fetch_and_rank(
     swing_granularity: str = "FIFTEEN_MINUTE",
     default_target_net_per_contract: float = 10.0,
     force_include: list[str] | None = None,
+    spec_fallbacks: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Fetch all CFM futures from Coinbase, score each on both amplitude
     (24h range %) AND swing frequency (roundtrips per lookback window at a
@@ -352,6 +353,15 @@ def fetch_and_rank(
                 details = raw.get("future_product_details") or {}
                 tick = _f(raw.get("price_increment"))
                 csize = _f(details.get("contract_size"))
+                # Store fallback: if Coinbase's raw response is missing spec
+                # fields for this product (nano futures often lack contract
+                # info until the product is more actively traded), pull from
+                # the previously-refreshed store config. Better than dropping.
+                fb = (spec_fallbacks or {}).get(pid) or {}
+                if not tick:
+                    tick = _f(fb.get("tick_size")) or 0.0
+                if not csize:
+                    csize = _f(fb.get("contract_size")) or 0.0
                 salvage_high = None
                 salvage_low = None
                 try:
