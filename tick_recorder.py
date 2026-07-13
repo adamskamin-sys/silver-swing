@@ -30,10 +30,55 @@ from typing import Optional
 
 
 def enabled() -> bool:
-    """Check the env gate. Cheap enough to call per tick — os.getenv reads
-    from the process's env dict, no syscall."""
+    """Check the env gate. Default is ENABLED unless explicitly opted out
+    with SWING_TICK_RECORDING=0. Adam's ask: 'turn them all on by default'.
+    Rationale: tick recording is the foundation for future backtest replay
+    + ML training. Starting collection now — even if we don't consume it
+    for weeks — is strictly better than starting later. Disk cost is
+    bounded by automatic pruning (see prune_old_ticks).
+    """
     v = os.getenv("SWING_TICK_RECORDING", "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    if v in ("0", "false", "no", "off"):
+        return False
+    # Anything else (including unset "") = enabled.
+    return True
+
+
+def prune_old_ticks(base_dir: str = "data/ticks", keep_days: int = 7) -> int:
+    """Delete tick directories older than keep_days. Called periodically
+    from live_runner. Returns number of directories removed. Safe to call
+    concurrently — best-effort deletion, errors ignored per-file.
+
+    keep_days=7 keeps the last week for immediate backtest replay while
+    capping total disk at roughly `symbols × 10MB × 7 = ~1GB` at our scale.
+    Longer retention → configure a persistent Render disk + set
+    SWING_TICK_KEEP_DAYS to the desired retention.
+    """
+    from datetime import datetime, timedelta, timezone
+    p = Path(base_dir)
+    if not p.exists():
+        return 0
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=keep_days)).date()
+    removed = 0
+    for entry in p.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            entry_date = datetime.strptime(entry.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue  # non-date dir, leave alone
+        if entry_date < cutoff_date:
+            try:
+                for f in entry.iterdir():
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+                entry.rmdir()
+                removed += 1
+            except Exception:
+                pass
+    return removed
 
 
 class TickRecorder:

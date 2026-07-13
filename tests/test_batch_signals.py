@@ -148,24 +148,14 @@ def test_crossex_gate_permissive_when_ref_missing(monkeypatch):
 # tick_recorder
 # =============================================================================
 
-def test_tick_recorder_no_op_when_env_off(monkeypatch, tmp_path):
+def test_tick_recorder_writes_by_default(monkeypatch, tmp_path):
+    """Default-on (Adam's ask). Env unset → enabled → writes."""
     from tick_recorder import TickRecorder
     monkeypatch.delenv("SWING_TICK_RECORDING", raising=False)
     r = TickRecorder("TEST", base_dir=str(tmp_path))
     r.on_ticker(100.0, 100.1, 100.05)
     r.on_trade(100.0, 1.0, "buy")
-    # No files should be created — recorder is disabled
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_tick_recorder_writes_when_env_on(monkeypatch, tmp_path):
-    from tick_recorder import TickRecorder
-    monkeypatch.setenv("SWING_TICK_RECORDING", "1")
-    r = TickRecorder("TEST", base_dir=str(tmp_path))
-    r.on_ticker(100.0, 100.1, 100.05)
-    r.on_trade(100.0, 1.0, "buy")
     r.close()
-    # A file should have been created under a date dir
     date_dirs = list(tmp_path.iterdir())
     assert len(date_dirs) == 1
     files = list(date_dirs[0].iterdir())
@@ -173,6 +163,34 @@ def test_tick_recorder_writes_when_env_on(monkeypatch, tmp_path):
     content = files[0].read_text()
     assert '"kind":"ticker"' in content
     assert '"kind":"trade"' in content
+
+
+def test_tick_recorder_disabled_by_explicit_opt_out(monkeypatch, tmp_path):
+    """Explicit SWING_TICK_RECORDING=0 disables recording."""
+    from tick_recorder import TickRecorder
+    monkeypatch.setenv("SWING_TICK_RECORDING", "0")
+    r = TickRecorder("TEST", base_dir=str(tmp_path))
+    r.on_ticker(100.0, 100.1, 100.05)
+    r.on_trade(100.0, 1.0, "buy")
+    # No files created — explicitly disabled
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_tick_recorder_prune_removes_old_directories(monkeypatch, tmp_path):
+    """prune_old_ticks() drops directories older than keep_days."""
+    from tick_recorder import prune_old_ticks
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    # Create dirs: one 10 days old, one 3 days old, one today.
+    for age in (10, 3, 0):
+        d = (now - timedelta(days=age)).strftime("%Y-%m-%d")
+        dir_ = tmp_path / d
+        dir_.mkdir()
+        (dir_ / "TEST.jsonl").write_text('{"kind":"ticker"}\n')
+    removed = prune_old_ticks(base_dir=str(tmp_path), keep_days=7)
+    assert removed == 1  # only the 10-day-old dir
+    remaining = sorted(d.name for d in tmp_path.iterdir())
+    assert len(remaining) == 2  # 3-day-old + today
 
 
 # =============================================================================

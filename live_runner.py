@@ -55,6 +55,12 @@ SPEC_REFRESH_SECS = float(os.getenv("SWING_SPEC_REFRESH_SECS", "21600.0"))
 # Twitter shadow scanner poll interval. 5 min balances freshness against
 # Nitter instance rate limits and RSS parse cost. Env override for tests.
 TWITTER_POLL_SECS = float(os.getenv("SWING_TWITTER_POLL_SECS", "300.0"))
+# Tick recorder pruning cadence + retention. Runs once per hour on the
+# main loop. keep_days=7 caps total disk at roughly ~1GB across ~15
+# symbols — bump SWING_TICK_KEEP_DAYS if a Render persistent disk is
+# configured and you want longer retention for training data.
+TICK_PRUNE_INTERVAL_SECS = float(os.getenv("SWING_TICK_PRUNE_INTERVAL_SECS", "3600.0"))
+TICK_KEEP_DAYS = int(os.getenv("SWING_TICK_KEEP_DAYS", "7"))
 
 
 def _log(msg: str) -> None:
@@ -290,6 +296,9 @@ def run() -> int:
     # Offset the first twitter poll by 60s so bot startup isn't dominated by
     # a slow RSS fetch across ~15 handles.
     last_twitter_poll = time.time() - TWITTER_POLL_SECS + 60.0
+    # Offset tick pruning by 15 min from startup so it doesn't compete with
+    # the first snapshot / scanner run.
+    last_tick_prune = time.time() - TICK_PRUNE_INTERVAL_SECS + 900.0
 
     # Scanner tick shared with paper mode — keeps Edit Strategy tiles fresh
     # even when bot-paper isn't running (Adam retired it). Reuses the same
@@ -391,6 +400,18 @@ def run() -> int:
                         _log(f"twitter_scanner: {telem}")
                 except Exception as e:
                     _log(f"twitter_scanner tick failed: {type(e).__name__}: {e}")
+            # Tick-recorder pruning: drop tick directories older than
+            # TICK_KEEP_DAYS. Bounded disk consumption on Render's
+            # ephemeral (or persistent) volume.
+            if now - last_tick_prune >= TICK_PRUNE_INTERVAL_SECS:
+                last_tick_prune = now
+                try:
+                    from tick_recorder import prune_old_ticks
+                    n = prune_old_ticks(keep_days=TICK_KEEP_DAYS)
+                    if n:
+                        _log(f"tick_recorder pruned {n} old day-directories")
+                except Exception as e:
+                    _log(f"tick prune failed: {type(e).__name__}: {e}")
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()
