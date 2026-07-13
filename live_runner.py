@@ -80,6 +80,7 @@ PORTFOLIO_REFRESH_SECS = float(os.getenv("SWING_PORTFOLIO_REFRESH_SECS", "30.0")
 # (expert_params × Layer-2 tuned multipliers). Alerts if silver's actual
 # trail/stop/reanchor levels have drifted off the expert data. Read-only. 5 min.
 EXPERT_GUARD_INTERVAL_SECS = float(os.getenv("SWING_EXPERT_GUARD_SECS", "300.0"))
+SENTINEL_INTERVAL_SECS = float(os.getenv("SWING_SENTINEL_SECS", "300.0"))
 
 
 def _log(msg: str) -> None:
@@ -352,6 +353,7 @@ def run() -> int:
         last_snapshot = 0.0
         last_reconcile = time.time()  # [crew:#4] startup reconcile just ran
         last_expert_guard = time.time()  # [crew] expert-params drift guard
+        last_sentinel = time.time()  # [crew] risk_sentinel periodic scan
         last_family_check = time.time()  # already resolved on startup
         while not stopping:
             t = feed.latest_ticker()
@@ -410,6 +412,13 @@ def run() -> int:
                         _log(f"expert_guard: DRIFT on {drifted} — alerted")
                 except Exception as e:
                     _log(f"expert_guard failed: {type(e).__name__}: {e}")
+            if now - last_sentinel >= SENTINEL_INTERVAL_SECS:
+                last_sentinel = now
+                try:
+                    import risk_sentinel
+                    risk_sentinel.run_sentinel(store, TENANT, log, now, notifier=notifier)
+                except Exception as e:
+                    _log(f"risk_sentinel failed: {type(e).__name__}: {e}")
             # Periodic sweep so no product's contract_size/fees can silently
             # drift for more than SPEC_REFRESH_SECS (6h default).
             if now - last_spec_refresh >= SPEC_REFRESH_SECS:
