@@ -11,7 +11,7 @@
  *   → backtest button opens window/mode picker → POST /api/backtest → leaderboard
  */
 
-const POLL_MS = 5000;
+const POLL_MS = 2000;
 
 // ---- DOM refs ------------------------------------------------------------
 
@@ -963,7 +963,22 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           const cs = Number(currentStore[liveTenant]?.[r.product]?.config?.contract_size) || 0;
           return cs > 0 ? cs.toLocaleString('en-US') : '<span class="dim">—</span>';
         })()}</td>
-        <td class="mono dim">${escapeHtml(r.side || '')}</td>
+        <td class="mono">${(() => {
+          const side = String(r.side || '').toUpperCase();
+          let cls = 'dim';
+          if (side === 'LONG') cls = 'pos';
+          else if (side === 'SHORT') cls = 'neg';
+          else if (side === 'WAITING') cls = 'warn';
+          const sideText = `<span class="${cls}">${escapeHtml(r.side || '—')}</span>`;
+          // Reversal-armed indicator — only for futures rows with any sleeve
+          // that has reversal_enabled=true. Shadow-only; the cockpit tile shows
+          // recent shadow fires, this shows "this row is watching."
+          const revArmed = r.kind === 'futures' && productHasReversalArmed(liveTenant, r.product);
+          const revBadge = revArmed
+            ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="Reversal watch armed — a crash flatten would log a shadow short signal (paper-only, no live order)">↺</span>`
+            : '';
+          return sideText + revBadge;
+        })()}</td>
         <td class="mono">${qtyText}</td>
         <td class="mono">${avgText}</td>
         <td class="mono">${markText}</td>
@@ -1046,7 +1061,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
       <tbody>${rowsHtml}</tbody>
       ${footHtml}
     </table>
-    <div class="pf-hint dim">Click a row to attach Model B/C/D/E · auto-refreshes every 2 min</div>
+    <div class="pf-hint dim">Click a row to attach Model B/C/D/E · auto-refreshes every 2s</div>
     ${renderOpenOrders(liveTenant)}
     ${isLive ? `
     <div id="live-tradeable" class="live-tradeable">
@@ -1326,6 +1341,19 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
 // strategy on it — primary state.realized_pnl + every sleeve's realized_pnl.
 // Used by the Live/Paper positions table so the user can see "this product
 // has banked $X so far" without opening the drill-down.
+// True if ANY sleeve on this product has reversal_enabled=true. Adam 2026-07-13
+// asked for a dashboard notation when reversal is "armed." Reversal is currently
+// SHADOW-only (sleeves.py:384-390 comment) — a crash logs a `reversal_signal`
+// event but places no live short. "Armed" here therefore means "configured to
+// detect and shadow-log a reversal." Recent shadow fires are shown in the
+// cockpit's reversals tile (👻N).
+function productHasReversalArmed(tenant, productId) {
+  const block = currentStore?.[tenant]?.[productId];
+  if (!block) return false;
+  const sleeves = block.config?.sleeves || [];
+  return sleeves.some(s => s && s.reversal_enabled === true);
+}
+
 // Next price that would fire a sleeve action on this product — the closest
 // trigger across all active sleeves, so the row shows "what has to happen for
 // something to change." ARMED_SELL → the sell price (trail floor if armed,
@@ -2287,7 +2315,7 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     return `
       <tr class="sleeve-row ${sleeveHalted ? 'halted' : ''}" data-sleeve-id="${escapeHtml(s.id)}">
         <td class="sleeve-name" data-label="Strategy">
-          <b>${escapeHtml(s.name || s.id)}</b>
+          <b>${escapeHtml(s.name || s.id)}</b>${s.reversal_enabled ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="Reversal watch armed — a crash flatten on this sleeve will log a shadow short signal (paper-only, no live order)">↺</span>` : ''}
           ${sleeveHalted && ss.halt_reason ? `<div class="sleeve-hint"><span class="halt-why">${escapeHtml(ss.halt_reason)}</span></div>` : ''}
         </td>
         <td class="sleeve-qty" data-label="Contracts">${sleeveQty}</td>
