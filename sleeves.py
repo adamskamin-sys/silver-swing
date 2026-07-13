@@ -389,6 +389,13 @@ class SleeveConfig:
     # engine must be built + paper-validated before any real order. OFF by
     # default.
     reversal_enabled: bool = False
+    # [crew] Channel re-anchor. When on, after a confirmed + settled drop
+    # (channel_finder: structural break + volatility contracted) the sleeve
+    # walks its whole channel — buy/sell/trail AND the stop reference — down to
+    # the new level, so nothing strands above the market. Cannot fire mid-crash
+    # (needs vol to have settled first; the crash guard handles the during-crash
+    # exit). OFF by default.
+    channel_reanchor_enabled: bool = False
 
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
@@ -458,6 +465,7 @@ class SleeveConfig:
             buy_trail_distance=float(d.get("buy_trail_distance") or 0.0),
             crash_guard_enabled=bool(d.get("crash_guard_enabled") or False),
             reversal_enabled=bool(d.get("reversal_enabled") or False),
+            channel_reanchor_enabled=bool(d.get("channel_reanchor_enabled") or False),
             trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
             trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
             trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),

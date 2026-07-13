@@ -1397,6 +1397,70 @@ class SwingTrader:
         except Exception as e:
             return False, f"reversal safety check failed: {e}"
 
+    def _maybe_reanchor_new_channel(self, sc, ss, last_price: float) -> None:
+        """[crew] After a confirmed + settled structural drop, walk the sleeve's
+        whole channel (buy/sell/trail + stop reference) DOWN to the new channel
+        so targets and the stop track reality instead of stranding above price.
+
+        Uses channel_finder (break-detect + vol-stabilization + adaptive center
+        + Donchian floor / Keltner width). It CANNOT fire mid-crash: find_channel
+        only reports `stabilized` once volatility has contracted, so the crash
+        guard owns the during-crash exit and this only re-establishes the range
+        AFTER the drop settles. Re-basing a monotonic-up stop is legitimate here
+        precisely because a settled break is a regime change — the old stop
+        belonged to a dead channel (Kaminski-Lo: stops are regime-dependent).
+        Opt-in (channel_reanchor_enabled); OFF by default; fail-safe on error."""
+        if not getattr(sc, "channel_reanchor_enabled", False):
+            return
+        # Adam's rule: hunt for a new channel ONLY while FLAT and waiting to buy
+        # (ARMED_BUY). Never re-anchor a HELD position — don't drag the sell
+        # target or stop down to "find a channel" and lock a loss; hold and exit
+        # positive. Finding the new channel is a decision for the NEXT entry.
+        if ss.state != SleeveStateEnum.ARMED_BUY:
+            return
+        try:
+            import channel_finder
+            prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(prices) < 24:
+                return
+            ch = channel_finder.find_channel(prices, atr=None)
+            if not (ch.get("broke") and ch.get("stabilized")):
+                return
+            new_buy, new_sell, lower = ch.get("buy_px"), ch.get("sell_px"), ch.get("lower")
+            if new_buy is None or new_sell is None or new_sell <= new_buy:
+                return
+            # act only on a MATERIAL downward move so we don't churn on noise
+            if float(new_buy) >= float(sc.buy_px):
+                return
+            dropped = float(sc.buy_px) - float(new_buy)
+            old_stop = float(sc.stop_loss_px or 0.0)
+            # 1) walk buy/sell/trail down to the new channel (tested primitive)
+            self._reanchor_sleeve(sc, ss, float(new_buy), float(new_sell), last_price)
+            # 2) re-base the stop to the new regime: reset the ratchet HWM to
+            #    current, and lower a stranded fixed stop to the new lower band.
+            ss.stop_loss_hwm = float(last_price)
+            new_stop = old_stop
+            if old_stop > 0 and lower is not None and old_stop > float(lower):
+                new_stop = round(float(lower), 6)
+                sc.stop_loss_px = new_stop
+                try:
+                    cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+                    sleeves = list(cfg.get("sleeves") or [])
+                    for s in sleeves:
+                        if s.get("id") == sc.id:
+                            s["stop_loss_px"] = new_stop
+                            break
+                    cfg["sleeves"] = sleeves
+                    self.store.put_config(self.tenant_id, self.symbol, cfg)
+                except Exception:
+                    pass
+            self._record("sleeve_channel_reanchored", sleeve_id=sc.id, sleeve_name=sc.name,
+                         new_buy=round(float(new_buy), 6), new_sell=round(float(new_sell), 6),
+                         new_center=ch.get("center"), new_stop=new_stop, old_stop=old_stop,
+                         dropped=round(dropped, 6), reason=ch.get("reason"))
+        except Exception as e:
+            self._record("channel_reanchor_error", sleeve_id=sc.id, error=str(e))
+
     def _sleeve_track_price(self, sc, last_price: float) -> None:
         """Append last_price to the sleeve's rolling window. Kept short so
         memory is bounded — window * 4 keeps enough history for pre-stop
@@ -1758,6 +1822,11 @@ class SwingTrader:
 
         # Track price for volatility signal & update HWM for ratcheting stop.
         self._sleeve_track_price(sc, last_price)
+
+        # [crew] Channel re-anchor: after a confirmed + settled drop, walk the
+        # whole channel (buy/sell/trail + stop) down to the new level so nothing
+        # strands above price. Opt-in; cannot fire mid-crash. Off by default.
+        self._maybe_reanchor_new_channel(sc, ss, last_price)
 
         # [crew] DEFENSIVE crash guard. OFF by default (crash_guard_enabled).
         # When on AND holding (ARMED_SELL), if a toxic liquidation cascade is
