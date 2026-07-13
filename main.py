@@ -258,6 +258,33 @@ def _default_live_holding_config(product_id: str, kind: str) -> dict:
     }
 
 
+def refresh_portfolio_snapshot(store, live_tenant: str) -> int:
+    """Adam durable rule (2026-07-13): refresh marks for ALL tracked
+    products, not just the primary. Pulls a fresh portfolio snapshot
+    from Coinbase (all futures positions with CURRENT marks + all spot
+    balances) and overwrites the stored __portfolio__ config.
+
+    Meant to be called every PORTFOLIO_REFRESH_SECS from live_runner.
+    Every row in the portfolio table reads its mark from this snapshot,
+    so a fresh call = every mark is current. Also fixes the downstream
+    stale-mark issues (sleeve unrealized, portfolio circuit breaker,
+    Carver risk contribution) that all read from the same source.
+
+    Returns the number of derivative positions refreshed, or 0 on error.
+    """
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        seed = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
+        broker = CoinbaseBroker(BrokerConfig(product_id=seed))
+        snap = broker.portfolio_snapshot()
+        _attach_expert_params(broker, snap)
+        store.put_config(live_tenant, "__portfolio__", snap)
+        return len(snap.get("derivatives") or [])
+    except Exception as e:
+        _log(f"[{live_tenant}] portfolio refresh failed: {type(e).__name__}: {e}")
+        return 0
+
+
 def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
     """Pull the user's real Coinbase portfolio (all futures positions + all
     non-zero spot balances) and upsert each holding as a tracked symbol on the

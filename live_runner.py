@@ -68,6 +68,14 @@ TICK_KEEP_DAYS = int(os.getenv("SWING_TICK_KEEP_DAYS", "7"))
 # whole uptime — potentially days on Render. Re-running it periodically credits
 # missed fills and halts on a core breach while the session is live. 60s default.
 RECONCILE_INTERVAL_SECS = float(os.getenv("SWING_RECONCILE_INTERVAL_SECS", "60.0"))
+# Adam durable rule (2026-07-13): refresh marks for ALL tracked products,
+# not just the primary. Prior behavior called broker.portfolio_snapshot()
+# only at startup — every non-primary product's mark stayed frozen for the
+# rest of the session, corrupting unrealized display, portfolio circuit
+# breaker aggregate math, and Carver risk-contribution reads. 30s is a
+# safe cadence: negligible Coinbase API cost, aggressive enough that stale
+# marks never lag by more than ~30s. Env override for tuning.
+PORTFOLIO_REFRESH_SECS = float(os.getenv("SWING_PORTFOLIO_REFRESH_SECS", "30.0"))
 # [crew] How often to verify the live config is still tracking the EXPERT params
 # (expert_params × Layer-2 tuned multipliers). Alerts if silver's actual
 # trail/stop/reanchor levels have drifted off the expert data. Read-only. 5 min.
@@ -307,6 +315,9 @@ def run() -> int:
     # Offset the first twitter poll by 60s so bot startup isn't dominated by
     # a slow RSS fetch across ~15 handles.
     last_twitter_poll = time.time() - TWITTER_POLL_SECS + 60.0
+    # Set to now so the FIRST refresh fires PORTFOLIO_REFRESH_SECS after
+    # startup (the initial refresh already happened in _sync_live_portfolio).
+    last_portfolio_refresh = time.time()
     # Offset tick pruning by 15 min from startup so it doesn't compete with
     # the first snapshot / scanner run.
     last_tick_prune = time.time() - TICK_PRUNE_INTERVAL_SECS + 900.0
@@ -429,6 +440,22 @@ def run() -> int:
             # loop passes a Twitter signal to any order path. Adam's ask:
             # "give it a try but don't execute any trades with it. I want
             # to see if it works first."
+            # Portfolio refresh: Adam durable rule 2026-07-13. Refresh marks
+            # for ALL tracked products every PORTFOLIO_REFRESH_SECS. Prior
+            # behavior called broker.portfolio_snapshot() only at startup;
+            # PT and every other non-primary product's mark stayed frozen,
+            # corrupting the dashboard's unrealized display, the aggregate
+            # circuit-breaker math, and Carver risk-contribution reads.
+            if now - last_portfolio_refresh >= PORTFOLIO_REFRESH_SECS:
+                last_portfolio_refresh = now
+                try:
+                    from main import refresh_portfolio_snapshot
+                    live_tenant = f"{TENANT}-live"
+                    n_refreshed = refresh_portfolio_snapshot(store, live_tenant)
+                    if n_refreshed > 0:
+                        pass  # silent success — logging every 30s is noisy
+                except Exception as e:
+                    _log(f"portfolio refresh failed: {type(e).__name__}: {e}")
             if now - last_twitter_poll >= TWITTER_POLL_SECS:
                 last_twitter_poll = now
                 try:
