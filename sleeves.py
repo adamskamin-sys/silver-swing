@@ -407,6 +407,12 @@ class SleeveConfig:
     # clean trend or calm swing near support, red = chop / toxic flow / crash.
     # Notification only, never an order. OFF by default.
     entry_quality_alert_enabled: bool = False
+    # [crew] Velocity guard on entries (knife_gate). When on, the buy fills at
+    # the target normally but is HELD while price is dropping too fast for this
+    # instrument's own volatility (Lee-Mykland jump) or into toxic/one-sided flow
+    # (VPIN/OFI/Kyle/OBI) — then released. Self-scaling per instrument; replaces
+    # the blanket bounce-wait (buy_trail). OFF by default.
+    velocity_gate_enabled: bool = False
 
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
@@ -479,6 +485,7 @@ class SleeveConfig:
             channel_reanchor_enabled=bool(d.get("channel_reanchor_enabled") or False),
             avg_down_alert_enabled=bool(d.get("avg_down_alert_enabled") or False),
             entry_quality_alert_enabled=bool(d.get("entry_quality_alert_enabled") or False),
+            velocity_gate_enabled=bool(d.get("velocity_gate_enabled") or False),
             trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
             trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
             trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),

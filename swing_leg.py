@@ -1431,6 +1431,7 @@ class SwingTrader:
             if light != self._entry_light.get(sc.id):   # edge-triggered
                 self._entry_light[sc.id] = light
                 self._record("entry_quality_light", sleeve_id=sc.id, sleeve_name=sc.name,
+                             symbol=self.symbol,
                              light=light, recommendation=rec,
                              entry_quality=a.get("entry_quality"), regime=a.get("regime"),
                              reason=a.get("reason"))
@@ -1492,6 +1493,7 @@ class SwingTrader:
             if light != self._avg_down_light.get(sc.id):   # edge-triggered
                 self._avg_down_light[sc.id] = light
                 self._record("avg_down_light", sleeve_id=sc.id, sleeve_name=sc.name,
+                             symbol=self.symbol,
                              light=light, reason=(sig.get("reasons") or [""])[0],
                              checks=sig.get("checks"))
                 if light == "green":
@@ -2201,6 +2203,26 @@ class SwingTrader:
                             return
                     except Exception as e:
                         self._record("cascade_reentry_error", sleeve_id=sc.id, error=str(e))
+                # [crew] Velocity guard — don't buy into a fast/forced drop.
+                # Self-scaling (Lee-Mykland jump vs this instrument's own vol) +
+                # flow-continuation (VPIN/OFI/Kyle/OBI). Holds the buy only while
+                # the drop is dangerous, then releases so it fills at target.
+                # Opt-in; the smarter replacement for the blanket bounce-wait.
+                # Fail-safe: no data -> doesn't block.
+                if getattr(sc, "velocity_gate_enabled", False):
+                    try:
+                        import knife_gate
+                        _kh = list(self._sleeve_price_history.get(sc.id, []) or [])
+                        _kr = [(_kh[i] - _kh[i - 1]) / _kh[i - 1]
+                               for i in range(1, len(_kh)) if _kh[i - 1]]
+                        _kms = self.ms.snapshot() if self.ms else {}
+                        _kg = knife_gate.knife_gate(_kr, ms=_kms)
+                        if _kg.get("block"):
+                            self._record("entry_velocity_hold", sleeve_id=sc.id, sleeve_name=sc.name,
+                                         velocity=_kg.get("velocity"), reason=_kg.get("reason"))
+                            return
+                    except Exception as e:
+                        self._record("velocity_gate_error", sleeve_id=sc.id, error=str(e))
                 # Trailing-buy (Livermore / Turtle / Le Beau). When enabled,
                 # returns None until mark bounces buy_trail_distance above the
                 # local low — otherwise returns sc.buy_px (identical to legacy
