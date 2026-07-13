@@ -265,21 +265,50 @@ class SwingTrader:
             return self._halt(
                 f"position {pos} already below core {self.cfg.core_qty}"
             )
+        # Primary swing: if the last known order filled while the bot was down,
+        # credit the fill through the normal on_fill path (cycles++, realized,
+        # state advance). Otherwise the sleeve stays stuck in the pre-fill
+        # state forever — this is the exact bug that ate ZEC's 2026-07-12 cycle.
+        credited_primary = None
         if self.s.live_order_id:
             st = self.b.order_status(self.s.live_order_id)
-            if st["status"] in ("FILLED", "CANCELLED", "EXPIRED", "UNKNOWN"):
+            status = st.get("status")
+            if status == "FILLED":
+                credited_primary = {"order_id": self.s.live_order_id,
+                                    "avg_price": st.get("average_filled_price"),
+                                    "filled_qty": st.get("filled_qty", 0)}
+                self.s.filled_qty = st.get("filled_qty", 0) or self.s.swing_qty
+                self._on_fill(st.get("average_filled_price"))
+            elif status in ("CANCELLED", "EXPIRED", "UNKNOWN"):
                 self.s.live_order_id = None
                 self.s.filled_qty = st.get("filled_qty", 0)
         # Same sweep for sleeves — a live_order_id that persisted across a bot
         # restart (or a live-exchange cancel) points at nothing on the fresh
-        # broker. Clear it here so the sleeve state machine can re-arm on the
-        # first tick instead of polling a dead id every cycle.
+        # broker. FILLED → credit via _sleeve_on_fill (cycles++, realized,
+        # state advance). CANCELLED/EXPIRED/UNKNOWN → clear only.
+        sleeves_cfg_by_id = {c.id: c for c in self._load_sleeves_cfg()}
         cleared_sleeves = []
+        credited_sleeves = []
         for sid, ss in self.s.sleeves.items():
             if not ss.live_order_id: continue
             st = self.b.order_status(ss.live_order_id)
-            if st.get("status") in ("FILLED", "CANCELLED", "EXPIRED", "UNKNOWN"):
-                cleared_sleeves.append((sid, ss.live_order_id, st.get("status")))
+            status = st.get("status")
+            if status == "FILLED":
+                sc = sleeves_cfg_by_id.get(sid)
+                if sc is None:
+                    # Config gone (sleeve removed while order was live). Best we
+                    # can do is clear the id — the fill happened but there's no
+                    # sleeve to credit it to.
+                    cleared_sleeves.append((sid, ss.live_order_id, "FILLED_NO_CONFIG"))
+                    ss.live_order_id = None
+                    ss.filled_qty = 0
+                else:
+                    credited_sleeves.append((sid, ss.live_order_id,
+                                             st.get("average_filled_price")))
+                    ss.filled_qty = st.get("filled_qty", 0) or sc.qty
+                    self._sleeve_on_fill(sc, ss, st.get("average_filled_price"))
+            elif status in ("CANCELLED", "EXPIRED", "UNKNOWN"):
+                cleared_sleeves.append((sid, ss.live_order_id, status))
                 ss.live_order_id = None
                 ss.filled_qty = 0
         self._record(
@@ -288,6 +317,8 @@ class SwingTrader:
             live_order_id=self.s.live_order_id,
             state=self.s.state.value,
             cleared_sleeves=cleared_sleeves,
+            credited_sleeves=credited_sleeves,
+            credited_primary=credited_primary,
         )
         self._save_state()
 
