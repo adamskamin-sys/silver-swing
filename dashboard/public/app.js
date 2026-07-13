@@ -5455,26 +5455,20 @@ function openScannerDetail(row) {
           // A holding sleeve now always shows its current MTM. Fresh sleeves
           // (cycles=0) inherit basis from position avg via the fallback chain.
           if (state === 'ARMED_SELL') {
-            const sell = Number(s.sell_px) || 0;
-            const buy = Number(s.buy_px) || 0;
-            const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
-            const basis = Number(ss.own_avg_entry)
-              || Number(s.entry_mark)
-              || Number(row._live_avg)
-              || midpoint
-              || 0;
+            // Basis = own_avg_entry (sleeve traded) OR position avg (sleeve
+            // inherited). NEVER entry_mark — that's just the mark at attach
+            // time, NOT a cost basis. PT bug: entry_mark=$1608.50 but
+            // pos_avg=$1640, using entry_mark showed +$213 instead of -$102.
+            const basis = Number(ss.own_avg_entry) || Number(row._live_avg) || 0;
             if (basis > 0 && liveMarkForSleeves > 0) {
               unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
             }
           }
-          // ENTRY should show the SAME basis UNREALIZED is calculated from —
-          // otherwise the row doesn't add up. If cycles>0 and own_avg_entry
-          // exists (sleeve has actually bought), that's the true cost basis.
-          // Fall back to entry_mark (attach-time mark) for fresh sleeves.
-          // Adam 2026-07-13: ZEC showed ENTRY=$519.80, UNREALIZED=-$2.70,
-          // math didn't work because UNREALIZED used own_avg ($514.25) but
-          // ENTRY displayed the attach-time mark.
-          const entryPx = Number(ss.own_avg_entry) || Number(s.entry_mark) || 0;
+          // ENTRY shows the SAME basis UNREALIZED uses. Retiring the "attach-
+          // time mark" fallback here — it produced Adam's PT +$213 vs -$102
+          // mismatch. For cycled sleeves: own_avg_entry. For fresh sleeves:
+          // position avg. If neither exists: dash.
+          const entryPx = Number(ss.own_avg_entry) || Number(row._live_avg) || 0;
           const posAvgPx = Number(row._live_avg) || 0;
           // Effective stop-loss: base is stop_loss_px, but if the ratchet is
           // enabled AND armed (hwm exists), the floor lifts to hwm − distance.
@@ -5732,25 +5726,18 @@ function refreshScannerDetailLive() {
       const state = String(ss.state || 'ARMED_SELL');
       const realized = Number(ss.realized_pnl) || 0;
       let unrealized = 0;
-      // Rule (Adam 2026-07-13, updated): sleeve UNREALIZED reflects the actual
-      // MTM on contracts the sleeve is holding, regardless of cycles. Earlier
-      // rule ("$0 until cycles > 0") hid PLAT's -$146 on a freshly-attached
-      // sleeve — Adam explicitly asked to see that. Fresh sleeves inherit
-      // basis from position avg via the fallback chain.
+      // Rule (Adam 2026-07-13): basis = own_avg_entry (sleeve traded) OR
+      // position avg (sleeve inherited). NEVER entry_mark — that's the mark
+      // at attach time, not a cost basis. PT bug: entry_mark=$1608.50,
+      // pos_avg=$1640; using entry_mark showed +$213 (wrong) instead of
+      // -$102 (right, matches Coinbase and the portfolio row).
       if (state === 'ARMED_SELL') {
-        const sell = Number(s.sell_px) || 0;
-        const buy = Number(s.buy_px) || 0;
-        const midpoint = (sell > 0 && buy > 0) ? (sell + buy) / 2 : 0;
-        const basis = Number(ss.own_avg_entry)
-          || Number(s.entry_mark)
-          || Number(avg)
-          || midpoint
-          || 0;
+        const basis = Number(ss.own_avg_entry) || Number(avg) || 0;
         if (basis > 0 && markForSleeves > 0) {
           unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
         }
       }
-      const entryPx = Number(ss.own_avg_entry) || Number(s.entry_mark) || 0;
+      const entryPx = Number(ss.own_avg_entry) || Number(avg) || 0;
       const posAvgPx = Number(avg) || 0;
       // Stop-loss cell — mirrors the initial-render logic so column stays
       // consistent across ticks. Without this the price-tick rebuild produced
