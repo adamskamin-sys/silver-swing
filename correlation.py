@@ -66,6 +66,32 @@ def _family_of(symbol: str) -> Optional[str]:
     return CORRELATION_FAMILIES.get(head)
 
 
+def _window_start_price(history, now: float, window_secs: float) -> Optional[float]:
+    """Earliest price sample within [now - window_secs, now].
+
+    [crew:#8] The old inline logic took the FIRST entry in `history` whose ts
+    fell in the window and broke — which is only the true window-start price if
+    history happens to be stored oldest-first. If it's newest-first, the "start"
+    price is actually the most recent one (~= mark), the computed change is ~0,
+    and the crash gate silently never fires. We sort defensively so the baseline
+    is correct regardless of stored order.
+    """
+    cutoff = now - window_secs
+    samples = []
+    for entry in history or []:
+        try:
+            ts_f = float(entry[0])
+            px_f = float(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if ts_f >= cutoff and px_f > 0:
+            samples.append((ts_f, px_f))
+    if not samples:
+        return None
+    samples.sort(key=lambda p: p[0])  # oldest first → [0] is the window start
+    return samples[0][1]
+
+
 def _peer_pct_change(store, tenant: str, family: str, exclude_symbol: str,
                      window_secs: float) -> tuple[float, str | None]:
     """Return (worst_pct_change, worst_symbol) across all peers in the same
@@ -93,15 +119,7 @@ def _peer_pct_change(store, tenant: str, family: str, exclude_symbol: str,
         # back to comparing mark against high_24h / low_24h as a rough proxy
         # for intra-day extent.
         history = snap.get("price_history") or []
-        window_start_price = None
-        for ts, px in history:
-            try:
-                ts_f = float(ts)
-                if ts_f >= now - window_secs:
-                    window_start_price = float(px)
-                    break
-            except (TypeError, ValueError):
-                continue
+        window_start_price = _window_start_price(history, now, window_secs)  # [crew:#8]
         if window_start_price is None or window_start_price <= 0:
             continue
         pct = (mark - window_start_price) / window_start_price * 100.0
@@ -265,16 +283,8 @@ def peer_crash_check(store, tenant: str, symbol: str, side: str,
                 continue
             mark = float(snap.get("last_mark") or 0)
             history = snap.get("price_history") or []
-            window_start_price = None
             now = time.time()
-            for ts, px in history:
-                try:
-                    ts_f = float(ts)
-                    if ts_f >= now - window_secs:
-                        window_start_price = float(px)
-                        break
-                except (TypeError, ValueError):
-                    continue
+            window_start_price = _window_start_price(history, now, window_secs)  # [crew:#8]
             if not window_start_price or window_start_price <= 0:
                 continue
             pct = (mark - window_start_price) / window_start_price * 100.0

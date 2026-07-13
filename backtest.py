@@ -86,9 +86,13 @@ class BacktestResult:
     price_end: Optional[float] = None
     candle_count: int = 0
     equity_curve: list[EquityPoint] = field(default_factory=list)
+    # [crew:#5] Populated when the run used unrealistic (optimistic) assumptions
+    # — zero slippage and/or zero fees. A caller/agent should surface these so a
+    # frictionless backtest isn't mistaken for a real edge.
+    realism_warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        return (
+        base = (
             f"start ${self.starting_balance:,.2f} → end ${self.final_equity:,.2f} "
             f"(${self.total_return:+,.2f} / {self.total_return_pct:+.2f}%) | "
             f"realized ${self.realized_pnl:+,.2f} | fees ${self.fees_paid:,.2f} | "
@@ -96,6 +100,9 @@ class BacktestResult:
             f"cycles {self.cycles} | fills {self.fills} | "
             f"{'HALTED: ' + (self.halt_reason or '?') if self.halted else 'ran clean'}"
         )
+        if self.realism_warnings:
+            base += "  ⚠ " + " ".join(self.realism_warnings)
+        return base
 
 
 def _walk_candle(c: Candle) -> list[float]:
@@ -124,10 +131,18 @@ def run_backtest(
     curve: list[EquityPoint] = []
 
     for candle in candles:
+        # [crew:#5] Run the state machine at EACH intrabar price, not only the
+        # close. Previously stops were evaluated once per candle at the close,
+        # so a wick that pierced your stop-loss and recovered by close was
+        # scored as "never stopped out" — systematically inflating results for
+        # any stop-based strategy. Stepping per walk price lets the stop fire on
+        # the wick, which is closer to how the live loop (stepping ~1x/sec)
+        # actually behaves. Fills already happen intrabar via broker.tick.
         for price in _walk_candle(candle):
             broker.tick(price, price)
-
-        trader.step(candle.close)
+            trader.step(price)
+            if broker._halted:
+                break
 
         curve.append(EquityPoint(
             ts=candle.ts,
@@ -149,6 +164,14 @@ def run_backtest(
     final = broker.equity()
     price_min = min((c.low for c in candles), default=None)
     price_max = max((c.high for c in candles), default=None)
+    # [crew:#5] Flag optimistic assumptions so a frictionless run isn't trusted.
+    realism_warnings: list[str] = []
+    if paper_config.slippage_ticks <= 0:
+        realism_warnings.append(
+            "slippage_ticks=0: fills are frictionless — set a realistic slippage before trusting the edge.")
+    if paper_config.fee_per_fill <= 0:
+        realism_warnings.append(
+            "fee_per_fill=0: no trading costs modeled — results overstate profitability.")
     return BacktestResult(
         starting_balance=start,
         final_equity=final,
@@ -169,6 +192,7 @@ def run_backtest(
         price_end=candles[-1].close if candles else None,
         candle_count=len(candles),
         equity_curve=curve,
+        realism_warnings=realism_warnings,
     )
 
 

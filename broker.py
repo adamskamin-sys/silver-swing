@@ -92,7 +92,7 @@ class CoinbaseBroker:
     # ---- Broker Protocol -------------------------------------------------
 
     def place_limit(self, side: str, qty: int, price: float,
-                    post_only: bool = False) -> str:
+                    post_only: bool = False, client_order_id=None) -> str:
         """Place a GTC limit order. Returns the exchange order_id.
 
         Idempotency: generates a fresh client_order_id (UUIDv4) per call. The
@@ -110,8 +110,13 @@ class CoinbaseBroker:
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         method = self.client.limit_order_gtc_buy if s == "BUY" else self.client.limit_order_gtc_sell
+        # [crew:#7] Accept a caller-supplied client_order_id. Coinbase dedupes on
+        # this id, so a caller that persists it can safely retry an ambiguous
+        # ack (network timeout after the order was accepted) and RECOVER the
+        # same order instead of orphaning a live position. Defaults to a fresh
+        # UUID (unchanged behavior) when the caller doesn't pass one.
         kwargs = {
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": client_order_id or str(uuid.uuid4()),
             "product_id": self.cfg.product_id,
             "base_size": str(int(qty)),
             "limit_price": f"{price:.{self.cfg.price_decimals}f}",
@@ -126,7 +131,7 @@ class CoinbaseBroker:
         err = resp.get("error_response") or resp.get("failure_reason") or resp
         raise RuntimeError(f"place_limit failed: {err}")
 
-    def place_market(self, side: str, qty: int) -> str:
+    def place_market(self, side: str, qty: int, client_order_id=None) -> str:
         """Submit a market order. Fills at whatever the book has right now.
 
         For futures/CFM, base_size is contract count. Same idempotency contract
@@ -137,7 +142,7 @@ class CoinbaseBroker:
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         method = self.client.market_order_buy if s == "BUY" else self.client.market_order_sell
         kwargs = {
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": client_order_id or str(uuid.uuid4()),  # [crew:#7] caller can supply for idempotent retry
             "product_id": self.cfg.product_id,
             "base_size": str(int(qty)),
         }
@@ -240,14 +245,19 @@ class CoinbaseBroker:
         """USD cash across CFM + CBI + USDC. Read from Coinbase."""
         try:
             return float(self.snapshot().get("balance") or 0.0)
-        except Exception:
+        except Exception as e:
+            # [crew:#7] Don't fail silently — a 0.0 here can feed sizing math as
+            # if the account were empty. Returning 0 is fail-safe (blocks arms
+            # rather than oversizing), but it MUST be visible, not swallowed.
+            print(f"[broker] balance read FAILED ({type(e).__name__}: {e}) — returning 0.0", flush=True)
             return 0.0
 
     @property
     def realized_pnl(self) -> float:
         try:
             return float(self.snapshot().get("realized_pnl") or 0.0)
-        except Exception:
+        except Exception as e:
+            print(f"[broker] realized_pnl read FAILED ({type(e).__name__}: {e}) — returning 0.0", flush=True)  # [crew:#7]
             return 0.0
 
     @property
