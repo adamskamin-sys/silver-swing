@@ -401,6 +401,12 @@ class SleeveConfig:
     # channel floor + calm flow + margin) and pings you when it turns green — a
     # notification only, never an order. OFF by default.
     avg_down_alert_enabled: bool = False
+    # [crew] Entry-quality GREEN LIGHT alert. When on, while WAITING to buy the
+    # sleeve scores the current moment (scanner_signals: regime + channel floor +
+    # microstructure) and pings you when it's a good time to enter — green =
+    # clean trend or calm swing near support, red = chop / toxic flow / crash.
+    # Notification only, never an order. OFF by default.
+    entry_quality_alert_enabled: bool = False
 
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
@@ -472,6 +478,7 @@ class SleeveConfig:
             reversal_enabled=bool(d.get("reversal_enabled") or False),
             channel_reanchor_enabled=bool(d.get("channel_reanchor_enabled") or False),
             avg_down_alert_enabled=bool(d.get("avg_down_alert_enabled") or False),
+            entry_quality_alert_enabled=bool(d.get("entry_quality_alert_enabled") or False),
             trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
             trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
             trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),

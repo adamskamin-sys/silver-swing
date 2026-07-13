@@ -424,6 +424,19 @@ function renderCockpit(store) {
     : (adAmber ? `<span class="ck-chip" style="font-size:var(--fs-xs)" title="watching — conditions not all met yet">🟡 ${adAmber}</span>`
                : '<span class="ck-chip ck-ok">—</span>');
 
+  // [crew] latest entry-quality light per sleeve (from the event feed)
+  const _eqLatest = {};
+  for (const e of (lastTradeEvents || [])) {
+    if (e && e.event_type === 'entry_quality_light' && e.sleeve_id) _eqLatest[e.sleeve_id] = e.light;
+  }
+  const _eqLights = Object.values(_eqLatest);
+  const eqGreen = _eqLights.filter(l => l === 'green').length;
+  const eqAmber = _eqLights.filter(l => l === 'amber').length;
+  const entryValue = eqGreen
+    ? `<span class="ck-chip ck-ok" title="a good entry lines up now — clean trend or calm swing near support, non-toxic flow">🟢 ${eqGreen}</span>`
+    : (eqAmber ? `<span class="ck-chip" style="font-size:var(--fs-xs)" title="neutral — waiting for a cleaner entry">🟡 ${eqAmber}</span>`
+               : '<span class="ck-chip ck-ok">—</span>');
+
   return `<div class="cockpit-row">
     <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
@@ -431,6 +444,7 @@ function renderCockpit(store) {
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
     <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
     <div class="ck-tile" title="Average-down GREEN LIGHT — lights up when the experts' proven conditions for a disciplined scale-in line up (mean-revert range, at the floor, calm flow, margin). Notification only; you pull the trigger."><div class="ck-label">avg-down signal</div><div class="ck-value">${avgDownValue}</div></div>
+    <div class="ck-tile" title="Entry-quality GREEN LIGHT — lights up when it's a good time to enter a long (clean trend or calm swing near support, non-toxic flow). Red = chop / toxic flow / crash. Notification only."><div class="ck-label">entry signal</div><div class="ck-value">${entryValue}</div></div>
     <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${healthClear ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
   </div>`;
 }
@@ -4143,6 +4157,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           <input type="checkbox" id="sl-avgdown" ${draft.avg_down_alert_enabled ? 'checked' : ''}>
           <b>Average-down green light (alert only, no order)</b>
         </label>
+        <label class="accumulate-toggle" title="Notification only. While waiting to buy, pings you when the moment scores well for a long entry — right regime (clean trend or calm range), price near support, non-toxic order flow. Red when it's chop, toxic flow, or a crash. Never places an order.">
+          <input type="checkbox" id="sl-entryq" ${draft.entry_quality_alert_enabled ? 'checked' : ''}>
+          <b>Entry-quality green light (alert only, no order)</b>
+        </label>
         <div class="accumulate-fields" id="sl-stoploss-fields" ${draft.stop_loss_enabled ? '' : 'hidden'}>
           <div class="target-inputs">
             <label>Trigger price ($) — sell when ${escapeHtml(symbolFamilyOf(symbol) || 'price')} falls to
@@ -4964,6 +4982,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       crash_guard_enabled: !!(m.querySelector('#sl-crashguard')?.checked),
       reversal_enabled: !!(m.querySelector('#sl-reversal')?.checked),
       avg_down_alert_enabled: !!(m.querySelector('#sl-avgdown')?.checked),
+      entry_quality_alert_enabled: !!(m.querySelector('#sl-entryq')?.checked),
       buy_trail_distance: (m.querySelector('#sl-buy-trail')?.checked
         ? Number(m.querySelector('#sl-buy-trail-distance')?.value || 0)
         : 0),

@@ -176,6 +176,8 @@ class SwingTrader:
         self._roll_expiry_checked: float = 0.0
         # [crew] Last average-down light per sleeve (edge-trigger notify + dash).
         self._avg_down_light: dict = {}
+        # [crew] Last entry-quality light per sleeve (edge-trigger notify + dash).
+        self._entry_light: dict = {}
 
     def _snap_to_tick(self, price: float) -> float:
         """Snap a price to the product's tick_size. Coinbase rejects orders
@@ -1399,6 +1401,48 @@ class SwingTrader:
         except Exception as e:
             return False, f"reversal safety check failed: {e}"
 
+    def _maybe_entry_quality_alert(self, sc, ss, last_price: float) -> None:
+        """[crew] Entry-quality GREEN LIGHT — notification only, never executes.
+        Fires only while WAITING to buy (ARMED_BUY), when the sleeve opts in.
+        Scores the moment via scanner_signals.entry_assessment (regime + channel
+        + microstructure) and, edge-triggered, records the light + pings on green
+        (a clean trend or a calm swing near support). Red = chop / toxic flow /
+        crash. Opt-in (entry_quality_alert_enabled); OFF by default; fail-safe."""
+        if not getattr(sc, "entry_quality_alert_enabled", False):
+            return
+        if ss.state != SleeveStateEnum.ARMED_BUY:   # only while waiting to enter
+            return
+        try:
+            import scanner_signals
+            prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(prices) < 24:
+                return
+            candles = [{"close": p} for p in prices]
+            ms_snap = self.ms.snapshot() if self.ms else {}
+            ofi = (ms_snap or {}).get("trade_ofi_60s") or (ms_snap or {}).get("ofi")
+            a = scanner_signals.entry_assessment(candles, ms=ms_snap, ofi=ofi)
+            rec = a.get("recommendation")
+            if rec in ("TREND-ENTER", "SWING-OK"):
+                light = "green"
+            elif rec in ("AVOID", "CASCADE-SHORT"):
+                light = "red"
+            else:
+                light = "amber"
+            if light != self._entry_light.get(sc.id):   # edge-triggered
+                self._entry_light[sc.id] = light
+                self._record("entry_quality_light", sleeve_id=sc.id, sleeve_name=sc.name,
+                             light=light, recommendation=rec,
+                             entry_quality=a.get("entry_quality"), regime=a.get("regime"),
+                             reason=a.get("reason"))
+                if light == "green":
+                    try:
+                        self._notify(f"ENTRY-OK: {self.symbol} / {sc.name}",
+                                    f"{rec}: {a.get('reason', '')}", Priority.HIGH)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self._record("entry_quality_alert_error", sleeve_id=sc.id, error=str(e))
+
     def _have_margin_for_one(self, sc) -> bool:
         """Best-effort: is there margin headroom to add ONE more contract?
         Advisory only — on unknown/error returns True (don't block the signal;
@@ -1892,6 +1936,9 @@ class SwingTrader:
 
         # [crew] Average-down GREEN LIGHT alert (notification only). Opt-in.
         self._maybe_avg_down_alert(sc, ss, last_price)
+
+        # [crew] Entry-quality GREEN LIGHT alert (notification only). Opt-in.
+        self._maybe_entry_quality_alert(sc, ss, last_price)
 
         # [crew] DEFENSIVE crash guard. OFF by default (crash_guard_enabled).
         # When on AND holding (ARMED_SELL), if a toxic liquidation cascade is
