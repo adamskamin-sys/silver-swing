@@ -664,25 +664,38 @@ function sleeveOnlyUnrealized(tenant, product, mark, coinbasePnl, positionQty, p
   const contractSize = Number(cfg.contract_size) || 0;
   if (contractSize <= 0 || !(mark > 0)) return null;
   const sleeveStates = (block.state || {}).sleeves || {};
-  // Rule (Adam 2026-07-13): portfolio row UNREALIZED must EQUAL the sum of
-  // per-sleeve UNREALIZEDs — same formula, same cycles>0 gate. Fresh
-  // sleeves (cycles=0) contribute $0 because the pre-attach paper move
-  // belongs to the position, not to any sleeve. This keeps row totals in
-  // sync with the sleeve-editor drilldown.
+  const posQty = Number(positionQty) || 0;
+  const posAvg = Number(positionAvg) || 0;
+  const cbPnl = Number(coinbasePnl);
+  const cbPnlValid = Number.isFinite(cbPnl) && posQty > 0;
+  const AVG_TOL = 0.005;
+  // Portfolio row answers "what's my position doing right now on the
+  // strategy-attached slice?" — includes fresh (cycles=0) sleeves at the
+  // inherited position-avg basis. Different from the sleeve-editor row,
+  // which answers "what has THIS sleeve earned through trading?" and gates
+  // on cycles>0. Keeping them separate is intentional.
   let pnl = 0;
   let qty = 0;
   for (const s of sleeves) {
     const ss = sleeveStates[s.id] || {};
-    const sleeveState = String(ss.state || 'ARMED_SELL');
-    if (sleeveState !== 'ARMED_SELL') continue;
+    if (String(ss.state || 'ARMED_SELL') !== 'ARMED_SELL') continue;
     const sq = Number(s.qty) || 0;
     if (sq <= 0) continue;
     const cycles = Number(ss.cycles) || 0;
-    if (cycles === 0) continue;
-    const ownEntry = ss.own_avg_entry != null && ss.own_avg_entry > 0
+    const rawOwn = ss.own_avg_entry != null && ss.own_avg_entry > 0
       ? Number(ss.own_avg_entry) : Number(s.buy_px);
-    if (!(ownEntry > 0)) continue;
-    pnl += (mark - ownEntry) * contractSize * sq;
+    // Fresh sleeve inherits position avg; cycled sleeve keeps own_avg.
+    const basis = (cycles === 0 && posAvg > 0) ? posAvg : rawOwn;
+    if (!(basis > 0)) continue;
+    // When basis == position avg, use Coinbase's authoritative pnl
+    // apportioned by qty (matches Coinbase's mark exactly). Otherwise
+    // local (mark − basis) × size × qty (used when the sleeve has
+    // cycled and its cost basis diverges from the position blend).
+    if (cbPnlValid && Math.abs(basis - posAvg) < AVG_TOL) {
+      pnl += cbPnl * (sq / posQty);
+    } else {
+      pnl += (mark - basis) * contractSize * sq;
+    }
     qty += sq;
   }
   return { pnl, qty };
@@ -842,7 +855,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
       ? `<span class="mono ${trig.side === 'SELL' ? 'pos' : 'neg'}" title="Sleeve fires ${trig.side} at this price">${trig.side === 'SELL' ? '↑' : '↓'} $${fmtPrice(trig.px)}</span>`
       : '<span class="dim">—</span>';
     const liqText = r.liq > 0 ? '$' + fmtPrice(r.liq) : '—';
-    const cycles = r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0;
+    const cycles = r.kind === 'futures' ? totalCyclesForProduct(r.product, liveTenant) : 0;
     const cyclesText = cycles > 0
       ? `<span title="Completed round-trips across all tenants (primary + sleeves)"><b>${cycles}</b></span>`
       : '<span class="dim">0</span>';
@@ -925,7 +938,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     return a + rowPnl;
   }, 0);
   const totalCyclesSum = filteredRows.reduce((a, r) =>
-    a + (r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0), 0);
+    a + (r.kind === 'futures' ? totalCyclesForProduct(r.product, liveTenant) : 0), 0);
   const totalRealizedSum = filteredRows.reduce((a, r) =>
     a + (r.kind === 'futures' ? totalRealizedForProduct(r.product, liveTenant) : 0), 0);
   const grandTotal = totalPnlSum + totalRealizedSum;
@@ -1299,10 +1312,11 @@ function totalRealizedForProduct(productId, tenantFilter) {
 // Cycles for a product across every tenant that runs a strategy on it —
 // primary strategy + all sleeves. Useful signal: "the bot has round-tripped
 // this thing N times somewhere" without pinning to a single tenant.
-function totalCyclesForProduct(productId) {
+function totalCyclesForProduct(productId, tenantFilter) {
   let total = 0;
   const store = currentStore || {};
   for (const tenant of Object.keys(store)) {
+    if (tenantFilter && tenant !== tenantFilter) continue;
     const entry = store[tenant] && store[tenant][productId];
     if (!entry) continue;
     total += Number((entry.state && entry.state.cycles) || 0);
