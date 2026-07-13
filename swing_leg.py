@@ -980,6 +980,7 @@ class SwingTrader:
                 source(f"sleeve_stop_loss:{sc.id}")
             oid = self.b.place_market("SELL", to_sell)
             sell_ok = True
+            self._refresh_portfolio_after_fill()
             self._record(
                 "sleeve_stop_loss_triggered",
                 sleeve_id=sc.id, sleeve_name=sc.name,
@@ -1496,6 +1497,7 @@ class SwingTrader:
             if callable(source):
                 source("stop_loss")
             oid = self.b.place_market("SELL", to_sell)
+            self._refresh_portfolio_after_fill()
             self._record(
                 "stop_loss_triggered",
                 price=last_price, trigger=trigger, sold=to_sell,
