@@ -253,6 +253,7 @@ def score_product_swings(
     active_hours_utc: tuple[int, int] | None = (13, 21),
     offhours_weight: float = 0.5,
     regime_penalty_weight: float = 0.3,
+    maker_fee_multiplier: float = 0.5,
 ) -> dict:
     """For a price series, try an ATR-anchored grid of spread candidates and
     return the one with the highest expected $/day AVERAGED ACROSS 24h/7d/30d.
@@ -289,77 +290,91 @@ def score_product_swings(
     w_sum = max(1e-9, w_d + w_w + w_m)
     w_d, w_w, w_m = w_d / w_sum, w_w / w_sum, w_m / w_sum
 
-    candidates = []
-    best = None
-    for spread in grid:
-        gross = spread * contract_size
-        net = gross - fee_rt
-        # 24h roundtrip count — no session weighting on this window (too
-        # short for the hourly weighting to converge). Just a headline count.
-        rt_daily, avg_d, _ = compute_roundtrip_metric(prices, spread)
-        daily_per_day = rt_daily * max(0.0, net)
-        # 7d / 30d: apply session-hour weighting (Livermore rule) — cycles
-        # that COMPLETE during CFM's active US session count full weight;
-        # off-hours cycles count `offhours_weight` (default 0.5) because
-        # we probably won't be watching (or the fill quality is worse).
-        if weekly_prices:
-            rt_weekly, _, _ = compute_roundtrip_metric(
-                weekly_prices, spread,
-                timestamps=weekly_timestamps,
-                active_hours_utc=active_hours_utc,
-                offhours_weight=offhours_weight,
-            )
-            weekly_per_day = (rt_weekly * max(0.0, net)) / 7.0
-        else:
-            rt_weekly = 0.0
-            weekly_per_day = daily_per_day
-        if monthly_prices:
-            rt_monthly, _, _ = compute_roundtrip_metric(
-                monthly_prices, spread,
-                timestamps=monthly_timestamps,
-                active_hours_utc=active_hours_utc,
-                offhours_weight=offhours_weight,
-            )
-            monthly_per_day = (rt_monthly * max(0.0, net)) / 30.0
-        else:
-            rt_monthly = 0.0
-            monthly_per_day = daily_per_day
-        # Regime robustness (Turtle rule): the monthly window is long enough
-        # to split into thirds. A spread whose profit only comes from ONE
-        # third gets penalized — we want spreads that work across market
-        # regimes, not just the one that happened this week.
-        robustness = _regime_robust_score(monthly_prices or prices, spread)
-        # Blend: expected $/day × (1 - penalty × (1 - robustness)). Perfectly
-        # even distribution → no penalty. All-in-one-third → up to
-        # regime_penalty_weight% cut. Default 0.3 means the worst-regime
-        # spread loses up to 30% of its expected $/day, which is enough to
-        # tip the pick to a more robust alternative when close.
-        base = (w_d * daily_per_day + w_w * weekly_per_day + w_m * monthly_per_day)
-        weighted_per_day = base * (1.0 - regime_penalty_weight * (1.0 - robustness))
-        entry = {
-            "spread": spread,
-            "spread_mult": round(spread / tick_size) if tick_size > 0 else None,
-            "roundtrips": rt_daily,  # for the UI's per-day tile (24h count)
-            "net_per_rt": round(net, 4),
-            # `score` is now the FULL weighted $/day: horizon-weighted +
-            # session-hour-weighted + regime-robustness-penalized. This is
-            # the number the UI sorts by, so 'BEST' reflects the full stack.
-            "score": round(weighted_per_day, 4),
-            "score_daily": round(daily_per_day, 4),
-            "score_weekly": round(weekly_per_day * 7.0, 4),
-            "score_monthly": round(monthly_per_day * 30.0, 4),
-            "avg_swing": round(avg_d, 4),
-            "regime_robustness": round(robustness, 3),
-            "session_weighted_weekly_rt": round(rt_weekly, 2),
-            "session_weighted_monthly_rt": round(rt_monthly, 2),
-        }
-        candidates.append(entry)
-        if best is None or weighted_per_day > best["score"]:
-            best = entry
-    # Sort descending so the UI's [0]=BEST assumption keeps working, then
-    # trim to top 8 so the modal doesn't drown in tiles.
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-    top_candidates = candidates[:8]
+    def _score_grid(fee_rt_use: float, tile_kind: str) -> tuple[list[dict], dict | None]:
+        """Score every candidate spread at the given fee level. Returns
+        (all_candidates_sorted_desc, best_candidate). Used twice: once at
+        the standard (taker/default) fee rate for the EXPERT tile, once at
+        the maker rate for the FRONT-RUN tile."""
+        out = []
+        top = None
+        for spread in grid:
+            gross = spread * contract_size
+            net = gross - fee_rt_use
+            rt_daily, avg_d, _ = compute_roundtrip_metric(prices, spread)
+            daily_per_day = rt_daily * max(0.0, net)
+            if weekly_prices:
+                rt_weekly, _, _ = compute_roundtrip_metric(
+                    weekly_prices, spread,
+                    timestamps=weekly_timestamps,
+                    active_hours_utc=active_hours_utc,
+                    offhours_weight=offhours_weight,
+                )
+                weekly_per_day = (rt_weekly * max(0.0, net)) / 7.0
+            else:
+                rt_weekly = 0.0
+                weekly_per_day = daily_per_day
+            if monthly_prices:
+                rt_monthly, _, _ = compute_roundtrip_metric(
+                    monthly_prices, spread,
+                    timestamps=monthly_timestamps,
+                    active_hours_utc=active_hours_utc,
+                    offhours_weight=offhours_weight,
+                )
+                monthly_per_day = (rt_monthly * max(0.0, net)) / 30.0
+            else:
+                rt_monthly = 0.0
+                monthly_per_day = daily_per_day
+            robustness = _regime_robust_score(monthly_prices or prices, spread)
+            base = (w_d * daily_per_day + w_w * weekly_per_day + w_m * monthly_per_day)
+            weighted_per_day = base * (1.0 - regime_penalty_weight * (1.0 - robustness))
+            entry = {
+                "spread": spread,
+                "spread_mult": round(spread / tick_size) if tick_size > 0 else None,
+                "roundtrips": rt_daily,
+                "net_per_rt": round(net, 4),
+                "score": round(weighted_per_day, 4),
+                "score_daily": round(daily_per_day, 4),
+                "score_weekly": round(weekly_per_day * 7.0, 4),
+                "score_monthly": round(monthly_per_day * 30.0, 4),
+                "avg_swing": round(avg_d, 4),
+                "regime_robustness": round(robustness, 3),
+                "session_weighted_weekly_rt": round(rt_weekly, 2),
+                "session_weighted_monthly_rt": round(rt_monthly, 2),
+                "tile_kind": tile_kind,
+                "fee_rt_used": round(fee_rt_use, 4),
+            }
+            out.append(entry)
+            if top is None or weighted_per_day > top["score"]:
+                top = entry
+        out.sort(key=lambda c: c["score"], reverse=True)
+        return out, top
+
+    # EXPERT tile: full multi-horizon + session-hour + regime-robust scoring
+    # at the product's real per-fill fee (usually taker). This is the pick
+    # that assumes we sometimes cross the spread and eat taker fees.
+    _all_expert, best_expert = _score_grid(fee_rt, "expert")
+    # FRONT-RUN tile: same scoring but assumes maker-only fees (post_only=true
+    # on every arm + penny_inside for queue priority). Coinbase CFM maker fees
+    # are ~40-60% of taker; default multiplier 0.5. The tighter spreads that
+    # were fee-negative under taker rates often go positive here, so the pick
+    # is genuinely different and only works IF the sleeve runs with
+    # post_only_enabled + penny_inside_enabled (both default ON in Model B).
+    maker_fee_rt = fee_rt * float(maker_fee_multiplier or 0.5)
+    _all_frontrun, best_frontrun = _score_grid(maker_fee_rt, "frontrun")
+
+    # Deliver ONLY the two tiles Adam asked for. If the front-run pick lands
+    # on the same spread as expert (rare — only when fees don't shift the
+    # ranking), skip the duplicate rather than clutter.
+    tiles: list[dict] = []
+    if best_expert:
+        best_expert = dict(best_expert)
+        best_expert["tile_label"] = "EXPERT"
+        tiles.append(best_expert)
+    if best_frontrun and (not best_expert or best_frontrun["spread"] != best_expert["spread"]):
+        best_frontrun = dict(best_frontrun)
+        best_frontrun["tile_label"] = "FRONT-RUN"
+        tiles.append(best_frontrun)
+    best = best_expert
     return {
         "best_spread": best["spread"] if best else None,
         "best_spread_mult": best["spread_mult"] if best else None,
@@ -367,7 +382,7 @@ def score_product_swings(
         "best_net_per_rt": best["net_per_rt"] if best else 0.0,
         "best_score": best["score"] if best else 0.0,
         "best_avg_swing": best["avg_swing"] if best else 0.0,
-        "candidates": top_candidates,
+        "candidates": tiles,
     }
 
 

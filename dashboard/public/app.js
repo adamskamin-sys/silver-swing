@@ -992,20 +992,21 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       triggerScanAndPoll();
       return;
     }
-    // Rank recs by score (best-first). Score is now WEIGHTED $/day across
-    // 24h + 7d + 30d (see scanner.py:score_product_swings), not raw 24h. Use
-    // the real per-horizon scores from the candidate instead of naive daily
-    // × 7 / × 30 extrapolation so the tile numbers actually reconcile.
+    // Two tiles only, as Adam requested: EXPERT (full stack scoring at real
+    // taker fees) and FRONT-RUN (same stack at maker fees, i.e. requires
+    // post_only + penny_inside to actually beat the other bots). Anything
+    // else was clutter — scanner returns exactly these two now.
     const ranked = [...candidates].sort((a, b) => (b.score || 0) - (a.score || 0));
-    const rowsHtml = ranked.map((c, i) => {
+    const rowsHtml = ranked.map((c) => {
       const spread = Number(c.spread) || 0;
-      const daily = Number(c.score) || 0;                    // weighted $/day
-      const weekly = Number(c.score_weekly) || daily * 7;    // real 7d $
-      const monthly = Number(c.score_monthly) || daily * 30; // real 30d $
+      const daily = Number(c.score) || 0;
+      const weekly = Number(c.score_weekly) || daily * 7;
+      const monthly = Number(c.score_monthly) || daily * 30;
       const net = Number(c.net_per_rt) || 0;
-      // Prefer monthly RT count / 30 for the "per day" tile display — one
-      // day of data is noise; a month is a signal. Falls back to 7d avg
-      // then 24h count if the deeper horizons weren't scored.
+      const feeUsed = Number(c.fee_rt_used) || 0;
+      const robustness = Number(c.regime_robustness) || 0;
+      const weeklyRtSess = Number(c.session_weighted_weekly_rt) || 0;
+      const monthlyRtSess = Number(c.session_weighted_monthly_rt) || 0;
       let rtPerDay = 0;
       const monthly30dRt = (net > 0) ? (monthly / net) : 0;
       const weekly7dRt = (net > 0) ? (weekly / net) : 0;
@@ -1016,14 +1017,24 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       const rtLabel = rtPerDay >= 1
         ? `${Math.round(rtPerDay)} roundtrips/day`
         : `${rtPerDay.toFixed(2)} roundtrips/day avg`;
-      const bestBadge = i === 0 ? '<span class="spread-rec-badge">BEST</span>' : '';
+      const kind = String(c.tile_label || c.tile_kind || 'EXPERT').toUpperCase();
+      const isFrontrun = kind === 'FRONT-RUN' || kind === 'FRONTRUN';
+      const badgeClass = isFrontrun ? 'spread-rec-badge frontrun' : 'spread-rec-badge';
+      const subtitle = isFrontrun
+        ? `<span class="dim">requires post-only + penny-inside (maker fees $${feeUsed.toFixed(2)}/RT)</span>`
+        : `<span class="dim">full expert stack at real fees ($${feeUsed.toFixed(2)}/RT)</span>`;
+      const tooltip = `${kind} · robustness ${(robustness * 100).toFixed(0)}% · `
+        + `session-weighted RTs: ${weeklyRtSess.toFixed(1)}/wk · `
+        + `${monthlyRtSess.toFixed(1)}/mo · fees $${feeUsed.toFixed(2)}/RT`;
       return `
-        <button type="button" class="spread-rec-tile" data-spread="${spread}" data-net="${net}"
-                title="Weighted score across 24h + 7d + 30d. Today: ${daily24hRt} RT · This week: ${Math.round(weekly7dRt)} RT · This month: ${Math.round(monthly30dRt)} RT">
+        <button type="button" class="spread-rec-tile ${isFrontrun ? 'frontrun' : 'expert'}"
+                data-spread="${spread}" data-net="${net}" title="${tooltip}">
           <div class="spread-rec-head">
-            $${fmtNum(spread, 4)} ${bestBadge}
+            <span class="${badgeClass}">${kind}</span>
+            <b style="font-size:1.1em;margin-left:6px">$${fmtNum(spread, 4)}</b>
             <span class="dim">· ${rtLabel} · $${fmtNum(net, 2)} net each</span>
           </div>
+          <div class="spread-rec-sub">${subtitle}</div>
           <div class="spread-rec-grid">
             <div><span class="dim">$/day (wtd)</span> <b class="pos">$${fmtNum(daily, 2)}</b></div>
             <div><span class="dim">$/week (7d)</span> <b class="pos">$${fmtNum(weekly, 2)}</b></div>
