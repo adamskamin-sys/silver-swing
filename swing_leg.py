@@ -1797,6 +1797,35 @@ class SwingTrader:
             ms = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
         except Exception:
             ms = None
+        # Per-product threshold overrides. Precedence (highest wins):
+        #   1. Per-sleeve override (sc.reentry_thresholds)
+        #   2. Per-product config scope (store.get_config(...).reentry_thresholds)
+        #   3. Per-product tuned scope (store __tuned_reentry_params__ — future
+        #      tuner writes here; read the symbol's dict)
+        #   4. DEFAULT_THRESHOLDS in experts_reentry
+        thresholds = None
+        try:
+            sc_override = getattr(sc, "reentry_thresholds", None)
+            if isinstance(sc_override, dict) and sc_override:
+                thresholds = dict(sc_override)
+        except Exception:
+            pass
+        if thresholds is None:
+            try:
+                cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+                cfg_override = cfg.get("reentry_thresholds")
+                if isinstance(cfg_override, dict) and cfg_override:
+                    thresholds = dict(cfg_override)
+            except Exception:
+                pass
+        if thresholds is None:
+            try:
+                tuned = self.store.get_state(self.tenant_id, "__tuned_reentry_params__") or {}
+                sym_tuned = tuned.get(self.symbol) if isinstance(tuned, dict) else None
+                if isinstance(sym_tuned, dict) and sym_tuned:
+                    thresholds = dict(sym_tuned)
+            except Exception:
+                pass
         decision = _er.compute_reentry(
             prices=prices,
             sold_price=float(sold_price),
@@ -1806,6 +1835,7 @@ class SwingTrader:
             worst_loss_per_contract=float(worst_loss_per_contract or 0.0),
             recent_cycle_pnls=recent,
             ms=ms,
+            thresholds=thresholds,
         )
         # Log the decision regardless of arm — audit trail for the algo.
         self._record(

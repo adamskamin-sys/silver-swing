@@ -171,3 +171,44 @@ def test_experts_returns_snapshot_for_logging():
     )
     assert "expert_snapshot" in d
     assert "reasons" in d
+
+
+# ---- Per-product threshold plumbing --------------------------------------
+
+def test_resolve_thresholds_default():
+    """No override → all defaults."""
+    thr = experts_reentry.resolve_thresholds(None)
+    assert thr["ehlers_bounce_low"] == 0.65
+    assert thr["connors_buy_zone"] == 60.0
+    assert thr["vpin_calm_ceiling"] == 0.60
+
+
+def test_resolve_thresholds_partial_override():
+    """Override applies to named keys; unmentioned keys keep defaults."""
+    thr = experts_reentry.resolve_thresholds({"ehlers_bounce_low": 0.70,
+                                              "vpin_calm_ceiling": 0.75})
+    assert thr["ehlers_bounce_low"] == 0.70
+    assert thr["vpin_calm_ceiling"] == 0.75
+    assert thr["connors_buy_zone"] == 60.0  # unchanged
+
+
+def test_resolve_thresholds_none_values_ignored():
+    """None in override → keep default. Prevents accidental wipe."""
+    thr = experts_reentry.resolve_thresholds({"connors_buy_zone": None})
+    assert thr["connors_buy_zone"] == 60.0
+
+
+def test_compute_reentry_honors_per_product_thresholds():
+    """Passing thresholds= to compute_reentry uses them (snapshot must
+    contain the merged view for audit)."""
+    prices = [75.0 + math.sin(i / 4.0) * 0.4 for i in range(120)]
+    d = experts_reentry.compute_reentry(
+        prices=prices, sold_price=75.0, spread=0.30, strategy_qty=5,
+        thresholds={"ehlers_bounce_low": 0.5, "vpin_calm_ceiling": 0.9},
+    )
+    snap = d.get("expert_snapshot") or {}
+    used = snap.get("thresholds_used") or {}
+    assert used.get("ehlers_bounce_low") == 0.5
+    assert used.get("vpin_calm_ceiling") == 0.9
+    # unmentioned key still default
+    assert used.get("connors_buy_zone") == 60.0
