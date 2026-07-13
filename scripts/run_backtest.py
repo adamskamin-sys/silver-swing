@@ -206,24 +206,28 @@ def main() -> int:
 #                      this Model may match another (e.g. microstructure gates
 #                      require live book data and can't be simulated).
 _MODEL_CONFIGS: dict[str, dict] = {
+    # Preset collapse (2026-07-13): Model B is now the canonical full-stack
+    # sleeve. Backtest variants that used to be Models C/D/E are represented
+    # here as +news, +ms, +both variants of Model B so historical A/B tests
+    # still work — but they're not user-facing presets anymore.
     "Model B — Defensive plus (trail + reanchor)": {
         "exit_mode": "trailing_stop",
         "trail_distance": 0.15,
         "reanchor_threshold": 0.75,
     },
-    "Model C — Microstructure-informed": {
-        "exit_mode": "trailing_stop",
-        "trail_distance": 0.15,
-        "reanchor_threshold": 0.75,
-        "_note": "microstructure gates (OBI/VPIN/Kyle-λ) need live book — not simulated on candles",
-    },
-    "Model D — News-aware": {
+    "Model B + news blackout": {
         "exit_mode": "trailing_stop",
         "trail_distance": 0.15,
         "reanchor_threshold": 0.75,
         "_skip_blackouts": True,
     },
-    "Model E — Kitchen sink": {
+    "Model B + microstructure gates": {
+        "exit_mode": "trailing_stop",
+        "trail_distance": 0.15,
+        "reanchor_threshold": 0.75,
+        "_note": "microstructure gates (OBI/VPIN/Kyle-λ) need live book — not simulated on candles",
+    },
+    "Model B + news + microstructure": {
         "exit_mode": "trailing_stop",
         "trail_distance": 0.15,
         "reanchor_threshold": 0.75,
@@ -235,8 +239,8 @@ _MODEL_CONFIGS: dict[str, dict] = {
 
 def _filter_candles_for_blackouts(candles):
     """Drop candles whose timestamp falls inside a scheduled news blackout.
-    Approximates Model D/E behavior: bot stands aside 15 min before + 30 min
-    after FOMC/CPI/NFP/PPI/ISM events.
+    Approximates the news-aware variant: bot stands aside 15 min before +
+    30 min after FOMC/CPI/NFP/PPI/ISM events.
     """
     from news_calendar import blackout_for
     return [c for c in candles if blackout_for(c.ts) is None]

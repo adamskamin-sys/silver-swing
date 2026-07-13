@@ -151,8 +151,11 @@ def _seed_lab_comparison_sleeves(store, tenant: str, symbol: str) -> None:
         "stop_loss_qty_mode": "all",
         "stop_loss_qty_custom": 0,
     }
-    # Model A (fixed_limit baseline) removed at Adam's request — see PRESETS
-    # in app.js for the same rationale (caps upside, misses breakouts).
+    # Preset collapse (2026-07-13): Models C/D/E removed — every feature they
+    # embodied (microstructure gates, news blackout, book imbalance) is now
+    # a per-sleeve toggle available on Model B. Lab auto-seed now creates one
+    # canonical Model B sleeve; A/B experiments should be run as sibling
+    # sleeves with specific toggles flipped, not as separate named models.
     models = [
         {**base, "id": "model_b", "name": "Model B — Defensive Plus",
          "exit_mode": "hybrid",
@@ -163,41 +166,10 @@ def _seed_lab_comparison_sleeves(store, tenant: str, symbol: str) -> None:
          "reentry_min_wait_secs": 30,
          "reanchor_threshold": 0.75,
          "accumulate_enabled": True},
-        {**base, "id": "model_c", "name": "Model C — Microstructure",
-         "exit_mode": "hybrid",
-         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
-         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
-         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
-         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
-         "reentry_min_wait_secs": 30,
-         "reanchor_threshold": 0.75,
-         "accumulate_enabled": True,
-         "microstructure_gate_enabled": True},
-        {**base, "id": "model_d", "name": "Model D — News-Aware",
-         "exit_mode": "hybrid",
-         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
-         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
-         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
-         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
-         "reentry_min_wait_secs": 30,
-         "reanchor_threshold": 0.75,
-         "accumulate_enabled": True,
-         "news_blackout_enabled": True, "news_blackout_tier": 2},
-        {**base, "id": "model_e", "name": "Model E — Kitchen Sink",
-         "exit_mode": "hybrid",
-         "stop_loss_enabled": True, "stop_loss_ratchet_enabled": True,
-         "stop_loss_ratchet_distance": 1.5, "stop_loss_ratchet_activation": 0.5,
-         "stop_loss_reanchor_on_trigger": True, "stop_loss_max_consecutive": 3,
-         "reentry_mode": "volatility", "reentry_range_contraction": 0.5,
-         "reentry_min_wait_secs": 30,
-         "reanchor_threshold": 0.75,
-         "accumulate_enabled": True,
-         "microstructure_gate_enabled": True,
-         "news_blackout_enabled": True, "news_blackout_tier": 2},
     ]
     cfg["sleeves"] = models
     store.put_config(tenant, symbol, cfg)
-    _log(f"[{tenant}/{symbol}] seeded Lab with 5 comparison sleeves (Models A–E, 2 contracts each)")
+    _log(f"[{tenant}/{symbol}] seeded Lab with Model B (canonical expert-stack sleeve)")
 
 
 def _attach_expert_params(broker, portfolio_snap: dict) -> None:

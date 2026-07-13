@@ -626,7 +626,7 @@ function renderLabComparison() {
   return `
     <div class="lab-comparison-header">
       <h3 class="section-title">Model Comparison — head-to-head</h3>
-      <div class="dim">Auto-seeded sleeves running Models A–E side-by-side on the same market data. Winner in green.</div>
+      <div class="dim">Comparison of sleeves running side-by-side on the same market data. Winner in green.</div>
     </div>
     <table class="lab-comparison-table">
       <thead>
@@ -3458,13 +3458,21 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       ))
     : defaultTotalProfit;
 
-  // Five head-to-head strategy models — designed to run side-by-side in the
-  // Lab tenant so you can compare which combination of features actually
-  // makes money on live silver data. Same base $10-net-swing math, layered
-  // additions. Model A (fixed-limit control) was removed at Adam's request —
-  // it sells at target and misses breakouts, so it's not a strategy he'd want
-  // to run live. Remaining Models all use hybrid mode with a trail so
-  // they capture upside continuation.
+  // Preset collapse (2026-07-13): Models C, D, E were removed. Every
+  // "differentiating feature" they had (microstructure gates, news
+  // blackout, book imbalance, etc.) is now a per-sleeve toggle — so
+  // "apply Model C" and "apply Model B + check the microstructure box"
+  // produce identical configs. Keeping five near-identical presets
+  // just added UX confusion. Model B is now the canonical full-expert-
+  // stack preset. Custom stays for manual configs. Model A (bare
+  // fixed-limit control) was removed earlier at Adam's request — it
+  // sold at target and missed breakouts.
+  //
+  // Existing sleeves that were created via Model C/D/E preset names
+  // are UNAFFECTED — their saved sleeve.name is a string, independent
+  // of the preset dropdown, and their configs already have the right
+  // toggles saved on them. Only the "apply this preset" dropdown loses
+  // the C/D/E options.
   const PRESETS = {
     'Model B — Defensive plus (ratchet + reanchor + volatility re-entry)': {
       // Everything the removed baseline had PLUS: ratcheting stop-loss (preserves gains),
@@ -3491,7 +3499,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
       // Maker-only + penny-inside placement — beat other bots on fill priority
-      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
+      // and slash fee cost. Defaults ON for Model B; opt-out via sleeve editor.
       postOnly: true,
       pennyInside: { enabled: true, max_ticks: 5 },
       // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
@@ -3503,110 +3511,6 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // it ON as part of the defensive stack.
       buyTrail: { enabled: true },
       note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop + falling-knife protection on rebuys. The expert-recommended stack per Van Tharp / Livermore / Turtles / Le Beau.',
-    },
-    'Model C — Microstructure-informed': {
-      // Model B + sleeve-level microstructure gates. Uses OBI (order book
-      // imbalance), VPIN (toxic flow), Kyle-λ (price impact) — but only
-      // active if SWING_MS_* env vars are set on the bot.
-      exit_mode: 'hybrid',
-      profitDollarsFixed: 10,
-      trailDistance: 0.15,
-      trailActivationOffset: 0.10,
-      hybridDelay: 5,
-      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
-      stopLoss: {
-        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
-        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: false, max_consecutive: 3,
-        protect_realized_enabled: true, protect_realized_frac: 0.5,
-      },
-      reanchorThreshold: 0.75,
-      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
-      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
-      volReanchorWindow: 60,         // over the last ~60 bars of price history
-      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
-      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
-      entryTrendFilter: { enabled: true, sma_window: 20 },
-      microstructureGate: true,
-      // Maker-only + penny-inside placement — beat other bots on fill priority
-      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
-      postOnly: true,
-      pennyInside: { enabled: true, max_ticks: 5 },
-      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
-      // fights current top-5 book pressure. Same 65% threshold both ways.
-      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
-      buyTrail: { enabled: true },
-      note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
-    },
-    'Model D — News-aware': {
-      // Model B + scheduled event blackout (FOMC / CPI / NFP / speeches).
-      // Pauses arms during high-uncertainty windows so news whipsaws don't
-      // eat into gains.
-      exit_mode: 'hybrid',
-      profitDollarsFixed: 10,
-      trailDistance: 0.15,
-      trailActivationOffset: 0.10,
-      hybridDelay: 5,
-      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
-      stopLoss: {
-        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
-        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: false, max_consecutive: 3,
-        protect_realized_enabled: true, protect_realized_frac: 0.5,
-      },
-      reanchorThreshold: 0.75,
-      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
-      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
-      volReanchorWindow: 60,         // over the last ~60 bars of price history
-      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
-      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
-      entryTrendFilter: { enabled: true, sma_window: 20 },
-      microstructureGate: true,
-      // Maker-only + penny-inside placement — beat other bots on fill priority
-      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
-      postOnly: true,
-      pennyInside: { enabled: true, max_ticks: 5 },
-      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
-      // fights current top-5 book pressure. Same 65% threshold both ways.
-      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
-      buyTrail: { enabled: true },
-      newsBlackout: { enabled: true, tier: 2 },
-      note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
-    },
-    'Model E — Kitchen sink (everything)': {
-      // Model B + C + D combined. Highest theoretical EV but highest
-      // parameter count / overfit risk. Compare against A/B/C/D to see
-      // if MORE features = more edge or just more noise.
-      exit_mode: 'hybrid',
-      profitDollarsFixed: 10,
-      trailDistance: 0.15,
-      trailActivationOffset: 0.10,
-      hybridDelay: 5,
-      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
-      stopLoss: {
-        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
-        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
-        reanchor_on_trigger: false, max_consecutive: 3,
-        protect_realized_enabled: true, protect_realized_frac: 0.5,
-      },
-      reanchorThreshold: 0.75,
-      timeReanchorSecs: 3600,        // 60 min: if we've been priced-out this long, walk forward
-      volReanchorPercentile: 90,     // if at top 10% of recent bars, market is trending — walk forward
-      volReanchorWindow: 60,         // over the last ~60 bars of price history
-      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
-      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
-      entryTrendFilter: { enabled: true, sma_window: 20 },
-      microstructureGate: true,
-      // Maker-only + penny-inside placement — beat other bots on fill priority
-      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
-      postOnly: true,
-      pennyInside: { enabled: true, max_ticks: 5 },
-      // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
-      // fights current top-5 book pressure. Same 65% threshold both ways.
-      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
-      buyTrail: { enabled: true },
-      newsBlackout: { enabled: true, tier: 2 },
-      note: 'Everything combined: Model B + microstructure gates + news blackout. Highest theoretical EV. Also highest complexity — a good win here vs Model B tells you the microstructure + news signals add real edge; a small/negative delta means those signals are noise for your timescale.',
     },
     'Custom': {
       exit_mode: 'fixed_limit',
@@ -4565,7 +4469,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       stop_loss_qty_custom: stopLossEnabled && stopMode === 'custom'
         ? parseInt(stopQtyEl?.value || 1, 10) : 0,
       // Ratchet + re-entry + microstructure + news blackout come from the
-      // draft (populated by applyPreset for Models B–E). No UI toggle for
+      // draft (populated by applyPreset for Model B). No UI toggle for
       // these yet — presets are the primary interface. Reading from draft
       // lets Model presets flow through the save without adding form fields.
       stop_loss_ratchet_enabled: !!draft.stop_loss_ratchet_enabled,
