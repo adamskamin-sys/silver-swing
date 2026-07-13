@@ -68,55 +68,14 @@ TICK_KEEP_DAYS = int(os.getenv("SWING_TICK_KEEP_DAYS", "7"))
 # whole uptime — potentially days on Render. Re-running it periodically credits
 # missed fills and halts on a core breach while the session is live. 60s default.
 RECONCILE_INTERVAL_SECS = float(os.getenv("SWING_RECONCILE_INTERVAL_SECS", "60.0"))
+# [crew] How often to verify the live config is still tracking the EXPERT params
+# (expert_params × Layer-2 tuned multipliers). Alerts if silver's actual
+# trail/stop/reanchor levels have drifted off the expert data. Read-only. 5 min.
+EXPERT_GUARD_INTERVAL_SECS = float(os.getenv("SWING_EXPERT_GUARD_SECS", "300.0"))
 
 
 def _log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
-
-
-def _migrate_stale_preset_names(store) -> int:
-    """One-shot rename of sleeve names left over from the pre-2026-07-13
-    preset collapse (Models C/D/E removed → Model B is now canonical).
-
-    Sleeves that were originally applied under Model C/D/E have a
-    sleeve.name field like 'Model C — Microstructure-informed' that
-    lingers in the display even though their config was ALREADY
-    normalized to Model B's toggles. This function walks every product
-    in every tenant and rewrites those stale display names in-place,
-    persisting the change to the store. Idempotent — safe to run every
-    startup.
-
-    Returns count of sleeve names renamed.
-    """
-    LEGACY = ("Model C — Microstructure-informed",
-              "Model D — News-aware",
-              "Model E — Kitchen sink (everything)",
-              "Model E — Kitchen sink")
-    CANONICAL = "Model B — Defensive plus (ratchet + reanchor + volatility re-entry)"
-    renamed = 0
-    for tenant in store.list_tenants():
-        for symbol in store.list_symbols(tenant):
-            if symbol.startswith("__"):
-                continue
-            try:
-                cfg = store.get_config(tenant, symbol) or {}
-            except Exception:
-                continue
-            sleeves = cfg.get("sleeves") or []
-            changed = False
-            for s in sleeves:
-                nm = str(s.get("name") or "")
-                if any(nm.startswith(lg) for lg in LEGACY):
-                    s["name"] = CANONICAL
-                    changed = True
-                    renamed += 1
-            if changed:
-                cfg["sleeves"] = sleeves
-                try:
-                    store.put_config(tenant, symbol, cfg)
-                except Exception as e:
-                    _log(f"[preset-migration] {tenant}/{symbol} failed to persist: {type(e).__name__}: {e}")
-    return renamed
 
 
 def _refresh_all_specs(store) -> int:
@@ -344,16 +303,6 @@ def run() -> int:
         _log(f"startup spec refresh: {n} product(s) refreshed against Coinbase truth")
     except Exception as e:
         _log(f"WARN: startup spec refresh failed: {type(e).__name__}: {e}")
-    # One-shot migration of legacy Model C/D/E display names → Model B.
-    # Idempotent — noop after the first successful pass. Run alongside the
-    # spec refresh so the dashboard's next paint reflects the canonical
-    # preset name without the user having to re-save each sleeve.
-    try:
-        n_renamed = _migrate_stale_preset_names(store)
-        if n_renamed > 0:
-            _log(f"preset name migration: renamed {n_renamed} legacy sleeve(s) to Model B")
-    except Exception as e:
-        _log(f"WARN: preset name migration failed: {type(e).__name__}: {e}")
     last_spec_refresh = time.time()
     # Offset the first twitter poll by 60s so bot startup isn't dominated by
     # a slow RSS fetch across ~15 handles.
@@ -391,6 +340,7 @@ def run() -> int:
 
         last_snapshot = 0.0
         last_reconcile = time.time()  # [crew:#4] startup reconcile just ran
+        last_expert_guard = time.time()  # [crew] expert-params drift guard
         last_family_check = time.time()  # already resolved on startup
         while not stopping:
             t = feed.latest_ticker()
@@ -434,6 +384,21 @@ def run() -> int:
                     trader.reconcile()
                 except Exception as e:
                     _log(f"periodic reconcile failed: {type(e).__name__}: {e}")
+            # [crew] Expert-params drift guard — is the live config still using
+            # the expert data (expert_params x tuned multipliers)? Alerts on
+            # drift. Read-only; a transient failure never stops the loop.
+            if now - last_expert_guard >= EXPERT_GUARD_INTERVAL_SECS:
+                last_expert_guard = now
+                try:
+                    import expert_guard
+                    reports = expert_guard.run_guard(
+                        store, TENANT, store.list_symbols(TENANT),
+                        notifier=notifier, trade_log=log)
+                    drifted = [r["symbol"] for r in reports if r.get("drifts")]
+                    if drifted:
+                        _log(f"expert_guard: DRIFT on {drifted} — alerted")
+                except Exception as e:
+                    _log(f"expert_guard failed: {type(e).__name__}: {e}")
             # Periodic sweep so no product's contract_size/fees can silently
             # drift for more than SPEC_REFRESH_SECS (6h default).
             if now - last_spec_refresh >= SPEC_REFRESH_SECS:
