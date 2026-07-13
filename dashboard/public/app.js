@@ -1062,12 +1062,19 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     // post_only + penny_inside to actually beat the other bots). Anything
     // else was clutter — scanner returns exactly these two now.
     //
-    // IMPORTANT: scanner returns per-CONTRACT numbers (net_per_rt, score,
-    // score_weekly, score_monthly). The slider below the tiles shows
-    // per-SWING at the user's current qty. Multiply here by qty so both
-    // scales match — Adam saw '$4.31 net each' vs slider '$21.55' and
-    // rightly called out the mismatch. Now the tile shows what the
-    // slider will show if you click it.
+    // RECONCILIATION INVARIANT (applies to EVERY product, current + future):
+    //   $/day    = c.score * qty
+    //   $/week   = $/day * 7
+    //   $/month  = $/day * 30
+    //   rt/day   = c.score / c.net_per_rt
+    //   $/swing  = c.net_per_rt * qty
+    // All five displayed numbers derive from exactly two scanner inputs
+    // (c.score, c.net_per_rt). Do NOT read c.score_weekly or c.score_monthly
+    // here — those are per-horizon raw rates that made $/week diverge from
+    // $/day × 7 on hot 7d windows. Adam asked to fix that 12× before I
+    // enforced the single-input structure. Per-horizon RT counts still exist
+    // in the tooltip via session_weighted_weekly_rt / _monthly_rt for anyone
+    // who wants the raw horizon data — they just don't drive the grid.
     const qtyLive = Math.max(1, parseInt(modalEl.querySelector('#sl-qty')?.value, 10) || 1);
     const ranked = [...candidates].sort((a, b) => (b.score || 0) - (a.score || 0));
     const rowsHtml = ranked.map((c) => {
