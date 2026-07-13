@@ -15,7 +15,18 @@ import sys
 from state_store import make_store
 
 
-TENANTS_TO_CHECK = ("adam-live", "adam", "adam-paper")
+FALLBACK_TENANTS = ("adam-live", "adam", "adam-paper")
+
+
+def _all_tenants(store):
+    m = getattr(store, "list_tenants", None)
+    if callable(m):
+        try:
+            listed = m()
+            return list(listed) if listed else list(FALLBACK_TENANTS)
+        except Exception:
+            pass
+    return list(FALLBACK_TENANTS)
 
 
 def _iter_scoped(store, tenant: str, needle: str):
@@ -52,8 +63,11 @@ def main() -> None:
     needle = sys.argv[1] if len(sys.argv) > 1 else "OIL"
     store = make_store(os.getenv("SWING_DATA_DIR", "data"))
 
+    tenants = _all_tenants(store)
+    print(f"Tenants in store: {tenants}\n")
+
     found_any = False
-    for tenant in TENANTS_TO_CHECK:
+    for tenant in tenants:
         for sym_key, st in _iter_scoped(store, tenant, needle):
             found_any = True
             print(f"\n=== tenant={tenant}  symbol_key={sym_key} ===")
@@ -83,9 +97,9 @@ def main() -> None:
                 print(f"  [{i}] {json.dumps(keep, indent=2, default=str)}")
 
     if not found_any:
-        print(f"No sleeves match '{needle}' in tenants {TENANTS_TO_CHECK}.")
+        print(f"No sleeves match '{needle}' in tenants {tenants}.")
         # Fallback — enumerate whatever we can.
-        for tenant in TENANTS_TO_CHECK:
+        for tenant in tenants:
             for method_name in ("list_symbols", "keys", "list_scopes"):
                 m = getattr(store, method_name, None)
                 if callable(m):
