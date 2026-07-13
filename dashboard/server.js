@@ -721,7 +721,10 @@ export function makeApp({
   app.get('/api/fills', requireAuth, async (req, res) => {
     const symbol = String(req.query.symbol || '').trim();
     if (!symbol) return res.status(400).json({ ok: false, error: 'symbol required' });
-    const limit = Math.min(parseInt(req.query.limit || '500', 10), 2000);
+    // Default deep — cycles from last week must still be reachable. RedisTradeLog
+    // caps at 10000 events; fetching all is one LRANGE and ~1 MB of JSON, fine
+    // for a chart-open trigger.
+    const limit = Math.min(parseInt(req.query.limit || '10000', 10), 10000);
     try {
       const events = await tailJsonl(tradeLogPath, limit);
       const fills = [];
@@ -750,7 +753,25 @@ export function makeApp({
       }
       // Sort ascending by ts so pairing buy→sell in order works client-side.
       fills.sort((a, b) => a.ts - b.ts);
-      res.json({ ok: true, fills });
+      // Diagnostics: how many events did we scan, how many symbols were seen,
+      // and did any event mention this symbol at all? Helps debug the
+      // "no fills for XLP but I know there are cycles" case.
+      const symbolsSeen = new Set();
+      let anyForSymbol = 0;
+      for (const e of events) {
+        if (e && e.symbol) symbolsSeen.add(e.symbol);
+        if (e && e.symbol === symbol) anyForSymbol++;
+      }
+      res.json({
+        ok: true,
+        fills,
+        _diag: {
+          events_scanned: events.length,
+          events_for_symbol: anyForSymbol,
+          symbols_in_log: Array.from(symbolsSeen).sort(),
+          matched_fill_events: fills.length,
+        },
+      });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
