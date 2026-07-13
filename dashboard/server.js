@@ -551,9 +551,25 @@ export function makeApp({
       }, 0);
       const budget = pos - core;
       if (activeSleeveQty + primaryQty > budget) {
+        // Staleness hint — if the __portfolio__ snapshot is old or errored,
+        // the position count we compared against is likely wrong (the class
+        // of bug from 2026-07-13 that caused this validator to reject
+        // NOL/OIL edits with "position 0" despite 19 contracts on Coinbase).
+        const pfSnapFull = store[tenant]?.__portfolio__?.config || {};
+        const pfTs = Number(pfSnapFull._refresh_ts) || 0;
+        const pfErr = pfSnapFull._last_error;
+        const ageSec = pfTs > 0 ? (Date.now() / 1000 - pfTs) : null;
+        let hint = '';
+        if (pfErr) {
+          hint = ` (WARNING: last portfolio-snapshot refresh failed with "${String(pfErr).slice(0, 200)}" — cached position count may be stale; run \`python3 diag_refresh_portfolio.py\` first)`;
+        } else if (ageSec === null) {
+          hint = ' (WARNING: portfolio snapshot has never been refreshed — cached position may be missing; run `python3 diag_refresh_portfolio.py` first)';
+        } else if (ageSec > 30) {
+          hint = ` (WARNING: portfolio snapshot is ${Math.floor(ageSec)}s old — expected 2s; run \`python3 diag_refresh_portfolio.py\` first)`;
+        }
         return res.status(400).json({
           ok: false,
-          error: `active sleeves (ARMED_SELL) sum to ${activeSleeveQty} + primary ${primaryQty} = ${activeSleeveQty + primaryQty}, exceeds available ${budget} (position ${pos} - core ${core}). Buy more contracts or reduce sleeve qtys.`,
+          error: `active sleeves (ARMED_SELL) sum to ${activeSleeveQty} + primary ${primaryQty} = ${activeSleeveQty + primaryQty}, exceeds available ${budget} (position ${pos} - core ${core}). Buy more contracts or reduce sleeve qtys.${hint}`,
         });
       }
 

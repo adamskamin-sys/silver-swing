@@ -400,6 +400,27 @@ function renderCockpit(store) {
   const liqCls = nearestLiqPct === null ? '' : (nearestLiqPct <= 15 ? 'ck-danger' : (nearestLiqPct <= 30 ? 'ck-warn' : 'ck-ok'));
   const liqChip = nearestLiqPct === null ? '' :
     `<span class="ck-chip ${liqCls}" title="Nearest position's adverse % move to a forced liquidation (margin sentinel)">liq&nbsp;${nearestLiqPct.toFixed(1)}%</span>`;
+
+  // [crew] Portfolio-snapshot staleness chip. main.refresh_portfolio_snapshot
+  // stamps `_refresh_ts` on success and `_last_error` on failure. If the
+  // snapshot is >30s old OR the last attempt failed, surface it here — the
+  // silent-staleness class of bug that caused the OIL sleeve editor to
+  // reject a valid edit with "exceeds available 0" on 2026-07-13.
+  let snapshotStaleChip = '';
+  if (pf) {
+    const refreshTs = Number(pf._refresh_ts) || 0;
+    const lastErr = pf._last_error;
+    const nowSec = Date.now() / 1000;
+    const ageSec = refreshTs > 0 ? (nowSec - refreshTs) : Number.POSITIVE_INFINITY;
+    if (lastErr) {
+      snapshotStaleChip = `<span class="ck-chip ck-danger" title="Last portfolio-snapshot refresh FAILED: ${escapeHtml(String(lastErr))}. Cached values may be stale; sleeve capacity checks may misfire.">snap ERR</span>`;
+    } else if (ageSec > 30) {
+      const label = ageSec > 3600 ? `${Math.floor(ageSec / 3600)}h` :
+                    ageSec > 60 ? `${Math.floor(ageSec / 60)}m` :
+                    `${Math.floor(ageSec)}s`;
+      snapshotStaleChip = `<span class="ck-chip ck-warn" title="Portfolio snapshot last refreshed ${label} ago. Expected every 2s — check that the bot is running. Sleeve capacity + unrealized may be stale.">snap&nbsp;${label}</span>`;
+    }
+  }
   const healthClear = !liqChip && halts === 0 && !paused;
 
   // [crew] reversal / crash-exit telemetry from the recent event feed
@@ -480,7 +501,7 @@ function renderCockpit(store) {
     <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
     <div class="ck-tile" title="Average-down GREEN LIGHT — lights up when the experts' proven conditions for a disciplined scale-in line up (mean-revert range, at the floor, calm flow, margin). Notification only; you pull the trigger."><div class="ck-label">avg-down signal</div><div class="ck-value">${avgDownValue}</div></div>
     <div class="ck-tile" title="Entry-quality GREEN LIGHT — lights up when it's a good time to enter a long (clean trend or calm swing near support, non-toxic flow). Red = chop / toxic flow / crash. Notification only."><div class="ck-label">entry signal</div><div class="ck-value">${entryValue}</div></div>
-    <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${healthClear ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
+    <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${snapshotStaleChip}${healthClear && !snapshotStaleChip ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
   </div>`;
 }
 

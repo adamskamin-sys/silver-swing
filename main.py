@@ -270,18 +270,52 @@ def refresh_portfolio_snapshot(store, live_tenant: str) -> int:
     stale-mark issues (sleeve unrealized, portfolio circuit breaker,
     Carver risk contribution) that all read from the same source.
 
+    Adds `_refresh_ts` (epoch) and `_refresh_ok` fields to the snapshot on
+    success so downstream (cockpit chip, sleeve-capacity validator) can
+    detect staleness instead of silently reading 0-position rows. On
+    failure records a `portfolio_snapshot_error` event to the trade log
+    so the daily audit + dashboard can flag it — the class of silent-
+    staleness bug that caused Adam's OIL sleeve editor to reject a
+    perfectly-valid edit with "exceeds available 0" on 2026-07-13.
+
     Returns the number of derivative positions refreshed, or 0 on error.
     """
+    import time as _time
     try:
         from broker import BrokerConfig, CoinbaseBroker
         seed = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
         broker = CoinbaseBroker(BrokerConfig(product_id=seed))
         snap = broker.portfolio_snapshot()
         _attach_expert_params(broker, snap)
+        snap["_refresh_ts"] = _time.time()
+        snap["_refresh_ok"] = True
         store.put_config(live_tenant, "__portfolio__", snap)
         return len(snap.get("derivatives") or [])
     except Exception as e:
         _log(f"[{live_tenant}] portfolio refresh failed: {type(e).__name__}: {e}")
+        # Log the failure to the trade log so the daily audit + dashboard
+        # can see silent staleness. Also stamp the prior snapshot with a
+        # `_last_error` marker so downstream code can distinguish "never
+        # refreshed" from "was fresh, current attempt failed".
+        try:
+            from safety import make_trade_log
+            log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
+            log.record(
+                "portfolio_snapshot_error",
+                tenant=live_tenant,
+                error_type=type(e).__name__,
+                error_message=str(e)[:500],
+            )
+        except Exception:
+            pass
+        try:
+            prev = store.get_config(live_tenant, "__portfolio__") or {}
+            prev["_last_error_ts"] = _time.time()
+            prev["_last_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+            prev["_refresh_ok"] = False
+            store.put_config(live_tenant, "__portfolio__", prev)
+        except Exception:
+            pass
         return 0
 
 
