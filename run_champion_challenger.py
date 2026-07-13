@@ -63,20 +63,42 @@ def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
         slippage_ticks=1.0,
     )
 
-    # Champion's implied trail multiple, then tighter/wider challengers. [ADJUST]
-    champ_mult = (float(champion.get("trail_distance") or (2.0 * atr)) / atr) if atr else 2.0
+    # Pick a meaningful challenger axis based on the champion's exit_mode.
+    # fixed_limit → vary sell/buy band width (trail_distance is a no-op there).
+    # trailing_stop / hybrid → vary trail_distance.
+    # Adam 2026-07-13: the earlier trail-only variants gave identical results
+    # because SLR ships fixed_limit — trail_distance was unused.
+    seed_price = candles[len(candles) // 2].close
+    exit_mode = str(champion.get("exit_mode") or "fixed_limit").lower()
 
-    def variant(mult: float) -> dict:
+    def _variant_trail(mult: float) -> dict:                # [ADJUST] trail key
         c = copy.deepcopy(champion)
-        c["trail_distance"] = round(atr * mult, 4)   # [ADJUST] if your trail key differs
+        base = float(champion.get("trail_distance") or (2.0 * atr)) if atr else 2.0
+        c["trail_distance"] = round(base * mult, 6)
         return c
 
-    configs = {
-        "champion": champion,
-        "tighter_trail": variant(champ_mult * 0.75),
-        "wider_trail": variant(champ_mult * 1.25),
-    }
-    seed_price = candles[len(candles) // 2].close
+    def _variant_band(mult: float) -> dict:                 # [ADJUST] band keys
+        c = copy.deepcopy(champion)
+        sell = float(champion.get("sell_px") or (seed_price + 0.5 * atr))
+        buy = float(champion.get("buy_px") or (seed_price - 0.5 * atr))
+        mid = (sell + buy) / 2.0
+        half = ((sell - buy) / 2.0) * mult
+        c["sell_px"] = round(mid + half, 6)
+        c["buy_px"] = round(mid - half, 6)
+        return c
+
+    if exit_mode in ("trailing_stop", "hybrid"):
+        configs = {
+            "champion": champion,
+            "tighter_trail": _variant_trail(0.75),
+            "wider_trail": _variant_trail(1.25),
+        }
+    else:
+        configs = {
+            "champion": champion,
+            "tighter_band": _variant_band(0.75),
+            "wider_band": _variant_band(1.25),
+        }
 
     def run_fn(cfg, cs):
         _, factory = _make_trader_factory(cfg, symbol, seed_price)
