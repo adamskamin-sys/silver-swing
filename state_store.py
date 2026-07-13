@@ -180,6 +180,32 @@ class JsonFileStateStore:
         return sorted(self._load().keys())
 
 
+class InMemoryStateStore(JsonFileStateStore):
+    """Zero-disk variant of JsonFileStateStore. Inherits all scoped methods
+    (get_/put_/clear_ config/state/snapshot/intent/etc) by overriding just
+    _load and _save to use a Python dict.
+
+    Purpose: backtests + parameter tuning call trader.step() thousands of
+    times, and each step calls self.store.put_state → _save → os.fsync.
+    Under JsonFileStateStore that's ~10ms/step. A single 30-day 5-min
+    backtest × 12 walk-forward folds = 100k+ fsyncs = 15-30 minutes just
+    waiting on disk. This store makes those calls near-free.
+
+    NOT SAFE for anything that expects durability. Only use for ephemeral
+    computations (backtest, walk-forward eval, grid tuning) where the
+    result is what matters, not the intermediate state file.
+    """
+
+    def __init__(self):
+        self._mem: dict = {}
+
+    def _load(self) -> dict:
+        return self._mem
+
+    def _save(self, data: dict) -> None:
+        self._mem = data
+
+
 class RedisJsonStore:
     """Redis-backed store that holds the entire state blob under one key.
 

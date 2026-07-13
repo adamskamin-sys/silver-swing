@@ -150,17 +150,19 @@ def _cfg_for_grid(mid_price: float, atr: float, trail_mult: float, contract_size
 
 def _make_trader_factory(cfg: dict, tenant_symbol: str, seed_price: float):
     """Return (store, factory) for a single grid run. Uses an in-memory
-    ephemeral state store so grid iterations don't leak state to each other."""
+    ephemeral state store so grid iterations don't leak state to each other
+    AND so each trader.step() doesn't pay a disk-fsync tax. Without this,
+    a 30-day 5-min walk-forward = 100k+ fsync calls = 15+ min just waiting
+    on disk. With InMemoryStateStore the same run completes in seconds."""
     import os
-    from state_store import JsonFileStateStore
+    from state_store import InMemoryStateStore
     from safety import TradeLog
     from swing_leg import SwingTrader
     tenant = "tuner"
-    tmp = os.path.join(os.getenv("SWING_DATA_DIR", "/tmp"),
-                        f"tune_{tenant_symbol.replace('-', '_')}_{int(time.time()*1000)}.json")
-    store = JsonFileStateStore(tmp)
+    store = InMemoryStateStore()
     store.put_config(tenant, tenant_symbol, cfg)
-    log = TradeLog(tmp.replace(".json", ".jsonl"))
+    log = TradeLog(os.path.join(os.getenv("SWING_DATA_DIR", "/tmp"),
+                                f"tune_{tenant_symbol.replace('-', '_')}_{int(time.time()*1000)}.jsonl"))
 
     def factory(broker):
         # Seed a position so the strategy has something to swing on.
