@@ -1889,11 +1889,15 @@ class SwingTrader:
         )
 
     def _sleeve_on_fill(self, sc: SleeveConfig, ss: SleeveState, fill_price) -> None:
+        # Capture order_id BEFORE clearing so the fill event carries it — makes
+        # repair scripts (find unclaimed order_ids) trivial to write.
+        filled_order_id = ss.live_order_id
         self._record(
             "sleeve_order_filled",
             sleeve_id=sc.id, sleeve_name=sc.name,
             leg=ss.state.value, filled_qty=sc.qty,
             average_filled_price=fill_price,
+            order_id=filled_order_id,
         )
         ss.live_order_id = None
         half_fee = (self.cfg.fee_per_contract_roundtrip / 2.0) * sc.qty
