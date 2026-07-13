@@ -157,23 +157,33 @@ def main() -> int:
     # NOT the bare "adam" tenant (which is paper). Auto-discover the live
     # tenant so `run_champion_challenger.py` without env-vars does the right
     # thing. Env SWING_TENANT overrides for edge cases.
+    # Always print tenant + symbol diagnostics up top — makes it obvious what
+    # the sweep is (and isn't) seeing. Adam 2026-07-13 kept getting "1 symbol"
+    # for reasons we couldn't diagnose without this visibility.
+    all_tenants = list(store.list_tenants() or [])
+    print(f"[diag] tenants in store: {all_tenants}")
+
     env_tenant = os.getenv("SWING_TENANT")
     if env_tenant:
         tenant = env_tenant
+        print(f"[diag] SWING_TENANT override: {tenant!r}")
     else:
-        all_tenants = store.list_tenants() or []
         live_tenants = [t for t in all_tenants if t.endswith("-live")]
         if live_tenants:
             tenant = live_tenants[0]
         else:
             tenant = "adam"
-        print(f"Tenants in store: {all_tenants}")
-        print(f"Sweeping tenant: {tenant!r} (live-tenant auto-detected)")
+        print(f"[diag] auto-picked tenant: {tenant!r}")
+
+    raw_symbols = list(store.list_symbols(tenant) or [])
+    print(f"[diag] {tenant}: raw list_symbols count = {len(raw_symbols)}")
+    print(f"[diag] {tenant}: raw list_symbols = {raw_symbols}")
 
     if single_symbol:
         symbols = [single_symbol]
     else:
         symbols = _list_tracked_symbols(store, tenant)
+        print(f"[diag] {tenant}: after _list_tracked_symbols filter = {len(symbols)} symbols")
         if not symbols:
             print(f"No tracked products for tenant {tenant!r}. "
                   f"Try SWING_TENANT=<tenant> or SWING_SYMBOL=<product>.")
