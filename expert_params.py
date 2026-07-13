@@ -7,19 +7,68 @@ literature. Silver's tight $0.005 tick and OIL's wide $0.005 tick × 10-contract
 size no longer share hardcoded numbers — each gets what its own volatility
 warrants.
 
-Formulas cited:
-  - Wilder ATR (Wilder 1978, "New Concepts in Technical Trading Systems")
-    is the volatility unit. 14 periods, 5-min candles.
-  - Turtle System (Dennis / Faith): 2N trailing stop for trend followers.
-  - Le Beau / Lucas ("Computer Analysis of the Futures Markets"):
-    Chandelier stop = 3×ATR from highest high, breakout confirmation
-    buffer ≈ 0.5×ATR above target.
-  - Van Tharp ("Trade Your Way to Financial Freedom"): 1R = 2×ATR
-    stop-loss risk unit, SafeZone re-entry after 1×ATR contraction.
-  - Kaufman ("Trading Systems and Methods"): crypto's higher volatility
-    warrants wider bands than commodities — multipliers bumped 25-33%.
-  - Ederington-Lee / Andersen-Bollerslev on macro announcement volatility:
-    news blackout windows of ~15 min before, ~30 min after.
+Provenance — verified against primary sources (2026 evidence review). Each
+technique is tagged [CANONICAL] (correctly-cited foremost source), [CONVENTION]
+(a reasonable round number, NOT an empirically-proven optimum), or [CORRECTED]
+(a prior misattribution now fixed).
+
+  - [CANONICAL] Wilder ATR (Wilder 1978, "New Concepts in Technical Trading
+    Systems") — the volatility unit. 14 periods, Wilder smoothing (a=1/N).
+    Volatility-scaling is the single best-evidenced idea in the trend
+    literature (see EVIDENCE below), so ATR-as-unit is the most defensible
+    choice in this whole framework.
+  - [CANONICAL] Turtle System (Dennis / Faith, "Way of the Turtle"): N = 20-day
+    ATR; 2N stop. NOTE the bot uses the 2N stop but NOT the Turtle's canonical
+    Donchian 20/55-day breakout ENTRIES — a known gap (see ROADMAP).
+  - [CANONICAL] Le Beau / Lucas ("Technical Traders Guide to Computer Analysis
+    of the Futures Markets", 1992): Chandelier = HighestHigh(22) - 3×ATR(22).
+    Our chandelier=3.0×ATR matches the source. The ~0.5×ATR breakout buffer is
+    [CONVENTION] (echoes the Turtle 1/2 N), not a crisp Le Beau rule.
+  - [CANONICAL] Van Tharp ("Trade Your Way to Financial Freedom"): the 1R /
+    R-multiple risk unit. His volatility stops run ~2.7-3.4x 10-day ATR, so a
+    "~2-3xATR stop" is a fair paraphrase. The 2.0xATR stop itself is
+    [CONVENTION] (Turtle 2N), sensible but not empirically optimal.
+  - [CORRECTED] Re-entry after a volatility/pullback contraction. This was
+    previously mis-cited as "Van Tharp SafeZone." SafeZone is actually
+    Alexander Elder's ("Come Into My Trading Room", 2002) and is built on
+    Directional-Movement penetrations x a 2-3 coefficient — NOT a "1xATR
+    contraction." Our reanchor_x_atr=1.0 is therefore a HOUSE RULE inspired by
+    the re-enter-after-contraction concept, not Elder's or Tharp's mechanism.
+    Implement Elder's real DM-based rule or keep this as an explicit house rule
+    (do not attribute it to Tharp).
+  - [CORRECTED] Crypto band widening. Kaufman's real, canonical contribution is
+    the Efficiency Ratio and the PRINCIPLE that bands/stops should be
+    volatility-proportional (they self-widen as vol rises) — his major works
+    predate crypto and prescribe no "25-33% wider" number. Since ATR ALREADY
+    auto-widens for crypto, the extra fixed bump risks double-counting; treat
+    it as a HOUSE adjustment justified by crypto's lower Efficiency Ratio /
+    higher noise, not a Kaufman prescription.
+  - [CANONICAL] Ederington-Lee (J.Finance 1993) / Andersen-Bollerslev
+    (J.Finance 1998): scheduled macro releases drive concentrated, short-lived
+    volatility spikes — basis for news-blackout windows (~15 min before/~30 after).
+
+EVIDENCE the underlying approach works (peer-reviewed):
+  - Time-series momentum / trend: Moskowitz, Ooi & Pedersen (2012, JFE),
+    "Time Series Momentum" — 58 futures, pooled t~4.34; vol-scaled.
+  - Cross-sectional momentum: Jegadeesh & Titman (1993, J.Finance) — ~1%/mo.
+  - Trend over a century: Hurst, Ooi & Pedersen (2017, JPM / AQR).
+  - Vol targeting for SIZING: Harvey et al. (2018, JPM); Moreira-Muir (2017).
+  - Stops, honestly: Kaminski & Lo (2014) — stops add value ONLY under
+    momentum/positive autocorrelation at monthly+ horizons, and HURT under
+    mean-reversion/random-walk. Han-Zhou-Zhu (2016): a stop doubled momentum's
+    Sharpe by truncating the left tail. Clare et al. (2013): adding a fixed
+    stop to a trend system that already exits on trend-change can HURT ("a
+    change of trend is the best stop loss"). => the chandelier (trend) exit is
+    the primary; treat the 2xATR stop as a catastrophic floor, not the main exit.
+
+ROADMAP — foremost evidence-backed techniques currently MISSING (see the
+crew review): (1) a time-series-momentum / 200-day-SMA trend ENTRY filter
+(MOP 2012, Faber 2007) — the biggest gap, and it's what makes stops work;
+(2) volatility-targeted position SIZING (Turtle "Unit"; Harvey 2018);
+(3) Donchian 20/55-day breakout entries (Turtle) in place of the bare 0.5xATR
+buffer; (4) a regime filter (Faber). Do NOT per-asset-tune the multipliers on
+short backtests (overfitting — Bailey/Lopez de Prado); keep round conventional
+numbers and sensitivity-test.
 
 Asset classes (matches app.js assetClassOf):
   metals   — Turtle 2N + Le Beau chandelier
@@ -100,7 +149,9 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "activation_offset_x_atr": 0.5,  # Le Beau breakout buffer
         "ratchet_x_atr": 3.0,       # Le Beau chandelier
         "ratchet_activation_x_atr": 0.5,  # Van Tharp — wait for 0.5R gain
-        "reanchor_x_atr": 1.0,      # Van Tharp SafeZone
+        "reanchor_x_atr": 1.0,      # HOUSE RULE (re-enter after ~1xATR contraction).
+                                    # NOT "Van Tharp SafeZone" — SafeZone is Elder's
+                                    # DM-based rule. See module docstring [CORRECTED].
         # Buy-side trailing distance — mirror of the trail. When trailing_buy
         # is enabled, we wait for mark to bounce this much above the local
         # low before actually placing the rebuy. Le Beau's entry-filter
@@ -118,8 +169,10 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "buy_trail_x_atr": 0.5,
     },
     "crypto": {
-        # Kaufman: 24/7 markets + higher realized vol → wider bands to
-        # avoid getting whipped by noise. 25-33% bump on all multipliers.
+        # Crypto: wider bands for 24/7 markets + higher noise. This ~25-33%
+        # bump is a HOUSE adjustment justified by crypto's lower Efficiency
+        # Ratio, NOT a Kaufman-prescribed number — and note ATR already
+        # auto-widens for crypto, so this stacks on top. See docstring [CORRECTED].
         "trail_x_atr": 2.5,
         "stop_x_atr": 3.0,
         "activation_offset_x_atr": 1.0,
