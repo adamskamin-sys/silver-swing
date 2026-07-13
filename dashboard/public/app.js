@@ -23,6 +23,7 @@ const passwordInput = document.getElementById('password');
 const logoutBtn = document.getElementById('logout-btn');
 const lastUpdated = document.getElementById('last-updated');
 const cardsEl = document.getElementById('instrument-cards');
+let lastTradeEvents = []; // [crew] recent trade events, for the cockpit reversal/crash indicator
 const tradeLogEl = document.getElementById('trade-log');
 const haltBanner = document.getElementById('halt-banner');
 const killBanner = document.getElementById('kill-banner');
@@ -376,11 +377,24 @@ function renderCockpit(store) {
     `<span class="ck-chip ${liqCls}" title="Nearest position's adverse % move to a forced liquidation (margin sentinel)">liq&nbsp;${nearestLiqPct.toFixed(1)}%</span>`;
   const healthClear = !liqChip && halts === 0 && !paused;
 
+  // [crew] reversal / crash-exit telemetry from the recent event feed
+  let revCount = 0, crashExits = 0, revPnl = 0, haveRevPnl = false;
+  for (const e of (lastTradeEvents || [])) {
+    const et = e && e.event_type;
+    if (et === 'position_reversed') revCount++;
+    if (et === 'crash_guard_flatten') crashExits++;
+    if (e && e.via_reversal && typeof e.gross === 'number') { revPnl += e.gross; haveRevPnl = true; }
+  }
+  const revValue = (revCount || crashExits)
+    ? `${revCount}↺${crashExits ? ` <span class="ck-chip ck-warn" style="font-size:var(--fs-xs)" title="crash-guard flatten exits">🛡${crashExits}</span>` : ''}${haveRevPnl ? ` <span class="${classForValue(revPnl)}">${revPnl >= 0 ? '+' : '-'}${fmtMoney(Math.abs(revPnl))}</span>` : ''}`
+    : '<span class="ck-chip ck-ok">0</span>';
+
   return `<div class="cockpit-row">
     <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
+    <div class="ck-tile" title="Reversals + crash-guard exits in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
     <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${healthClear ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
   </div>`;
 }
@@ -2786,6 +2800,7 @@ async function refreshOnce() {
   ]);
   if (status._unauthorized || trades._unauthorized) { showLogin(); return; }
   currentStore = status.store || {};
+  lastTradeEvents = (trades && trades.events) ? trades.events : []; // [crew]
   refreshStopLossToggleUi();
   renderBanners(currentStore);
   renderModeTabs(currentStore);
@@ -4052,6 +4067,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           <input type="checkbox" id="sl-stoploss" ${draft.stop_loss_enabled ? 'checked' : ''}>
           <b>Stop-loss (protects during a crash)</b>
         </label>
+        <label class="accumulate-toggle" title="Flatten this sleeve at market the instant a toxic liquidation cascade (VPIN / order-flow / Kyle-λ + jump) runs against the long — faster than the stop for a gap-through. Off by default.">
+          <input type="checkbox" id="sl-crashguard" ${draft.crash_guard_enabled ? 'checked' : ''}>
+          <b>Crash guard — flatten fast on a liquidation cascade</b>
+        </label>
         <div class="accumulate-fields" id="sl-stoploss-fields" ${draft.stop_loss_enabled ? '' : 'hidden'}>
           <div class="target-inputs">
             <label>Trigger price ($) — sell when ${escapeHtml(symbolFamilyOf(symbol) || 'price')} falls to
@@ -4870,6 +4889,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Trailing buy (Livermore / Turtle / Le Beau) — don't grab a falling
       // knife. See swing_leg._trailing_buy_ready for the state machine.
       buy_trail_enabled: !!(m.querySelector('#sl-buy-trail')?.checked),
+      crash_guard_enabled: !!(m.querySelector('#sl-crashguard')?.checked),
       buy_trail_distance: (m.querySelector('#sl-buy-trail')?.checked
         ? Number(m.querySelector('#sl-buy-trail-distance')?.value || 0)
         : 0),
