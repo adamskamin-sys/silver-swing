@@ -3535,6 +3535,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // 0.3, does NOT gate arms. Purely observational, feeds the Signals
       // tab with ml@PlaceholderLinear entries.
       mlShadow: { enabled: true, threshold: 0.3 },
+      // Classic-indicator shadow signals (RSI Wilder / Bollinger / MACD Appel).
+      // Emitted at every arm for evaluation vs 1h/6h/24h outcomes.
+      // Shadow-only: never gates arms.
+      classicIndicatorsShadow: { enabled: true },
       note: 'Full expert stack: hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop + falling-knife protection on rebuys + funding-aware entries + Kelly-scaled sizing + vol-adaptive spread + cross-exchange fair-value check + dynamic correlation + ML shadow harness. Every feature is internally data-gated: no misfires when history is thin. Van Tharp / Livermore / Turtles / Le Beau / Andersen-Bollerslev / Aksoy-Cheng / Vince.',
     },
     'Custom': {
@@ -3591,6 +3595,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     correlation_dynamic_threshold: 0.6,
     ml_shadow_enabled: true,
     ml_signal_threshold: 0.3,
+    classic_indicators_shadow_enabled: true,
   };
 
   // Coerce falling-knife protection to ON for EXISTING sleeves too if the
@@ -4181,6 +4186,8 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const ml = p.mlShadow || {};
     draft.ml_shadow_enabled = ml.enabled !== undefined ? !!ml.enabled : true;
     draft.ml_signal_threshold = ml.threshold != null ? Number(ml.threshold) : 0.3;
+    const ci = p.classicIndicatorsShadow || {};
+    draft.classic_indicators_shadow_enabled = ci.enabled !== undefined ? !!ci.enabled : true;
     applyModeVisibility();
   }
 
@@ -4711,6 +4718,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       correlation_dynamic_threshold: Number(draft.correlation_dynamic_threshold) || 0.6,
       ml_shadow_enabled: !!draft.ml_shadow_enabled,
       ml_signal_threshold: Number(draft.ml_signal_threshold) || 0.3,
+      classic_indicators_shadow_enabled: !!draft.classic_indicators_shadow_enabled,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }

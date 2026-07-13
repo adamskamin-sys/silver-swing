@@ -258,6 +258,14 @@ class SleeveConfig:
     ml_shadow_enabled: bool = False
     ml_signal_threshold: float = 0.3
 
+    # Classic-indicator shadow signals (RSI Wilder, Bollinger, MACD Appel).
+    # Emitted from price_history at arm time. Same shadow harness as
+    # twitter/tape/ml — 1h/6h/24h outcome scoring in the Signals tab.
+    # Purely observational — validates whether classic indicators add
+    # edge on our 5s-tick timeframe before considering promotion to
+    # a live gate.
+    classic_indicators_shadow_enabled: bool = False
+
     # Andrew Lo — Adaptive Markets Hypothesis — regime detection.
     # When enabled, arm-time decisions get regime-specific multipliers:
     #   momentum      → wider spread, longer buy-trail, smaller size
@@ -413,6 +421,7 @@ class SleeveConfig:
             regime_adaptive_enabled=bool(d.get("regime_adaptive_enabled") or False),
             execution_slicing_enabled=bool(d.get("execution_slicing_enabled") or False),
             execution_slicing_urgency_secs=float(d.get("execution_slicing_urgency_secs") or 30.0),
+            classic_indicators_shadow_enabled=bool(d.get("classic_indicators_shadow_enabled") or False),
         )
 
 

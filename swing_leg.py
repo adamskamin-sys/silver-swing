@@ -1635,6 +1635,7 @@ class SwingTrader:
                     self._sleeve_hybrid_step(sc, ss, last_price)
                 else:
                     self._maybe_emit_ml_shadow(sc)
+                    self._maybe_emit_classic_shadows(sc)
                     reg = self._regime_multipliers(sc)
                     eff_qty = max(1, int(round(self._kelly_adjusted_qty(sc, ss) * reg["size_multiplier"])))
                     eff_qty = self._maybe_slice_arm(sc, "SELL", eff_qty, sc.sell_px)
@@ -1747,6 +1748,7 @@ class SwingTrader:
                 if arm_price is None:
                     return  # still tracking the low, don't arm this tick
                 self._maybe_emit_ml_shadow(sc)
+                self._maybe_emit_classic_shadows(sc)
                 reg = self._regime_multipliers(sc)
                 eff_qty = max(1, int(round(self._kelly_adjusted_qty(sc, ss) * reg["size_multiplier"])))
                 eff_qty = self._maybe_slice_arm(sc, "BUY", eff_qty, arm_price)
@@ -2427,6 +2429,42 @@ class SwingTrader:
             return max(1, int(first_slice_qty))
         except Exception:
             return int(qty)
+
+    def _maybe_emit_classic_shadows(self, sc) -> None:
+        """RSI + Bollinger + MACD shadow signal emission. Reads price_history
+        from the snapshot, computes each indicator, emits to the shared
+        Signals tab log via classic_shadow. Never gates arms."""
+        if not getattr(sc, "classic_indicators_shadow_enabled", False):
+            return
+        try:
+            snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+            history = snap.get("price_history") or []
+            prices = []
+            for entry in history[-200:]:
+                try:
+                    px = float(entry[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if px > 0:
+                    prices.append(px)
+            if len(prices) < 30:
+                return  # not enough for MACD (needs 26 + 9)
+            mark = prices[-1]
+            import classic_indicators
+            import classic_shadow
+            rsi = classic_indicators.compute_rsi(prices)
+            if rsi is not None:
+                classic_shadow.emit_rsi_signal(self.store, self.symbol, rsi, mark)
+            bands = classic_indicators.compute_bollinger_bands(prices)
+            if bands is not None:
+                classic_shadow.emit_bollinger_signal(self.store, self.symbol,
+                                                    mark, bands, mark)
+            mtup = classic_indicators.compute_macd(prices)
+            if mtup is not None:
+                classic_shadow.emit_macd_signal(self.store, self.symbol, mtup, mark)
+        except Exception as e:
+            self._record("classic_indicators_shadow_failed",
+                         sleeve_id=sc.id, error=str(e))
 
     def _maybe_emit_ml_shadow(self, sc) -> None:
         """If ml_shadow_enabled, extract features + run predictor + log signal.
