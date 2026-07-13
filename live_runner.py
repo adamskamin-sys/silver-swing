@@ -74,6 +74,51 @@ def _log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
 
 
+def _migrate_stale_preset_names(store) -> int:
+    """One-shot rename of sleeve names left over from the pre-2026-07-13
+    preset collapse (Models C/D/E removed → Model B is now canonical).
+
+    Sleeves that were originally applied under Model C/D/E have a
+    sleeve.name field like 'Model C — Microstructure-informed' that
+    lingers in the display even though their config was ALREADY
+    normalized to Model B's toggles. This function walks every product
+    in every tenant and rewrites those stale display names in-place,
+    persisting the change to the store. Idempotent — safe to run every
+    startup.
+
+    Returns count of sleeve names renamed.
+    """
+    LEGACY = ("Model C — Microstructure-informed",
+              "Model D — News-aware",
+              "Model E — Kitchen sink (everything)",
+              "Model E — Kitchen sink")
+    CANONICAL = "Model B — Defensive plus (ratchet + reanchor + volatility re-entry)"
+    renamed = 0
+    for tenant in store.list_tenants():
+        for symbol in store.list_symbols(tenant):
+            if symbol.startswith("__"):
+                continue
+            try:
+                cfg = store.get_config(tenant, symbol) or {}
+            except Exception:
+                continue
+            sleeves = cfg.get("sleeves") or []
+            changed = False
+            for s in sleeves:
+                nm = str(s.get("name") or "")
+                if any(nm.startswith(lg) for lg in LEGACY):
+                    s["name"] = CANONICAL
+                    changed = True
+                    renamed += 1
+            if changed:
+                cfg["sleeves"] = sleeves
+                try:
+                    store.put_config(tenant, symbol, cfg)
+                except Exception as e:
+                    _log(f"[preset-migration] {tenant}/{symbol} failed to persist: {type(e).__name__}: {e}")
+    return renamed
+
+
 def _refresh_all_specs(store) -> int:
     """Pull fresh contract_size/tick_size/fees from Coinbase for EVERY product
     in EVERY tenant's config, and merge into the stored config. Runs once on
@@ -299,6 +344,16 @@ def run() -> int:
         _log(f"startup spec refresh: {n} product(s) refreshed against Coinbase truth")
     except Exception as e:
         _log(f"WARN: startup spec refresh failed: {type(e).__name__}: {e}")
+    # One-shot migration of legacy Model C/D/E display names → Model B.
+    # Idempotent — noop after the first successful pass. Run alongside the
+    # spec refresh so the dashboard's next paint reflects the canonical
+    # preset name without the user having to re-save each sleeve.
+    try:
+        n_renamed = _migrate_stale_preset_names(store)
+        if n_renamed > 0:
+            _log(f"preset name migration: renamed {n_renamed} legacy sleeve(s) to Model B")
+    except Exception as e:
+        _log(f"WARN: preset name migration failed: {type(e).__name__}: {e}")
     last_spec_refresh = time.time()
     # Offset the first twitter poll by 60s so bot startup isn't dominated by
     # a slow RSS fetch across ~15 handles.
