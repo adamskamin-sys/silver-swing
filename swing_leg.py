@@ -766,25 +766,64 @@ class SwingTrader:
             self._save_state()
 
     def _maybe_scale_up_sleeve(self, sc, ss) -> None:
-        """Per-sleeve accumulation. Same logic as _maybe_scale_up but scoped
-        to this sleeve's own realized_pnl and its own max_qty ceiling. That
-        way each sleeve compounds independently — a winning sleeve grows,
-        a losing sleeve stays at its starting size.
+        """Per-sleeve accumulation. Threshold: realized_pnl >=
+        margin_per_contract × scale_up_buffer_mult. On trigger, one of two
+        actions depending on sc.accumulate_mode:
 
-        Bumps sc.qty in memory AND writes the new qty back to the store so a
-        restart preserves the accumulated size.
+          - 'qty' (legacy): sc.qty += 1. Same sleeve, more contracts. All
+            future cycles use the SAME sell/buy/trail as the parent — the
+            new contract inherits stale parameters if the market has
+            moved. This is the pre-2026-07-13 default.
+
+          - 'spawn' (Adam's rule, new default): CREATE A NEW SIBLING sleeve
+            with fresh expert-derived parameters anchored to the CURRENT
+            market. New sleeve gets its own state machine, its own
+            entry_mark, sell/buy/trail/stop all recomputed from expert
+            canon at spawn time. Winning sleeves compound as a FAMILY of
+            expert-tuned sleeves each optimized for the market at the
+            moment they were spawned.
+
+        Both modes decrement the parent's realized_pnl by the margin so
+        the same profit can't fund two contracts.
         """
         if not getattr(sc, "accumulate_enabled", False):
             return
         max_qty = int(getattr(sc, "max_qty", 0) or 0)
-        if max_qty <= sc.qty:
+        # For spawn mode, max_qty caps total FAMILY size (parent + all children).
+        # For qty mode, it caps the parent's own qty. Both semantics land at
+        # the same numeric ceiling.
+        family_size = self._sleeve_family_size(sc.id)
+        if max_qty <= family_size:
             return
         need = self.cfg.margin_per_contract * float(getattr(sc, "scale_up_buffer_mult", 1.5) or 1.5)
         if ss.realized_pnl < need:
             return
-        # Enough banked to add one contract. Bump in memory, persist to store,
-        # and decrement the sleeve's own realized so the same profit can't be
-        # counted twice next cycle. Matches the primary's semantics.
+        mode = str(getattr(sc, "accumulate_mode", "spawn") or "spawn").lower()
+        if mode == "spawn":
+            spawned_id = self._spawn_child_sleeve(sc, ss)
+            if spawned_id is None:
+                # Spawn failed for some data reason — fall back to qty bump so
+                # profit isn't wasted. Better than silently dropping.
+                sc.qty += 1
+                ss.realized_pnl -= need
+                self._persist_sleeve_qty(sc.id, sc.qty)
+                self._record(
+                    "sleeve_scaled_up_fallback_qty",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    new_qty=sc.qty, consumed=need,
+                    reason="spawn returned None",
+                )
+                return
+            ss.realized_pnl -= need
+            self._record(
+                "sleeve_spawned_child",
+                parent_sleeve_id=sc.id, parent_sleeve_name=sc.name,
+                child_sleeve_id=spawned_id,
+                consumed=need, max_family_qty=max_qty,
+                family_size_after=family_size + 1,
+            )
+            return
+        # Legacy 'qty' mode
         sc.qty += 1
         ss.realized_pnl -= need
         self._persist_sleeve_qty(sc.id, sc.qty)
@@ -794,6 +833,133 @@ class SwingTrader:
             new_qty=sc.qty, max_qty=max_qty,
             consumed=need,
         )
+
+    def _sleeve_family_size(self, root_or_parent_id: str) -> int:
+        """Sum of qty across the sleeve identified by root_or_parent_id AND
+        every descendant (any sleeve with spawned_from tracing back to it).
+        Used as the accumulation ceiling in spawn mode."""
+        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+        sleeves = list(cfg.get("sleeves") or [])
+        by_id = {s.get("id"): s for s in sleeves if s.get("id")}
+        # Ancestor lookup: walk spawned_from until we hit the root.
+        def root_of(sid):
+            seen = set()
+            cur = sid
+            while cur and cur not in seen:
+                seen.add(cur)
+                parent = (by_id.get(cur) or {}).get("spawned_from")
+                if not parent:
+                    return cur
+                cur = parent
+            return cur
+        my_root = root_of(root_or_parent_id)
+        total = 0
+        for s in sleeves:
+            if root_of(s.get("id")) == my_root:
+                total += int(s.get("qty") or 0)
+        return total
+
+    def _spawn_child_sleeve(self, parent_sc, parent_ss) -> Optional[str]:
+        """Create a new sibling sleeve with FRESH expert-derived parameters
+        anchored to the current market. Returns the new sleeve id, or None
+        if we couldn't compute expert params (spawn is silently skipped —
+        caller falls back to qty mode).
+
+        Every parameter is recomputed from CURRENT ATR and CURRENT mark:
+          sell_px, buy_px  — mark ± (expert spread / 2)
+          trail_distance   — expertATR × trail_x_atr (Turtle 2N / Kaufman)
+          stop_loss_px     — entry − (expertATR × stop_x_atr) (Van Tharp 1R)
+          activation_px    — sell_px + expertATR × 0.5 (Le Beau)
+          reanchor_threshold — expertATR × reanchor_x_atr
+          buy_trail_distance — expertATR × buy_trail_x_atr
+
+        Feature toggles are copied from parent (falling knife, Kelly,
+        adaptive spread, book imbalance, etc.) — the child inherits the
+        parent's strategy stack, only price levels are fresh.
+        """
+        import uuid as _uuid
+        snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+        mark = float(snap.get("last_mark") or 0)
+        if mark <= 0:
+            return None
+        # Pull expert params for THIS product from the __portfolio__ snap.
+        pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
+        expert = None
+        for d in (pf.get("derivatives") or []):
+            if d.get("product_id") == self.symbol:
+                expert = d.get("expert_params")
+                break
+        if not expert:
+            return None
+        try:
+            atr = float(expert.get("atr") or 0)
+        except (TypeError, ValueError):
+            return None
+        if atr <= 0:
+            return None
+        mults = expert.get("multipliers") or {}
+        # Fresh spread: use the parent's saved spread as a reasonable seed
+        # scaled by CURRENT ATR / parent's implied ATR ratio. If the parent's
+        # spread was already ATR-derived, this preserves the same character;
+        # if the market vol has doubled, spread widens accordingly.
+        parent_spread = max(0.0, float(parent_sc.sell_px) - float(parent_sc.buy_px))
+        # If parent spread is unreasonable (0 or wildly different from ATR-
+        # implied), fall back to ATR × trail_x_atr as a default spread.
+        atr_implied_spread = atr * float(mults.get("trail_x_atr") or 2.0)
+        if parent_spread <= 0 or parent_spread > 20 * atr_implied_spread:
+            spread = atr_implied_spread
+        else:
+            spread = parent_spread
+        half = spread / 2.0
+        new_sell = round(mark + half, 6)
+        new_buy = round(mark - half, 6)
+        new_trail = atr * float(mults.get("trail_x_atr") or 2.0)
+        new_stop_distance = atr * float(mults.get("stop_x_atr") or 2.0)
+        new_activation_offset = atr * float(mults.get("activation_offset_x_atr") or 0.5)
+        new_reanchor = atr * float(mults.get("reanchor_x_atr") or 1.0)
+        new_buy_trail = atr * float(mults.get("buy_trail_x_atr") or 0.5)
+        new_ratchet = atr * float(mults.get("ratchet_x_atr") or 3.0)
+        new_ratchet_act = atr * float(mults.get("ratchet_activation_x_atr") or 0.5)
+        child_id = f"s{_uuid.uuid4().hex[:8]}"
+        generation = int(getattr(parent_sc, "spawn_generation", 0) or 0) + 1
+        child_name = f"{parent_sc.name} · Gen {generation}"
+        import time as _t
+        # Copy the parent's dict-serialized config as a starting template,
+        # then override the fields that need to be fresh. This preserves
+        # every feature toggle without listing them exhaustively.
+        parent_dict = None
+        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+        for s in (cfg.get("sleeves") or []):
+            if s.get("id") == parent_sc.id:
+                parent_dict = dict(s)
+                break
+        if parent_dict is None:
+            return None
+        child_dict = dict(parent_dict)
+        child_dict.update({
+            "id": child_id,
+            "name": child_name,
+            "qty": 1,   # Van Tharp: always start a new position at 1 R-unit
+            "sell_px": new_sell,
+            "buy_px": new_buy,
+            "trail_trigger": new_sell,
+            "trail_distance": round(new_trail, 6),
+            "trail_activation_px": round(new_sell + new_activation_offset, 6),
+            "reanchor_threshold": round(new_reanchor, 6),
+            "buy_trail_distance": round(new_buy_trail, 6),
+            "stop_loss_px": round(new_buy - new_stop_distance, 6) if float(parent_dict.get("stop_loss_px") or 0) > 0 else 0.0,
+            "stop_loss_ratchet_distance": round(new_ratchet, 6),
+            "stop_loss_ratchet_activation": round(new_ratchet_act, 6),
+            "entry_mark": mark,
+            "entry_ts": _t.time(),
+            "spawned_from": parent_sc.id,
+            "spawn_generation": generation,
+        })
+        sleeves_list = list(cfg.get("sleeves") or [])
+        sleeves_list.append(child_dict)
+        cfg["sleeves"] = sleeves_list
+        self.store.put_config(self.tenant_id, self.symbol, cfg)
+        return child_id
 
     def _compute_sleeve_stop_loss_qty(self, sc, position_qty: int) -> int:
         """Same rules as _compute_stop_loss_qty but scoped to a sleeve. Always

@@ -49,6 +49,23 @@ class SleeveConfig:
     accumulate_enabled: bool = False
     max_qty: int = 0                          # 0 or <= qty disables
     scale_up_buffer_mult: float = 1.5
+    # Accumulation mode: 'qty' (increment this sleeve's contract count) OR
+    # 'spawn' (Adam 2026-07-13 rule — create a NEW sibling sleeve when the
+    # threshold hits, so each new contract gets its own expert-derived
+    # parameters tuned to the CURRENT market, not the parent's stale sell/
+    # buy/trail/stop values). Spawn mode inherits the parent's feature
+    # toggles (falling knife, Kelly, adaptive spread, etc.) but starts
+    # its own state machine and gets fresh sell_px/buy_px anchored to the
+    # current mark + expert-derived spread (ATR × asset-class multiplier).
+    accumulate_mode: str = "spawn"
+    # Parent sleeve id — populated when this sleeve was spawned from a
+    # parent's accumulation. None for root sleeves. Used for family
+    # tracking + so a child's realized_pnl doesn't confuse the parent's
+    # accumulation math.
+    spawned_from: Optional[str] = None
+    # Monotonic generation counter for spawn naming. Root = 0; first child
+    # of root = 1; first child of that = 2, etc.
+    spawn_generation: int = 0
 
     # Per-sleeve stop-loss. Fires independently: only this sleeve halts,
     # rest of the strategies keep running. Qty modes match the primary's:
@@ -359,6 +376,9 @@ class SleeveConfig:
             accumulate_enabled=bool(d.get("accumulate_enabled") or False),
             max_qty=int(d.get("max_qty") or 0),
             scale_up_buffer_mult=float(d.get("scale_up_buffer_mult") or 1.5),
+            accumulate_mode=str(d.get("accumulate_mode") or "spawn"),
+            spawned_from=d.get("spawned_from"),
+            spawn_generation=int(d.get("spawn_generation") or 0),
             stop_loss_enabled=bool(d.get("stop_loss_enabled") or False),
             stop_loss_px=float(d.get("stop_loss_px") or 0.0),
             stop_loss_qty_mode=str(d.get("stop_loss_qty_mode") or "all"),
