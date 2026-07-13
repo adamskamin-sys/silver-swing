@@ -63,42 +63,42 @@ def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
         slippage_ticks=1.0,
     )
 
-    # Pick a meaningful challenger axis based on the champion's exit_mode.
-    # fixed_limit → vary sell/buy band width (trail_distance is a no-op there).
-    # trailing_stop / hybrid → vary trail_distance.
-    # Adam 2026-07-13: the earlier trail-only variants gave identical results
-    # because SLR ships fixed_limit — trail_distance was unused.
+    # Adam 2026-07-13: variants must touch BOTH the top-level primary
+    # SwingConfig fields AND every sleeve's fields — sleeves are where the
+    # real trading happens on Adam's live setup, and they carry their own
+    # sell_px / buy_px / trail_distance. Only scaling the primary yielded
+    # identical backtest metrics across all configs. Scale both bands
+    # (sell/buy) and trail — one variant hits every exit_mode.
     seed_price = candles[len(candles) // 2].close
-    exit_mode = str(champion.get("exit_mode") or "fixed_limit").lower()
 
-    def _variant_trail(mult: float) -> dict:                # [ADJUST] trail key
+    def _scale_node(node: dict, mult: float) -> None:
+        # sell/buy band around the mid                             [ADJUST]
+        sell = node.get("sell_px"); buy = node.get("buy_px")
+        if sell is not None and buy is not None:
+            s = float(sell); b = float(buy)
+            if s > b:
+                mid = (s + b) / 2.0
+                half = ((s - b) / 2.0) * mult
+                node["sell_px"] = round(mid + half, 6)
+                node["buy_px"] = round(mid - half, 6)
+        # trailing-stop distance                                    [ADJUST]
+        td = node.get("trail_distance")
+        if td is not None:
+            node["trail_distance"] = round(float(td) * mult, 6)
+
+    def _variant(mult: float) -> dict:
         c = copy.deepcopy(champion)
-        base = float(champion.get("trail_distance") or (2.0 * atr)) if atr else 2.0
-        c["trail_distance"] = round(base * mult, 6)
+        _scale_node(c, mult)
+        for s in (c.get("sleeves") or []):
+            if isinstance(s, dict):
+                _scale_node(s, mult)
         return c
 
-    def _variant_band(mult: float) -> dict:                 # [ADJUST] band keys
-        c = copy.deepcopy(champion)
-        sell = float(champion.get("sell_px") or (seed_price + 0.5 * atr))
-        buy = float(champion.get("buy_px") or (seed_price - 0.5 * atr))
-        mid = (sell + buy) / 2.0
-        half = ((sell - buy) / 2.0) * mult
-        c["sell_px"] = round(mid + half, 6)
-        c["buy_px"] = round(mid - half, 6)
-        return c
-
-    if exit_mode in ("trailing_stop", "hybrid"):
-        configs = {
-            "champion": champion,
-            "tighter_trail": _variant_trail(0.75),
-            "wider_trail": _variant_trail(1.25),
-        }
-    else:
-        configs = {
-            "champion": champion,
-            "tighter_band": _variant_band(0.75),
-            "wider_band": _variant_band(1.25),
-        }
+    configs = {
+        "champion": champion,
+        "tighter": _variant(0.75),
+        "wider": _variant(1.25),
+    }
 
     def run_fn(cfg, cs):
         _, factory = _make_trader_factory(cfg, symbol, seed_price)
