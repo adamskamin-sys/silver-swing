@@ -1361,6 +1361,15 @@ header { padding: 20px 32px; }
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
   font-family: var(--mono); font-size: 11px;
 }
+.spread-rec-signals {
+  margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--dim);
+  font-family: var(--mono); font-size: 10px;
+  display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center;
+  color: var(--text);
+}
+.spread-rec-signals .pos { color: var(--good); }
+.spread-rec-signals .warn { color: var(--warn, #d4a017); }
+.spread-rec-signals .neg { color: var(--bad); }
 
 .anchor-custom-input {
   font-family: var(--mono); font-size: 20px; font-weight: 600;

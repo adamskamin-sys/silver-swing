@@ -1111,7 +1111,16 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       const subtitle = isFrontrun
         ? `<span class="dim">requires post-only + penny-inside (maker fees $${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)</span>`
         : `<span class="dim">full expert stack at real fees ($${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)</span>`;
-      const tooltip = `${kind} · robustness ${(robustness * 100).toFixed(0)}% · `
+      // Raw per-horizon signals — what the algo actually observed before
+      // blending. Surfaced on the tile so the user can judge the pick's
+      // confidence, not just the output. The main grid stays reconciled
+      // ($/day × 7 = week, $/day × 30 = month projections), this row is
+      // the "evidence" the pick was built on.
+      const daily24hRt = Number(c.roundtrips) || 0;
+      const robustPct = (robustness * 100).toFixed(0);
+      // Color-code robustness: green if ≥70% (Turtle-safe), amber 40-70%, red <40%.
+      const robustClass = robustness >= 0.7 ? 'pos' : (robustness >= 0.4 ? 'warn' : 'neg');
+      const tooltip = `${kind} · robustness ${robustPct}% (min-chunk / avg-chunk over 30d) · `
         + `session-weighted RTs: ${weeklyRtSess.toFixed(1)}/wk · `
         + `${monthlyRtSess.toFixed(1)}/mo · fees $${feePerSwing.toFixed(2)}/swing at ${qtyLive} contracts · `
         + `per-contract net $${netPerCt.toFixed(2)}`;
@@ -1128,6 +1137,16 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
             <div><span class="dim">$/day (wtd)</span> <b class="pos">$${fmtNum(daily, 2)}</b></div>
             <div><span class="dim">$/week (7d)</span> <b class="pos">$${fmtNum(weekly, 2)}</b></div>
             <div><span class="dim">$/month (30d)</span> <b class="pos">$${fmtNum(monthly, 2)}</b></div>
+          </div>
+          <div class="spread-rec-signals">
+            <span class="dim">observed:</span>
+            <span title="Roundtrips found in last 24h of candles">${daily24hRt.toFixed(1)} RTs/24h</span>
+            <span class="dim">·</span>
+            <span title="Session-weighted roundtrips in last 7d (US session full weight, off-hours 0.5)">${weeklyRtSess.toFixed(1)} RTs/7d</span>
+            <span class="dim">·</span>
+            <span title="Session-weighted roundtrips in last 30d">${monthlyRtSess.toFixed(1)} RTs/30d</span>
+            <span class="dim">·</span>
+            <span class="${robustClass}" title="Turtle robustness: min-chunk RTs / avg-chunk RTs across 3 chunks of 30d. ≥70% is stable, <40% is a bumpy regime.">${robustPct}% robust</span>
           </div>
         </button>`;
     }).join('');
