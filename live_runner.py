@@ -45,10 +45,48 @@ SNAPSHOT_INTERVAL = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
 # How often (seconds) to re-check the front-month contract when family mode
 # is active. Once/hour is plenty — expiries move on multi-week cadences.
 FAMILY_RECHECK_SECS = float(os.getenv("SWING_FAMILY_RECHECK_SECS", "3600.0"))
+# How often (seconds) to re-pull contract_size, tick_size, and per-fill fees
+# from Coinbase for EVERY product in the store. Coinbase adjusts fees (Adam's
+# 30d volume tier shifts), contract specs occasionally change (roll cycles),
+# and any product whose config was seeded with wrong defaults stays wrong
+# until we overwrite it. 6h is a fine tradeoff: 4 refreshes/day, negligible
+# Coinbase API budget, and no product can drift for more than 6h.
+SPEC_REFRESH_SECS = float(os.getenv("SWING_SPEC_REFRESH_SECS", "21600.0"))
 
 
 def _log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
+
+
+def _refresh_all_specs(store) -> int:
+    """Pull fresh contract_size/tick_size/fees from Coinbase for EVERY product
+    in EVERY tenant's config, and merge into the stored config. Runs once on
+    startup and periodically thereafter. Returns count of refreshes attempted.
+
+    Why: bot-live used to only guarantee spec freshness for its own primary
+    symbol (SWING_SYMBOL). Every OTHER product Adam holds a strategy on
+    (attached via the dashboard, force-included in the scanner) kept whatever
+    contract_size was originally seeded — often wrong for nano/micro futures
+    (BIT stored as 0.04 instead of 0.01, silver-defaults for oil products,
+    etc.). Result: slider says '$10 net', but the sleeve produces $1.24
+    because the modal computes spread with the wrong contract_size.
+
+    Failures are logged and swallowed. One bad product must never block the
+    refresh sweep for the other 20.
+    """
+    from main import _refresh_contract_spec_into_config  # reuse the paper logic
+    tenants = store.list_tenants()
+    refreshed = 0
+    for tenant in tenants:
+        for symbol in store.list_symbols(tenant):
+            if symbol.startswith("__"):
+                continue  # namespace / meta keys, not products
+            try:
+                _refresh_contract_spec_into_config(store, tenant, symbol)
+                refreshed += 1
+            except Exception as e:
+                _log(f"[spec-refresh] {tenant}/{symbol} FAILED: {type(e).__name__}: {e}")
+    return refreshed
 
 
 class DryRunBroker:
@@ -235,6 +273,18 @@ def run() -> int:
     trader = SwingTrader(broker, store, TENANT, SYMBOL,
                          trade_log=log, kill_switch=ks, notifier=notifier)
 
+    # Sync EVERY product's contract_size + fees from Coinbase before the
+    # trader takes its first step. Without this, dashboard modals and slider
+    # math for non-primary products (BIT, NOL, XLP, everything else) run
+    # against whatever was seeded — often wrong for nano futures. Runs again
+    # every SPEC_REFRESH_SECS in the main loop so specs stay honest.
+    try:
+        n = _refresh_all_specs(store)
+        _log(f"startup spec refresh: {n} product(s) refreshed against Coinbase truth")
+    except Exception as e:
+        _log(f"WARN: startup spec refresh failed: {type(e).__name__}: {e}")
+    last_spec_refresh = time.time()
+
     # Scanner tick shared with paper mode — keeps Edit Strategy tiles fresh
     # even when bot-paper isn't running (Adam retired it). Reuses the same
     # cadence (30s floor, 15 min auto) and force_include semantics.
@@ -296,6 +346,15 @@ def run() -> int:
                 except Exception as e:
                     _log(f"front-month recheck failed ({type(e).__name__}: {e})")
             scanner_worker.tick()
+            # Periodic sweep so no product's contract_size/fees can silently
+            # drift for more than SPEC_REFRESH_SECS (6h default).
+            if now - last_spec_refresh >= SPEC_REFRESH_SECS:
+                last_spec_refresh = now
+                try:
+                    n = _refresh_all_specs(store)
+                    _log(f"periodic spec refresh: {n} product(s) refreshed")
+                except Exception as e:
+                    _log(f"periodic spec refresh failed: {type(e).__name__}: {e}")
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()
