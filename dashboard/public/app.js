@@ -3510,7 +3510,32 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // undefined here means "use the expert-derived default". Model B ships
       // it ON as part of the defensive stack.
       buyTrail: { enabled: true },
-      note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop + falling-knife protection on rebuys. The expert-recommended stack per Van Tharp / Livermore / Turtles / Le Beau.',
+      // Funding-rate gate (Aksoy-Cheng / Hasbrouck) — crypto perps only.
+      // Blocks BUY arms when 8h funding > +0.05% (expensive to hold long).
+      // Non-perp products (silver/oil) unaffected — funding_gate_ok_for_buy
+      // returns permissive-default when funding data missing.
+      fundingGate: { enabled: true, threshold: 0.0005 },
+      // Kelly quarter-Kelly sizing (Van Tharp) — no effect until sleeve has
+      // 8+ cycles of data. Then sizes cfg.qty × Kelly f* (capped at 1.0
+      // via kelly_fraction, never sizes up).
+      kelly: { enabled: true, fraction: 0.25, min_cycles: 8 },
+      // Adaptive spread (Andersen-Bollerslev) — widens spread up to 2× in
+      // high realized-vol regimes. No effect when vol matches baseline.
+      adaptiveSpread: { enabled: true, max_multiplier: 2.0, vol_window_secs: 300 },
+      // Cross-exchange fair-value gate (Binance reference) — blocks arms
+      // when Coinbase price diverges >1% from Binance mid. Only crypto
+      // (BTC/ETH/SOL/…); permissive for non-mapped products.
+      crossexGate: { enabled: true, max_divergence_pct: 1.0 },
+      // Dynamic correlation gate — catches cross-family co-movement
+      // (BTC↔gold in macro shocks). Requires 7d+ of snapshots per product;
+      // permissive-default until then.
+      correlationDynamic: { enabled: true, threshold: 0.6 },
+      // ML predictor shadow signal — placeholder linear model until real
+      // training data collected. Emits shadow log entries when |score| >
+      // 0.3, does NOT gate arms. Purely observational, feeds the Signals
+      // tab with ml@PlaceholderLinear entries.
+      mlShadow: { enabled: true, threshold: 0.3 },
+      note: 'Full expert stack: hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop + falling-knife protection on rebuys + funding-aware entries + Kelly-scaled sizing + vol-adaptive spread + cross-exchange fair-value check + dynamic correlation + ML shadow harness. Every feature is internally data-gated: no misfires when history is thin. Van Tharp / Livermore / Turtles / Le Beau / Andersen-Bollerslev / Aksoy-Cheng / Vince.',
     },
     'Custom': {
       exit_mode: 'fixed_limit',
@@ -3531,12 +3556,29 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     qty: 1,
     exit_mode: 'fixed_limit',
     reanchor_threshold: 2.0,
-    // Falling-knife protection ON by default for NEW sleeves per Adam.
-    // Existing sleeves preserve whatever they had (draft = existing branch).
-    // Distance = Le Beau 0.5×ATR default from expert_params (or 0.05
-    // fallback if ATR hasn't loaded for this product yet).
+    // Full expert stack ON by default for NEW sleeves (Adam: "turn them all
+    // on by default"). Every feature is internally data-gated: Kelly waits
+    // for 8+ cycles, adaptive spread waits for vol history, dynamic
+    // correlation waits for 7d+ of snapshots, funding gate no-ops on non-
+    // perps, crossex is permissive without Binance data. Nothing misfires
+    // when the sleeve is brand new — they turn on when data arrives.
+    // Existing sleeves preserve their saved config (draft = existing branch).
     buy_trail_enabled: true,
     buy_trail_distance: expertDollars?.buy_trail_distance || 0.05,
+    funding_gate_enabled: true,
+    funding_gate_threshold: 0.0005,
+    kelly_enabled: true,
+    kelly_fraction: 0.25,
+    kelly_min_cycles: 8,
+    adaptive_spread_enabled: true,
+    adaptive_spread_max_multiplier: 2.0,
+    adaptive_spread_vol_window_secs: 300,
+    crossex_gate_enabled: true,
+    crossex_max_divergence_pct: 1.0,
+    correlation_dynamic_enabled: true,
+    correlation_dynamic_threshold: 0.6,
+    ml_shadow_enabled: true,
+    ml_signal_threshold: 0.3,
   };
 
   // Distance from anchor to current mark — surface a warning when the anchor
@@ -4059,6 +4101,29 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     draft.buy_trail_distance = bt.distance != null
       ? Number(bt.distance)
       : (expertDollars?.buy_trail_distance || draft.buy_trail_distance || 0.05);
+    // Seven-feature batch (2026-07-13). All internally data-gated so
+    // enabling doesn't misfire when history is thin — they no-op until
+    // there's real data to act on.
+    const fg = p.fundingGate || {};
+    draft.funding_gate_enabled = fg.enabled !== undefined ? !!fg.enabled : true;
+    draft.funding_gate_threshold = fg.threshold != null ? Number(fg.threshold) : 0.0005;
+    const kl = p.kelly || {};
+    draft.kelly_enabled = kl.enabled !== undefined ? !!kl.enabled : true;
+    draft.kelly_fraction = kl.fraction != null ? Number(kl.fraction) : 0.25;
+    draft.kelly_min_cycles = kl.min_cycles != null ? Number(kl.min_cycles) : 8;
+    const ad = p.adaptiveSpread || {};
+    draft.adaptive_spread_enabled = ad.enabled !== undefined ? !!ad.enabled : true;
+    draft.adaptive_spread_max_multiplier = ad.max_multiplier != null ? Number(ad.max_multiplier) : 2.0;
+    draft.adaptive_spread_vol_window_secs = ad.vol_window_secs != null ? Number(ad.vol_window_secs) : 300;
+    const cx = p.crossexGate || {};
+    draft.crossex_gate_enabled = cx.enabled !== undefined ? !!cx.enabled : true;
+    draft.crossex_max_divergence_pct = cx.max_divergence_pct != null ? Number(cx.max_divergence_pct) : 1.0;
+    const cd = p.correlationDynamic || {};
+    draft.correlation_dynamic_enabled = cd.enabled !== undefined ? !!cd.enabled : true;
+    draft.correlation_dynamic_threshold = cd.threshold != null ? Number(cd.threshold) : 0.6;
+    const ml = p.mlShadow || {};
+    draft.ml_shadow_enabled = ml.enabled !== undefined ? !!ml.enabled : true;
+    draft.ml_signal_threshold = ml.threshold != null ? Number(ml.threshold) : 0.3;
     applyModeVisibility();
   }
 
@@ -4506,6 +4571,24 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       buy_trail_distance: (m.querySelector('#sl-buy-trail')?.checked
         ? Number(m.querySelector('#sl-buy-trail-distance')?.value || 0)
         : 0),
+      // Seven-feature batch — persist whatever the draft holds. These have
+      // no UI toggles yet (Model B preset + new-sleeve default sets them
+      // ON; existing sleeves preserve saved values). Adding UI toggles is
+      // a follow-up build.
+      funding_gate_enabled: !!draft.funding_gate_enabled,
+      funding_gate_threshold: Number(draft.funding_gate_threshold) || 0.0005,
+      kelly_enabled: !!draft.kelly_enabled,
+      kelly_fraction: Number(draft.kelly_fraction) || 0.25,
+      kelly_min_cycles: parseInt(draft.kelly_min_cycles || 8, 10),
+      adaptive_spread_enabled: !!draft.adaptive_spread_enabled,
+      adaptive_spread_max_multiplier: Number(draft.adaptive_spread_max_multiplier) || 2.0,
+      adaptive_spread_vol_window_secs: Number(draft.adaptive_spread_vol_window_secs) || 300,
+      crossex_gate_enabled: !!draft.crossex_gate_enabled,
+      crossex_max_divergence_pct: Number(draft.crossex_max_divergence_pct) || 1.0,
+      correlation_dynamic_enabled: !!draft.correlation_dynamic_enabled,
+      correlation_dynamic_threshold: Number(draft.correlation_dynamic_threshold) || 0.6,
+      ml_shadow_enabled: !!draft.ml_shadow_enabled,
+      ml_signal_threshold: Number(draft.ml_signal_threshold) || 0.3,
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }
