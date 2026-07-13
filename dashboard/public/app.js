@@ -1061,20 +1061,35 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
     // taker fees) and FRONT-RUN (same stack at maker fees, i.e. requires
     // post_only + penny_inside to actually beat the other bots). Anything
     // else was clutter — scanner returns exactly these two now.
+    //
+    // IMPORTANT: scanner returns per-CONTRACT numbers (net_per_rt, score,
+    // score_weekly, score_monthly). The slider below the tiles shows
+    // per-SWING at the user's current qty. Multiply here by qty so both
+    // scales match — Adam saw '$4.31 net each' vs slider '$21.55' and
+    // rightly called out the mismatch. Now the tile shows what the
+    // slider will show if you click it.
+    const qtyLive = Math.max(1, parseInt(modalEl.querySelector('#sl-qty')?.value, 10) || 1);
     const ranked = [...candidates].sort((a, b) => (b.score || 0) - (a.score || 0));
     const rowsHtml = ranked.map((c) => {
       const spread = Number(c.spread) || 0;
-      const daily = Number(c.score) || 0;
-      const weekly = Number(c.score_weekly) || daily * 7;
-      const monthly = Number(c.score_monthly) || daily * 30;
-      const net = Number(c.net_per_rt) || 0;
+      const dailyPerCt = Number(c.score) || 0;
+      const weeklyPerCt = Number(c.score_weekly) || dailyPerCt * 7;
+      const monthlyPerCt = Number(c.score_monthly) || dailyPerCt * 30;
+      const netPerCt = Number(c.net_per_rt) || 0;
+      // Multiply to per-swing / total qty units so tile ↔ slider reconciles.
+      const daily = dailyPerCt * qtyLive;
+      const weekly = weeklyPerCt * qtyLive;
+      const monthly = monthlyPerCt * qtyLive;
+      const net = netPerCt * qtyLive;
       const feeUsed = Number(c.fee_rt_used) || 0;
+      const feePerSwing = feeUsed * qtyLive;
       const robustness = Number(c.regime_robustness) || 0;
       const weeklyRtSess = Number(c.session_weighted_weekly_rt) || 0;
       const monthlyRtSess = Number(c.session_weighted_monthly_rt) || 0;
+      // RT/day derived from per-CONTRACT scores — count doesn't change with qty.
       let rtPerDay = 0;
-      const monthly30dRt = (net > 0) ? (monthly / net) : 0;
-      const weekly7dRt = (net > 0) ? (weekly / net) : 0;
+      const monthly30dRt = (netPerCt > 0) ? (monthlyPerCt / netPerCt) : 0;
+      const weekly7dRt = (netPerCt > 0) ? (weeklyPerCt / netPerCt) : 0;
       const daily24hRt = Number(c.roundtrips) || 0;
       if (monthly30dRt > 0) rtPerDay = monthly30dRt / 30;
       else if (weekly7dRt > 0) rtPerDay = weekly7dRt / 7;
@@ -1086,18 +1101,19 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
       const isFrontrun = kind === 'FRONT-RUN' || kind === 'FRONTRUN';
       const badgeClass = isFrontrun ? 'spread-rec-badge frontrun' : 'spread-rec-badge';
       const subtitle = isFrontrun
-        ? `<span class="dim">requires post-only + penny-inside (maker fees $${feeUsed.toFixed(2)}/RT)</span>`
-        : `<span class="dim">full expert stack at real fees ($${feeUsed.toFixed(2)}/RT)</span>`;
+        ? `<span class="dim">requires post-only + penny-inside (maker fees $${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)</span>`
+        : `<span class="dim">full expert stack at real fees ($${feePerSwing.toFixed(2)}/swing on ${qtyLive} ct)</span>`;
       const tooltip = `${kind} · robustness ${(robustness * 100).toFixed(0)}% · `
         + `session-weighted RTs: ${weeklyRtSess.toFixed(1)}/wk · `
-        + `${monthlyRtSess.toFixed(1)}/mo · fees $${feeUsed.toFixed(2)}/RT`;
+        + `${monthlyRtSess.toFixed(1)}/mo · fees $${feePerSwing.toFixed(2)}/swing at ${qtyLive} contracts · `
+        + `per-contract net $${netPerCt.toFixed(2)}`;
       return `
         <button type="button" class="spread-rec-tile ${isFrontrun ? 'frontrun' : 'expert'}"
-                data-spread="${spread}" data-net="${net}" title="${tooltip}">
+                data-spread="${spread}" data-net="${netPerCt}" title="${tooltip}">
           <div class="spread-rec-head">
             <span class="${badgeClass}">${kind}</span>
             <b style="font-size:1.1em;margin-left:6px">$${fmtNum(spread, 4)}</b>
-            <span class="dim">· ${rtLabel} · $${fmtNum(net, 2)} net each</span>
+            <span class="dim">· ${rtLabel} · $${fmtNum(net, 2)} net/swing (${qtyLive} ct)</span>
           </div>
           <div class="spread-rec-sub">${subtitle}</div>
           <div class="spread-rec-grid">

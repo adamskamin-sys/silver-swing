@@ -1869,6 +1869,27 @@ class SwingTrader:
         # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
         # spins forever emitting sleeve_arm_failed with no order on the book.
         price = self._snap_to_tick(price)
+        # News blackout (Van Tharp / Cartea-Jaimungal rule): scheduled
+        # macro events (FOMC, CPI, NFP) whipsaw silver/futures ±$1 in 30s.
+        # Any sleeve with news_blackout_enabled respects its configured tier:
+        #   tier 2+ → pause new arms during the blackout window
+        #   tier 3  → also flatten (handled by _maybe_trigger_stop_loss path)
+        if getattr(sc, "news_blackout_enabled", False):
+            try:
+                from news_calendar import blackout_for
+                active = blackout_for()
+                if active and active["tier"] >= int(sc.news_blackout_tier or 2):
+                    self._record(
+                        "sleeve_arm_skipped_news_blackout",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        side=side, qty=qty, price=price,
+                        event=active["name"], tier=active["tier"],
+                        blackout_ends_ts=active["end_ts"],
+                    )
+                    return
+            except Exception as e:
+                self._record("news_blackout_check_failed",
+                             sleeve_id=sc.id, error=str(e))
         # Book-imbalance gate (Chan/Harris rule): refuse to arm a leg whose
         # expected direction fights the current book pressure. Cheap: reads
         # a 5s-cached top-25 snapshot from Coinbase.
