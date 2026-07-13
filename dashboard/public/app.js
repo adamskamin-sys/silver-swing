@@ -2074,9 +2074,23 @@ function renderSleevesSection(tenant, symbol, config, state, snapshot) {
     } else if (Number(s.buy_px) > 0) {
       ownEntry = Number(s.buy_px); ownEntrySource = 'buy_px_target';
     }
-    const unreal = (ownEntry > 0 && sleeveQty > 0 && sState === 'ARMED_SELL')
-      ? (mark - ownEntry) * contractSize * sleeveQty
-      : 0;
+    // Belt-and-suspenders: unrealized MUST be $0 when the sleeve isn't holding
+    // contracts. Adam saw +$2.60 unrealized on a PT sleeve in ARMED_BUY (0
+    // contracts held, position_qty=0). Root cause: the fallback chain
+    // populated ownEntry from s.buy_px (the FUTURE rebuy target — not real
+    // cost basis) and the state gate somehow passed. Tighter check now:
+    //   - state must be ARMED_SELL (holds contracts)
+    //   - ownEntrySource must be a REAL cost basis (not buy_px_target, not none)
+    //   - snapshot.position_qty must be > 0 (physically holds contracts)
+    // Any one of these failing → unrealized is $0.
+    const positionQty = Number(snapshot?.position_qty) || 0;
+    const isRealCostBasis = ownEntrySource !== 'none' && ownEntrySource !== 'buy_px_target';
+    const unreal = (
+      ownEntry > 0 && sleeveQty > 0
+      && sState === 'ARMED_SELL'
+      && isRealCostBasis
+      && positionQty > 0
+    ) ? (mark - ownEntry) * contractSize * sleeveQty : 0;
     const paramsHtml = fmtTrailingParams(
       s.exit_mode || 'fixed_limit',
       { armed: !!ss.trail_armed, hwm: ss.trail_high_water_price, distance: s.trail_distance,

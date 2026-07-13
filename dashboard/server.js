@@ -400,6 +400,7 @@ export function makeApp({
     if (!Array.isArray(sleeves)) return res.status(400).json({ ok: false, error: 'sleeves must be an array' });
 
     const issues = [];
+    const autoFixed = [];
     const seenIds = new Set();
     for (const s of sleeves) {
       if (!s.id || typeof s.id !== 'string') { issues.push({ field: 'id', message: 'sleeve id required' }); continue; }
@@ -414,8 +415,21 @@ export function makeApp({
       if (s.exit_mode === 'hybrid') {
         const act = Number(s.trail_activation_px);
         const delay = Number(s.hybrid_delay_secs);
-        if (!Number.isFinite(act) || act <= sell)
-          issues.push({ field: `${s.id}.trail_activation_px`, message: 'trail_activation_px must be > sell_px' });
+        // Auto-heal: if trail_activation_px is below/at sell_px, bump it to
+        // sell_px + 0.5% (or a minimum $0.01). This commonly happens when a
+        // sibling sleeve's sell_px was raised on a prior edit but activation
+        // wasn't. Prior behavior blocked the WHOLE save on the sibling's
+        // stale activation — a footgun Adam hit when trying to save Model B
+        // because another sleeve on the same product had a stale hybrid
+        // activation. Auto-heal instead of block; the sibling picks up a
+        // safe default, the current edit proceeds.
+        if (Number.isFinite(sell) && sell > 0 && (!Number.isFinite(act) || act <= sell)) {
+          const safeAct = Math.max(sell * 1.005, sell + 0.01);
+          s.trail_activation_px = safeAct;
+          autoFixed.push({ field: `${s.id}.trail_activation_px`,
+                           from: act, to: safeAct,
+                           reason: 'activation was <= sell_px; bumped 0.5% above sell_px' });
+        }
         if (!Number.isFinite(delay) || delay < 1)
           issues.push({ field: `${s.id}.hybrid_delay_secs`, message: 'hybrid_delay_secs must be >= 1' });
       }
@@ -492,7 +506,7 @@ export function makeApp({
       cfg.sleeves = sleeves;
       store[tenant][symbol].config = cfg;
       await writeStoreAtomic(storePath, store);
-      res.json({ ok: true });
+      res.json({ ok: true, auto_fixed: autoFixed });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
