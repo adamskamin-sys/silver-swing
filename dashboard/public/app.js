@@ -2928,7 +2928,16 @@ async function refreshSignals() {
                     : wa === 'ALERT_ARM' ? 'pos' : 'dim';
       const kw = Array.isArray(e.keywords_matched) ? e.keywords_matched.join(', ') : '';
       const prods = Array.isArray(e.products_affected) ? e.products_affected : [];
-      const prodDisplay = prods.length ? `${prods.length} product${prods.length === 1 ? '' : 's'}` : '—';
+      // Name the symbols, don't just count. Adam 2026-07-13: "how do I know
+      // what contract this signal concerns?" — before this fix the cell just
+      // said "1 product" so the symbol was hidden. Shows the first up to 3
+      // symbols inline; overflow gets a "+N more" chip with the full list in
+      // the tooltip.
+      const prodDisplay = prods.length
+        ? (prods.length <= 3
+            ? prods.map(p => `<code class="dim">${escapeHtml(p)}</code>`).join(' ')
+            : `<code class="dim">${escapeHtml(prods[0])}</code> <span class="dim" title="${escapeHtml(prods.join(', '))}">+${prods.length - 1} more</span>`)
+        : '—';
       const outs = e.outcomes || {};
       const outCell = (h) => {
         const o = outs[h];
