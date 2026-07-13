@@ -4230,28 +4230,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // editor is fully usable while this loads.
   loadSpreadRecommendations(symbol, m, {
     onApply: (spread, netPerRt) => {
-      // Auto re-anchor to CURRENT MARKET on tile click. Adam caught the
-      // footgun where a stale anchor (e.g., Your Contract Avg from an
-      // older price) combined with the tile's spread produced a sell
-      // target BELOW current mark — the sleeve would then fire the sell
-      // immediately at a worse-than-intended price. Tiles now always
-      // center their spread around the LATEST market price so the pick
-      // is always symmetric around 'now', not around a stale reference.
-      // Also flip the anchor-choice UI to Current market so it's obvious
-      // what happened.
-      if (mark > 0) {
-        currentAnchor = mark;
-        const marketBtn = anchorChoiceBtns.find(
-          b => b.dataset.anchor
-               && Math.abs(Number(b.dataset.anchor) - mark) < 0.001
-        );
-        if (marketBtn) {
-          for (const b of anchorChoiceBtns) b.classList.toggle('active', b === marketBtn);
-        }
-      }
-      // Apply the picked spread as sell_px/buy_px centered around the
-      // (now re-anchored) current mark. Same math as syncTargetsFromSlider
-      // so the values stay consistent with everything else in the form.
+      // Respect the user's chosen anchor. Prior behavior force-reanchored
+      // to current market on tile click — Adam correctly pushed back:
+      // "I try to use my contract average and when I click the expert tile
+      // it reverts to current market. I wanted to use my contract average
+      // because I don't want to make any sales until I am above water."
+      //
+      // The tile picks a SPREAD (independent of anchor). The anchor is
+      // WHERE to center that spread. If the user picked Your Contract Avg
+      // above the current mark, the resulting sell/buy stay above water —
+      // which is exactly what they want. Silently overriding that choice
+      // was the wrong call. Keep whatever anchor the user selected.
       const halfSpread = spread / 2;
       const newSell = Number((currentAnchor + halfSpread).toFixed(pricePrec));
       const newBuy = Number((currentAnchor - halfSpread).toFixed(pricePrec));
