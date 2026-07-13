@@ -343,8 +343,59 @@ def fetch_and_rank(
                 ranking.extend(forced)
                 ranked_ids.add(pid)
             else:
-                print(f"[scanner] force_include: compute_ranking dropped {pid} "
-                      f"(missing tick_size / contract_size / price?)", flush=True)
+                # compute_ranking's drop trigger is price is None/<=0 OR high/
+                # low 24h missing. For low-volume nano futures (NOL, PT, etc.)
+                # Coinbase's product dict often omits the 24h range fields.
+                # Fall back: derive high/low from recent candles and build a
+                # minimal entry so swing scoring below still runs.
+                px = _f(raw.get("price")) or 0.0
+                details = raw.get("future_product_details") or {}
+                tick = _f(raw.get("price_increment"))
+                csize = _f(details.get("contract_size"))
+                salvage_high = None
+                salvage_low = None
+                try:
+                    closes = _fetch_recent_closes(
+                        coinbase_client, pid,
+                        granularity="ONE_HOUR", lookback_secs=24 * 3600,
+                    )
+                    if closes:
+                        salvage_high = max(closes)
+                        salvage_low = min(closes)
+                        if not px:
+                            px = closes[-1]
+                except Exception as e:
+                    print(f"[scanner] force_include salvage candles failed for {pid}: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                if px > 0 and tick and csize and salvage_high and salvage_low:
+                    mid = (salvage_high + salvage_low) / 2 or px
+                    rng = salvage_high - salvage_low
+                    vol_pct = round((rng / mid) * 100, 3) if mid > 0 else 0.0
+                    ranking.append({
+                        "product_id": pid,
+                        "price": px,
+                        "high_24h": salvage_high,
+                        "low_24h": salvage_low,
+                        "vol_pct": vol_pct,
+                        "volume_24h": _f(raw.get("approximate_quote_24h_volume")) or 0,
+                        "tick_size": tick,
+                        "contract_size": csize,
+                        "tick_value": tick * csize,
+                        "contract_expiry": details.get("contract_expiry"),
+                        "intraday_margin_rate": _f(details.get("intraday_margin_rate")),
+                        "overnight_margin_rate": _f(details.get("overnight_margin_rate")),
+                    })
+                    ranked_ids.add(pid)
+                    print(f"[scanner] force_include: SALVAGED {pid} via candles "
+                          f"(high={salvage_high}, low={salvage_low}, tick={tick}, "
+                          f"csize={csize})", flush=True)
+                else:
+                    print(f"[scanner] force_include: compute_ranking dropped {pid} — "
+                          f"price={px}, high={raw.get('high_24_h') or raw.get('high_24h')}, "
+                          f"low={raw.get('low_24_h') or raw.get('low_24h')}, "
+                          f"tick={tick}, csize={csize}, "
+                          f"salvage_high={salvage_high}, salvage_low={salvage_low}",
+                          flush=True)
     for entry in ranking:
         pid = entry.get("product_id")
         tick = entry.get("tick_size")
