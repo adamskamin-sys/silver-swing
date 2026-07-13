@@ -2001,15 +2001,59 @@ class SwingTrader:
         return True
 
     def _penny_inside_price(self, sc, side: str, target_price: float) -> float:
-        """If the target is within pennyinside_max_ticks of the current best
-        on our side, snap one tick INSIDE that best (better queue position
-        than resting AT the best price where other bots already sit). Returns
-        the original target if the broker has no best_bid/best_ask, or if
-        the target is too far from market to matter."""
+        """Snap one tick INSIDE the best place-to-be for queue priority.
+
+        Two-tier logic (Larry Harris / Rishi Narang):
+        1. WALL-AWARE (preferred): if there's a WALL (level with >= wall_min_ratio
+           of top-N total size) within max_dist of target_price on our side,
+           snap one tick INSIDE that wall. When the wall clears we fill FIRST
+           at a way better price than resting AT the wall itself.
+        2. BEST-PRICE fallback: if no wall found, snap one tick inside the
+           current best on our side (the original penny-inside logic).
+
+        Uses the 5s-cached book snapshot from _book_imbalance_ok_for when
+        available. Returns the original target if the broker doesn't expose
+        depth or the target is too far from market.
+        """
         tick = float(self.cfg.tick_size or 0.005)
         if tick <= 0:
             return target_price
         max_dist = float(sc.penny_inside_max_ticks or 5) * tick
+
+        # Try wall-aware first (needs book depth). Reuse the same cached book
+        # the imbalance gate populated — one book fetch shared across both.
+        book = None
+        get_book = getattr(self.b, "get_orderbook", None)
+        if callable(get_book):
+            import time as _time
+            now = _time.time()
+            cache = getattr(self, "_book_cache", None)
+            if cache and (now - cache["ts"]) < 5.0:
+                book = cache["book"]
+            else:
+                try:
+                    book = get_book(limit=25)
+                    self._book_cache = {"ts": now, "book": book}
+                except Exception:
+                    book = None
+        if book and (book.get("bids") or book.get("asks")):
+            wall_price = self._find_wall(book, side, target_price, max_dist)
+            if wall_price is not None:
+                # Snap one tick INSIDE the wall on our side. SELL side wall
+                # is above us in price → snap wall - tick. BUY side wall is
+                # below us → snap wall + tick.
+                if side == "SELL":
+                    candidate = self._snap_to_tick(wall_price - tick)
+                else:
+                    candidate = self._snap_to_tick(wall_price + tick)
+                # Sanity: must remain on the correct side of top-of-book.
+                best_bid, best_ask = self._best_from_book(book)
+                if side == "SELL" and candidate > best_bid:
+                    return candidate
+                if side == "BUY" and (best_ask <= 0 or candidate < best_ask):
+                    return candidate
+
+        # Best-price fallback (no depth or no wall in range).
         try:
             spec = self.b.contract_spec() if hasattr(self.b, "contract_spec") else {}
             best_bid = float(spec.get("best_bid") or 0)
@@ -2019,19 +2063,52 @@ class SwingTrader:
         if side == "SELL":
             if best_ask <= 0 or abs(target_price - best_ask) > max_dist:
                 return target_price
-            # One tick INSIDE best_ask on the sell side = best_ask - tick
-            # (still above best_bid so we're providing liquidity, but ahead
-            # of everyone resting at best_ask).
             candidate = self._snap_to_tick(best_ask - tick)
             if candidate > best_bid and candidate < target_price + max_dist:
                 return candidate
-        else:  # BUY
+        else:
             if best_bid <= 0 or abs(target_price - best_bid) > max_dist:
                 return target_price
             candidate = self._snap_to_tick(best_bid + tick)
             if candidate < best_ask and candidate > target_price - max_dist:
                 return candidate
         return target_price
+
+    def _best_from_book(self, book: dict) -> tuple[float, float]:
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        best_bid = float(bids[0][0]) if bids else 0.0
+        best_ask = float(asks[0][0]) if asks else 0.0
+        return best_bid, best_ask
+
+    def _find_wall(self, book: dict, side: str, target_price: float,
+                    max_dist: float, wall_min_ratio: float = 0.35,
+                    levels: int = 10) -> float | None:
+        """Return the price of the biggest wall on our side within max_dist
+        of target_price, OR None if no such wall exists. 'Wall' = a single
+        price level whose size >= wall_min_ratio × sum(top-`levels` sizes)
+        on that side. Default 0.35 means a level with 35%+ of the top-10
+        depth qualifies — anything materially bigger than the median level.
+        """
+        side_rows = (book.get("asks") or []) if side == "SELL" else (book.get("bids") or [])
+        if not side_rows:
+            return None
+        top = side_rows[:levels]
+        total_size = sum(sz for _, sz in top)
+        if total_size <= 0:
+            return None
+        min_wall_size = total_size * wall_min_ratio
+        best_wall_px = None
+        best_wall_sz = 0.0
+        for px, sz in top:
+            if sz < min_wall_size:
+                continue
+            if abs(px - target_price) > max_dist:
+                continue
+            if sz > best_wall_sz:
+                best_wall_sz = sz
+                best_wall_px = px
+        return best_wall_px
 
     def _sleeve_on_fill(self, sc: SleeveConfig, ss: SleeveState, fill_price) -> None:
         # Capture order_id BEFORE clearing so the fill event carries it — makes
