@@ -138,7 +138,6 @@ def main() -> int:
     if "--days" in sys.argv:
         days = int(sys.argv[sys.argv.index("--days") + 1])
 
-    tenant = os.getenv("SWING_TENANT", "adam")
     single_symbol = os.getenv("SWING_SYMBOL")
     data_dir = os.getenv("SWING_DATA_DIR", "data")
 
@@ -148,14 +147,30 @@ def main() -> int:
     store = make_store(data_dir)
 
     # Adam 2026-07-13: "every tracked product and every future product."
-    # Either the single-symbol override or a sweep across the tenant.
+    # LIVE contracts live under the "-live" suffixed tenant (e.g., "adam-live"),
+    # NOT the bare "adam" tenant (which is paper). Auto-discover the live
+    # tenant so `run_champion_challenger.py` without env-vars does the right
+    # thing. Env SWING_TENANT overrides for edge cases.
+    env_tenant = os.getenv("SWING_TENANT")
+    if env_tenant:
+        tenant = env_tenant
+    else:
+        all_tenants = store.list_tenants() or []
+        live_tenants = [t for t in all_tenants if t.endswith("-live")]
+        if live_tenants:
+            tenant = live_tenants[0]
+        else:
+            tenant = "adam"
+        print(f"Tenants in store: {all_tenants}")
+        print(f"Sweeping tenant: {tenant!r} (live-tenant auto-detected)")
+
     if single_symbol:
         symbols = [single_symbol]
     else:
         symbols = _list_tracked_symbols(store, tenant)
         if not symbols:
             print(f"No tracked products for tenant {tenant!r}. "
-                  f"Set SWING_SYMBOL=<product> to test a specific one.")
+                  f"Try SWING_TENANT=<tenant> or SWING_SYMBOL=<product>.")
             return 1
 
     print(f"Champion-challenger sweep: {len(symbols)} symbol(s), {days}d each")
