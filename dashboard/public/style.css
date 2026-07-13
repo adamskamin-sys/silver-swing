@@ -2121,3 +2121,15 @@ header { padding: 20px 32px; }
 #signals-table .signal-would.neg { background: rgba(220, 60, 60, 0.15); color: var(--bad); }
 #signals-table .signal-would.warn { background: rgba(212, 160, 23, 0.15); color: var(--warn, #d4a017); }
 #signals-table .signal-would.pos { background: rgba(76, 205, 138, 0.15); color: var(--good); }
+
+/* Below-cost warning banner in the sleeve editor preview. Fires when the
+   sell target is below the position's cost basis — a silent losing setup
+   that Adam explicitly wants to avoid ("don't sell until above water"). */
+.preview-below-cost {
+  background: rgba(220, 60, 60, 0.12);
+  border: 1px solid rgba(220, 60, 60, 0.45);
+  color: var(--bad);
+  padding: 10px 14px; border-radius: 5px; margin-bottom: 10px;
+  font-size: 12px; line-height: 1.5;
+}
+.preview-below-cost b { color: var(--bad); }

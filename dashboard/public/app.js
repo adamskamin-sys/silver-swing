@@ -3351,14 +3351,25 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // so the user can pick the exact price they want the strategy anchored on.
   // Initial value = current mark (a sensible default that's guaranteed > 0).
   anchorChoices.push({ label: 'Custom target', value: mark, custom: true });
-  // Default anchor: for edits, keep the sleeve's original buy_px behavior
-  // (users' targets shouldn't jump around on re-open). For new / from-lot,
-  // use the first choice.
+  // Default anchor priority:
+  //   1. Lot context: purchased price (opened from a specific lot).
+  //   2. Existing sleeve + underwater: Your Contract Avg. Adam's ask —
+  //      "I try to use my contract average because I don't want to make
+  //      any sales until I am above water." If posAvgEntry is above mark,
+  //      picking the stale sleeve buy_px lands the auto-applied EXPERT
+  //      tile's sell target BELOW cost. Default to cost avg so the derived
+  //      sell stays above water.
+  //   3. Existing sleeve + above water: sleeve's original buy_px (stable
+  //      across re-opens once a cycle is profitable).
+  //   4. New / no context: Current market.
   let anchor;
   let anchorLabel;
   if (lotContext) {
     anchor = Number(lotContext.entry_price) || mark;
     anchorLabel = 'Purchased price';
+  } else if (existingSleeveForAnchor && posAvgEntry > 0 && posAvgEntry > mark) {
+    anchor = posAvgEntry;
+    anchorLabel = 'Your contract avg';
   } else if (existingSleeveForAnchor) {
     anchor = Number(existingSleeveForAnchor.buy_px) || mark;
     anchorLabel = "Strategy's original entry";
@@ -4115,6 +4126,24 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     const grossPerSwing = (sellPx - buyPx) * contractSize * qty;
     const netPerSwing = grossPerSwing - feesPerSwing;
 
+    // Below-cost warning. Adam's rule: never sell below cost basis. If the
+    // current sell target lands below Your Contract Avg, warn conspicuously
+    // — anchor drift or slider drag can silently produce this scenario.
+    const costBasis = Number(snap.position_avg_entry) || 0;
+    let belowCostBanner = '';
+    if (costBasis > 0 && sellPx > 0 && sellPx < costBasis) {
+      const lossPerCt = (costBasis - sellPx) * contractSize;
+      const totalLoss = lossPerCt * qty;
+      belowCostBanner = `
+        <div class="preview-below-cost">
+          ⚠ SELL TARGET BELOW COST — $${fmtPrice(sellPx)} vs cost $${fmtPrice(costBasis)}.
+          If this fires, you lose <b>$${totalLoss.toFixed(2)}</b> on the sale
+          ($${lossPerCt.toFixed(2)} × ${qty} contract${qty === 1 ? '' : 's'}).
+          Switch anchor to <b>Your contract avg</b> to keep sell above water.
+        </div>
+      `;
+    }
+
     // Only overwrite the input if the user isn't currently focused in it —
     // otherwise we clobber their typing mid-edit.
     if (document.activeElement !== profitValEl) profitValEl.value = profitEl.value;
@@ -4172,6 +4201,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       const estGross = Math.max(0, (sellPx - trailDistance - buyPx) * contractSize * qty);
       const estNet = estGross - feesPerSwing;
       previewEl.innerHTML = `
+        ${belowCostBanner}
         <div class="preview-row">
           <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtPrice(buyPx)}</span></div>
           <div><span class="preview-label">Now</span><span class="preview-num">$${fmtPrice(mark)}</span></div>
@@ -4197,6 +4227,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       const estGrossTrailWorst = Math.max(0, (activation - trailDistance - buyPx) * contractSize * qty);
       const estNetTrailWorst = estGrossTrailWorst - feesPerSwing;
       previewEl.innerHTML = `
+        ${belowCostBanner}
         <div class="preview-row">
           <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtPrice(buyPx)}</span></div>
           <div><span class="preview-label">Sell target</span><span class="preview-num sell">$${fmtPrice(sellPx)}</span></div>
@@ -4215,6 +4246,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     } else {
       const perContract = qty > 0 ? grossPerSwing / qty : 0;
       previewEl.innerHTML = `
+        ${belowCostBanner}
         <div class="preview-row">
           <div><span class="preview-label">Buy back at</span><span class="preview-num buy">$${fmtPrice(buyPx)}</span></div>
           <div><span class="preview-label">Now</span><span class="preview-num">$${fmtPrice(mark)}</span></div>
