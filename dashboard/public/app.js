@@ -411,12 +411,26 @@ function renderCockpit(store) {
     ? `${revCount}↺${crashExits ? ` <span class="ck-chip ck-warn" style="font-size:var(--fs-xs)" title="crash-guard flatten exits">🛡${crashExits}</span>` : ''}${shadowRev ? ` <span class="ck-chip" style="font-size:var(--fs-xs)" title="shadow reversal signals — hypothetical short flips logged for paper/backtest, no live order placed">👻${shadowRev}</span>` : ''}${haveRevPnl ? ` <span class="${classForValue(revPnl)}">${revPnl >= 0 ? '+' : '-'}${fmtMoney(Math.abs(revPnl))}</span>` : ''}`
     : '<span class="ck-chip ck-ok">0</span>';
 
+  // [crew] latest average-down light per sleeve (from the event feed)
+  const _adLatest = {};
+  for (const e of (lastTradeEvents || [])) {
+    if (e && e.event_type === 'avg_down_light' && e.sleeve_id) _adLatest[e.sleeve_id] = e.light;
+  }
+  const _adLights = Object.values(_adLatest);
+  const adGreen = _adLights.filter(l => l === 'green').length;
+  const adAmber = _adLights.filter(l => l === 'amber').length;
+  const avgDownValue = adGreen
+    ? `<span class="ck-chip ck-ok" title="experts say a disciplined average-down is on the table right now">🟢 ${adGreen}</span>`
+    : (adAmber ? `<span class="ck-chip" style="font-size:var(--fs-xs)" title="watching — conditions not all met yet">🟡 ${adAmber}</span>`
+               : '<span class="ck-chip ck-ok">—</span>');
+
   return `<div class="cockpit-row">
     <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
     <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
+    <div class="ck-tile" title="Average-down GREEN LIGHT — lights up when the experts' proven conditions for a disciplined scale-in line up (mean-revert range, at the floor, calm flow, margin). Notification only; you pull the trigger."><div class="ck-label">avg-down signal</div><div class="ck-value">${avgDownValue}</div></div>
     <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${healthClear ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
   </div>`;
 }
@@ -4125,6 +4139,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           <input type="checkbox" id="sl-reversal" ${draft.reversal_enabled ? 'checked' : ''}>
           <b>Reversal signals (shadow — records would-be short, no live order)</b>
         </label>
+        <label class="accumulate-toggle" title="Notification only. While holding an underwater long, pings you when the experts' proven conditions for a disciplined average-down line up (mean-revert range, price at the floor, calm flow, margin headroom). Never places an order — you decide.">
+          <input type="checkbox" id="sl-avgdown" ${draft.avg_down_alert_enabled ? 'checked' : ''}>
+          <b>Average-down green light (alert only, no order)</b>
+        </label>
         <div class="accumulate-fields" id="sl-stoploss-fields" ${draft.stop_loss_enabled ? '' : 'hidden'}>
           <div class="target-inputs">
             <label>Trigger price ($) — sell when ${escapeHtml(symbolFamilyOf(symbol) || 'price')} falls to
@@ -4945,6 +4963,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       buy_trail_enabled: !!(m.querySelector('#sl-buy-trail')?.checked),
       crash_guard_enabled: !!(m.querySelector('#sl-crashguard')?.checked),
       reversal_enabled: !!(m.querySelector('#sl-reversal')?.checked),
+      avg_down_alert_enabled: !!(m.querySelector('#sl-avgdown')?.checked),
       buy_trail_distance: (m.querySelector('#sl-buy-trail')?.checked
         ? Number(m.querySelector('#sl-buy-trail-distance')?.value || 0)
         : 0),

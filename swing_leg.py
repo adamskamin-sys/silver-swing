@@ -174,6 +174,8 @@ class SwingTrader:
             self._roll_guard_blackout_hours = 0.0
         self._roll_expiry_ts: Optional[float] = None
         self._roll_expiry_checked: float = 0.0
+        # [crew] Last average-down light per sleeve (edge-trigger notify + dash).
+        self._avg_down_light: dict = {}
 
     def _snap_to_tick(self, price: float) -> float:
         """Snap a price to the product's tick_size. Coinbase rejects orders
@@ -1397,6 +1399,66 @@ class SwingTrader:
         except Exception as e:
             return False, f"reversal safety check failed: {e}"
 
+    def _have_margin_for_one(self, sc) -> bool:
+        """Best-effort: is there margin headroom to add ONE more contract?
+        Advisory only — on unknown/error returns True (don't block the signal;
+        the human sees their own margin)."""
+        try:
+            fb = self.b.futures_balance() if hasattr(self.b, "futures_balance") else {}
+            avail = None
+            for k in ("available_margin", "available_balance", "buying_power",
+                      "cbi_usd_balance", "futures_buying_power"):
+                v = (fb or {}).get(k)
+                if isinstance(v, dict):
+                    v = v.get("value")
+                if v is not None:
+                    try:
+                        avail = float(v); break
+                    except (TypeError, ValueError):
+                        pass
+            if avail is None:
+                return True
+            need = float(getattr(self.cfg, "margin_per_contract", 0) or 0) * int(getattr(sc, "qty", 1) or 1)
+            return avail >= need
+        except Exception:
+            return True
+
+    def _maybe_avg_down_alert(self, sc, ss, last_price: float) -> None:
+        """[crew] Average-down GREEN LIGHT — notification only, never executes.
+        Fires only while HOLDING an underwater long, when the sleeve opts in.
+        Computes avg_down_signal and, edge-triggered, records the light + pings
+        on green. Opt-in (avg_down_alert_enabled); OFF by default; fail-safe."""
+        if not getattr(sc, "avg_down_alert_enabled", False):
+            return
+        if ss.state != SleeveStateEnum.ARMED_SELL:   # only while holding a long
+            return
+        try:
+            avg = ss.own_avg_entry
+            if avg is None or float(last_price) >= float(avg):   # only underwater
+                return
+            import avg_down_signal
+            prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(prices) < 24:
+                return
+            ms_snap = self.ms.snapshot() if self.ms else {}
+            sig = avg_down_signal.average_down_signal(
+                prices, ms=ms_snap, position_avg=float(avg), last_price=float(last_price),
+                have_margin=self._have_margin_for_one(sc))
+            light = sig.get("light")
+            if light != self._avg_down_light.get(sc.id):   # edge-triggered
+                self._avg_down_light[sc.id] = light
+                self._record("avg_down_light", sleeve_id=sc.id, sleeve_name=sc.name,
+                             light=light, reason=(sig.get("reasons") or [""])[0],
+                             checks=sig.get("checks"))
+                if light == "green":
+                    try:
+                        self._notify(f"AVG-DOWN GREEN: {self.symbol} / {sc.name}",
+                                     (sig.get("reasons") or [""])[0], Priority.HIGH)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self._record("avg_down_alert_error", sleeve_id=sc.id, error=str(e))
+
     def _maybe_reanchor_new_channel(self, sc, ss, last_price: float) -> None:
         """[crew] After a confirmed + settled structural drop, walk the sleeve's
         whole channel (buy/sell/trail + stop reference) DOWN to the new channel
@@ -1827,6 +1889,9 @@ class SwingTrader:
         # whole channel (buy/sell/trail + stop) down to the new level so nothing
         # strands above price. Opt-in; cannot fire mid-crash. Off by default.
         self._maybe_reanchor_new_channel(sc, ss, last_price)
+
+        # [crew] Average-down GREEN LIGHT alert (notification only). Opt-in.
+        self._maybe_avg_down_alert(sc, ss, last_price)
 
         # [crew] DEFENSIVE crash guard. OFF by default (crash_guard_enabled).
         # When on AND holding (ARMED_SELL), if a toxic liquidation cascade is

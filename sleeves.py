@@ -396,6 +396,11 @@ class SleeveConfig:
     # (needs vol to have settled first; the crash guard handles the during-crash
     # exit). OFF by default.
     channel_reanchor_enabled: bool = False
+    # [crew] Average-down GREEN LIGHT alert. When on, while HOLDING an underwater
+    # long the sleeve computes avg_down_signal (mean-revert regime + at the
+    # channel floor + calm flow + margin) and pings you when it turns green — a
+    # notification only, never an order. OFF by default.
+    avg_down_alert_enabled: bool = False
 
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
@@ -466,6 +471,7 @@ class SleeveConfig:
             crash_guard_enabled=bool(d.get("crash_guard_enabled") or False),
             reversal_enabled=bool(d.get("reversal_enabled") or False),
             channel_reanchor_enabled=bool(d.get("channel_reanchor_enabled") or False),
+            avg_down_alert_enabled=bool(d.get("avg_down_alert_enabled") or False),
             trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
             trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
             trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),
