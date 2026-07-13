@@ -837,6 +837,10 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     const qtyText = r.kind === 'spot' ? fmtNum(r.qty, 6) : r.qty;
     const avgText = r.avg > 0 ? '$' + fmtPrice(r.avg) : '—';
     const markText = r.mark > 0 ? '$' + fmtPrice(r.mark) : '—';
+    const trig = r.kind === 'futures' ? nextTriggerForProduct(liveTenant, r.product, r.mark) : null;
+    const triggerText = trig
+      ? `<span class="mono ${trig.side === 'SELL' ? 'pos' : 'neg'}" title="Sleeve fires ${trig.side} at this price">${trig.side === 'SELL' ? '↑' : '↓'} $${fmtPrice(trig.px)}</span>`
+      : '<span class="dim">—</span>';
     const liqText = r.liq > 0 ? '$' + fmtPrice(r.liq) : '—';
     const cycles = r.kind === 'futures' ? totalCyclesForProduct(r.product) : 0;
     const cyclesText = cycles > 0
@@ -877,6 +881,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td class="mono">${qtyText}</td>
         <td class="mono">${avgText}</td>
         <td class="mono">${markText}</td>
+        <td class="mono">${triggerText}</td>
         <td class="mono">${cyclesText}</td>
         <td class="mono">${realizedText}</td>
         <td class="mono">${totalText}</td>
@@ -936,6 +941,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td></td>
         <td></td>
         <td></td>
+        <td></td>
         <td class="mono"><b>${totalCyclesSum}</b></td>
         <td class="mono ${footClass(totalRealizedSum)}">${fmtSigned(totalRealizedSum)}</td>
         <td class="mono ${footClass(grandTotal)}">${fmtSigned(grandTotal)}</td>
@@ -949,7 +955,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     <table class="pf-table-compact">
       <thead><tr>
         <th>Name</th><th title="Unrealized (mark-to-market on open position)">Unrealized</th><th title="Contract size — units of the underlying per contract (e.g., 50 for silver, 2000 for copper, 10 for oil/platinum). Straight from Coinbase spec.">Size</th><th>Side</th><th>Qty</th>
-        <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized + Realized">Unrealized + Realized</th><th title="Funding rate (crypto perps only). Positive = longs pay shorts (expensive carry). Negative = shorts pay longs (you get paid to hold).">Funding</th><th>Liq</th>
+        <th>Avg</th><th>Mark</th><th title="Next price that fires a sleeve action. ↑ = sell trigger, ↓ = buy trigger. Closest across all sleeves on this product.">Trigger</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized + Realized">Unrealized + Realized</th><th title="Funding rate (crypto perps only). Positive = longs pay shorts (expensive carry). Negative = shorts pay longs (you get paid to hold).">Funding</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
       ${footHtml}
@@ -1234,6 +1240,46 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
 // strategy on it — primary state.realized_pnl + every sleeve's realized_pnl.
 // Used by the Live/Paper positions table so the user can see "this product
 // has banked $X so far" without opening the drill-down.
+// Next price that would fire a sleeve action on this product — the closest
+// trigger across all active sleeves, so the row shows "what has to happen for
+// something to change." ARMED_SELL → the sell price (trail floor if armed,
+// else sell_px). ARMED_BUY → buy_px. Returns { px, side } or null if nothing
+// is armed. Multi-sleeve: picks the trigger closest to mark (fires first).
+function nextTriggerForProduct(tenant, productId, mark) {
+  const block = currentStore?.[tenant]?.[productId];
+  if (!block) return null;
+  const sleeves = Array.isArray(block.config?.sleeves) ? block.config.sleeves : [];
+  if (!sleeves.length) return null;
+  const sleeveStates = (block.state || {}).sleeves || {};
+  const m = Number(mark) || 0;
+  let best = null;
+  for (const s of sleeves) {
+    const ss = sleeveStates[s.id] || {};
+    const st = String(ss.state || 'ARMED_SELL');
+    if (st === 'HALTED') continue;
+    let px = 0;
+    let side = '';
+    if (st === 'ARMED_SELL') {
+      const peak = Number(ss.trail_high_water_price) || 0;
+      const trailDist = Number(s.trail_distance) || 0;
+      const trailMode = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
+      if (trailMode && peak > 0 && trailDist > 0) {
+        px = peak - trailDist;
+      } else {
+        px = Number(s.sell_px) || 0;
+      }
+      side = 'SELL';
+    } else if (st === 'ARMED_BUY') {
+      px = Number(s.buy_px) || 0;
+      side = 'BUY';
+    }
+    if (!(px > 0)) continue;
+    const dist = m > 0 ? Math.abs(px - m) : px;
+    if (best === null || dist < best.dist) best = { px, side, dist };
+  }
+  return best ? { px: best.px, side: best.side } : null;
+}
+
 function totalRealizedForProduct(productId, tenantFilter) {
   let total = 0;
   const store = currentStore || {};

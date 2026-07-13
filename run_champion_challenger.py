@@ -3,16 +3,20 @@
 your Coinbase credentials + your live config. READ-ONLY: never trades or edits.
 
 Usage (from the repo root):
+    # sweep every tracked product on the tenant
+    python3 run_champion_challenger.py --days 30
+
+    # or scope to one symbol
     SWING_SYMBOL=SLR-27AUG26-CDE python3 run_champion_challenger.py --days 30
 
-What it does:
-  - reads your LIVE config for the symbol as the "champion"
+What it does per symbol:
+  - reads the LIVE config as the "champion"
   - builds two trail-distance challenger variants (tighter / wider)
   - fetches the last N days of 5-min candles
   - evaluates every config OUT-OF-SAMPLE via walk-forward
-  - prints a conservative promotion recommendation (usually: keep the champion)
+  - prints a conservative promotion recommendation (usually: keep champion)
 
-Note: this assumes your SwingConfig keys match expert_tuner._cfg_for_grid
+Note: this assumes SwingConfig keys match expert_tuner._cfg_for_grid
 (trail_distance, contract_size, margin_per_contract, ...). If a key differs on
 your setup, adjust the two spots marked [ADJUST].
 """
@@ -24,40 +28,23 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 
-def main() -> int:
-    days = 30
-    if "--days" in sys.argv:
-        days = int(sys.argv[sys.argv.index("--days") + 1])
-
-    tenant = os.getenv("SWING_TENANT", "adam")
-    symbol = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
-    data_dir = os.getenv("SWING_DATA_DIR", "data")
-
-    from state_store import make_store
-    from broker import BrokerConfig, CoinbaseBroker
+def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
+    """Walk-forward CC for a single symbol. Returns (ok, report_or_msg)."""
     from backtest import fetch_candles, run_backtest
     from paper_broker import PaperConfig
     from expert_tuner import _make_trader_factory
     from expert_params import compute_atr
     import champion_challenger as cc
 
-    store = make_store(data_dir)
-    champion = store.get_config(tenant, symbol)
-    if not champion:
-        print(f"No live config found for {tenant}/{symbol}. "
-              f"Set SWING_TENANT / SWING_SYMBOL to a configured product.")
-        return 1
-
-    coinbase = CoinbaseBroker(BrokerConfig(product_id=symbol))
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    print(f"Fetching {days}d of 5-min candles for {symbol} ...")
-    candles = fetch_candles(coinbase.client, symbol, start, end, granularity="FIVE_MINUTE")
+    try:
+        candles = fetch_candles(coinbase.client, symbol, start, end, granularity="FIVE_MINUTE")
+    except Exception as e:
+        return False, f"fetch_candles error: {type(e).__name__}: {e}"
     if len(candles) < 200:
-        print(f"Only {len(candles)} candles — need >= 200 for a walk-forward.")
-        return 1
+        return False, f"only {len(candles)} candles (need >= 200)"
     atr = compute_atr(candles, 14)
-    print(f"{len(candles)} candles, ATR(14) = {atr:.6f}")
 
     spec = {}
     try:
@@ -73,7 +60,7 @@ def main() -> int:
         fee_per_fill=float(champion.get("fee_per_contract_roundtrip", 4.68)) / 2.0,
         margin_per_contract=float(champion.get("margin_per_contract", 275.0)),
         starting_balance=100_000.0,
-        slippage_ticks=1.0,   # [crew:#5] realistic, not frictionless
+        slippage_ticks=1.0,
     )
 
     # Champion's implied trail multiple, then tighter/wider challengers. [ADJUST]
@@ -89,19 +76,108 @@ def main() -> int:
         "tighter_trail": variant(champ_mult * 0.75),
         "wider_trail": variant(champ_mult * 1.25),
     }
-
     seed_price = candles[len(candles) // 2].close
 
     def run_fn(cfg, cs):
         _, factory = _make_trader_factory(cfg, symbol, seed_price)
         return run_backtest(factory, paper_cfg, cs)
 
-    report = cc.evaluate_challengers(
-        candles, configs, run_fn,
-        champion="champion", n_splits=4, embargo=5, min_edge_pct=10.0,
-    )
-    print(json.dumps(report, indent=2, default=str))
-    print("\n>>>", report.get("note"))
+    try:
+        report = cc.evaluate_challengers(
+            candles, configs, run_fn,
+            champion="champion", n_splits=4, embargo=5, min_edge_pct=10.0,
+        )
+    except Exception as e:
+        return False, f"evaluate_challengers error: {type(e).__name__}: {e}"
+    report["_candles"] = len(candles)
+    report["_atr"] = round(atr, 6)
+    return True, report
+
+
+def _list_tracked_symbols(store, tenant: str) -> list[str]:
+    """Every symbol in the tenant with a real config (not meta keys). Includes
+    futures + perps + anything the user tracks."""
+    out = []
+    try:
+        symbols = store.list_symbols(tenant) or []
+    except Exception:
+        symbols = []
+    for sym in symbols:
+        if sym.startswith("__"):
+            continue
+        cfg = store.get_config(tenant, sym) or {}
+        if cfg.get("product_id") or cfg.get("contract_size"):
+            out.append(sym)
+    return sorted(set(out))
+
+
+def main() -> int:
+    days = 30
+    if "--days" in sys.argv:
+        days = int(sys.argv[sys.argv.index("--days") + 1])
+
+    tenant = os.getenv("SWING_TENANT", "adam")
+    single_symbol = os.getenv("SWING_SYMBOL")
+    data_dir = os.getenv("SWING_DATA_DIR", "data")
+
+    from state_store import make_store
+    from broker import BrokerConfig, CoinbaseBroker
+
+    store = make_store(data_dir)
+
+    # Adam 2026-07-13: "every tracked product and every future product."
+    # Either the single-symbol override or a sweep across the tenant.
+    if single_symbol:
+        symbols = [single_symbol]
+    else:
+        symbols = _list_tracked_symbols(store, tenant)
+        if not symbols:
+            print(f"No tracked products for tenant {tenant!r}. "
+                  f"Set SWING_SYMBOL=<product> to test a specific one.")
+            return 1
+
+    print(f"Champion-challenger sweep: {len(symbols)} symbol(s), {days}d each")
+    print("=" * 72)
+
+    summary = []
+    for i, symbol in enumerate(symbols, 1):
+        champion = store.get_config(tenant, symbol)
+        if not champion:
+            print(f"\n[{i}/{len(symbols)}] {symbol}: no config; skip")
+            summary.append({"symbol": symbol, "status": "no_config"})
+            continue
+        print(f"\n[{i}/{len(symbols)}] {symbol} — fetching {days}d candles ...")
+        try:
+            coinbase = CoinbaseBroker(BrokerConfig(product_id=symbol))
+        except Exception as e:
+            print(f"  broker init failed: {type(e).__name__}: {e}")
+            summary.append({"symbol": symbol, "status": "broker_error", "error": str(e)})
+            continue
+        ok, report = _evaluate_one(symbol, champion, coinbase, days)
+        if not ok:
+            print(f"  {report}")
+            summary.append({"symbol": symbol, "status": "error", "error": report})
+            continue
+        print(f"  {report['_candles']} candles, ATR(14) = {report['_atr']}")
+        print(json.dumps(
+            {k: v for k, v in report.items() if not k.startswith("_")},
+            indent=2, default=str,
+        ))
+        print(f"  >>> {report.get('note')}")
+        summary.append({
+            "symbol": symbol,
+            "status": "ok",
+            "recommend_promote": report.get("recommend_promote"),
+            "champion_oos_mean_return": report.get("champion_metrics", {}).get("oos_mean_return"),
+        })
+
+    print("\n" + "=" * 72)
+    print("SWEEP SUMMARY")
+    print("=" * 72)
+    for row in summary:
+        print(json.dumps(row, default=str))
+    promotable = [r["symbol"] for r in summary if r.get("recommend_promote")]
+    print(f"\nPromotable: {promotable if promotable else 'none — keep all champions'}")
     return 0
 
 
