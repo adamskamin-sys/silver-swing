@@ -1354,24 +1354,44 @@ class SwingTrader:
         return -86400 < secs_left <= hours * 3600
 
     def _reversal_position_safe(self, sc, ss):
-        """Guard for the OFFENSIVE reversal (flip long->short). On Coinbase
-        ONE-WAY netting the account holds a single net position, so flipping a
-        sleeve to short would sell straight THROUGH any contracts that sleeve
-        does not own — the protected core (core_qty) and any manually-held /
-        orphan contracts. Adam's rule: never reverse when contracts exist
-        outside this sleeve. Returns (ok, reason). Fail-safe: any error returns
-        (False, ...) so an accounting hiccup can never let a flip run over
-        un-sleeved size."""
+        """Guard for the OFFENSIVE reversal (flip long->short). Two rules, both
+        Adam's, both fail-safe:
+          1. NO UN-SLEEVED CONTRACTS. On Coinbase ONE-WAY netting the account
+             holds a single net position, so a flip sells straight THROUGH any
+             contracts the sleeves don't own — the protected core (core_qty) or
+             manually-held / orphan contracts. Refuse if net position exceeds
+             what the sleeves hold.
+          2. ALL-OR-NOTHING. A reversal is refused unless EVERY sleeve holding
+             contracts on this product has reversal enabled. If even one holding
+             sleeve is not cleared to short, none may — never a partial short
+             that nets against a sleeve that isn't supposed to be short.
+        Returns (ok, reason). Any error -> (False, ...) so an accounting hiccup
+        can never let a flip run over un-sleeved or not-cleared size."""
         try:
             core = int(getattr(self.cfg, "core_qty", 0) or 0)
             if core > 0:
                 return False, f"protected core of {core} present — a reversal would sell the core"
             pos = int(self.b.position_qty() or 0)
-            held = int(getattr(ss, "current_qty", 0) or 0) or int(getattr(sc, "qty", 0) or 0)
-            if held <= 0:
-                return False, "sleeve holds nothing to reverse"
-            if pos > held:
-                return False, (f"un-sleeved contracts present (net {pos} > this sleeve's {held}) "
+            cfgs = {c.id: c for c in self._load_sleeves_cfg()}
+            total_held = 0
+            for sid, oss in self.s.sleeves.items():
+                ocfg = cfgs.get(sid)
+                if ocfg is None:
+                    continue
+                oheld = int(getattr(oss, "current_qty", 0) or 0)
+                if oheld <= 0 and oss.state == SleeveStateEnum.ARMED_SELL:
+                    oheld = int(getattr(ocfg, "qty", 0) or 0)
+                if oheld <= 0:
+                    continue
+                total_held += oheld
+                # ALL-OR-NOTHING: any holding sleeve without reversal on blocks ALL.
+                if not getattr(ocfg, "reversal_enabled", False):
+                    return False, (f"all-or-nothing: sleeve '{ocfg.name}' holds {oheld} "
+                                   "with reversal OFF — no sleeve may short")
+            if total_held <= 0:
+                return False, "no sleeve holds anything to reverse"
+            if pos > total_held:
+                return False, (f"un-sleeved contracts present (net {pos} > sleeve-held {total_held}) "
                                "— a reversal would net against them")
             return True, ""
         except Exception as e:
