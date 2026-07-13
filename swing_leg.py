@@ -1634,7 +1634,10 @@ class SwingTrader:
                 elif sc.exit_mode == "hybrid":
                     self._sleeve_hybrid_step(sc, ss, last_price)
                 else:
-                    ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "SELL", sc.qty, sc.sell_px, last_price)
+                    self._maybe_emit_ml_shadow(sc)
+                    eff_qty = self._kelly_adjusted_qty(sc, ss)
+                    eff_price = self._adaptive_spread_price(sc, "SELL", sc.sell_px)
+                    ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "SELL", eff_qty, eff_price, last_price)
                     if ms_qty is None:
                         return  # microstructure gate said pause
                     self._sleeve_arm(sc, ss, "SELL", ms_qty, ms_px)
@@ -1741,7 +1744,10 @@ class SwingTrader:
                 arm_price = self._trailing_buy_ready(sc, ss, last_price)
                 if arm_price is None:
                     return  # still tracking the low, don't arm this tick
-                ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, arm_price, last_price)
+                self._maybe_emit_ml_shadow(sc)
+                eff_qty = self._kelly_adjusted_qty(sc, ss)
+                eff_price = self._adaptive_spread_price(sc, "BUY", arm_price)
+                ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", eff_qty, eff_price, last_price)
                 if ms_qty is None:
                     return  # microstructure gate said pause
                 self._sleeve_arm(sc, ss, "BUY", ms_qty, ms_px)
@@ -2021,7 +2027,9 @@ class SwingTrader:
         # Cross-asset correlation gate: don't fresh-long silver into a
         # copper crash (or oil into a natgas dump). Only gates BUY arms —
         # SELL arms must always be allowed so we can exit into a crash
-        # instead of being blocked from cutting risk.
+        # instead of being blocked from cutting risk. Dynamic-correlation
+        # mode (opt-in) also inspects any product with rolling-30d Pearson
+        # ≥ threshold, catching macro cross-family co-movement.
         if getattr(sc, "correlation_gate_enabled", False):
             try:
                 import correlation
@@ -2029,6 +2037,8 @@ class SwingTrader:
                     self.store, self.tenant_id, self.symbol, side,
                     window_secs=float(getattr(sc, "correlation_window_secs", 3600.0)),
                     crash_threshold_pct=float(getattr(sc, "correlation_crash_pct", 3.0)),
+                    use_dynamic_correlation=bool(getattr(sc, "correlation_dynamic_enabled", False)),
+                    correlation_threshold=float(getattr(sc, "correlation_dynamic_threshold", 0.6)),
                 )
                 if crash:
                     self._record(
@@ -2040,6 +2050,49 @@ class SwingTrader:
                     return
             except Exception as e:
                 self._record("correlation_check_failed",
+                             sleeve_id=sc.id, error=str(e))
+        # Funding-rate gate (crypto perps). Block BUY arms when funding is
+        # strongly positive — you'd be paying to hold long during a probable
+        # reversal (Aksoy-Cheng / Hasbrouck).
+        if getattr(sc, "funding_gate_enabled", False) and side == "BUY":
+            try:
+                import funding_signals
+                if funding_signals.is_perp(self.symbol):
+                    snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+                    fr = funding_signals.funding_rate_of(snap)
+                    thr = float(getattr(sc, "funding_gate_threshold", 0.0005) or 0.0005)
+                    if not funding_signals.funding_gate_ok_for_buy(fr, thr):
+                        self._record(
+                            "sleeve_arm_skipped_funding_positive",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            side=side, qty=qty, price=price,
+                            funding_rate=fr, threshold=thr,
+                        )
+                        return
+            except Exception as e:
+                self._record("funding_check_failed",
+                             sleeve_id=sc.id, error=str(e))
+        # Cross-exchange fair-value gate (Binance reference for crypto).
+        # Refuse arms when Coinbase price diverges too far from Binance mid.
+        if getattr(sc, "crossex_gate_enabled", False):
+            try:
+                import crossex
+                ok, div = crossex.crossex_gate_ok(
+                    self.symbol,
+                    float(price or 0),
+                    float(getattr(sc, "crossex_max_divergence_pct", 1.0) or 1.0),
+                )
+                if not ok:
+                    self._record(
+                        "sleeve_arm_skipped_crossex_divergence",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        side=side, qty=qty, price=price,
+                        divergence_pct=div,
+                        max_pct=float(getattr(sc, "crossex_max_divergence_pct", 1.0) or 1.0),
+                    )
+                    return
+            except Exception as e:
+                self._record("crossex_check_failed",
                              sleeve_id=sc.id, error=str(e))
         # For SELL: capture cost basis of the contracts we're about to sell so
         # realized P/L on the fill uses the ACTUAL price paid, not sc.buy_px.
@@ -2187,6 +2240,82 @@ class SwingTrader:
             if (1.0 - bid_ratio) > thr:  # ask pressure = 1 - bid pressure
                 return False
         return True
+
+    def _kelly_adjusted_qty(self, sc, ss) -> int:
+        """Apply Kelly-fraction sizing if enabled. Never sizes UP (only ≤ cfg.qty)."""
+        if not getattr(sc, "kelly_enabled", False):
+            return int(sc.qty)
+        try:
+            import kelly
+            recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
+            mult = kelly.compute_kelly_multiplier(
+                recent,
+                kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
+                min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
+            )
+            return kelly.size_from_qty(int(sc.qty), mult)
+        except Exception as e:
+            self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
+            return int(sc.qty)
+
+    def _adaptive_spread_price(self, sc, side: str, arm_price: float) -> float:
+        """When adaptive spread is enabled, widen the arm price to account
+        for current realized vol vs baseline. Returns the (possibly wider)
+        arm price. No effect when disabled or insufficient data."""
+        if not getattr(sc, "adaptive_spread_enabled", False):
+            return arm_price
+        try:
+            import adaptive_spread
+            snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+            history = snap.get("price_history") or []
+            window = float(getattr(sc, "adaptive_spread_vol_window_secs", 300.0) or 300.0)
+            rv = adaptive_spread.realized_vol_from_history(history, window_secs=window)
+            # Baseline: compute rv over a longer window as the "normal" reference.
+            baseline = adaptive_spread.realized_vol_from_history(history,
+                                                                  window_secs=window * 12)
+            mult = adaptive_spread.spread_multiplier(
+                rv, baseline,
+                max_multiplier=float(getattr(sc, "adaptive_spread_max_multiplier", 2.0) or 2.0),
+            )
+            if mult <= 1.0:
+                return arm_price
+            new_sell, new_buy = adaptive_spread.adjusted_targets(sc.sell_px, sc.buy_px, mult)
+            widened = new_sell if side == "SELL" else new_buy
+            self._record(
+                "adaptive_spread_widened",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                side=side, multiplier=round(mult, 3),
+                orig_price=arm_price, widened_price=widened,
+                realized_vol=round(rv, 6) if rv else None,
+                baseline_vol=round(baseline, 6) if baseline else None,
+            )
+            return widened
+        except Exception as e:
+            self._record("adaptive_spread_failed", sleeve_id=sc.id, error=str(e))
+            return arm_price
+
+    def _maybe_emit_ml_shadow(self, sc) -> None:
+        """If ml_shadow_enabled, extract features + run predictor + log signal.
+        Purely observational — does not gate the arm."""
+        if not getattr(sc, "ml_shadow_enabled", False):
+            return
+        try:
+            import ml_predictor
+            snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+            features = ml_predictor.extract_features(snap)
+            if not features:
+                return
+            score = ml_predictor.predict(features)
+            threshold = float(getattr(sc, "ml_signal_threshold", 0.3) or 0.3)
+            if abs(score) < threshold:
+                return
+            baseline_mark = float(snap.get("last_mark") or 0)
+            ml_predictor.emit_ml_shadow_signal(
+                self.store, self.tenant_id, self.symbol,
+                features, score, baseline_mark,
+            )
+        except Exception as e:
+            self._record("ml_shadow_failed", sleeve_id=sc.id, error=str(e))
 
     def _trade_ofi_ok_for(self, sc, side: str) -> bool:
         """Trade-tape OFI gate. Mirror of _book_imbalance_ok_for but reads

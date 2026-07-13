@@ -543,6 +543,16 @@ class _Track:
         self.ms = MicrostructureFilter() if is_primary_track else None
         if self.ms and not self.ms.any_enabled():
             self.ms = None
+        # Tick recorder — writes every ticker/trade/L2 to disk when
+        # SWING_TICK_RECORDING=1 for future backtest / ML training. No-op
+        # when the env var is unset (default).
+        self.tick_recorder = None
+        try:
+            from tick_recorder import TickRecorder, enabled as _tr_enabled
+            if _tr_enabled():
+                self.tick_recorder = TickRecorder(symbol)
+        except Exception:
+            self.tick_recorder = None
         # Wire the aggressor-run shadow-signal callback. Fires from
         # MicrostructureFilter.on_trade when the run detector crosses its
         # threshold. Shadow ONLY: emit_aggressor_run_signal only writes to
@@ -566,13 +576,27 @@ class _Track:
 
         self.trader = SwingTrader(self.broker, store, tenant, symbol,
                                   trade_log=log, kill_switch=ks, microstructure=self.ms)
+        # Fan out feed callbacks: MicrostructureFilter first, then tick
+        # recorder (if enabled). This way tick recording works even for
+        # symbols/tenants that don't have an active MS filter.
+        def _fanout_l2_snapshot(bids, asks):
+            if self.ms is not None: self.ms.on_l2_snapshot(bids, asks)
+            if self.tick_recorder is not None: self.tick_recorder.on_l2_snapshot(bids, asks)
+        def _fanout_l2_update(side, price, sz):
+            if self.ms is not None: self.ms.on_l2_update(side, price, sz)
+            if self.tick_recorder is not None: self.tick_recorder.on_l2_update(side, price, sz)
+        def _fanout_trade(price, size, side, ts=None):
+            if self.ms is not None: self.ms.on_trade(price, size, side, ts)
+            if self.tick_recorder is not None: self.tick_recorder.on_trade(price, size, side, ts)
+        needs_l2 = (self.ms is not None and self.ms.needs_l2()) or (self.tick_recorder is not None)
+        needs_trades = (self.ms is not None and self.ms.needs_trades()) or (self.tick_recorder is not None)
         self.feed = LiveTickerFeed(
             symbol,
-            subscribe_l2=(self.ms.needs_l2() if self.ms else False),
-            subscribe_trades=(self.ms.needs_trades() if self.ms else False),
-            on_l2_snapshot=(self.ms.on_l2_snapshot if self.ms else None),
-            on_l2_update=(self.ms.on_l2_update if self.ms else None),
-            on_trade=(self.ms.on_trade if self.ms else None),
+            subscribe_l2=needs_l2,
+            subscribe_trades=needs_trades,
+            on_l2_snapshot=(_fanout_l2_snapshot if needs_l2 else None),
+            on_l2_update=(_fanout_l2_update if needs_l2 else None),
+            on_trade=(_fanout_trade if needs_trades else None),
         )
         self.last_snapshot_ts = 0.0
         self.reconciled = False
@@ -594,6 +618,8 @@ class _Track:
         self.broker.tick(t["best_bid"], t["best_ask"])
         if self.ms is not None:
             self.ms.on_ticker(t["best_bid"], t["best_ask"], t["price"])
+        if self.tick_recorder is not None:
+            self.tick_recorder.on_ticker(t["best_bid"], t["best_ask"], t["price"])
         set_range = getattr(self.broker, "set_external_day_range", None)
         if callable(set_range):
             set_range(t.get("high_24h"), t.get("low_24h"))
@@ -618,6 +644,11 @@ class _Track:
             self.feed.stop()
         except Exception:
             pass
+        if self.tick_recorder is not None:
+            try:
+                self.tick_recorder.close()
+            except Exception:
+                pass
 
 
 def _discover_tracked_symbols(store, tenant: str, primary_symbol: str) -> list[str]:

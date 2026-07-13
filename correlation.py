@@ -111,31 +111,181 @@ def _peer_pct_change(store, tenant: str, family: str, exclude_symbol: str,
     return worst_pct, worst_sym
 
 
+def rolling_correlation(store, tenant: str, symbol_a: str, symbol_b: str,
+                        window_secs: float = 30 * 24 * 3600.0) -> Optional[float]:
+    """Pearson correlation of price_history between two symbols over the
+    last window_secs. Reads snapshot.price_history — no new API calls.
+
+    Returns None if insufficient overlapping samples. Used to DISCOVER
+    correlations at runtime, beyond the hardcoded CORRELATION_FAMILIES.
+    Cross-asset macro shocks (BTC ↔ gold during a rate scare) create
+    temporary correlations that the static family map misses.
+    """
+    import math
+    def _history(sym):
+        try:
+            snap = store.get_snapshot(tenant, sym) if hasattr(store, "get_snapshot") else None
+        except Exception:
+            return []
+        if not snap:
+            return []
+        return snap.get("price_history") or []
+    ha = _history(symbol_a)
+    hb = _history(symbol_b)
+    if not ha or not hb:
+        return None
+    now = time.time()
+    cutoff = now - window_secs
+    def _samples(h):
+        out = []
+        for entry in h:
+            try:
+                ts = float(entry[0])
+                px = float(entry[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if ts >= cutoff and px > 0:
+                out.append((ts, px))
+        return out
+    sa = _samples(ha)
+    sb = _samples(hb)
+    if len(sa) < 10 or len(sb) < 10:
+        return None
+    # Align via nearest-timestamp lookup. Cheap N×log(M) — both lists are
+    # small (bounded by snapshot history size).
+    sb_sorted = sorted(sb, key=lambda p: p[0])
+    sb_ts = [p[0] for p in sb_sorted]
+    sb_px = [p[1] for p in sb_sorted]
+    import bisect
+    pairs = []
+    for ts_a, px_a in sa:
+        idx = bisect.bisect_left(sb_ts, ts_a)
+        # nearest neighbor within 60s
+        best = None
+        for cand in (idx - 1, idx):
+            if 0 <= cand < len(sb_ts):
+                dt = abs(sb_ts[cand] - ts_a)
+                if dt <= 60.0 and (best is None or dt < best[0]):
+                    best = (dt, sb_px[cand])
+        if best:
+            pairs.append((px_a, best[1]))
+    if len(pairs) < 10:
+        return None
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    n = len(pairs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+    dx = math.sqrt(sum((xs[i] - mx) ** 2 for i in range(n)))
+    dy = math.sqrt(sum((ys[i] - my) ** 2 for i in range(n)))
+    if dx == 0 or dy == 0:
+        return None
+    return num / (dx * dy)
+
+
+def discover_correlated_peers(store, tenant: str, symbol: str,
+                              threshold: float = 0.6,
+                              window_secs: float = 30 * 24 * 3600.0) -> list[tuple[str, float]]:
+    """Return list of (peer_symbol, correlation) where |correlation| > threshold.
+    Complements CORRELATION_FAMILIES — catches dynamic correlations across
+    families that the hardcoded map wouldn't have.
+
+    Cost: O(N) correlation computes over N products in the tenant. Cheap
+    at our scale (< 30 products) but the caller should cache.
+    """
+    peers: list[tuple[str, float]] = []
+    for sym in store.list_symbols(tenant):
+        if sym.startswith("__") or sym == symbol:
+            continue
+        c = rolling_correlation(store, tenant, symbol, sym, window_secs=window_secs)
+        if c is not None and abs(c) >= threshold:
+            peers.append((sym, round(c, 3)))
+    peers.sort(key=lambda p: -abs(p[1]))
+    return peers
+
+
 def peer_crash_check(store, tenant: str, symbol: str, side: str,
                      window_secs: float = 3600.0,
-                     crash_threshold_pct: float = 3.0) -> Optional[dict]:
-    """Check if a peer in the same family has crashed more than
-    crash_threshold_pct in the last window_secs. Returns a dict describing
-    the peer crash if the arm should be BLOCKED, else None.
+                     crash_threshold_pct: float = 3.0,
+                     use_dynamic_correlation: bool = False,
+                     correlation_threshold: float = 0.6) -> Optional[dict]:
+    """Check if a peer has crashed more than crash_threshold_pct in the
+    last window_secs. Returns a dict describing the peer crash if the
+    arm should be BLOCKED, else None.
 
     Only gates BUY arms (fresh long entries). SELL arms are always allowed
     — if we already hold contracts, we may want to EXIT into a peer crash
     (that's what the trail is for), not be blocked from exiting.
+
+    use_dynamic_correlation=True (opt-in): also check peers discovered via
+    rolling correlation ≥ correlation_threshold, not just the hardcoded
+    family map. Catches macro-shock cross-family correlations (e.g., BTC
+    tanking after an FOMC surprise correlates with everything else that
+    day, even though the static families don't group crypto with metals).
     """
     if side != "BUY":
         return None
     family = _family_of(symbol)
-    if not family:
-        return None
-    worst_pct, worst_sym = _peer_pct_change(store, tenant, family,
-                                             exclude_symbol=symbol,
-                                             window_secs=window_secs)
-    if worst_pct <= -abs(crash_threshold_pct):
-        return {
-            "family": family,
-            "worst_peer": worst_sym,
-            "worst_pct": round(worst_pct, 3),
-            "window_secs": window_secs,
-            "threshold_pct": crash_threshold_pct,
-        }
+    # Static-family check (existing behavior).
+    if family:
+        worst_pct, worst_sym = _peer_pct_change(store, tenant, family,
+                                                 exclude_symbol=symbol,
+                                                 window_secs=window_secs)
+        if worst_pct <= -abs(crash_threshold_pct):
+            return {
+                "family": family,
+                "worst_peer": worst_sym,
+                "worst_pct": round(worst_pct, 3),
+                "window_secs": window_secs,
+                "threshold_pct": crash_threshold_pct,
+                "source": "static_family",
+            }
+    # Dynamic-correlation check (opt-in additional coverage).
+    if use_dynamic_correlation:
+        try:
+            peers = discover_correlated_peers(
+                store, tenant, symbol,
+                threshold=correlation_threshold,
+                window_secs=max(window_secs, 7 * 24 * 3600.0),  # need ≥ 7d for stable corr
+            )
+        except Exception:
+            peers = []
+        # For each strongly-correlated peer, check its recent pct change.
+        # If the correlation is POSITIVE (co-moves) and the peer crashed,
+        # our long is likely to follow — block.
+        for peer_sym, corr in peers:
+            if corr <= 0:
+                continue  # only care about positive co-movement
+            try:
+                snap = store.get_snapshot(tenant, peer_sym)
+            except Exception:
+                snap = None
+            if not snap:
+                continue
+            mark = float(snap.get("last_mark") or 0)
+            history = snap.get("price_history") or []
+            window_start_price = None
+            now = time.time()
+            for ts, px in history:
+                try:
+                    ts_f = float(ts)
+                    if ts_f >= now - window_secs:
+                        window_start_price = float(px)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not window_start_price or window_start_price <= 0:
+                continue
+            pct = (mark - window_start_price) / window_start_price * 100.0
+            if pct <= -abs(crash_threshold_pct):
+                return {
+                    "family": family or "dynamic",
+                    "worst_peer": peer_sym,
+                    "worst_pct": round(pct, 3),
+                    "window_secs": window_secs,
+                    "threshold_pct": crash_threshold_pct,
+                    "correlation": corr,
+                    "source": "dynamic_correlation",
+                }
     return None

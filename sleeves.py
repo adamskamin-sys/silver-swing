@@ -207,6 +207,57 @@ class SleeveConfig:
     correlation_window_secs: float = 3600.0    # look-back window (1h default)
     correlation_crash_pct: float = 3.0         # peer drop that triggers block
 
+    # Funding-rate signal (crypto perps only). When enabled and funding is
+    # strongly POSITIVE (paying to hold long), BUY arms are blocked.
+    # Aksoy-Cheng 2018 / Hasbrouck 2021: extreme funding predicts near-term
+    # reversals. Threshold is a fraction (0.0005 = 0.05% per 8h). No effect
+    # on non-perp products (silver/oil/etc.).
+    funding_gate_enabled: bool = False
+    funding_gate_threshold: float = 0.0005  # +0.05% per 8h → block longs
+
+    # Kelly-fraction dynamic sizing (Van Tharp quarter-Kelly). When enabled,
+    # the effective arm qty is cfg.qty × Kelly-multiplier, computed from the
+    # sleeve's recent_cycle_pnls. Never sizes UP — only equal or down.
+    # kelly_fraction is the safety cap on Kelly (default 0.25 = quarter Kelly).
+    # min_cycles is the sample threshold below which we fall through to
+    # full cfg.qty (don't Kelly-size on 2 cycles of data).
+    kelly_enabled: bool = False
+    kelly_fraction: float = 0.25
+    kelly_min_cycles: int = 8
+
+    # Volatility-adaptive spread widening (Andersen-Bollerslev). When
+    # realized vol spikes above baseline, WIDEN the arm's effective spread
+    # (never touches user's saved sell/buy — only the per-arm limit price).
+    # multiplier_max caps how much we can widen (default 2× — never more
+    # than twice the user's designed spread even in extreme vol).
+    adaptive_spread_enabled: bool = False
+    adaptive_spread_max_multiplier: float = 2.0
+    adaptive_spread_vol_window_secs: float = 300.0  # 5-min realized vol
+
+    # Cross-exchange fair-value gate (Binance reference for crypto).
+    # Refuse arms when Coinbase mark diverges > max_divergence_pct from
+    # Binance's mid on the same underlying. Only applies to products with
+    # a Binance mapping in crossex._BINANCE_SYMBOL. Silent no-op elsewhere.
+    crossex_gate_enabled: bool = False
+    crossex_max_divergence_pct: float = 1.0
+
+    # Dynamic-correlation gate (rolling-30d Pearson beyond hardcoded families).
+    # When enabled, peer_crash_check also inspects any product whose price
+    # history has correlation ≥ correlation_dynamic_threshold with this
+    # product. Catches macro-shock cross-family co-movement that static
+    # families would miss. Requires ≥ 7d of snapshot history to be useful;
+    # falls through to permissive-default when data is thin.
+    correlation_dynamic_enabled: bool = False
+    correlation_dynamic_threshold: float = 0.6
+
+    # ML-predictor shadow signal emission. When enabled, every arm-tick
+    # extracts the ml_predictor feature vector, runs the placeholder linear
+    # model, and if |score| > ml_signal_threshold, writes a shadow log entry.
+    # DOES NOT gate arms — pure evaluation harness. Compare accuracy over
+    # 2-4 weeks before considering promotion to a live gate.
+    ml_shadow_enabled: bool = False
+    ml_signal_threshold: float = 0.3
+
     # Trade-tape OFI gate — mirror of book_imbalance_gate but reads the
     # EXECUTED trade tape instead of resting depth. Cont-Kukanov-Stoikov
     # (2014) + Cartea-Jaimungal find trade OFI is a stronger short-term
@@ -313,6 +364,20 @@ class SleeveConfig:
             trade_ofi_gate_enabled=bool(d.get("trade_ofi_gate_enabled") or False),
             trade_ofi_window_secs=float(d.get("trade_ofi_window_secs") or 60.0),
             trade_ofi_threshold=float(d.get("trade_ofi_threshold") or 0.65),
+            funding_gate_enabled=bool(d.get("funding_gate_enabled") or False),
+            funding_gate_threshold=float(d.get("funding_gate_threshold") or 0.0005),
+            kelly_enabled=bool(d.get("kelly_enabled") or False),
+            kelly_fraction=float(d.get("kelly_fraction") or 0.25),
+            kelly_min_cycles=int(d.get("kelly_min_cycles") or 8),
+            adaptive_spread_enabled=bool(d.get("adaptive_spread_enabled") or False),
+            adaptive_spread_max_multiplier=float(d.get("adaptive_spread_max_multiplier") or 2.0),
+            adaptive_spread_vol_window_secs=float(d.get("adaptive_spread_vol_window_secs") or 300.0),
+            crossex_gate_enabled=bool(d.get("crossex_gate_enabled") or False),
+            crossex_max_divergence_pct=float(d.get("crossex_max_divergence_pct") or 1.0),
+            correlation_dynamic_enabled=bool(d.get("correlation_dynamic_enabled") or False),
+            correlation_dynamic_threshold=float(d.get("correlation_dynamic_threshold") or 0.6),
+            ml_shadow_enabled=bool(d.get("ml_shadow_enabled") or False),
+            ml_signal_threshold=float(d.get("ml_signal_threshold") or 0.3),
         )
 
 
