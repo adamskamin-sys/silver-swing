@@ -5243,7 +5243,10 @@ async function loadScannerChart() {
     // each completed cycle with a line.
     const [candleResp, fillsResp] = await Promise.all([
       fetch(`/api/candles?product_id=${encodeURIComponent(product_id)}&${rangeParam}&granularity=${granularity}`, { credentials: 'same-origin' }),
-      fetch(`/api/fills?symbol=${encodeURIComponent(product_id)}&limit=500`, { credentials: 'same-origin' }),
+      // limit=10000 matches the RedisTradeLog cap so cycles from earlier in
+      // the day/week still make it onto the chart. 500 was silently dropping
+      // fills whenever there were more than ~500 events since the buy leg.
+      fetch(`/api/fills?symbol=${encodeURIComponent(product_id)}&limit=10000`, { credentials: 'same-origin' }),
     ]);
     if (!candleResp.ok) throw new Error(`HTTP ${candleResp.status}`);
     const data = await candleResp.json();
