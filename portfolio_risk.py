@@ -39,6 +39,14 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "max_drawdown_pct": 5.0,          # 5% drawdown from peak → halt
     "min_drawdown_dollars": 50.0,     # ...but only if >= $50 absolute (noise floor)
+    # [crew:#2] Absolute-dollar hard breaker. The percentage breaker above is
+    # blind whenever peak P&L sits near $0 (a fresh or oscillating account):
+    # abs(peak) <= 1.0 forces drawdown_pct to 0, so a large DOLLAR loss produces
+    # a 0% drawdown and the halt NEVER fires — exactly when you'd want it. This
+    # trips the halt on absolute dollars regardless of the percentage. It only
+    # blocks NEW arms (open legs ride), and auto-resumes with hysteresis.
+    # TUNE THIS to your risk tolerance; 0 disables it (and re-opens the dead zone).
+    "max_drawdown_dollars": 500.0,
     "resume_threshold_pct": 0.5,      # resume when drawdown < 2.5% (half of 5%)
     "peak_lookback_secs": 24 * 3600,  # rolling 24h peak
 }
@@ -123,17 +131,24 @@ def tick(store, tenant: str, trade_log=None) -> Optional[dict]:
     drawdown_pct = (drawdown / abs(peak) * 100.0) if abs(peak) > 1.0 else 0.0
     was_halted = bool(st.get("halted", False))
     change = None
+    max_dd_dollars = float(cfg.get("max_drawdown_dollars") or 0.0)
     if not was_halted:
         # Halt trigger: BOTH % and absolute must exceed thresholds. Prevents
         # halting on a 5% swing of $10 (noise) or a $500 loss on a $50k
         # account (only 1%, not a real drawdown).
-        if (drawdown_pct >= float(cfg["max_drawdown_pct"])
-                and drawdown >= float(cfg["min_drawdown_dollars"])):
+        pct_trip = (drawdown_pct >= float(cfg["max_drawdown_pct"])
+                    and drawdown >= float(cfg["min_drawdown_dollars"]))
+        # [crew:#2] Absolute-dollar hard breaker — fires even when the % path is
+        # blind (peak P&L ~ $0 forces drawdown_pct to 0). This is the guard that
+        # actually protects a fresh/oscillating account.
+        abs_trip = max_dd_dollars > 0 and drawdown >= max_dd_dollars
+        if pct_trip or abs_trip:
             st["halted"] = True
             st["halted_ts"] = now
             st["halt_reason"] = (
-                f"portfolio drawdown {drawdown_pct:.1f}% "
-                f"(${drawdown:.2f}) exceeds {cfg['max_drawdown_pct']}%")
+                f"portfolio drawdown ${drawdown:.2f} ({drawdown_pct:.1f}%) "
+                + ("exceeds absolute $%.2f limit" % max_dd_dollars if (abs_trip and not pct_trip)
+                   else f"exceeds {cfg['max_drawdown_pct']}%"))
             change = {
                 "kind": "halted",
                 "drawdown_pct": drawdown_pct,
@@ -154,7 +169,11 @@ def tick(store, tenant: str, trade_log=None) -> Optional[dict]:
     else:
         # Auto-resume when drawdown falls back to resume_threshold × halt.
         resume_pct = float(cfg["max_drawdown_pct"]) * float(cfg["resume_threshold_pct"])
-        if drawdown_pct < resume_pct:
+        # [crew:#2] Also require the absolute drawdown to recover below its
+        # hysteresis band, or an absolute-dollar halt would instantly re-resume
+        # (its drawdown_pct is ~0, already under resume_pct).
+        abs_ok = (max_dd_dollars <= 0) or (drawdown < max_dd_dollars * float(cfg["resume_threshold_pct"]))
+        if drawdown_pct < resume_pct and abs_ok:
             st["halted"] = False
             st["resumed_ts"] = now
             st["last_halt_reason"] = st.get("halt_reason")

@@ -201,16 +201,51 @@ class RedisJsonStore:
         raw = self._r.get(self._key)
         return json.loads(raw) if raw else {}
 
+    # [crew:#1] Concurrency-safe read-modify-write via Redis WATCH/MULTI.
+    # PROBLEM this fixes: the bot rewrites its `state` scope ~1x/sec while the
+    # dashboard writes the kill switch / portfolio halt into the SAME blob key.
+    # The old plain load->mutate->SET meant the bot's save (built from a blob it
+    # loaded a moment earlier) could silently ERASE a kill switch the dashboard
+    # set in between — your panic-stop reverts and the bot keeps trading.
+    # WATCH the key: if any other writer changes it between our read and our
+    # SET, the transaction aborts and we retry with fresh data, so the other
+    # writer's change (e.g. the kill switch) is preserved rather than clobbered.
+    _RMW_MAX_RETRIES = 50
+
+    def _mutate(self, fn) -> None:
+        """Atomically load the blob, apply fn(data) to mutate it in place, and
+        persist — retrying if a concurrent writer touches the key mid-flight."""
+        import redis  # local import mirrors __init__; keeps redis-less tests importable
+        for _ in range(self._RMW_MAX_RETRIES):
+            with self._r.pipeline() as pipe:
+                try:
+                    pipe.watch(self._key)
+                    raw = pipe.get(self._key)
+                    data = json.loads(raw) if raw else {}
+                    fn(data)
+                    pipe.multi()
+                    pipe.set(self._key, json.dumps(data, sort_keys=True))
+                    pipe.execute()
+                    return
+                except redis.exceptions.WatchError:
+                    continue  # someone else wrote; reload and retry
+        # Extreme sustained contention: fall back to a best-effort direct write
+        # rather than silently dropping the update.
+        raw = self._r.get(self._key)
+        data = json.loads(raw) if raw else {}
+        fn(data)
+        self._r.set(self._key, json.dumps(data, sort_keys=True))
+
     def _save(self, data: dict) -> None:
+        # Retained for API compatibility. Prefer _mutate() for any concurrent
+        # path — a bare SET can still clobber a concurrent writer.
         self._r.set(self._key, json.dumps(data, sort_keys=True))
 
     def _get_scope(self, tenant_id, symbol, scope):
         return self._load().get(tenant_id, {}).get(symbol, {}).get(scope)
 
     def _put_scope(self, tenant_id, symbol, scope, value):
-        data = self._load()
-        data.setdefault(tenant_id, {}).setdefault(symbol, {})[scope] = value
-        self._save(data)
+        self._mutate(lambda data: data.setdefault(tenant_id, {}).setdefault(symbol, {}).__setitem__(scope, value))
 
     def get_config(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "config")
     def put_config(self, tenant_id, symbol, config): self._put_scope(tenant_id, symbol, "config", config)
@@ -225,11 +260,11 @@ class RedisJsonStore:
     def put_intent(self, tenant_id, symbol, intent): self._put_scope(tenant_id, symbol, "intent", intent)
 
     def _clear_scope(self, tenant_id, symbol, scope):
-        data = self._load()
-        block = data.get(tenant_id, {}).get(symbol, {})
-        if scope in block:
-            del block[scope]
-            self._save(data)
+        def _apply(data):
+            block = data.get(tenant_id, {}).get(symbol, {})
+            if scope in block:
+                del block[scope]
+        self._mutate(_apply)  # [crew:#1] atomic RMW, see _mutate above
 
     def clear_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "intent")
     def get_resume_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "resume_intent")
