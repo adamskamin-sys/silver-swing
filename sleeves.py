@@ -258,6 +258,24 @@ class SleeveConfig:
     ml_shadow_enabled: bool = False
     ml_signal_threshold: float = 0.3
 
+    # Andrew Lo — Adaptive Markets Hypothesis — regime detection.
+    # When enabled, arm-time decisions get regime-specific multipliers:
+    #   momentum      → wider spread, longer buy-trail, smaller size
+    #   chop          → tighter spread, shorter buy-trail, smaller size
+    #   mean_reversion → default (no adjustment — our baseline is MR)
+    # Requires ~10+ minutes of price history to classify — permissive-
+    # default (mean_reversion) until then.
+    regime_adaptive_enabled: bool = False
+
+    # Almgren-Chriss (2000) — optimal execution slicing.
+    # When enabled AND qty > 1, splits the order into an exponentially
+    # front-loaded schedule using Kyle's λ as the impact parameter. First
+    # slice fires immediately; subsequent slices at delay intervals up to
+    # urgency_secs total horizon. Only activates for qty > 1 — single
+    # contracts have nothing to slice.
+    execution_slicing_enabled: bool = False
+    execution_slicing_urgency_secs: float = 30.0
+
     # Rob Carver — Systematic Trading — portfolio-level risk budgeting.
     # When enabled, effective arm qty is the MIN of (cfg.qty, Carver
     # target qty). Prevents accidental over-exposure to high-vol products
@@ -392,6 +410,9 @@ class SleeveConfig:
             ml_signal_threshold=float(d.get("ml_signal_threshold") or 0.3),
             risk_budget_enabled=bool(d.get("risk_budget_enabled") or False),
             risk_budget_target_dollar_vol=float(d.get("risk_budget_target_dollar_vol") or 50.0),
+            regime_adaptive_enabled=bool(d.get("regime_adaptive_enabled") or False),
+            execution_slicing_enabled=bool(d.get("execution_slicing_enabled") or False),
+            execution_slicing_urgency_secs=float(d.get("execution_slicing_urgency_secs") or 30.0),
         )
 
 

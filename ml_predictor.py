@@ -149,21 +149,53 @@ _PLACEHOLDER_WEIGHTS: dict[str, float] = {
 }
 
 
+_TRAINED_MODEL_CACHE = {"model": None, "checked": False}
+_TRAINED_MODEL_PATH = "data/ml_model.json"
+
+
+def _load_trained_model_once():
+    """Attempt to load a trained model from disk once per process. Cached
+    result — bot restarts to pick up a new model. Returns None if the
+    file doesn't exist (predict falls back to placeholder weights)."""
+    if _TRAINED_MODEL_CACHE["checked"]:
+        return _TRAINED_MODEL_CACHE["model"]
+    try:
+        from ml_training import load_model
+        m = load_model(_TRAINED_MODEL_PATH)
+        if m and m.get("weights"):
+            _TRAINED_MODEL_CACHE["model"] = m
+    except Exception:
+        pass
+    _TRAINED_MODEL_CACHE["checked"] = True
+    return _TRAINED_MODEL_CACHE["model"]
+
+
 def predict(features: list[float]) -> float:
-    """Linear placeholder — returns a score in ~[-1, +1] where positive is
-    bullish. Real model would replace this; feature extraction upstream
-    stays identical."""
+    """Returns a score in ~[-1, +1] where positive is bullish.
+
+    Prefers a trained model if data/ml_model.json exists (López de Prado
+    training pipeline in ml_training.py produces this). Falls back to
+    the placeholder linear weights when no trained model is available.
+    Interface stays stable so a future LightGBM/XGBoost trained model
+    is a drop-in swap — same features in, same score out."""
     if not features or len(features) != len(FEATURE_NAMES):
         return 0.0
+    trained = _load_trained_model_once()
+    if trained and trained.get("weights"):
+        # Trained logistic regression: sigmoid(w·x + b), then map to [-1, +1]
+        w = trained["weights"]
+        b = float(trained.get("bias") or 0.0)
+        if len(w) == len(features):
+            score = b + sum(w[i] * features[i] for i in range(len(w)))
+            # Map score → tanh for consistent range with placeholder path
+            return math.tanh(score)
+    # Placeholder linear path
     score = 0.0
     for name, val in zip(FEATURE_NAMES, features):
         w = _PLACEHOLDER_WEIGHTS.get(name, 0.0)
-        # Center VPIN around 0.5 (its neutral point) so a "no data" vpin
-        # of 0.5 contributes exactly 0 to the score.
         if name == "vpin":
             val = val - 0.5
         score += w * val
-    # Squash to (-1, +1) with tanh.
     return math.tanh(score)
 
 

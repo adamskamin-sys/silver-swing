@@ -1635,7 +1635,9 @@ class SwingTrader:
                     self._sleeve_hybrid_step(sc, ss, last_price)
                 else:
                     self._maybe_emit_ml_shadow(sc)
-                    eff_qty = self._kelly_adjusted_qty(sc, ss)
+                    reg = self._regime_multipliers(sc)
+                    eff_qty = max(1, int(round(self._kelly_adjusted_qty(sc, ss) * reg["size_multiplier"])))
+                    eff_qty = self._maybe_slice_arm(sc, "SELL", eff_qty, sc.sell_px)
                     eff_price = self._adaptive_spread_price(sc, "SELL", sc.sell_px)
                     ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "SELL", eff_qty, eff_price, last_price)
                     if ms_qty is None:
@@ -1745,7 +1747,9 @@ class SwingTrader:
                 if arm_price is None:
                     return  # still tracking the low, don't arm this tick
                 self._maybe_emit_ml_shadow(sc)
-                eff_qty = self._kelly_adjusted_qty(sc, ss)
+                reg = self._regime_multipliers(sc)
+                eff_qty = max(1, int(round(self._kelly_adjusted_qty(sc, ss) * reg["size_multiplier"])))
+                eff_qty = self._maybe_slice_arm(sc, "BUY", eff_qty, arm_price)
                 eff_price = self._adaptive_spread_price(sc, "BUY", arm_price)
                 ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", eff_qty, eff_price, last_price)
                 if ms_qty is None:
@@ -2330,6 +2334,99 @@ class SwingTrader:
         except Exception as e:
             self._record("adaptive_spread_failed", sleeve_id=sc.id, error=str(e))
             return arm_price
+
+    def _current_regime(self):
+        """Andrew Lo — Adaptive Markets. Classify current regime from
+        snapshot price_history + expert_params ATR. Returns one of
+        mean_reversion / momentum / chop / unknown. Cached ~5s to bound
+        cost."""
+        import time as _t
+        cache = getattr(self, "_regime_cache", None)
+        now = _t.time()
+        if cache and now - cache["ts"] < 5.0:
+            return cache["regime"]
+        regime = "unknown"
+        try:
+            import regime_detector
+            snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
+            history = snap.get("price_history") or []
+            prices = []
+            for entry in history[-200:]:
+                try:
+                    px = float(entry[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if px > 0:
+                    prices.append(px)
+            pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
+            derivs = pf.get("derivatives") or []
+            atr = 0.0
+            for d in derivs:
+                if d.get("product_id") == self.symbol:
+                    atr = float((d.get("expert_params") or {}).get("atr") or 0)
+                    break
+            if prices and atr > 0:
+                regime = regime_detector.classify_regime(prices, atr)
+        except Exception:
+            regime = "unknown"
+        self._regime_cache = {"ts": now, "regime": regime}
+        return regime
+
+    def _regime_multipliers(self, sc) -> dict:
+        """Return spread/size/buy-trail multipliers for the current regime
+        IF the sleeve has regime_adaptive_enabled. Otherwise all 1.0."""
+        if not getattr(sc, "regime_adaptive_enabled", False):
+            return {"spread_multiplier": 1.0, "size_multiplier": 1.0,
+                    "buy_trail_multiplier": 1.0}
+        try:
+            import regime_detector
+            return regime_detector.regime_adjustments(self._current_regime())
+        except Exception:
+            return {"spread_multiplier": 1.0, "size_multiplier": 1.0,
+                    "buy_trail_multiplier": 1.0}
+
+    def _maybe_slice_arm(self, sc, side, qty, price):
+        """Almgren-Chriss slicing. Returns the FIRST slice qty to arm now;
+        remaining slices are logged as intent for the next tick to pick up
+        (we don't have a real timer — we approximate by cycling through
+        the ARMED_SELL/ARMED_BUY step at each tick). If disabled or
+        single-contract, returns qty unchanged.
+
+        The simplification vs pure Almgren-Chriss: we don't fire multiple
+        orders at once — instead we place the first slice as the arm,
+        and the remaining contracts join on subsequent cycles' arms. That
+        matches our maker-only + post-only constraint (only one live order
+        per sleeve at a time) while still front-loading exposure per the
+        schedule."""
+        if not getattr(sc, "execution_slicing_enabled", False):
+            return int(qty)
+        if int(qty) <= 1:
+            return int(qty)
+        try:
+            import execution
+            kyle_l = None
+            if getattr(self, "ms", None) is not None:
+                try:
+                    kyle_l = self.ms.kyle.value()
+                except Exception:
+                    kyle_l = None
+            schedule = execution.optimal_slice_schedule(
+                int(qty),
+                urgency_secs=float(getattr(sc, "execution_slicing_urgency_secs", 30.0) or 30.0),
+                kyle_lambda=kyle_l,
+            )
+            first_slice_qty = schedule[0][1] if schedule else int(qty)
+            if first_slice_qty < int(qty):
+                self._record(
+                    "execution_slice_partial",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    side=side, price=price,
+                    total_qty=int(qty), first_slice_qty=first_slice_qty,
+                    schedule=schedule, kyle_lambda=kyle_l,
+                )
+            return max(1, int(first_slice_qty))
+        except Exception:
+            return int(qty)
 
     def _maybe_emit_ml_shadow(self, sc) -> None:
         """If ml_shadow_enabled, extract features + run predictor + log signal.
