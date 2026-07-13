@@ -449,9 +449,28 @@ function renderCockpit(store) {
     : (eqAmber ? `<span class="ck-chip" style="font-size:var(--fs-xs)" title="neutral — waiting for a cleaner entry">🟡 ${eqAmber}</span>`
                : '<span class="ck-chip ck-ok">—</span>');
 
+  // [crew] 24h realized — sum of cycle_pnl (sleeve cycles) + (gross - fees)
+  // (primary legacy cycles) from the last 86400s of trade events, scoped
+  // to the active mode's tenant. Answers "what did the bot net today?"
+  const nowSec = Date.now() / 1000;
+  const cutoff = nowSec - 24 * 3600;
+  let realized24h = 0;
+  for (const e of (lastTradeEvents || [])) {
+    if (!e || !e.event_type) continue;
+    if (e.tenant && e.tenant !== tenant) continue;
+    const ts = Number(e.ts) || 0;
+    if (ts < cutoff) continue;
+    if (e.event_type === 'sleeve_cycle_completed') {
+      realized24h += Number(e.cycle_pnl) || 0;
+    } else if (e.event_type === 'cycle_completed') {
+      realized24h += (Number(e.gross) || 0) - (Number(e.fees) || 0);
+    }
+  }
+
   return `<div class="cockpit-row">
     <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
+    <div class="ck-tile" title="Realized P&amp;L across all sleeve + primary cycles that fired in the last 24 hours on the ${activeMode} tenant. Sums sleeve_cycle_completed.cycle_pnl and cycle_completed (gross − fees)."><div class="ck-label">24h realized</div><div class="ck-value ${classForValue(realized24h)}">${realized24h >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realized24h))}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
     <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
