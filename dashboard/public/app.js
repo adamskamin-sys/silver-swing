@@ -5249,9 +5249,13 @@ async function loadScannerChart() {
     const data = await candleResp.json();
     if (!data.ok) throw new Error(data.error || 'unknown error');
     let fills = [];
+    let fillsDiag = null;
     try {
       const fj = await fillsResp.json();
-      if (fj && fj.ok && Array.isArray(fj.fills)) fills = fj.fills;
+      if (fj && fj.ok && Array.isArray(fj.fills)) {
+        fills = fj.fills;
+        fillsDiag = fj._diag || null;
+      }
     } catch { /* fills are optional — chart still renders without them */ }
     // Pull sleeve targets (sell/buy/stop) for reference lines so Adam can
     // see at a glance where the current strategy would fire.
@@ -5266,6 +5270,8 @@ async function loadScannerChart() {
     }
     renderCandleChart(data.candles || [], scannerDetailChart, {
       fills,
+      fillsDiag,
+      symbol: product_id,
       targetLines,
       tickSize: Number(cfg.tick_size) || 0,
       contractSize: Number(cfg.contract_size) || 0,
@@ -5444,6 +5450,20 @@ function renderCandleChart(candles, container, opts = {}) {
   // Legend below chart so Adam can decode markers without hovering.
   const cycleWon = cycles.filter(c => c.sell.price > c.buy.price).length;
   const cycleLost = cycles.length - cycleWon;
+  // When 0 fills for this symbol, surface the diagnostic block directly on
+  // the chart so we can see whether the log has fills under a DIFFERENT
+  // symbol (naming mismatch) or genuinely nothing to plot.
+  let diagLine = '';
+  const diag = opts.fillsDiag;
+  const sym = opts.symbol || '(unknown symbol)';
+  if (fills.length === 0 && diag) {
+    const others = (diag.symbols_in_log || []).filter(s => s !== sym).slice(0, 12);
+    const othersStr = others.length ? ` · other symbols in log: <b>${others.map(escapeHtml).join(', ')}</b>` : '';
+    diagLine = `
+      <div style="padding:8px 12px;font-size:12px;color:#facc15;font-family:ui-monospace,monospace;background:rgba(250,204,21,0.06);border-top:1px solid rgba(250,204,21,0.2);">
+        no fills to plot for <b>${escapeHtml(sym)}</b> — scanned ${diag.events_scanned} log events, ${diag.events_for_symbol} tagged with this symbol${othersStr}
+      </div>`;
+  }
   const legend = `
     <div style="display:flex;gap:16px;flex-wrap:wrap;padding:8px 12px;font-size:12px;color:#8a99ac;font-family:ui-monospace,monospace;">
       <span><span style="color:#3b82f6;">▲</span> BUY fill</span>
@@ -5452,7 +5472,7 @@ function renderCandleChart(candles, container, opts = {}) {
       ${targetLines.length ? '<span style="border-top:1px dashed #8a99ac;padding-top:1px;">current target lines</span>' : ''}
       ${cycles.length ? `<span>· <b style="color:#22c55e;">${cycleWon}</b> winning · <b style="color:#ef4444;">${cycleLost}</b> losing cycle${cycles.length === 1 ? '' : 's'} on chart</span>` : ''}
     </div>`;
-  container.innerHTML = parts.join('') + legend;
+  container.innerHTML = parts.join('') + legend + diagLine;
 }
 
 // ---- delegated events ---------------------------------------------------
