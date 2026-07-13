@@ -555,6 +555,21 @@ def fetch_and_rank(
     ranking.sort(key=lambda r: (-(r.get("best_score") or 0.0),
                                 -(r.get("vol_pct") or 0.0),
                                 -(r.get("volume_24h") or 0.0)))
+    # Force-included products MUST survive the top_n truncation. The scanner's
+    # job is to help Adam discover NEW products worth trading; anything he
+    # already has a strategy on (force_include) needs its BEST tile populated
+    # regardless of where it ranks on 24h volatility. Split the sorted list:
+    # keep the top_n by score, then append every force_include entry that
+    # didn't make that cut. That way the dashboard's Edit Strategy modal
+    # always finds swing_candidates for products he's actively trading.
+    forced_set = set(force_include or [])
+    if forced_set:
+        top_slice = ranking[:top_n]
+        top_ids = {e.get("product_id") for e in top_slice}
+        extras = [e for e in ranking[top_n:]
+                  if e.get("product_id") in forced_set
+                  and e.get("product_id") not in top_ids]
+        return top_slice + extras
     return ranking[:top_n]
 
 
