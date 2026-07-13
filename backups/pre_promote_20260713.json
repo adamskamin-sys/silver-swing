@@ -1,0 +1,77 @@
+{
+  "_note": "Snapshot of the exact fields promote_candidate.py changed on 2026-07-13. Use with revert_todays_promotions.py to surgically restore just these fields on the live config, leaving everything else the promoter didn't touch (stops, ratchets, sleeves' non-price fields, etc.) intact. Not a full config backup — the /tmp full-config backups from that morning were lost when Render restarted the pod.",
+  "promoted_at": "2026-07-13T11:47:59Z",
+  "promoter_command": "promote_candidate.py --mult",
+  "tenant": "adam-live",
+  "symbols": {
+    "XLP-20DEC30-CDE": {
+      "mult_applied": 0.75,
+      "root": {},
+      "sleeves": [
+        {
+          "id": "smrcid2ef",
+          "name": "Model B — Defensive plus (ratchet + reanchor + volatility re-entry)",
+          "pre_promotion": {
+            "sell_px": 0.18937,
+            "buy_px": 0.18841,
+            "trail_distance": 0.01
+          },
+          "post_promotion": {
+            "sell_px": 0.18925,
+            "buy_px": 0.18853,
+            "trail_distance": 0.0075
+          }
+        }
+      ]
+    },
+    "PT-28SEP26-CDE": {
+      "mult_applied": 0.75,
+      "root": {},
+      "sleeves": [
+        {
+          "id": "smrir89bx",
+          "name": "Model B — Defensive plus (ratchet + reanchor + volatility re-entry)",
+          "pre_promotion": {
+            "sell_px": 1642.5,
+            "buy_px": 1637.5,
+            "trail_distance": 1
+          },
+          "post_promotion": {
+            "sell_px": 1641.875,
+            "buy_px": 1638.125,
+            "trail_distance": 0.75
+          }
+        }
+      ]
+    },
+    "SLR-27AUG26-CDE": {
+      "mult_applied": 1.25,
+      "root": {
+        "pre_promotion": {
+          "sell_px": 65,
+          "buy_px": 63
+        },
+        "post_promotion": {
+          "sell_px": 65.25,
+          "buy_px": 62.75
+        }
+      },
+      "sleeves": [
+        {
+          "id": "smrh2p60l",
+          "name": "Model B — Defensive plus (ratchet + reanchor + volatility re-entry)",
+          "pre_promotion": {
+            "sell_px": 60.032,
+            "buy_px": 59.748,
+            "trail_distance": 0.195
+          },
+          "post_promotion": {
+            "sell_px": 60.0675,
+            "buy_px": 59.7125,
+            "trail_distance": 0.24375
+          }
+        }
+      ]
+    }
+  }
+}
