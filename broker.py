@@ -91,23 +91,34 @@ class CoinbaseBroker:
 
     # ---- Broker Protocol -------------------------------------------------
 
-    def place_limit(self, side: str, qty: int, price: float) -> str:
+    def place_limit(self, side: str, qty: int, price: float,
+                    post_only: bool = False) -> str:
         """Place a GTC limit order. Returns the exchange order_id.
 
         Idempotency: generates a fresh client_order_id (UUIDv4) per call. The
         caller must NOT blindly retry on network error — a retry with a new UUID
         creates a second order. Coordinate retries at the SwingTrader layer.
+
+        post_only: when True, Coinbase REJECTS the order if it would take
+        liquidity (cross the spread). Guarantees maker fees, which on CFM are
+        ~40-60% cheaper than taker. Cost: orders resting BELOW best_ask on a
+        buy leg (or above best_bid on a sell leg) fill normally; only orders
+        that would immediately cross get rejected. Caller re-arms next tick
+        with a slightly different price.
         """
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
         method = self.client.limit_order_gtc_buy if s == "BUY" else self.client.limit_order_gtc_sell
-        resp = _dump(method(
-            client_order_id=str(uuid.uuid4()),
-            product_id=self.cfg.product_id,
-            base_size=str(int(qty)),
-            limit_price=f"{price:.{self.cfg.price_decimals}f}",
-        ))
+        kwargs = {
+            "client_order_id": str(uuid.uuid4()),
+            "product_id": self.cfg.product_id,
+            "base_size": str(int(qty)),
+            "limit_price": f"{price:.{self.cfg.price_decimals}f}",
+        }
+        if post_only:
+            kwargs["post_only"] = True
+        resp = _dump(method(**kwargs))
         if resp.get("success"):
             oid = (resp.get("success_response") or {}).get("order_id")
             if oid:

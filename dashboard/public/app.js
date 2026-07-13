@@ -3203,6 +3203,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
+      // Maker-only + penny-inside placement — beat other bots on fill priority
+      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
+      postOnly: true,
+      pennyInside: { enabled: true, max_ticks: 5 },
       note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore / Turtles.',
     },
     'Model C — Microstructure-informed': {
@@ -3229,6 +3233,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
+      // Maker-only + penny-inside placement — beat other bots on fill priority
+      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
+      postOnly: true,
+      pennyInside: { enabled: true, max_ticks: 5 },
       note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
     },
     'Model D — News-aware': {
@@ -3255,6 +3263,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
+      // Maker-only + penny-inside placement — beat other bots on fill priority
+      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
+      postOnly: true,
+      pennyInside: { enabled: true, max_ticks: 5 },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
     },
@@ -3282,6 +3294,10 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
       entryTrendFilter: { enabled: true, sma_window: 20 },
       microstructureGate: true,
+      // Maker-only + penny-inside placement — beat other bots on fill priority
+      // and slash fee cost. Defaults ON for Models B-E; opt-out via sleeve editor.
+      postOnly: true,
+      pennyInside: { enabled: true, max_ticks: 5 },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Everything combined: Model B + microstructure gates + news blackout. Highest theoretical EV. Also highest complexity — a good win here vs Model B tells you the microstructure + news signals add real edge; a small/negative delta means those signals are noise for your timescale.',
     },
@@ -3762,6 +3778,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     draft.news_blackout_enabled = !!nb.enabled;
     draft.news_blackout_tier = nb.tier ?? 2;
     draft.microstructure_gate_enabled = !!p.microstructureGate;
+    // Maker-only + penny-inside — preset ships them ON for Model B+; overrides
+    // land here so the sleeve save picks them up alongside the other fields.
+    draft.post_only_enabled = !!p.postOnly;
+    const pi = p.pennyInside || {};
+    draft.penny_inside_enabled = !!pi.enabled;
+    draft.penny_inside_max_ticks = pi.max_ticks ?? 5;
     applyModeVisibility();
   }
 
@@ -4164,6 +4186,11 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       entry_trend_sma_window: parseInt(draft.entry_trend_sma_window || 20, 10),
       post_trail_reentry_mode: String(draft.post_trail_reentry_mode || 'off'),
       post_trail_stage_b_max_wait_secs: Number(draft.post_trail_stage_b_max_wait_secs) || 3600,
+      // Maker-only + penny-inside (see swing_leg._sleeve_arm). Cheaper fees +
+      // better queue position vs other bots at the same price level.
+      post_only_enabled: !!draft.post_only_enabled,
+      penny_inside_enabled: !!draft.penny_inside_enabled,
+      penny_inside_max_ticks: parseInt(draft.penny_inside_max_ticks || 5, 10),
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }

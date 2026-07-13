@@ -103,12 +103,28 @@ class PaperBroker:
 
     # ---- Broker Protocol -------------------------------------------------
 
-    def place_limit(self, side: str, qty: int, price: float) -> str:
+    def place_limit(self, side: str, qty: int, price: float,
+                    post_only: bool = False) -> str:
         if self._halted:
             raise RuntimeError(f"paper broker halted: {self._halt_reason}")
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        # Paper: post_only semantics — reject if the order would immediately
+        # take (cross the spread). Mirrors CFM's real behavior. Callers can
+        # still pass post_only=False to fall back to the old always-accept
+        # flow used by the backtest.
+        if post_only:
+            best_bid = float(self._bid) if getattr(self, "_bid", None) else 0.0
+            best_ask = float(self._ask) if getattr(self, "_ask", None) else 0.0
+            if s == "BUY" and best_ask > 0 and price >= best_ask:
+                raise RuntimeError(
+                    f"paper post_only rejected: BUY {price} would cross ask {best_ask}"
+                )
+            if s == "SELL" and best_bid > 0 and price <= best_bid:
+                raise RuntimeError(
+                    f"paper post_only rejected: SELL {price} would cross bid {best_bid}"
+                )
         oid = f"paper-{uuid.uuid4()}"
         self.open_orders[oid] = PaperOrder(
             order_id=oid,

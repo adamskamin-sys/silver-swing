@@ -156,6 +156,25 @@ class SleeveConfig:
     post_trail_reentry_mode: str = "off"
     post_trail_stage_b_max_wait_secs: float = 3600.0
 
+    # Maker-only orders: when True, every place_limit is submitted with
+    # post_only=True so we can NEVER pay taker fees. Coinbase rejects the
+    # order if it would immediately cross the spread; the sleeve re-arms
+    # on the next tick with a fresh (still-limit) price. Reduces per-cycle
+    # fee cost ~40-60% since maker fees on CFM are much cheaper than taker.
+    # Default: False (opt-in). Model B onward defaults ON via the preset.
+    post_only_enabled: bool = False
+
+    # Penny-inside placement: when True, the sleeve places its limit one
+    # tick INSIDE the current best price on our side of the book (for
+    # SELL: best_ask − tick; for BUY: best_bid + tick), instead of at the
+    # raw sell_px / buy_px target. Gives us front-of-queue at a price that
+    # still profits vs the target. Requires broker.best_bid / best_ask to
+    # be populated (all live CoinbaseBroker snapshots include these).
+    # Only kicks in when the arm price is WITHIN pennyinside_max_ticks of
+    # the current best on that side — never widens a fresh arm.
+    penny_inside_enabled: bool = False
+    penny_inside_max_ticks: int = 5
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -206,6 +225,9 @@ class SleeveConfig:
             entry_trend_sma_window=int(d.get("entry_trend_sma_window") or 20),
             post_trail_reentry_mode=str(d.get("post_trail_reentry_mode") or "off"),
             post_trail_stage_b_max_wait_secs=float(d.get("post_trail_stage_b_max_wait_secs") or 3600.0),
+            post_only_enabled=bool(d.get("post_only_enabled") or False),
+            penny_inside_enabled=bool(d.get("penny_inside_enabled") or False),
+            penny_inside_max_ticks=int(d.get("penny_inside_max_ticks") or 5),
         )
 
 
