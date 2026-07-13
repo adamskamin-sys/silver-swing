@@ -79,7 +79,14 @@ class ScannerWorker:
             # single 0..1 penalty passed to the scanner. VPIN alone is bounded
             # 0..1 (Easley-López de Prado); we cap at 1.0 for safety.
             toxicity_lookup: dict[str, float] = {}
+            # Aksoy-Cheng / Hasbrouck funding-boost lookup — for crypto perps,
+            # extreme funding predicts near-term reversals. Read funding_rate
+            # from each perp's snapshot and translate into a scanner tile
+            # multiplier via funding_signals.scanner_boost. Non-perps + missing
+            # data produce boost=1.0 (silent no-op).
+            funding_boost_lookup: dict[str, float] = {}
             try:
+                import funding_signals as _fs
                 for t in self.store.list_tenants():
                     for sym in self.store.list_symbols(t):
                         if sym.startswith("__") or sym in spec_fallbacks:
@@ -97,13 +104,20 @@ class ScannerWorker:
                                 toxicity_lookup[sym] = max(0.0, min(1.0, float(vpin_v)))
                             except (TypeError, ValueError):
                                 pass
+                        if _fs.is_perp(sym):
+                            fr = _fs.funding_rate_of(snap)
+                            if fr is not None:
+                                boost = _fs.scanner_boost(fr)
+                                if boost != 1.0:
+                                    funding_boost_lookup[sym] = boost
             except Exception as e:
-                _log(f"spec_fallbacks / toxicity gather failed: {type(e).__name__}: {e}")
+                _log(f"spec_fallbacks / toxicity / funding gather failed: {type(e).__name__}: {e}")
             ranking = fetch_and_rank(
                 self._coinbase_client, top_n=10,
                 force_include=list(forced),
                 spec_fallbacks=spec_fallbacks,
                 toxicity_lookup=toxicity_lookup,
+                funding_boost_lookup=funding_boost_lookup,
             )
             write_ranking_to_redis(self.redis_url, ranking, generated_at=now)
             self.last_scanner = now

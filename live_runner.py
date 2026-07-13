@@ -438,6 +438,17 @@ def run() -> int:
                         _log(f"twitter_scanner: {telem}")
                 except Exception as e:
                     _log(f"twitter_scanner tick failed: {type(e).__name__}: {e}")
+                # Funding sign-flip watcher rides the same cadence — every
+                # 5 min. Cheap (reads snapshot cache, no external API), so
+                # no additional throttle needed. Emits shadow signals into
+                # the Signals tab when a perp's funding rate crosses zero.
+                try:
+                    import funding_watcher
+                    ftelem = funding_watcher.tick(store, TENANT)
+                    if ftelem.get("flips_detected", 0):
+                        _log(f"funding_watcher: {ftelem}")
+                except Exception as e:
+                    _log(f"funding_watcher tick failed: {type(e).__name__}: {e}")
             # Tick-recorder pruning: drop tick directories older than
             # TICK_KEEP_DAYS. Bounded disk consumption on Render's
             # ephemeral (or persistent) volume.

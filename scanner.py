@@ -255,6 +255,7 @@ def score_product_swings(
     regime_penalty_weight: float = 0.3,
     maker_fee_multiplier: float = 0.5,
     toxicity_penalty: float = 0.0,
+    funding_boost: float = 1.0,
 ) -> dict:
     """For a price series, try an ATR-anchored grid of spread candidates and
     return the one with the highest expected $/day AVERAGED ACROSS 24h/7d/30d.
@@ -334,6 +335,13 @@ def score_product_swings(
             # Easley-López de Prado-O'Hara 2012 (VPIN paper), Kyle 1985.
             if toxicity_penalty > 0:
                 weighted_per_day = weighted_per_day * max(0.0, 1.0 - toxicity_penalty)
+            # Funding boost (Aksoy-Cheng / Hasbrouck): for crypto perps,
+            # negative funding = shorts pay longs (bullish for us as a long-
+            # biased bot — we get PAID to hold). scanner_boost returns a
+            # multiplier in [0.5, 1.5]. Non-perps and missing funding data
+            # produce boost=1.0 (no effect).
+            if funding_boost and funding_boost != 1.0:
+                weighted_per_day = weighted_per_day * float(funding_boost)
             entry = {
                 "spread": spread,
                 "spread_mult": round(spread / tick_size) if tick_size > 0 else None,
@@ -573,6 +581,7 @@ def fetch_and_rank(
     force_include: list[str] | None = None,
     spec_fallbacks: dict[str, dict] | None = None,
     toxicity_lookup: dict[str, float] | None = None,
+    funding_boost_lookup: dict[str, float] | None = None,
 ) -> list[dict]:
     """Fetch all CFM futures from Coinbase, score each on both amplitude
     (24h range %) AND swing frequency (roundtrips per lookback window at a
@@ -751,6 +760,12 @@ def fetch_and_rank(
                 product_toxicity = float(toxicity_lookup.get(pid) or 0.0)
             except (TypeError, ValueError):
                 product_toxicity = 0.0
+        product_funding_boost = 1.0
+        if funding_boost_lookup:
+            try:
+                product_funding_boost = float(funding_boost_lookup.get(pid) or 1.0)
+            except (TypeError, ValueError):
+                product_funding_boost = 1.0
         swing = score_product_swings(
             closes, tick, csize, effective_fee_rt,
             weekly_prices=weekly_closes or None,
@@ -758,6 +773,7 @@ def fetch_and_rank(
             weekly_timestamps=weekly_ts or None,
             monthly_timestamps=monthly_ts or None,
             toxicity_penalty=max(0.0, min(1.0, product_toxicity)),
+            funding_boost=product_funding_boost,
         )
         if fallback_used and swing.get("candidates"):
             # 7d/1H fallback: `closes` is a week's worth, so rt count needs

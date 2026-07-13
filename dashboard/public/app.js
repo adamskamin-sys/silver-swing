@@ -880,6 +880,26 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td class="mono">${cyclesText}</td>
         <td class="mono">${realizedText}</td>
         <td class="mono">${totalText}</td>
+        <td class="mono">${(() => {
+          if (r.kind !== 'futures') return '<span class="dim">—</span>';
+          const isPerp = /-PERP-/i.test(String(r.product || ''));
+          if (!isPerp) return '<span class="dim">—</span>';
+          const snap = currentStore[liveTenant]?.[r.product]?.snapshot || {};
+          const fr = Number(snap.funding_rate ?? snap.predicted_funding_rate ?? snap.current_funding_rate);
+          if (!Number.isFinite(fr)) return '<span class="dim">—</span>';
+          // Positive = you PAY (bearish for long holders). Negative = you RECEIVE.
+          const pct = (fr * 100).toFixed(4);
+          const cls = fr <= -0.0002 ? 'pos' : fr >= 0.0002 ? 'neg' : 'dim';
+          const csize = Number(currentStore[liveTenant]?.[r.product]?.config?.contract_size) || 0;
+          const notional = csize * Number(r.mark || 0) * Number(r.qty || 0);
+          const perPeriodPay = fr * notional;
+          const dailyPay = perPeriodPay * 3;  // 3 × 8h periods per day
+          const dailyPayStr = notional > 0
+            ? `${fr < 0 ? '+' : '-'}$${Math.abs(dailyPay).toFixed(2)}/day`
+            : '';
+          const tooltip = `Funding = ${pct}% per 8h. ${fr < 0 ? 'Shorts pay longs — you RECEIVE' : fr > 0 ? 'Longs pay shorts — you PAY' : 'Neutral'}. ${dailyPayStr ? `At ${r.qty} contract${r.qty === 1 ? '' : 's'} × $${(csize * Number(r.mark || 0)).toFixed(0)} notional/ct: ${dailyPayStr}` : ''}`;
+          return `<span class="${cls}" title="${escapeHtml(tooltip)}">${pct}%${dailyPayStr ? ` <span class="dim">${dailyPayStr}</span>` : ''}</span>`;
+        })()}</td>
         <td class="mono dim">${liqText}</td>
       </tr>`;
   }).join('');
@@ -917,6 +937,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         <td class="mono ${footClass(totalRealizedSum)}">${fmtSigned(totalRealizedSum)}</td>
         <td class="mono ${footClass(grandTotal)}">${fmtSigned(grandTotal)}</td>
         <td></td>
+        <td></td>
       </tr>
     </tfoot>` : '';
 
@@ -925,7 +946,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     <table class="pf-table-compact">
       <thead><tr>
         <th>Name</th><th title="Unrealized (mark-to-market on open position)">Unrealized</th><th title="Contract size — units of the underlying per contract (e.g., 50 for silver, 2000 for copper, 10 for oil/platinum). Straight from Coinbase spec.">Size</th><th>Side</th><th>Qty</th>
-        <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized + Realized">Unrealized + Realized</th><th>Liq</th>
+        <th>Avg</th><th>Mark</th><th>Cycles</th><th title="Total closed-trade profit for this product">Realized</th><th title="Unrealized + Realized">Unrealized + Realized</th><th title="Funding rate (crypto perps only). Positive = longs pay shorts (expensive carry). Negative = shorts pay longs (you get paid to hold).">Funding</th><th>Liq</th>
       </tr></thead>
       <tbody>${rowsHtml}</tbody>
       ${footHtml}
