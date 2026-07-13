@@ -1137,6 +1137,25 @@ async function loadSpreadRecommendations(productId, modalEl, opts) {
         }
       };
     });
+    // Auto-apply EXPERT tile on load — uniform across all sleeves (fresh and
+    // existing). Adam: 'make this a uniform change across all sleeves and
+    // future sleeves.' Reason: the tile numbers being different from the
+    // sell/buy/slider values in the form was the recurring 'those numbers
+    // don't add up' complaint. Now the tile ALWAYS wins on modal open, so
+    // every editor immediately reflects the current expert-stack pick.
+    // User can still click FRONT-RUN to switch, or manually edit sell/buy
+    // afterward. The auto-apply is silent (no confirmation) since it's
+    // effectively saying 'here's what the experts + data say to do right now'.
+    const expertBtn = Array.from(body.querySelectorAll('.spread-rec-tile.expert'))[0]
+      || body.querySelectorAll('.spread-rec-tile')[0];
+    if (expertBtn && opts && typeof opts.onApply === 'function') {
+      const spread = Number(expertBtn.dataset.spread) || 0;
+      const net = Number(expertBtn.dataset.net) || 0;
+      if (spread > 0) {
+        opts.onApply(spread, net);
+        expertBtn.classList.add('active');
+      }
+    }
   } catch (err) {
     body.innerHTML = `<span class="dim">could not load recommendations: ${escapeHtml(String(err.message || err))}</span>`;
     container.hidden = false;
