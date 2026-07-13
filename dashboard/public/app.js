@@ -3497,7 +3497,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
       // fights current top-5 book pressure. Same 65% threshold both ways.
       bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
-      note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop. The expert-recommended stack per Van Tharp / Livermore / Turtles.',
+      // Trailing buy (Livermore / Turtle / Le Beau) — wait for bounce before
+      // rebuying. Distance defaults to Le Beau 0.5×ATR from expert_params;
+      // undefined here means "use the expert-derived default". Model B ships
+      // it ON as part of the defensive stack.
+      buyTrail: { enabled: true },
+      note: 'Hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop + falling-knife protection on rebuys. The expert-recommended stack per Van Tharp / Livermore / Turtles / Le Beau.',
     },
     'Model C — Microstructure-informed': {
       // Model B + sleeve-level microstructure gates. Uses OBI (order book
@@ -3530,6 +3535,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
       // fights current top-5 book pressure. Same 65% threshold both ways.
       bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
+      buyTrail: { enabled: true },
       note: 'Model B + microstructure gates on every arm: order-book imbalance (OBI), toxic flow (VPIN), price impact (Kyle-λ). Only trades when book conditions favor the entry. Requires SWING_MS_ALL=1 env var on the bot.',
     },
     'Model D — News-aware': {
@@ -3563,6 +3569,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
       // fights current top-5 book pressure. Same 65% threshold both ways.
       bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
+      buyTrail: { enabled: true },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Model B + news event blackout. Pauses new arms 15 min before FOMC / CPI / NFP announcements + 30 min after. Skips the news whipsaw window. Adds ~5-10% to expected returns by avoiding losing trades around scheduled events.',
     },
@@ -3597,6 +3604,7 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Book-imbalance gate (Chan/Harris): don't arm a leg whose direction
       // fights current top-5 book pressure. Same 65% threshold both ways.
       bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
+      buyTrail: { enabled: true },
       newsBlackout: { enabled: true, tier: 2 },
       note: 'Everything combined: Model B + microstructure gates + news blackout. Highest theoretical EV. Also highest complexity — a good win here vs Model B tells you the microstructure + news signals add real edge; a small/negative delta means those signals are noise for your timescale.',
     },
@@ -3619,6 +3627,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     qty: 1,
     exit_mode: 'fixed_limit',
     reanchor_threshold: 2.0,
+    // Falling-knife protection ON by default for NEW sleeves per Adam.
+    // Existing sleeves preserve whatever they had (draft = existing branch).
+    // Distance = Le Beau 0.5×ATR default from expert_params (or 0.05
+    // fallback if ATR hasn't loaded for this product yet).
+    buy_trail_enabled: true,
+    buy_trail_distance: expertDollars?.buy_trail_distance || 0.05,
   };
 
   // Distance from anchor to current mark — surface a warning when the anchor
@@ -4034,6 +4048,17 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         bufEl.value = p.accumulate.buffer_mult;
       }
     }
+    // Trailing-buy (falling-knife) toggle + distance. Sync the checkbox +
+    // fields visibility whenever a preset is applied so switching presets
+    // mid-edit updates the UI.
+    {
+      const btEl = m.querySelector('#sl-buy-trail');
+      const btDistEl = m.querySelector('#sl-buy-trail-distance');
+      const btFields = m.querySelector('#sl-buy-trail-fields');
+      if (btEl) btEl.checked = !!draft.buy_trail_enabled;
+      if (btFields) btFields.hidden = !draft.buy_trail_enabled;
+      if (btDistEl && draft.buy_trail_distance) btDistEl.value = draft.buy_trail_distance;
+    }
     // Stop-loss toggle + fields — presets can enable crash protection.
     if (p.stopLoss) {
       const slEl = m.querySelector('#sl-stoploss');
@@ -4122,6 +4147,14 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     draft.book_imbalance_depth_levels = bi.depth ?? 5;
     draft.book_imbalance_sell_threshold = bi.sell_threshold ?? 0.65;
     draft.book_imbalance_buy_threshold = bi.buy_threshold ?? 0.65;
+    // Trailing buy (falling-knife protection). Distance defaults from expert
+    // params (0.5×ATR for metals/energy, 0.75×ATR for crypto) unless the
+    // preset overrides. Preset can also disable it explicitly.
+    const bt = p.buyTrail || {};
+    draft.buy_trail_enabled = bt.enabled !== undefined ? !!bt.enabled : true;
+    draft.buy_trail_distance = bt.distance != null
+      ? Number(bt.distance)
+      : (expertDollars?.buy_trail_distance || draft.buy_trail_distance || 0.05);
     applyModeVisibility();
   }
 
