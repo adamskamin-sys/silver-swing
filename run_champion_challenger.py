@@ -30,7 +30,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 
-def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
+def _evaluate_one(symbol: str, champion: dict, coinbase, days: int,
+                  wide_grid: bool = False):
     """Walk-forward CC for a single symbol. Returns (ok, report_or_msg)."""
     from backtest import fetch_candles, run_backtest
     from paper_broker import PaperConfig
@@ -99,11 +100,24 @@ def _evaluate_one(symbol: str, champion: dict, coinbase, days: int):
                 _scale_node(s, mult)
         return c
 
-    configs = {
-        "champion": champion,
-        "tighter": _variant(0.75),
-        "wider": _variant(1.25),
-    }
+    # Default grid: coarse tighter/wider (3-point). --wide-grid: 6-point
+    # response curve (0.75, 0.90, 1.10, 1.25, 1.40 + champion) so we can see
+    # if "wider is better" is monotonic or peaks somewhere. ~2× runtime.
+    if wide_grid:
+        configs = {
+            "champion": champion,
+            "0.75x": _variant(0.75),
+            "0.90x": _variant(0.90),
+            "1.10x": _variant(1.10),
+            "1.25x": _variant(1.25),
+            "1.40x": _variant(1.40),
+        }
+    else:
+        configs = {
+            "champion": champion,
+            "tighter": _variant(0.75),
+            "wider": _variant(1.25),
+        }
 
     def run_fn(cfg, cs):
         _, factory = _make_trader_factory(cfg, symbol, seed_price)
@@ -154,6 +168,7 @@ def main() -> int:
     single_symbol = None
     if "--symbol" in sys.argv:
         single_symbol = sys.argv[sys.argv.index("--symbol") + 1]
+    wide_grid = "--wide-grid" in sys.argv
     data_dir = os.getenv("SWING_DATA_DIR", "data")
 
     from state_store import make_store
@@ -215,7 +230,7 @@ def main() -> int:
             print(f"  broker init failed: {type(e).__name__}: {e}")
             summary.append({"symbol": symbol, "status": "broker_error", "error": str(e)})
             continue
-        ok, report = _evaluate_one(symbol, champion, coinbase, days)
+        ok, report = _evaluate_one(symbol, champion, coinbase, days, wide_grid=wide_grid)
         if not ok:
             print(f"  {report}")
             summary.append({"symbol": symbol, "status": "error", "error": report})
@@ -226,21 +241,107 @@ def main() -> int:
             indent=2, default=str,
         ))
         print(f"  >>> {report.get('note')}")
+        # Pull the best challenger for the summary table so Adam can see
+        # WHERE the edge (if any) came from without opening the full JSON.
+        challengers = (report.get("challengers") or {})
+        best_name, best_return, best_worst = None, None, None
+        champ_return = report.get("champion_metrics", {}).get("oos_mean_return")
+        champ_worst = report.get("champion_metrics", {}).get("oos_worst_fold")
+        for name, m in challengers.items():
+            if name == "champion":
+                continue
+            r = m.get("oos_mean_return")
+            if r is None:
+                continue
+            if best_return is None or r > best_return:
+                best_return, best_name, best_worst = r, name, m.get("oos_worst_fold")
+        edge_pct = None
+        if isinstance(champ_return, (int, float)) and isinstance(best_return, (int, float)):
+            if champ_return > 0:
+                edge_pct = round((best_return - champ_return) / champ_return * 100.0, 1)
+            elif best_return > champ_return:
+                edge_pct = 999.0
         summary.append({
             "symbol": symbol,
             "status": "ok",
+            "champion_return": champ_return,
+            "champion_worst": champ_worst,
+            "best_challenger": best_name,
+            "best_return": best_return,
+            "best_worst": best_worst,
+            "edge_pct": edge_pct,
             "recommend_promote": report.get("recommend_promote"),
-            "champion_oos_mean_return": report.get("champion_metrics", {}).get("oos_mean_return"),
         })
 
-    print("\n" + "=" * 72)
-    print("SWEEP SUMMARY")
-    print("=" * 72)
-    for row in summary:
-        print(json.dumps(row, default=str))
-    promotable = [r["symbol"] for r in summary if r.get("recommend_promote")]
-    print(f"\nPromotable: {promotable if promotable else 'none — keep all champions'}")
+    _print_summary_table(summary)
     return 0
+
+
+def _classify(row: dict) -> str:
+    """Health flag for the summary table:
+      🟢 healthy — traded, positive OOS mean, worst-fold within 2× mean
+      🟡 borderline — traded, positive OOS mean but noisy (worst-fold > 2× mean)
+      🔴 at-risk — traded, negative OOS mean OR promotion recommended (act)
+      ⚪ idle — didn't trade (all metrics 0)
+      ❌ error — status='error' / 'no_config' / 'broker_error'
+    """
+    st = row.get("status")
+    if st != "ok":
+        return "❌"
+    r = row.get("champion_return") or 0.0
+    w = row.get("champion_worst") or 0.0
+    if row.get("recommend_promote"):
+        return "🔴 promote"
+    if r == 0.0 and w == 0.0:
+        return "⚪ idle"
+    if r < 0:
+        return "🔴 losing"
+    if r > 0 and abs(w) > 2.0 * r:
+        return "🟡 noisy"
+    return "🟢 healthy"
+
+
+def _fmt_money(v) -> str:
+    if v is None:
+        return "     —"
+    try:
+        return f"{v:+8.2f}"
+    except Exception:
+        return f"{v!s:>8}"
+
+
+def _print_summary_table(summary: list) -> None:
+    print("\n" + "=" * 100)
+    print("SWEEP SUMMARY")
+    print("=" * 100)
+    # Rank by champion return desc so highest-earning products are on top.
+    ranked = sorted(summary, key=lambda r: (r.get("champion_return") or 0.0), reverse=True)
+    header = f"{'FLAG':<14} {'SYMBOL':<22} {'CHAMP $':>9} {'WORST $':>9} {'BEST':<8} {'CHALL $':>9} {'CHALL WORST':>12} {'EDGE %':>8}"
+    print(header)
+    print("-" * len(header))
+    for row in ranked:
+        flag = _classify(row)
+        edge = row.get("edge_pct")
+        edge_s = f"{edge:+7.1f}" if isinstance(edge, (int, float)) else "     —"
+        print(f"{flag:<14} {row['symbol']:<22} "
+              f"{_fmt_money(row.get('champion_return')):>9} "
+              f"{_fmt_money(row.get('champion_worst')):>9} "
+              f"{(row.get('best_challenger') or '—'):<8} "
+              f"{_fmt_money(row.get('best_return')):>9} "
+              f"{_fmt_money(row.get('best_worst')):>12} "
+              f"{edge_s:>8}")
+    # Buckets
+    buckets = {"🔴 promote": [], "🔴 losing": [], "🟡 noisy": [],
+               "🟢 healthy": [], "⚪ idle": [], "❌": []}
+    for row in ranked:
+        buckets[_classify(row)].append(row["symbol"])
+    print("\n=== By verdict ===")
+    for k in ("🔴 promote", "🔴 losing", "🟡 noisy", "🟢 healthy", "⚪ idle", "❌"):
+        if buckets[k]:
+            print(f"  {k}: {buckets[k]}")
+    # Actionable list
+    promo = [r["symbol"] for r in ranked if r.get("recommend_promote")]
+    print(f"\nPromotable: {promo if promo else 'none — keep all champions'}")
 
 
 if __name__ == "__main__":
