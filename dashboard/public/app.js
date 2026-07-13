@@ -3564,7 +3564,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     // when the sleeve is brand new — they turn on when data arrives.
     // Existing sleeves preserve their saved config (draft = existing branch).
     buy_trail_enabled: true,
-    buy_trail_distance: expertDollars?.buy_trail_distance || 0.05,
+    // Expert-canon default when ATR is loaded (Le Beau 0.5×ATR / Kaufman
+    // 0.75×ATR). Absolute-last fallback of 0.05 only fires when neither
+    // ATR nor tick_size is available — very rare cold-start case.
+    buy_trail_distance: (
+      expertDollars?.buy_trail_distance
+      || (cfg?.tick_size ? Number(cfg.tick_size) * 20 : 0.05)
+    ),
     funding_gate_enabled: true,
     funding_gate_threshold: 0.0005,
     kelly_enabled: true,
@@ -3771,15 +3777,44 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
           <div class="target-inputs">
             <label>Bounce distance ($)
               <input type="number" id="sl-buy-trail-distance" step="0.0001"
-                     value="${draft.buy_trail_distance || (expertDollars?.buy_trail_distance || (draft.trail_distance ? draft.trail_distance * 0.25 : 0.05))}">
+                     value="${draft.buy_trail_distance || (
+                       // Preferred: pure expert canon from ATR × class multiplier
+                       // (Le Beau 0.5× for metals/energy, Kaufman 0.75× for crypto)
+                       expertDollars?.buy_trail_distance
+                       // Fallback: half of the sleeve's trail_distance. This is
+                       // mathematically 0.5×ATR when trail_x_atr=2.0 (the metals/
+                       // energy default). Off for crypto (0.625× vs 0.75× canonical).
+                       // Adam flagged this in the UI — for full expert canon the
+                       // scanner needs to have fetched candles for this product so
+                       // expertATR loads. Until then, this fallback is the closest
+                       // approximation available client-side.
+                       || (draft.trail_distance ? draft.trail_distance * 0.5 : 0)
+                       // Last resort: tick_size × 20 (a rough vol proxy) or 0.05.
+                       || (cfg?.tick_size ? Number(cfg.tick_size) * 20 : 0.05)
+                     )}"
+                     title="${expertDollars?.buy_trail_distance
+                       ? `Expert-derived: ${(effectiveMultipliers?.buy_trail_x_atr || 0.5).toFixed(2)}×ATR of ${fmtPrice(expertATR)} = ${fmtPrice(expertDollars.buy_trail_distance)} (${expertParams?.asset_class || 'unknown'} class)`
+                       : `Fallback (no expert ATR loaded for ${escapeHtml(symbol)}). Half of the sleeve's trail_distance — a rough proxy. Fully-expert value activates once the scanner has candles for this product.`
+                     }">
             </label>
           </div>
           <div class="preview-note">
             When mark drops through your buy target, the sleeve tracks the running low
             instead of buying immediately. It only submits the buy after mark bounces
             <b>this much</b> above the local low — confirms the fall is over. Never
-            pays more than the original buy target. Expert default: 0.5×ATR (Le Beau
-            entry filter). Livermore's "pivot" rule; Turtle breakout confirmation.
+            pays more than the original buy target.
+            ${expertDollars?.buy_trail_distance ? `
+              <b class="pos">Expert-derived from ATR</b>:
+              ${(effectiveMultipliers?.buy_trail_x_atr || 0.5).toFixed(2)}×ATR of
+              $${fmtPrice(expertATR)} = <b class="mono">$${fmtPrice(expertDollars.buy_trail_distance)}</b>
+              (${escapeHtml(expertParams?.asset_class || 'unknown')} — Le Beau /
+              ${expertParams?.asset_class === 'crypto' ? 'Kaufman crypto bump' : 'entry filter'}).
+            ` : `
+              <b class="warn">Approximate</b> — expert ATR isn't loaded for ${escapeHtml(symbol)} yet.
+              Current default is half the sleeve's trail_distance (a rough proxy for 0.5×ATR).
+              Value auto-refreshes to pure expert canon once the scanner fetches candles for this product.
+            `}
+            Livermore's "pivot" rule; Turtle breakout confirmation; Le Beau ATR entry filter.
           </div>
         </div>
       </div>
