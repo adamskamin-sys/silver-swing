@@ -207,6 +207,32 @@ class SleeveConfig:
     correlation_window_secs: float = 3600.0    # look-back window (1h default)
     correlation_crash_pct: float = 3.0         # peer drop that triggers block
 
+    # Trailing buy — mirror of trailing_stop for the rebuy leg. When True,
+    # the sleeve does NOT rest a limit BUY at buy_px. Instead: when mark
+    # crosses buy_px downward, it starts tracking the running low; only
+    # arms the actual buy once mark bounces buy_trail_distance ABOVE that
+    # local low. This is the "don't buy a falling knife" pattern.
+    #
+    # Expert canon:
+    #   - Livermore (Reminiscences ch.5): "Never buy on the way down.
+    #     Buy on the pivot."
+    #   - Turtle (Faith, Way of the Turtle): entry only on N-bar Donchian
+    #     breakout confirmation
+    #   - Le Beau (Computer Analysis of the Futures Markets ch.4): 0.5×ATR
+    #     entry-filter buffer above the recent low
+    #   - Van Tharp (Trade Your Way, ch.10): entry confirmation trigger
+    #   - Chan (Quantitative Trading, ch.5): mean-reversion needs micro-
+    #     structure confirmation
+    #   - Cartea/Jaimungal (Algorithmic and HFT, ch.8): passive limits pay
+    #     adverse selection during directional moves
+    #
+    # buy_trail_distance defaults to expert_params buy_trail_x_atr × ATR
+    # (0.5×ATR for metals/energy, 0.75×ATR for crypto). 0 = disabled even
+    # if the flag is on. Never fills ABOVE buy_px — the max we'd pay is
+    # capped at the original buy target.
+    buy_trail_enabled: bool = False
+    buy_trail_distance: float = 0.0
+
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
     # so declaring config fields would let a user pick an unwired preset that
@@ -268,6 +294,8 @@ class SleeveConfig:
             correlation_gate_enabled=bool(d.get("correlation_gate_enabled") or False),
             correlation_window_secs=float(d.get("correlation_window_secs") or 3600.0),
             correlation_crash_pct=float(d.get("correlation_crash_pct") or 3.0),
+            buy_trail_enabled=bool(d.get("buy_trail_enabled") or False),
+            buy_trail_distance=float(d.get("buy_trail_distance") or 0.0),
         )
 
 
@@ -332,6 +360,18 @@ class SleeveState:
     # TCA display and the auto-disable decision — a sleeve losing 5 in a
     # row is much more obvious than eyeballing totals.
     recent_cycle_pnls: list = field(default_factory=list)
+
+    # Trailing-buy state. Only populated when SleeveConfig.buy_trail_enabled
+    # is True. Two invariants:
+    #   - buy_trail_armed=True means mark has crossed sc.buy_px downward
+    #     and we're now tracking the running low.
+    #   - buy_trail_low_water holds the running low while armed. When mark
+    #     bounces buy_trail_distance above this, we arm the actual buy.
+    # Reset (both fields cleared) whenever the buy fires or mark recovers
+    # back above sc.buy_px. Persisted so a bot restart mid-fall doesn't
+    # lose track of the running low.
+    buy_trail_armed: bool = False
+    buy_trail_low_water: float = 0.0
 
     # Post-stop re-entry state — only used when reentry_mode = 'volatility'.
     # reentry_pending = True while watching for volatility contraction after
@@ -408,6 +448,8 @@ class SleeveState:
             cycles_losing_streak=int(d.get("cycles_losing_streak") or 0),
             last_cycle_realized=float(d.get("last_cycle_realized") or 0.0),
             recent_cycle_pnls=list(d.get("recent_cycle_pnls") or []),
+            buy_trail_armed=bool(d.get("buy_trail_armed") or False),
+            buy_trail_low_water=float(d.get("buy_trail_low_water") or 0.0),
         )
 
     def to_dict(self) -> dict:

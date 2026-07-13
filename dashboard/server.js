@@ -433,6 +433,16 @@ export function makeApp({
         if (!Number.isFinite(delay) || delay < 1)
           issues.push({ field: `${s.id}.hybrid_delay_secs`, message: 'hybrid_delay_secs must be >= 1' });
       }
+      // Per-sleeve trailing-buy validation. Only enforced when enabled —
+      // the distance must be positive so the state machine has a real
+      // bounce threshold. 0 distance would mean "buy on the tick that
+      // touches buy_px", indistinguishable from the disabled path but
+      // more confusing to reason about.
+      if (s.buy_trail_enabled) {
+        const btd = Number(s.buy_trail_distance);
+        if (!Number.isFinite(btd) || btd <= 0)
+          issues.push({ field: `${s.id}.buy_trail_distance`, message: 'buy_trail_distance must be > 0 when trailing_buy is enabled' });
+      }
       // Per-sleeve accumulation validation. Only enforced when enabled.
       if (s.accumulate_enabled) {
         const maxQ = Number(s.max_qty);

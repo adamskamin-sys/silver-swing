@@ -3324,6 +3324,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     ratchet_distance: +(expertATR * effectiveMultipliers.ratchet_x_atr).toFixed(4),
     ratchet_activation: +(expertATR * effectiveMultipliers.ratchet_activation_x_atr).toFixed(4),
     reanchor_threshold: +(expertATR * effectiveMultipliers.reanchor_x_atr).toFixed(4),
+    // Le Beau entry-filter default — 0.5×ATR bounce required to confirm
+    // the fall is over before rebuying (Livermore's pivot rule).
+    buy_trail_distance: +(expertATR * (effectiveMultipliers.buy_trail_x_atr || 0.5)).toFixed(4),
   } : null;
   // Priority order for the anchor (the price the swing is centered on):
   //   1. Lot's entry price if opened from a specific lot ("+ Strategy" per lot)
@@ -3794,6 +3797,33 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         <!-- filled by updatePreview() -->
       </div>
 
+      <!-- Trailing buy — wait for a bounce before rebuying instead of
+           letting a resting limit catch the falling knife. Expert canon:
+           Livermore ("Buy on the pivot"), Turtle Rules (breakout confirm),
+           Le Beau (ATR entry filter). Default distance = 0.5×ATR from
+           expert_params. -->
+      <div class="accumulate-block">
+        <label class="accumulate-toggle">
+          <input type="checkbox" id="sl-buy-trail" ${draft.buy_trail_enabled ? 'checked' : ''}>
+          <b>Wait for bounce before rebuying (don't catch a falling knife)</b>
+        </label>
+        <div class="accumulate-fields" id="sl-buy-trail-fields" ${draft.buy_trail_enabled ? '' : 'hidden'}>
+          <div class="target-inputs">
+            <label>Bounce distance ($)
+              <input type="number" id="sl-buy-trail-distance" step="0.0001"
+                     value="${draft.buy_trail_distance || (expertDollars?.buy_trail_distance || (draft.trail_distance ? draft.trail_distance * 0.25 : 0.05))}">
+            </label>
+          </div>
+          <div class="preview-note">
+            When mark drops through your buy target, the sleeve tracks the running low
+            instead of buying immediately. It only submits the buy after mark bounces
+            <b>this much</b> above the local low — confirms the fall is over. Never
+            pays more than the original buy target. Expert default: 0.5×ATR (Le Beau
+            entry filter). Livermore's "pivot" rule; Turtle breakout confirmation.
+          </div>
+        </div>
+      </div>
+
       <!-- Per-sleeve accumulation. Independent of the primary's scale-up so
            each sleeve compounds its own realized P&L into more contracts. -->
       <div class="accumulate-block">
@@ -3887,6 +3917,13 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   if (accumulateToggle && accumulateFields) {
     accumulateToggle.addEventListener('change', () => {
       accumulateFields.hidden = !accumulateToggle.checked;
+    });
+  }
+  const buyTrailToggle = m.querySelector('#sl-buy-trail');
+  const buyTrailFields = m.querySelector('#sl-buy-trail-fields');
+  if (buyTrailToggle && buyTrailFields) {
+    buyTrailToggle.addEventListener('change', () => {
+      buyTrailFields.hidden = !buyTrailToggle.checked;
     });
   }
   const stopLossToggle = m.querySelector('#sl-stoploss');
@@ -4526,6 +4563,12 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       book_imbalance_depth_levels: parseInt(draft.book_imbalance_depth_levels || 5, 10),
       book_imbalance_sell_threshold: Number(draft.book_imbalance_sell_threshold) || 0.65,
       book_imbalance_buy_threshold: Number(draft.book_imbalance_buy_threshold) || 0.65,
+      // Trailing buy (Livermore / Turtle / Le Beau) — don't grab a falling
+      // knife. See swing_leg._trailing_buy_ready for the state machine.
+      buy_trail_enabled: !!(m.querySelector('#sl-buy-trail')?.checked),
+      buy_trail_distance: (m.querySelector('#sl-buy-trail')?.checked
+        ? Number(m.querySelector('#sl-buy-trail-distance')?.value || 0)
+        : 0),
     };
     if (!(patch.qty >= 1)) { errEl.hidden = false; errEl.innerHTML = 'Contracts must be at least 1'; return; }
     if (!(buyPx < sellPx)) { errEl.hidden = false; errEl.innerHTML = 'Buy target must be below sell target'; return; }

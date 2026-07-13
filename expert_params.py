@@ -101,6 +101,12 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "ratchet_x_atr": 3.0,       # Le Beau chandelier
         "ratchet_activation_x_atr": 0.5,  # Van Tharp — wait for 0.5R gain
         "reanchor_x_atr": 1.0,      # Van Tharp SafeZone
+        # Buy-side trailing distance — mirror of the trail. When trailing_buy
+        # is enabled, we wait for mark to bounce this much above the local
+        # low before actually placing the rebuy. Le Beau's entry-filter
+        # canonical: 0.5×ATR is enough to confirm the fall is over
+        # (Livermore's "pivot") without being so wide we miss the reversal.
+        "buy_trail_x_atr": 0.5,
     },
     "energy": {
         "trail_x_atr": 2.0,
@@ -109,6 +115,7 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "ratchet_x_atr": 3.0,
         "ratchet_activation_x_atr": 0.5,
         "reanchor_x_atr": 1.0,
+        "buy_trail_x_atr": 0.5,
     },
     "crypto": {
         # Kaufman: 24/7 markets + higher realized vol → wider bands to
@@ -119,6 +126,9 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "ratchet_x_atr": 4.0,
         "ratchet_activation_x_atr": 0.75,
         "reanchor_x_atr": 1.5,
+        # Crypto bounces are noisier — need a wider confirmation before
+        # trusting a reversal. 0.75×ATR (matches Kaufman's crypto bump).
+        "buy_trail_x_atr": 0.75,
     },
     "equity": {
         # Equity indices are more mean-reverting during regular hours;
@@ -129,6 +139,7 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "ratchet_x_atr": 2.5,
         "ratchet_activation_x_atr": 0.5,
         "reanchor_x_atr": 1.0,
+        "buy_trail_x_atr": 0.4,
     },
 }
 
@@ -158,5 +169,6 @@ def expert_params(product_id: str, atr: float) -> dict[str, float]:
         "ratchet_distance": round(atr * m["ratchet_x_atr"], 4),
         "ratchet_activation": round(atr * m["ratchet_activation_x_atr"], 4),
         "reanchor_threshold": round(atr * m["reanchor_x_atr"], 4),
+        "buy_trail_distance": round(atr * m.get("buy_trail_x_atr", 0.5), 4),
         "multipliers": m,
     }

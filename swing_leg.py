@@ -1115,6 +1115,74 @@ class SwingTrader:
 
         return False
 
+    def _trailing_buy_ready(self, sc, ss, last_price: float):
+        """Falling-knife guard on the BUY leg. Returns the price at which
+        to arm the buy NOW, or None to wait another tick.
+
+        Semantics (mirror of trailing_stop but for entries):
+          Phase 1  mark > sc.buy_px          → not yet dipped; wait
+          Phase 2  mark <= sc.buy_px, first  → arm the trail, track low
+          Phase 3  mark drops further        → update running low
+          Phase 4  mark bounces >= low +     → confirm reversal → arm buy
+                   sc.buy_trail_distance
+
+        Expert canon (Livermore's pivot / Turtle breakout confirmation /
+        Le Beau entry filter). The arm price is capped at sc.buy_px so
+        we NEVER pay more than the original limit — even if a shallow
+        dip bounces above buy_px, we cap and fall through to normal
+        limit behavior at buy_px.
+
+        Disabled path (buy_trail_enabled=False or distance<=0): returns
+        sc.buy_px immediately — identical to the pre-existing behavior.
+        """
+        if not getattr(sc, "buy_trail_enabled", False):
+            return sc.buy_px
+        distance = float(getattr(sc, "buy_trail_distance", 0.0) or 0.0)
+        if distance <= 0:
+            return sc.buy_px
+
+        # Once armed, we STAY armed until the bounce confirms. A brief recovery
+        # above buy_px while armed IS a bounce confirmation — it means the
+        # market went down and came back, which is exactly what we're waiting
+        # for. Don't disarm on recovery; check the bounce first.
+        if ss.buy_trail_armed:
+            # Still falling — update the running low.
+            if last_price < ss.buy_trail_low_water:
+                ss.buy_trail_low_water = float(last_price)
+                return None
+            # Bounce confirmed? Fire at min(mark, buy_px) — cap so we never
+            # overpay vs the original target.
+            if last_price >= ss.buy_trail_low_water + distance:
+                arm_price = min(float(last_price), float(sc.buy_px))
+                self._record(
+                    "buy_trail_bounce_confirmed",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    low_water=round(ss.buy_trail_low_water, 6),
+                    last_price=round(float(last_price), 6),
+                    arm_price=round(arm_price, 6),
+                    trail_distance=distance,
+                )
+                ss.buy_trail_armed = False
+                ss.buy_trail_low_water = 0.0
+                return arm_price
+            # Between low and low+distance — still waiting for confirmation.
+            return None
+
+        # Not yet armed: only arm once mark dips at/through buy_px.
+        if last_price > sc.buy_px:
+            return None
+
+        ss.buy_trail_armed = True
+        ss.buy_trail_low_water = float(last_price)
+        self._record(
+            "buy_trail_armed",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            buy_px=sc.buy_px,
+            last_price=round(float(last_price), 6),
+            trail_distance=distance,
+        )
+        return None
+
     def _sleeve_trend_ok_for_buy(self, sc, last_price: float) -> bool:
         """Trend gate on the BUY arm. Returns False (block the buy) when the
         filter is enabled AND last_price < the M-bar SMA of the sleeve's
@@ -1665,7 +1733,15 @@ class SwingTrader:
                 # the "priced-out to the upside" case.
                 if not self._sleeve_trend_ok_for_buy(sc, last_price):
                     return
-                ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, sc.buy_px, last_price)
+                # Trailing-buy (Livermore / Turtle / Le Beau). When enabled,
+                # returns None until mark bounces buy_trail_distance above the
+                # local low — otherwise returns sc.buy_px (identical to legacy
+                # behavior). arm_price is capped at sc.buy_px so we never
+                # overpay vs the original target.
+                arm_price = self._trailing_buy_ready(sc, ss, last_price)
+                if arm_price is None:
+                    return  # still tracking the low, don't arm this tick
+                ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", sc.qty, arm_price, last_price)
                 if ms_qty is None:
                     return  # microstructure gate said pause
                 self._sleeve_arm(sc, ss, "BUY", ms_qty, ms_px)
@@ -2230,6 +2306,9 @@ class SwingTrader:
             ss.trail_armed = False
             ss.trail_high_water_price = 0.0
             ss.hybrid_sell_triggered_ts = None
+            # Trailing-buy state reset too — new cycle, no prior low to honor.
+            ss.buy_trail_armed = False
+            ss.buy_trail_low_water = 0.0
             # Winning cycle completed → reset the consecutive-stop counter
             # (breaks any streak that was accumulating). Also clear the
             # ratcheting HWM — next cycle starts fresh at the new basis.
