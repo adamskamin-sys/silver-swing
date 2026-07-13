@@ -61,6 +61,13 @@ TWITTER_POLL_SECS = float(os.getenv("SWING_TWITTER_POLL_SECS", "300.0"))
 # configured and you want longer retention for training data.
 TICK_PRUNE_INTERVAL_SECS = float(os.getenv("SWING_TICK_PRUNE_INTERVAL_SECS", "3600.0"))
 TICK_KEEP_DAYS = int(os.getenv("SWING_TICK_KEEP_DAYS", "7"))
+# [crew:#4] How often to re-run reconcile() DURING the session. Previously
+# reconcile ran once at startup and never again, so any drift between the bot's
+# believed state and the exchange (an order filled/cancelled outside the step
+# loop, a manual trade, position slipping below core) went undetected for the
+# whole uptime — potentially days on Render. Re-running it periodically credits
+# missed fills and halts on a core breach while the session is live. 60s default.
+RECONCILE_INTERVAL_SECS = float(os.getenv("SWING_RECONCILE_INTERVAL_SECS", "60.0"))
 
 
 def _log(msg: str) -> None:
@@ -328,6 +335,7 @@ def run() -> int:
         trader.reconcile()
 
         last_snapshot = 0.0
+        last_reconcile = time.time()  # [crew:#4] startup reconcile just ran
         last_family_check = time.time()  # already resolved on startup
         while not stopping:
             t = feed.latest_ticker()
@@ -361,6 +369,16 @@ def run() -> int:
                 except Exception as e:
                     _log(f"front-month recheck failed ({type(e).__name__}: {e})")
             scanner_worker.tick()
+            # [crew:#4] Periodic reconcile — trust the exchange, not memory.
+            # Credits fills that happened outside the step loop and halts on a
+            # core breach. Wrapped so a transient broker/API error never takes
+            # the loop down; the next tick retries.
+            if now - last_reconcile >= RECONCILE_INTERVAL_SECS:
+                last_reconcile = now
+                try:
+                    trader.reconcile()
+                except Exception as e:
+                    _log(f"periodic reconcile failed: {type(e).__name__}: {e}")
             # Periodic sweep so no product's contract_size/fees can silently
             # drift for more than SPEC_REFRESH_SECS (6h default).
             if now - last_spec_refresh >= SPEC_REFRESH_SECS:
