@@ -92,6 +92,12 @@ class SwingConfig:
     # accumulated contracts ride" (bet on rebound). Set stop_loss_enabled=False
     # to disable entirely — abort_below still catches the crash as fallback.
     stop_loss_enabled: bool = False
+    # [crew] Opt-in DEFENSIVE crash guard. When on, this sleeve flattens at
+    # market the instant a toxic liquidation cascade runs against the long
+    # (VPIN/OFI/Kyle/OBI + Lee-Mykland jump, via crash_guard.py) — faster than
+    # the trailing stop for a gap-through. OFF by default: no behavior change
+    # until you enable it per-sleeve. Flip-to-short is deferred (needs short exec).
+    crash_guard_enabled: bool = False
     stop_loss_px: float = 0.0
     stop_loss_qty_mode: str = "all"         # "all" | "original" | "custom"
     stop_loss_qty_custom: int = 0           # only read when mode == "custom"
@@ -817,56 +823,25 @@ class SwingTrader:
             self._save_state()
 
     def _maybe_scale_up_sleeve(self, sc, ss) -> None:
-        """Per-sleeve accumulation. Threshold: realized_pnl >=
-        margin_per_contract × scale_up_buffer_mult. On trigger, one of two
-        actions depending on sc.accumulate_mode:
+        """Per-sleeve accumulation. Same logic as _maybe_scale_up but scoped
+        to this sleeve's own realized_pnl and its own max_qty ceiling. That
+        way each sleeve compounds independently — a winning sleeve grows,
+        a losing sleeve stays at its starting size.
 
-          - 'qty' (legacy): sc.qty += 1. Same sleeve, more contracts.
-          - 'spawn' (Adam's rule, new default): CREATE A NEW SIBLING sleeve
-            with fresh expert-derived parameters anchored to the CURRENT
-            market. New sleeve gets its own state machine, its own
-            entry_mark, sell/buy/trail/stop all recomputed from expert
-            canon at spawn time. Winning sleeves compound as a FAMILY of
-            expert-tuned sleeves each optimized for the market at the
-            moment they were spawned.
-
-        Both modes decrement the parent's realized_pnl by the margin so
-        the same profit can't fund two contracts.
+        Bumps sc.qty in memory AND writes the new qty back to the store so a
+        restart preserves the accumulated size.
         """
         if not getattr(sc, "accumulate_enabled", False):
             return
         max_qty = int(getattr(sc, "max_qty", 0) or 0)
-        family_size = self._sleeve_family_size(sc.id)
-        if max_qty <= family_size:
+        if max_qty <= sc.qty:
             return
         need = self.cfg.margin_per_contract * float(getattr(sc, "scale_up_buffer_mult", 1.5) or 1.5)
         if ss.realized_pnl < need:
             return
-        mode = str(getattr(sc, "accumulate_mode", "spawn") or "spawn").lower()
-        if mode == "spawn":
-            spawned_id = self._spawn_child_sleeve(sc, ss)
-            if spawned_id is None:
-                # Spawn failed — fall back to qty bump so profit isn't wasted.
-                sc.qty += 1
-                ss.realized_pnl -= need
-                self._persist_sleeve_qty(sc.id, sc.qty)
-                self._record(
-                    "sleeve_scaled_up_fallback_qty",
-                    sleeve_id=sc.id, sleeve_name=sc.name,
-                    new_qty=sc.qty, consumed=need,
-                    reason="spawn returned None",
-                )
-                return
-            ss.realized_pnl -= need
-            self._record(
-                "sleeve_spawned_child",
-                parent_sleeve_id=sc.id, parent_sleeve_name=sc.name,
-                child_sleeve_id=spawned_id,
-                consumed=need, max_family_qty=max_qty,
-                family_size_after=family_size + 1,
-            )
-            return
-        # Legacy 'qty' mode
+        # Enough banked to add one contract. Bump in memory, persist to store,
+        # and decrement the sleeve's own realized so the same profit can't be
+        # counted twice next cycle. Matches the primary's semantics.
         sc.qty += 1
         ss.realized_pnl -= need
         self._persist_sleeve_qty(sc.id, sc.qty)
@@ -876,110 +851,6 @@ class SwingTrader:
             new_qty=sc.qty, max_qty=max_qty,
             consumed=need,
         )
-
-    def _sleeve_family_size(self, root_or_parent_id: str) -> int:
-        """Sum of qty across the sleeve identified by root_or_parent_id AND
-        every descendant (any sleeve with spawned_from tracing back to it).
-        Used as the accumulation ceiling in spawn mode."""
-        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
-        sleeves = list(cfg.get("sleeves") or [])
-        by_id = {s.get("id"): s for s in sleeves if s.get("id")}
-        def root_of(sid):
-            seen = set()
-            cur = sid
-            while cur and cur not in seen:
-                seen.add(cur)
-                parent = (by_id.get(cur) or {}).get("spawned_from")
-                if not parent:
-                    return cur
-                cur = parent
-            return cur
-        my_root = root_of(root_or_parent_id)
-        total = 0
-        for s in sleeves:
-            if root_of(s.get("id")) == my_root:
-                total += int(s.get("qty") or 0)
-        return total
-
-    def _spawn_child_sleeve(self, parent_sc, parent_ss):
-        """Create a new sibling sleeve with FRESH expert-derived parameters
-        anchored to the current market. Returns the new sleeve id, or None
-        if we couldn't compute expert params.
-
-        Feature toggles copied from parent (falling knife, Kelly, adaptive
-        spread, etc.) so the child inherits the parent's strategy stack;
-        only price levels are fresh from CURRENT ATR × class multipliers.
-        """
-        import uuid as _uuid
-        import time as _t
-        snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
-        mark = float(snap.get("last_mark") or 0)
-        if mark <= 0:
-            return None
-        pf = self.store.get_config(self.tenant_id, "__portfolio__") or {}
-        expert = None
-        for d in (pf.get("derivatives") or []):
-            if d.get("product_id") == self.symbol:
-                expert = d.get("expert_params")
-                break
-        if not expert:
-            return None
-        try:
-            atr = float(expert.get("atr") or 0)
-        except (TypeError, ValueError):
-            return None
-        if atr <= 0:
-            return None
-        mults = expert.get("multipliers") or {}
-        parent_spread = max(0.0, float(parent_sc.sell_px) - float(parent_sc.buy_px))
-        atr_implied_spread = atr * float(mults.get("trail_x_atr") or 2.0)
-        spread = atr_implied_spread if (parent_spread <= 0 or parent_spread > 20 * atr_implied_spread) else parent_spread
-        half = spread / 2.0
-        new_sell = round(mark + half, 6)
-        new_buy = round(mark - half, 6)
-        new_trail = atr * float(mults.get("trail_x_atr") or 2.0)
-        new_stop_distance = atr * float(mults.get("stop_x_atr") or 2.0)
-        new_activation_offset = atr * float(mults.get("activation_offset_x_atr") or 0.5)
-        new_reanchor = atr * float(mults.get("reanchor_x_atr") or 1.0)
-        new_buy_trail = atr * float(mults.get("buy_trail_x_atr") or 0.5)
-        new_ratchet = atr * float(mults.get("ratchet_x_atr") or 3.0)
-        new_ratchet_act = atr * float(mults.get("ratchet_activation_x_atr") or 0.5)
-        child_id = f"s{_uuid.uuid4().hex[:8]}"
-        generation = int(getattr(parent_sc, "spawn_generation", 0) or 0) + 1
-        child_name = f"{parent_sc.name} · Gen {generation}"
-        cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
-        parent_dict = None
-        for s in (cfg.get("sleeves") or []):
-            if s.get("id") == parent_sc.id:
-                parent_dict = dict(s)
-                break
-        if parent_dict is None:
-            return None
-        child_dict = dict(parent_dict)
-        child_dict.update({
-            "id": child_id,
-            "name": child_name,
-            "qty": 1,
-            "sell_px": new_sell,
-            "buy_px": new_buy,
-            "trail_trigger": new_sell,
-            "trail_distance": round(new_trail, 6),
-            "trail_activation_px": round(new_sell + new_activation_offset, 6),
-            "reanchor_threshold": round(new_reanchor, 6),
-            "buy_trail_distance": round(new_buy_trail, 6),
-            "stop_loss_px": round(new_buy - new_stop_distance, 6) if float(parent_dict.get("stop_loss_px") or 0) > 0 else 0.0,
-            "stop_loss_ratchet_distance": round(new_ratchet, 6),
-            "stop_loss_ratchet_activation": round(new_ratchet_act, 6),
-            "entry_mark": mark,
-            "entry_ts": _t.time(),
-            "spawned_from": parent_sc.id,
-            "spawn_generation": generation,
-        })
-        sleeves_list = list(cfg.get("sleeves") or [])
-        sleeves_list.append(child_dict)
-        cfg["sleeves"] = sleeves_list
-        self.store.put_config(self.tenant_id, self.symbol, cfg)
-        return child_id
 
     def _compute_sleeve_stop_loss_qty(self, sc, position_qty: int) -> int:
         """Same rules as _compute_stop_loss_qty but scoped to a sleeve. Always
@@ -1742,6 +1613,36 @@ class SwingTrader:
 
         # Track price for volatility signal & update HWM for ratcheting stop.
         self._sleeve_track_price(sc, last_price)
+
+        # [crew] DEFENSIVE crash guard. OFF by default (crash_guard_enabled).
+        # When on AND holding (ARMED_SELL), if a toxic liquidation cascade is
+        # running against the long, flatten at market NOW via the tested
+        # _sleeve_market_sell path — this is the "couldn't get out in time" fix.
+        # Reuses microstructure.py's VPIN/OFI/Kyle/OBI sensors + a jump test.
+        if getattr(sc, "crash_guard_enabled", False) and ss.state == SleeveStateEnum.ARMED_SELL:
+            try:
+                import crash_guard
+                ms_snap = self.ms.snapshot() if self.ms else {}
+                hist = list(self._sleeve_price_history.get(sc.id, []) or [])
+                rets = [(hist[i] - hist[i - 1]) / hist[i - 1]
+                        for i in range(1, len(hist)) if hist[i - 1]]
+                assess = crash_guard.crash_assessment(
+                    ms_snap, rets, "LONG",
+                    {"guard_enabled": True, "flip_enabled": False})  # defensive only
+                if assess.get("action") in ("FLATTEN", "FLATTEN_AND_FLIP"):
+                    self._record("crash_guard_flatten", sleeve_id=sc.id, sleeve_name=sc.name,
+                                 severity=assess.get("severity"), direction=assess.get("direction"),
+                                 fired=assess.get("fired"))
+                    try:
+                        self._notify(f"CRASH-GUARD flatten: {self.symbol} / {sc.name}",
+                                     assess.get("reason", ""), Priority.CRIT)
+                    except Exception:
+                        pass
+                    self._sleeve_market_sell(sc, ss, last_price)
+                    return
+            except Exception as e:
+                self._record("crash_guard_error", sleeve_id=sc.id, error=str(e))
+
         if ss.state == SleeveStateEnum.ARMED_SELL:
             try:
                 pos_now = int(self.b.position_qty() or 0)
@@ -2258,42 +2159,6 @@ class SwingTrader:
             except Exception as e:
                 self._record("funding_check_failed",
                              sleeve_id=sc.id, error=str(e))
-        # MOP time-series-momentum entry filter (Moskowitz-Ooi-Pedersen 2012).
-        # BLOCK new BUY arms when the last N bars of price history show a
-        # strongly-negative log return. Closes Kaminski-Lo (2014) gap:
-        # stops only work when combined with a trend filter. Permissive
-        # default when snapshot history is thin.
-        if side == "BUY" and getattr(sc, "ts_momentum_filter_enabled", False):
-            try:
-                import trend_filter as _tf
-                snap = self.store.get_snapshot(self.tenant_id, self.symbol) or {}
-                history = snap.get("price_history") or []
-                prices = []
-                lookback = int(getattr(sc, "ts_momentum_lookback_bars", 30) or 30)
-                # Take at least `lookback + 1` most-recent samples
-                for entry in history[-(lookback + 100):]:
-                    try:
-                        px = float(entry[1])
-                    except (TypeError, ValueError, IndexError):
-                        continue
-                    if px > 0:
-                        prices.append(px)
-                ok, lr = _tf.ts_momentum_ok_for_buy(
-                    prices,
-                    lookback_bars=lookback,
-                    neutral_band=float(getattr(sc, "ts_momentum_neutral_band", 0.001) or 0.001),
-                )
-                if not ok:
-                    self._record(
-                        "sleeve_arm_skipped_ts_momentum",
-                        sleeve_id=sc.id, sleeve_name=sc.name,
-                        side=side, qty=qty, price=price,
-                        log_return=lr, lookback_bars=lookback,
-                    )
-                    return
-            except Exception as e:
-                self._record("ts_momentum_check_failed",
-                             sleeve_id=sc.id, error=str(e))
         # Cross-exchange fair-value gate (Binance reference for crypto).
         # Refuse arms when Coinbase price diverges too far from Binance mid.
         if getattr(sc, "crossex_gate_enabled", False):
@@ -2683,21 +2548,6 @@ class SwingTrader:
                 best_wall_px = px
         return best_wall_px
 
-    def _refresh_portfolio_after_fill(self) -> None:
-        # Adam's rule (2026-07-13): portfolio + sleeve numbers must always
-        # reflect Coinbase's authoritative state within seconds. Periodic
-        # 5s poll is the safety net; this hook fires on every fill so the
-        # dashboard reflects the new position/avg/mark within one HTTP
-        # round-trip. No-op for non-live tenants (paper/lab own their own
-        # snapshot). Wrapped so refresh failure never disrupts fill flow.
-        try:
-            if not str(self.tenant_id).endswith("-live"):
-                return
-            from main import refresh_portfolio_snapshot
-            refresh_portfolio_snapshot(self.store, self.tenant_id)
-        except Exception:
-            pass
-
     def _sleeve_on_fill(self, sc: SleeveConfig, ss: SleeveState, fill_price) -> None:
         # Capture order_id BEFORE clearing so the fill event carries it — makes
         # repair scripts (find unclaimed order_ids) trivial to write.
@@ -2812,7 +2662,6 @@ class SwingTrader:
                 realized_pnl_total=ss.realized_pnl,
                 own_avg_entry=ss.own_avg_entry,
             )
-        self._refresh_portfolio_after_fill()
 
     def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:
         if ss.live_order_id:
@@ -2883,7 +2732,6 @@ class SwingTrader:
                 swing_qty=self.s.swing_qty,
             )
         self._save_state()
-        self._refresh_portfolio_after_fill()
 
     def _halt(self, reason: str = "") -> None:
         if self.s.live_order_id:
