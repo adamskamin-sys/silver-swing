@@ -195,6 +195,48 @@ class CoinbaseBroker:
         if not r.get("success"):
             raise RuntimeError(f"cancel failed: {r}")
 
+    def list_open_orders(self, product_ids: Optional[list[str]] = None) -> list[dict]:
+        """Return currently-OPEN orders from Coinbase, normalized to the
+        shape reconciliation_monitor expects: [{order_id, symbol, side,
+        price, qty}, ...]. Passes product_ids= to the SDK if provided;
+        otherwise all-account open orders. Safe/read-only — used by the
+        reconciliation monitor to diff exchange orders vs bot sleeve state."""
+        try:
+            kwargs = {"order_status": ["OPEN"]}
+            if product_ids:
+                kwargs["product_ids"] = list(product_ids)
+            resp = _dump(self.client.list_orders(**kwargs))
+        except Exception:
+            return []
+        out: list[dict] = []
+        for o in (resp.get("orders") or []):
+            pid = o.get("product_id")
+            side = str(o.get("side") or "").upper()
+            oid = o.get("order_id")
+            # Price + qty live under order_configuration for the various
+            # limit_* / market_* order shapes. We only care about limit
+            # orders that reconciliation might flag as duplicates.
+            cfg = o.get("order_configuration") or {}
+            price = None
+            qty = None
+            for shape_key in ("limit_limit_gtc", "limit_limit_gtd",
+                              "limit_limit_fok", "limit_limit_ioc"):
+                shape = cfg.get(shape_key)
+                if shape:
+                    try:
+                        price = float(shape.get("limit_price") or 0)
+                        qty = int(float(shape.get("base_size") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if price is None or qty is None or not pid or not oid or not side:
+                continue
+            out.append({
+                "order_id": oid, "symbol": pid,
+                "side": side, "price": price, "qty": qty,
+            })
+        return out
+
     def position_qty(self) -> int:
         """Signed net contract count for this product. LONG > 0, SHORT < 0, flat = 0."""
         for p in _dump(self.client.list_futures_positions()).get("positions") or []:

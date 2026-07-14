@@ -493,8 +493,19 @@ def run() -> int:
                             "armed_at": st.get("last_heartbeat_ts"),
                             "last_sale_px": st.get("last_sell_fill_price"),
                         })
+                    # Fetch open orders from Coinbase via broker.list_open_orders
+                    # so reconciliation_monitor's duplicate_order + orphan_order
+                    # checks have data to work with. Fail-safe: on any exception,
+                    # pass empty and rely on position_mismatch + stale_entry.
+                    open_orders_data: list[dict] = []
+                    try:
+                        list_orders_fn = getattr(coinbase, "list_open_orders", None)
+                        if callable(list_orders_fn):
+                            open_orders_data = list_orders_fn() or []
+                    except Exception as _e:
+                        _log(f"reconciliation_monitor: list_open_orders failed: {_e}")
                     findings = rmon.reconcile(
-                        open_orders=[],  # TODO: wire Coinbase list_orders in a follow-up
+                        open_orders=open_orders_data,
                         exch_positions=exch_positions,
                         sleeves=sleeves_data,
                         now_ts=now,
