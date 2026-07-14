@@ -233,11 +233,31 @@ def _maybe_run_tuner(store, live_tenant: str) -> None:
         _log(f"[{live_tenant}] tuner failed: {type(e).__name__}: {e}")
 
 
-def _derive_live_tenant(paper_tenant: str) -> str:
-    """adam-paper → adam-live. Anything else gets '-live' appended."""
-    if paper_tenant.endswith("-paper"):
-        return paper_tenant[: -len("-paper")] + "-live"
-    return f"{paper_tenant}-live"
+def _derive_live_tenant(source_tenant: str) -> str:
+    """Derive a live-shaped tenant name from source_tenant.
+
+    HARDENED 2026-07-14 (auditor Goal A) — refuses to derive a live tenant
+    from ANY source that isn't already live-shaped. Historical paper-mode
+    derivation (adam-paper → adam-live) is REFUSED because that was the
+    root cause of the 2026-07-14 multi-writer incident: silver-swing-bot-
+    paper had SWING_LIVE_ENGINE=1, this function silently derived adam-
+    live, and the paper service placed duplicate live orders alongside
+    silver-swing-bot-live.
+
+    Accepted: source already ends with '-live' → returned unchanged.
+    Refused: anything else raises ValueError. To run the live engine,
+    set SWING_TENANT to a '-live' tenant explicitly (e.g. 'adam-live');
+    no other name can silently become one.
+    """
+    if source_tenant.endswith("-live"):
+        return source_tenant
+    raise ValueError(
+        f"_derive_live_tenant: refusing to derive a live tenant from "
+        f"{source_tenant!r}. Source must already end with '-live'. Set "
+        f"SWING_TENANT to a live-shaped tenant explicitly. Refusing to "
+        f"guess prevents the 2026-07-14 multi-writer incident class where "
+        f"a non-live service silently derived adam-live."
+    )
 
 
 def _default_live_holding_config(product_id: str, kind: str) -> dict:
@@ -589,7 +609,11 @@ class _Track:
         self.symbol = symbol
         self.store = store
         self.log = log
-        self.is_live = (tenant == _derive_live_tenant(TENANT))
+        # Hardened 2026-07-14: is_live is a semantic check on THIS track's
+        # tenant, not a derivation from module-level TENANT. Prevents the
+        # class where a paper service silently derives adam-live and marks
+        # a track as real-money (the 2026-07-14 multi-writer incident).
+        self.is_live = isinstance(tenant, str) and tenant.endswith("-live")
 
         if self.is_live:
             # REAL MONEY path. CoinbaseBroker places actual orders and reads
@@ -786,17 +810,40 @@ def run_paper_mode() -> int:
         if lab_tenant != TENANT:
             tenants.append(lab_tenant)
 
-    # Live engine: opt-in, DOUBLE-gated. SWING_LIVE_ENGINE=1 enables the wiring
-    # AND SWING_LIVE_CONFIRM=I_UNDERSTAND acknowledges real orders will place
-    # on Coinbase. Missing either flag runs paper/lab only.
-    live_tenant = _derive_live_tenant(TENANT)
+    # Live engine: opt-in, TRIPLE-gated (hardened 2026-07-14 auditor Goal A).
+    # (1) SWING_LIVE_ENGINE=1 enables the wiring.
+    # (2) SWING_LIVE_CONFIRM=I_UNDERSTAND acknowledges real orders will place
+    #     on Coinbase.
+    # (3) NEW: SWING_TENANT must ALREADY be live-shaped (ends with '-live').
+    #     Prevents the 2026-07-14 multi-writer incident where a non-live
+    #     service silently derived adam-live and placed duplicate orders.
+    #     If any gate fails, the live engine will NOT be started here.
+    live_tenant: Optional[str] = None
+    try:
+        live_tenant = _derive_live_tenant(TENANT)
+    except ValueError as _derive_err:
+        # Non-live source. If the operator ALSO set the live-engine env vars,
+        # that's a misconfiguration we must NOT silently accept — log CRIT
+        # so it's visible in Render logs + notifier.
+        if os.getenv("SWING_LIVE_ENGINE", "0") == "1":
+            _log(
+                f"REFUSING LIVE ENGINE: SWING_LIVE_ENGINE=1 but "
+                f"SWING_TENANT={TENANT!r} is not live-shaped. {_derive_err} "
+                f"Multi-writer safety gate — this service will NOT manage a "
+                f"live tenant. Fix: set SWING_TENANT to a '-live' name or "
+                f"unset SWING_LIVE_ENGINE."
+            )
     live_engine_enabled = (
-        os.getenv("SWING_LIVE_ENGINE", "0") == "1"
+        live_tenant is not None
+        and os.getenv("SWING_LIVE_ENGINE", "0") == "1"
         and os.getenv("SWING_LIVE_CONFIRM") == "I_UNDERSTAND"
     )
     if os.getenv("SWING_LIVE_ENGINE", "0") == "1" and not live_engine_enabled:
-        _log("SWING_LIVE_ENGINE=1 but SWING_LIVE_CONFIRM!=I_UNDERSTAND — Live engine will NOT run")
-    if live_engine_enabled and live_tenant != TENANT and live_tenant not in tenants:
+        if live_tenant is None:
+            pass  # already logged above
+        else:
+            _log("SWING_LIVE_ENGINE=1 but SWING_LIVE_CONFIRM!=I_UNDERSTAND — Live engine will NOT run")
+    if live_engine_enabled and live_tenant is not None and live_tenant != TENANT and live_tenant not in tenants:
         tenants.append(live_tenant)
 
     _log(f"paper mode: primary={SYMBOL}, tenants={tenants}"

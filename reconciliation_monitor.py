@@ -88,6 +88,29 @@ def check_stale_entries(sleeves, now_ts, stale_after_s=3600, price_lookup=None, 
     return out
 
 
+def check_safety_halts(sleeves):
+    """Count HALTED sleeves and surface as warnings — but EXCLUDE
+    reentry_reeval expire halts, which are deliberate near-expiry exits
+    (auditor 2026-07-14 Tier 2 (b)). A safety-halt count that included
+    them would false-alarm every audit cycle whenever expert-reentry
+    is enabled on a dated futures near its expiry."""
+    try:
+        from reentry_reeval import is_expire_halt
+    except Exception:
+        def is_expire_halt(_r):  # pragma: no cover — defensive fallback
+            return False
+    out = []
+    for s in sleeves:
+        if str(s.get("state") or "") != "HALTED":
+            continue
+        reason = s.get("halt_reason") or ""
+        if is_expire_halt(reason):
+            continue  # deliberate expire — not a safety concern
+        out.append(Finding("warn", "safety_halt", s.get("symbol") or "?",
+                   f"sleeve HALTED (reason: {reason or 'unspecified'}) — review + resume"))
+    return out
+
+
 def check_state_config_drift(state_config_pairs):
     """Auditor 2026-07-14 SLR-incident agenda item — flag when runtime
     state.swing_qty disagrees with persisted config.swing_qty.
@@ -134,6 +157,7 @@ def reconcile(*, open_orders, exch_positions, sleeves, now_ts,
     findings += check_orphans_and_missing(open_orders, sleeves)
     findings += check_position_mismatch(exch_positions, sleeves)
     findings += check_stale_entries(sleeves, now_ts, stale_after_s, price_lookup)
+    findings += check_safety_halts(sleeves)
     findings += check_state_config_drift(state_config_pairs)
     rank = {"critical": 0, "warn": 1, "info": 2}
     findings.sort(key=lambda f: rank.get(f.severity, 3))

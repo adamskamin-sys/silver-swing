@@ -147,6 +147,40 @@ def test_no_stale_when_fresh_and_no_drift():
     assert findings == []
 
 
+# ---- safety_halt (Tier 2 (b) — excludes reentry_reeval expire halts) ----
+
+def test_safety_halt_flagged_for_generic_halt():
+    """Any sleeve in HALTED state (non-expire reason) surfaces as warn."""
+    sleeves = [{"symbol": "OIL", "state": "HALTED",
+                "halt_reason": "drawdown breach"}]
+    findings = rm.check_safety_halts(sleeves)
+    assert len(findings) == 1
+    assert findings[0].severity == "warn"
+    assert findings[0].kind == "safety_halt"
+
+
+def test_safety_halt_EXCLUDES_reentry_reeval_expire():
+    """AUDITOR 2026-07-14 Tier 2 (b): a HALTED sleeve whose reason starts
+    with the reentry_reeval expire prefix MUST NOT count as a safety halt —
+    those are deliberate near-expiry exits, not fixable safety halts."""
+    from reentry_reeval import EXPIRE_HALT_PREFIX
+    sleeves = [
+        {"symbol": "OIL", "state": "HALTED",
+         "halt_reason": f"{EXPIRE_HALT_PREFIX} extended, no pullback room"},
+        {"symbol": "CU",  "state": "HALTED",
+         "halt_reason": "portfolio circuit breaker"},
+    ]
+    findings = rm.check_safety_halts(sleeves)
+    # Only the non-expire halt should surface
+    assert len(findings) == 1
+    assert findings[0].symbol == "CU"
+
+
+def test_safety_halt_no_finding_when_not_halted():
+    sleeves = [{"symbol": "OIL", "state": "ARMED_SELL", "halt_reason": None}]
+    assert rm.check_safety_halts(sleeves) == []
+
+
 # ---- reconcile() — full pipeline + severity ordering ---------------------
 
 def test_reconcile_returns_critical_first():
