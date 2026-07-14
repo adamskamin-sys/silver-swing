@@ -83,6 +83,11 @@ PORTFOLIO_REFRESH_SECS = float(os.getenv("SWING_PORTFOLIO_REFRESH_SECS", "2.0"))
 # trail/stop/reanchor levels have drifted off the expert data. Read-only. 5 min.
 EXPERT_GUARD_INTERVAL_SECS = float(os.getenv("SWING_EXPERT_GUARD_SECS", "300.0"))
 SENTINEL_INTERVAL_SECS = float(os.getenv("SWING_SENTINEL_SECS", "300.0"))
+# reconciliation_monitor cadence (2026-07-14 auditor artifact). Read-only
+# defense — diffs exchange orders/positions against bot's sleeve state.
+# 5 min is aggressive enough to catch a duplicate-orders or SLR-ghost
+# class of bug within one tick window, cheap enough not to spam the notifier.
+RECONCILIATION_INTERVAL_SECS = float(os.getenv("SWING_RECONCILIATION_SECS", "300.0"))
 
 
 def _log(msg: str) -> None:
@@ -356,6 +361,7 @@ def run() -> int:
         last_reconcile = time.time()  # [crew:#4] startup reconcile just ran
         last_expert_guard = time.time()  # [crew] expert-params drift guard
         last_sentinel = time.time()  # [crew] risk_sentinel periodic scan
+        last_reconciliation = time.time()  # [crew] reconciliation_monitor
         last_family_check = time.time()  # already resolved on startup
         while not stopping:
             t = feed.latest_ticker()
@@ -449,6 +455,75 @@ def run() -> int:
             # go wrong'. Runs on the same cadence as snapshot so it can see
             # fresh mark prices when computing unrealized. Cheap: single
             # aggregation over all sleeves in this tenant.
+            # [crew 2026-07-14] reconciliation_monitor — read-only defense.
+            # Diffs Coinbase state (positions from __portfolio__ snapshot)
+            # against bot sleeve state; flags duplicate orders, position
+            # mismatches, stale entries. Never cancels — notifies + logs.
+            # Would have caught today's SLR ghost automatically
+            # (state.swing_qty=2 vs Coinbase position=1 → position_mismatch
+            # critical). See reconciliation_monitor.py + AGENTS.md.
+            if now - last_reconciliation >= RECONCILIATION_INTERVAL_SECS:
+                last_reconciliation = now
+                try:
+                    import reconciliation_monitor as rmon
+                    live_tenant = f"{TENANT}-live" if not TENANT.endswith("-live") else TENANT
+                    pf = (store.get_config(live_tenant, "__portfolio__") or {})
+                    exch_positions: dict[str, float] = {}
+                    for d in (pf.get("derivatives") or []):
+                        pid = d.get("product_id")
+                        if pid:
+                            exch_positions[pid] = abs(float(d.get("qty") or 0))
+                    sleeves_data = []
+                    try:
+                        syms = store.list_symbols(live_tenant) or []
+                    except Exception:
+                        syms = []
+                    for sym in syms:
+                        if sym.startswith("__"):
+                            continue
+                        st = store.get_state(live_tenant, sym) or {}
+                        # Primary row
+                        sleeves_data.append({
+                            "symbol": sym,
+                            "expected_position": int(st.get("swing_qty") or 0),
+                            "armed": str(st.get("state") or "") in ("ARMED_SELL", "ARMED_BUY"),
+                            "side": "SELL" if str(st.get("state") or "") == "ARMED_SELL" else "BUY",
+                            "state": st.get("state"),
+                            "live_order_id": st.get("live_order_id"),
+                            "armed_at": st.get("last_heartbeat_ts"),
+                            "last_sale_px": st.get("last_sell_fill_price"),
+                        })
+                    findings = rmon.reconcile(
+                        open_orders=[],  # TODO: wire Coinbase list_orders in a follow-up
+                        exch_positions=exch_positions,
+                        sleeves=sleeves_data,
+                        now_ts=now,
+                    )
+                    alert = rmon.format_alert(findings)
+                    if alert:
+                        _log(f"RECONCILIATION FINDINGS:\n{alert}")
+                        try:
+                            from alerting import Priority
+                            crit = any(f.severity == "critical" for f in findings)
+                            notifier.send("reconciliation_monitor",
+                                          alert,
+                                          Priority.HIGH if crit else Priority.NORMAL)
+                        except Exception:
+                            pass
+                        # Also record to trade log so the daily audit sees it.
+                        try:
+                            for f in findings:
+                                log.record(f"reconciliation_{f.kind}",
+                                           severity=f.severity,
+                                           symbol=f.symbol,
+                                           detail=f.detail)
+                        except Exception:
+                            pass
+                    _health.record_ok(store, "reconciliation_monitor", TENANT)
+                except Exception as e:
+                    _log(f"reconciliation_monitor failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "reconciliation_monitor", TENANT, e, trade_log=log)
+
             if now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     import portfolio_risk
