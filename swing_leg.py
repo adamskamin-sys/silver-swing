@@ -2798,6 +2798,35 @@ class SwingTrader:
                             best_bid=best_bid, best_ask=best_ask,
                         )
                         post_only = False
+        # Cross-process dedup lock (arm_dedup, added 2026-07-14 after the
+        # two-writer duplicate-orders incident). On TOP of the in-process
+        # guard at 2423 (`not ss.live_order_id`) — the 2423 guard is
+        # single-process-only and cannot see another writer's state, so
+        # two processes both pass their own guard and both place the same
+        # order. This Redis SETNX lock catches that. Fail-closed: if
+        # Redis is unreachable, we BLOCK the arm and emit a loud health
+        # event, because losing an arm cycle beats double-placing a
+        # real-money order.
+        try:
+            import arm_dedup as _dedup
+            _arm_lock = _dedup.try_acquire_arm_lock(
+                self.store, self.tenant_id, self.symbol, side, price,
+                float(getattr(self.cfg, "tick_size", 0.0001) or 0.0001))
+        except Exception as _le:
+            _arm_lock = {"acquired": False, "reason": "unavailable",
+                         "error": f"{type(_le).__name__}: {_le}"}
+        if not _arm_lock.get("acquired"):
+            self._record(
+                ("sleeve_arm_blocked_dedup_lock"
+                 if _arm_lock.get("reason") == "held"
+                 else "sleeve_arm_blocked_dedup_lock_unavailable"),
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                side=side, qty=qty, price=price,
+                reason=_arm_lock.get("reason"),
+                error=_arm_lock.get("error"),
+                lock_key=_arm_lock.get("key"),
+            )
+            return
         try:
             # Not every broker signature supports post_only (paper backtest
             # broker fixtures, etc.). Try with, fall back without.
