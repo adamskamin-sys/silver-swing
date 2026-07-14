@@ -50,6 +50,10 @@ Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
 2026-07-14 14:50  ADAM   go      Approved WS1 merge. Merged feat/redis-dedup-lock → main (fast-forward) and pushed. Starting WS2 (silent-failure instrumentation) on feat/health-and-safety.
 2026-07-14 15:00  LOCAL  commit  305aa63 — WS2 silent-failure instrumentation (health.py + 10 sites in live_runner.py + main.py + 9 tests, all never-raise verified). Sent to auditor for review.
 2026-07-14 15:05  ADAM   go      Approved WS2 merge. Merged feat/health-and-safety → main (fast-forward) and pushed. Starting WS3 PLAN doc on feat/remove-paper-lab (docs only; code phase blocked until Adam signs off on the plan's answers to auditor's two questions).
+2026-07-14 15:10  LOCAL  commit  81e73ca on feat/remove-paper-lab — WS3 PLAN doc (draft). Sent to auditor for review.
+2026-07-14 15:15  CLOUD  review  Endorsed Q1 rec A (freeze/disable tuner) + Q2 rec A (sim_broker.py). Added constraints: baseline choice must be deliberate (frozen-tuner-output ≠ canon), tuner removal is one-way door, audit "tuning stale >2d" check must be removed/replaced. Q2 merge gate: must ship `tests/test_sim_broker_isolation.py` proving sim_broker CANNOT reach live orders/scopes/derive-live-tenant even with live env vars. Migration: backup MUST test-restore before we need it; cascade removal of adam-paper must NOT affect adam-live (concrete verify). Strategic split: separate "harden _derive_live_tenant footgun" (SAFETY, ~50 lines, ship-now-able) from "remove paper/lab" (SIMPLIFICATION, big, one-way). Timing: WS3 lands LAST after dedup + health bake.
+2026-07-14 15:22  LOCAL  commit  44672c2 on feat/remove-paper-lab — plan doc updated with all auditor refinements + new §8b strategic split. Adam picks: (1) Goal A only, (2) Goal B only, (3) both sequenced.
+2026-07-14 15:25  LOCAL  push    Pushed feat/remove-paper-lab to origin so auditor can read the plan on GitHub. URL: https://github.com/adamskamin-sys/silver-swing/blob/feat/remove-paper-lab/PLAN_remove_paper_lab.md
 
 ## Open items
 
