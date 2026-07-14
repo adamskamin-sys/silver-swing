@@ -348,6 +348,20 @@ def run() -> int:
     from scanner_worker import ScannerWorker
     scanner_worker = ScannerWorker(store, os.getenv("REDIS_URL") or None, SYMBOL)
 
+    # Candle/backtest job servicer — dashboard queues candle-fetch and backtest
+    # requests to Redis; a background thread here services them so the /api/
+    # candles endpoint doesn't hang. This USED to run only inside run_paper_mode;
+    # when Adam suspended silver-swing-bot-paper (2026-07-14), the dashboard
+    # chart went silent (queued jobs, no consumer). Live is now the sole
+    # consumer. Thread — no impact on the trader tick loop.
+    if os.getenv("REDIS_URL"):
+        try:
+            import backtest_worker
+            backtest_worker.start(os.getenv("REDIS_URL"))
+            _log("backtest_worker: started (services /api/candles + /api/backtest)")
+        except Exception as e:
+            _log(f"WARN: backtest_worker failed to start: {type(e).__name__}: {e}")
+
     feed = LiveTickerFeed(SYMBOL)
     stopping = False
 
