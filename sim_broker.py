@@ -81,6 +81,10 @@ class SimOrder:
 
 @dataclass
 class SimPosition:
+    # product_id kept for behavioral parity with PaperPosition (used by
+    # scripts/run_backtest.py:271 _seed_paper_position). Default "" so
+    # existing callers that don't pass it keep working.
+    product_id: str = ""
     qty: int = 0                     # signed — LONG > 0, SHORT < 0
     avg_entry: float = 0.0           # 0 when flat
 

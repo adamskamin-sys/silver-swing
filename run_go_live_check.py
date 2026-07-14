@@ -82,7 +82,7 @@ def main() -> int:
     from state_store import make_store
     from broker import BrokerConfig, CoinbaseBroker
     from backtest import fetch_candles, run_backtest
-    from paper_broker import PaperConfig
+    from sim_broker import SimConfig as PaperConfig  # WS3: sim_broker replaces paper_broker
     from expert_tuner import _make_trader_factory
     from expert_params import compute_atr
     import go_live_check as glc

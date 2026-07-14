@@ -65,7 +65,7 @@ def execute(req: dict) -> dict:
     try:
         from backtest import fetch_candles, run_backtest
         from broker import BrokerConfig, CoinbaseBroker
-        from paper_broker import PaperConfig
+        from sim_broker import SimConfig as PaperConfig  # WS3: sim_broker replaces paper_broker
         from safety import TradeLog
         from state_store import JsonFileStateStore
         from swing_leg import SwingTrader
@@ -266,7 +266,7 @@ def _seed_paper_position(broker, qty: int, price: float) -> None:
     """Give the broker `qty` open contracts at `price` so the ARMED_SELL state
     machine has something to sell in the first candle. Mirrors what a real
     live account looks like at t=0: already long, waiting for the target."""
-    from paper_broker import Lot, PaperPosition
+    from sim_broker import SimLot as Lot, SimPosition as PaperPosition  # WS3
     import time as _t, uuid as _uuid
     broker.position = PaperPosition(product_id=broker.cfg.product_id, qty=qty, avg_entry=price)
     broker.lots = [Lot(

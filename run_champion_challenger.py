@@ -34,7 +34,7 @@ def _evaluate_one(symbol: str, champion: dict, coinbase, days: int,
                   wide_grid: bool = False):
     """Walk-forward CC for a single symbol. Returns (ok, report_or_msg)."""
     from backtest import fetch_candles, run_backtest
-    from paper_broker import PaperConfig
+    from sim_broker import SimConfig as PaperConfig  # WS3: sim_broker replaces paper_broker
     from expert_tuner import _make_trader_factory
     from expert_params import compute_atr
     import champion_challenger as cc
