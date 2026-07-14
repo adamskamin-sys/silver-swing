@@ -414,6 +414,12 @@ function renderCockpit(store) {
     const ageSec = refreshTs > 0 ? (nowSec - refreshTs) : Number.POSITIVE_INFINITY;
     if (lastErr) {
       snapshotStaleChip = `<span class="ck-chip ck-danger" title="Last portfolio-snapshot refresh FAILED: ${escapeHtml(String(lastErr))}. Cached values may be stale; sleeve capacity checks may misfire.">snap ERR</span>`;
+    } else if (refreshTs === 0) {
+      // No _refresh_ts on the __portfolio__ snapshot yet. Either Render
+      // hasn't redeployed the newer main.py that stamps it, or the first
+      // refresh hasn't run since deploy. Render "?" rather than
+      // "Infinityh" (the old label math divided POSITIVE_INFINITY by 3600).
+      snapshotStaleChip = `<span class="ck-chip ck-warn" title="Portfolio snapshot has no _refresh_ts. Either the bot hasn't redeployed the timestamp-stamping code, or the first snapshot after deploy hasn't run. Cached values may be stale.">snap&nbsp;?</span>`;
     } else if (ageSec > 30) {
       const label = ageSec > 3600 ? `${Math.floor(ageSec / 3600)}h` :
                     ageSec > 60 ? `${Math.floor(ageSec / 60)}m` :
