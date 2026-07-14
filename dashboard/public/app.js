@@ -628,7 +628,11 @@ function renderModeTabs(store) {
 
   const currentBadge = document.createElement('div');
   currentBadge.className = 'mode-current-badge mode-' + activeMode;
-  const modeLabels = { live: 'live · real money', paper: 'paper · simulated', lab: 'lab · $100k sandbox', scanner: 'scanner · derivatives', signals: 'signals · twitter (shadow)' };
+  // paper + lab removed WS3 2026-07-14 (Adam's Option B). Kept keys in
+  // the map for legacy activeMode values that may still round-trip through
+  // localStorage — they render if activeMode gets set to them somehow, but
+  // the hamburger no longer offers them.
+  const modeLabels = { live: 'live · real money', paper: 'paper · simulated (retired)', lab: 'lab · $100k sandbox (retired)', scanner: 'scanner · derivatives', signals: 'signals · twitter (shadow)' };
   currentBadge.textContent = modeLabels[activeMode] || activeMode;
   modeTabs.appendChild(currentBadge);
 
@@ -644,10 +648,12 @@ function renderModeTabs(store) {
   // POLL_MS render would drop a fresh hidden=true menuDrop over the one the
   // user just opened, killing the click before it lands on Scanner/etc.
   menuDrop.hidden = !modeMenuOpen;
+  // Paper + Lab removed WS3 2026-07-14 (Adam's Option B). Only Live +
+  // Scanner + Signals available in the hamburger. If a returning user's
+  // activeMode is still "paper" or "lab" from localStorage, they'll see
+  // an empty view — they can pick Live from the hamburger to recover.
   const modes = [
     ['live',    'Live',    'real money · your portfolio',  counts.live || 0, 'mode-live'],
-    ['paper',   'Paper',   'simulated fills',              counts.paper || 0, 'mode-paper'],
-    ['lab',     'Lab',     '$100k sandbox · Models A-E',   counts.lab || 0, 'mode-lab'],
     ['scanner', 'Scanner', 'top derivatives by volatility', 0, 'mode-scanner'],
     ['signals', 'Signals', 'twitter · SHADOW (no trades)',  0, 'mode-signals'],
   ];
