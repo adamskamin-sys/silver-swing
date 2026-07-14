@@ -1,0 +1,47 @@
+# COORDINATION_LOG.md
+
+Handoff log between LOCAL (Claude Code) and CLOUD auditor, per AGENTS.md rule 6.
+One line per material action (commit sha, deploy, scope flip, halt clear).
+Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
+
+## Legend
+- **LOCAL** = Claude Code (this repo). Sole writer.
+- **CLOUD** = read-only auditor session.
+- **ADAM**  = manual user action.
+
+## Log
+
+2026-07-13 07:15  LOCAL  commit  c275dcb — Revert net for today's promotions (backups + surgical restore script)
+2026-07-13 07:47  LOCAL  commit  b9c5be3 — Post-reversal UI: reversal-armed badge, colored SIDE, faster refresh
+2026-07-13 07:54  LOCAL  commit  b80931e — Stop-loss re-enable safety + ENTRY column reflects actual basis
+2026-07-13 08:18  LOCAL  commit  9adb10c — Average-down green light (notification-only, never executes)
+2026-07-13 08:41  LOCAL  commit  9711727 — Sleeve UNREALIZED always shows MTM (removes cycles>0 gate)
+2026-07-13 08:46  LOCAL  commit  d14e67b — Sleeve UNREALIZED basis: own_avg_entry → position avg, never entry_mark
+2026-07-13 09:11  LOCAL  commit  c5a1b9b — Avg-down signal: per-product 🟢/🟡 badge + tooltip names the contract
+2026-07-13 09:15  LOCAL  commit  9be2d3a — Avg-down badge: match by symbol only, not tenant
+2026-07-13 10:18  LOCAL  commit  a8bb301 — diag_oil_skips.py: name the guard blocking a sleeve's re-entry
+2026-07-13 10:22  LOCAL  commit  666fab1 — diag_oil_skips.py: substring match + list-all-symbols on no match
+2026-07-13 10:26  LOCAL  commit  fe87e50 — diag_sleeve_state.py: find where OIL sleeves actually live
+2026-07-13 10:30  LOCAL  commit  327192e — diag_sleeve_state.py: enumerate ALL tenants, not just three
+2026-07-13 10:31  LOCAL  commit  e8beb18 — diag_grep_events.py: server-side grep of the Redis prod trade log
+2026-07-13 10:50  LOCAL  commit  fe2f53a — Portfolio-halt: fix small-peak explosion + raise noise floor + clear script
+2026-07-13 10:52  ADAM   action  ran `python3 diag_clear_halt.py` on Render → adam-live portfolio halt CLEARED. peak_pnl reset from -82.72 to current -206.81
+2026-07-13 11:01  LOCAL  commit  a599a71 — Expert-driven re-entry: buy_px never above the last sale (ehlers/elder/connors/vince + orchestrator wired swing_leg.py:2994)
+2026-07-13 11:08  LOCAL  commit  3273f67 — Cockpit: add 24h realized tile
+2026-07-13 11:20  LOCAL  commit  6d45bd5 — Reanchor clamp: never place buy above the sleeve's last sell fill (all 3 cascade sites)
+2026-07-13 11:27  LOCAL  commit  ba73713 — Per-product re-entry thresholds — plumbing for expert-chain tuning
+2026-07-13 11:34  LOCAL  commit  26bba25 — Per-product re-entry threshold tuner + manual-review promote gate
+2026-07-13 11:35  LOCAL  commit  b43e452 — Hamburger menu: preserve open state across 2s refresh renders
+2026-07-13 11:41  LOCAL  commit  28fcfb0 — Signals tab: name the product, don't just count it
+2026-07-13 11:54  LOCAL  commit  b4b69f2 — diag_refresh_portfolio.py: force a __portfolio__ snapshot pull now
+2026-07-13 12:00  LOCAL  commit  9fa304c — Portfolio snapshot: staleness detection + chip + validator hint
+
+2026-07-14 13:34  LOCAL  commit  a88a499 — Add AGENTS.md — two-agent operating agreement (NOT YET PUSHED — awaiting Adam's `git push`)
+
+## Open items
+
+- **Adam step 0** (LIVE-MONEY): cancel duplicate SLVR sell on Coinbase; verify Render Service → Instances == 1, kill extras; `ps aux | grep -E "main.py|live_runner"` on Mac, kill any stray runner.
+- **Adam step 1**: set `REDIS_URL` (read-only) on the Mac shell so LOCAL is not blind on paper JSON.
+- **LOCAL step 3** (BLOCKED until multi-writer settled): merge safety layer into `experts_reentry.py` — flag gate + `legacy_fallback` + preflight PASS/FAIL. Keep kill switch during swap.
+- **LOCAL step 4** (BLOCKED until step 3 in place): resume silent-failure instrumentation on the feature branch.
+- **ROBUSTNESS** (after step 0 stops the bleeding): Redis-backed dedup guard (SETNX lock keyed on tenant+symbol+side or on live_order_id) so it holds across processes.
