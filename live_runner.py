@@ -482,17 +482,44 @@ def run() -> int:
                         if sym.startswith("__"):
                             continue
                         st = store.get_state(live_tenant, sym) or {}
-                        # Primary row
+                        cfg = store.get_config(live_tenant, sym) or {}
+                        # PRIMARY row — the tenant's own swing strategy, if any.
+                        # Includes core_qty in expected_position because core
+                        # contracts ARE held on the exchange but no bot piece
+                        # trades them. Without this, position_mismatch would
+                        # false-alarm on every product with a core holding.
+                        core_qty = int(cfg.get("core_qty") or 0)
+                        prim_state_str = str(st.get("state") or "")
+                        prim_qty = int(st.get("swing_qty") or 0) if prim_state_str == "ARMED_SELL" else 0
                         sleeves_data.append({
                             "symbol": sym,
-                            "expected_position": int(st.get("swing_qty") or 0),
-                            "armed": str(st.get("state") or "") in ("ARMED_SELL", "ARMED_BUY"),
-                            "side": "SELL" if str(st.get("state") or "") == "ARMED_SELL" else "BUY",
-                            "state": st.get("state"),
+                            "expected_position": prim_qty + core_qty,
+                            "armed": prim_state_str in ("ARMED_SELL", "ARMED_BUY"),
+                            "side": "SELL" if prim_state_str == "ARMED_SELL" else "BUY",
+                            "state": prim_state_str,
                             "live_order_id": st.get("live_order_id"),
                             "armed_at": st.get("last_heartbeat_ts"),
                             "last_sale_px": st.get("last_sell_fill_price"),
                         })
+                        # PER-SLEEVE rows — each sleeve holds its own qty of
+                        # contracts when ARMED_SELL. Include so position_mismatch
+                        # reflects the real total bot-managed position.
+                        sleeve_states = st.get("sleeves") or {}
+                        for s_cfg in (cfg.get("sleeves") or []):
+                            sid = s_cfg.get("id")
+                            s_st = (sleeve_states.get(sid) or {}) if sid else {}
+                            s_state_str = str(s_st.get("state") or "")
+                            s_qty = int(s_cfg.get("qty") or 0)
+                            sleeves_data.append({
+                                "symbol": sym,
+                                "expected_position": s_qty if s_state_str == "ARMED_SELL" else 0,
+                                "armed": s_state_str in ("ARMED_SELL", "ARMED_BUY"),
+                                "side": "SELL" if s_state_str == "ARMED_SELL" else "BUY",
+                                "state": s_state_str,
+                                "live_order_id": s_st.get("live_order_id"),
+                                "armed_at": s_st.get("armed_buy_since_ts"),
+                                "last_sale_px": s_st.get("last_sell_fill_price"),
+                            })
                     # Fetch open orders from Coinbase via broker.list_open_orders
                     # so reconciliation_monitor's duplicate_order + orphan_order
                     # checks have data to work with. Fail-safe: on any exception,
