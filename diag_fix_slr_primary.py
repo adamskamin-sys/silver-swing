@@ -3,22 +3,41 @@ swing_qty=2 despite config.swing_qty=0. Every tick, the primary state
 machine (ARMED_SELL, live_order_id cleared after cancellation) re-arms
 `sell 2 @ $65.25`.
 
+⚠️  BOT MUST BE SUSPENDED BEFORE RUNNING WITH --confirm  ⚠️
+
+The bot has authoritative in-memory state that OVERWRITES Redis writes
+on every tick. If you run this while the bot is running, the bot's
+next tick undoes your write within seconds. Symptom you'll see: state
+looks fixed for a moment, then re-arms.
+
+CORRECT SEQUENCE:
+  1. Render dashboard → silver-swing-bot-live → Suspend Service
+  2. Wait ~10s for the pod to actually stop (status shows "Suspended")
+  3. python3 diag_fix_slr_primary.py --confirm
+  4. Cancel the open Coinbase order (live_order_id printed at end)
+  5. Render dashboard → Resume Service
+  6. New pod loads the fixed state from Redis, keeps it.
+
+If you skip step 1, your write gets clobbered.
+
 This script:
   1. Reads adam-live/SLR-27AUG26-CDE STATE
-  2. Shows the current values you're about to change
-  3. If --confirm: sets state.swing_qty=0, state.state=HALTED,
-     state.live_order_id=None, adds halt_reason for the audit trail.
+  2. Checks last_heartbeat_ts — if fresh (<30s old), warns bot is
+     likely running and REFUSES --confirm unless --force is set.
+  3. Shows the current values you're about to change
+  4. If --confirm (+ safe heartbeat): sets state.swing_qty=0,
+     state.state=HALTED, state.live_order_id=None, adds halt_reason.
 
 Effect:
   * Primary strategy for SLR on adam-live stops re-arming.
   * Sleeves (if any) keep working — they're independent of the primary.
-  * The currently-OPEN Coinbase order (live_order_id=396c24c4...) is
-    NOT cancelled by this script. You must cancel it manually on
-    Coinbase after running this. Otherwise it can still fill.
+  * The currently-OPEN Coinbase order is NOT cancelled by this script.
+    You must cancel it manually on Coinbase after running this.
 
 Usage:
     python3 diag_fix_slr_primary.py            # PREVIEW ONLY
-    python3 diag_fix_slr_primary.py --confirm  # WRITE
+    python3 diag_fix_slr_primary.py --confirm  # WRITE (refuses if bot alive)
+    python3 diag_fix_slr_primary.py --confirm --force  # WRITE anyway
 """
 from __future__ import annotations
 import argparse
@@ -41,10 +60,31 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--confirm", action="store_true",
                     help="actually write the fix (default: preview only)")
+    ap.add_argument("--force", action="store_true",
+                    help="allow --confirm even if bot appears alive (dangerous)")
     args = ap.parse_args()
 
     store = make_store(os.getenv("SWING_DATA_DIR", "data"))
     state = store.get_state(TENANT, SYMBOL) or {}
+
+    # Safety: refuse --confirm if bot is heartbeating. Running bot has
+    # in-memory state that overwrites Redis writes on every tick. Fix has
+    # to run WHILE BOT IS SUSPENDED.
+    if args.confirm and not args.force:
+        hb = state.get("last_heartbeat_ts")
+        if hb is not None:
+            try:
+                age = time.time() - float(hb)
+                if age < 30.0:
+                    print(f"REFUSING --confirm: bot is alive (last_heartbeat_ts "
+                          f"was {age:.1f}s ago, threshold 30s).")
+                    print("Bot in-memory state will overwrite this write within seconds.")
+                    print()
+                    print("SUSPEND silver-swing-bot-live on Render FIRST, then re-run.")
+                    print("(If you know what you're doing, add --force to override.)")
+                    sys.exit(2)
+            except (TypeError, ValueError):
+                pass
 
     print(f"BEFORE ({TENANT}/{SYMBOL}):")
     keep = ["state", "swing_qty", "live_order_id", "halt_reason",
