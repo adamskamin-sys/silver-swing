@@ -533,7 +533,21 @@ function renderBanners(store) {
   const relevantHalts = haltedInstruments.filter(h => h.mode === activeMode);
   if (relevantHalts.length > 0) {
     haltBanner.hidden = false;
-    haltBanner.innerHTML = `⚠ Strategy halted — ${relevantHalts.map(h => `${escapeHtml(h.tenant)}/${escapeHtml(h.symbol)}`).join(', ')}. See the halt reason on the strategy row, fix the underlying issue, then click <b>Resume</b>.`;
+    // Include inline Resume buttons per halted product for cases where the
+    // strategy row doesn't render (e.g. a product with no sleeves — the
+    // Resume button in the sleeve loop never fires). Adam 2026-07-14:
+    // "there isnt a button to let me resume because there is no silver
+    // sleeve open on our dashboard" — SLR had a primary halt with 0
+    // sleeves in state.sleeves, banner told him to click Resume with
+    // nowhere to click. Now the banner itself carries the button.
+    const parts = relevantHalts.map(h => {
+      const label = `${escapeHtml(h.tenant)}/${escapeHtml(h.symbol)}`;
+      return `${label} <button class="small primary" data-action="resume-live-strategy" `
+           + `data-tenant="${escapeHtml(h.tenant)}" `
+           + `data-symbol="${escapeHtml(h.symbol)}" `
+           + `title="Clears the halt on the primary strategy. Warning: if the bot has stale in-memory swing_qty, it will re-arm on the next tick. Suspend the bot service first if you want the halt to stick.">Resume</button>`;
+    });
+    haltBanner.innerHTML = `⚠ Strategy halted — ${parts.join(' · ')} — See the halt reason on the strategy row for details.`;
   } else {
     haltBanner.hidden = true;
   }
