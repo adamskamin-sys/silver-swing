@@ -113,6 +113,82 @@ def test_drift_clamped_when_armed_buy_and_no_fill(tmp_path):
     assert notifier.sent[0]["priority"] == Priority.CRIT
 
 
+def test_drift_clamp_cancels_stale_exchange_order(tmp_path):
+    """AUDITOR 2026-07-14 must-verify #1: when the clamp clears
+    live_order_id, it must ALSO call broker.cancel(stale_oid) so we don't
+    leave an orphan order on the exchange."""
+    trader, store, log = _make_trader(
+        tmp_path, cfg_swing_qty=0, state_swing_qty=2,
+        state_val=State.ARMED_BUY, filled_qty=0,
+        live_order_id="stale-exchange-order-xyz")
+
+    # Instrument the broker's cancel
+    cancel_calls = []
+    original_cancel = trader.b.cancel
+    def spy_cancel(oid):
+        cancel_calls.append(oid)
+        # Sim broker's cancel returns cleanly for unknown order ids,
+        # which matches the real broker's tolerance for already-gone orders.
+        try:
+            return original_cancel(oid)
+        except Exception:
+            pass
+    trader.b.cancel = spy_cancel
+
+    bsn.normalize_primary_swing_qty(trader, log=log)
+
+    # Broker.cancel was called with the stale order id
+    assert cancel_calls == ["stale-exchange-order-xyz"], (
+        f"expected cancel of stale order, got calls={cancel_calls}")
+    # In-memory + Redis both cleared
+    assert trader.s.live_order_id is None
+    persisted = store.get_state(TENANT, SYMBOL)
+    assert persisted["live_order_id"] is None
+    # halt_reason records the cancel outcome
+    assert "cancel:" in (trader.s.halt_reason or "")
+
+
+def test_drift_clamp_survives_cancel_failure(tmp_path):
+    """If broker.cancel raises (order already gone / API error), the state
+    fix must STILL apply. Reconciliation orphan_order finding is the
+    backstop for any surviving exchange-side order."""
+    trader, store, log = _make_trader(
+        tmp_path, cfg_swing_qty=0, state_swing_qty=2,
+        state_val=State.ARMED_BUY, filled_qty=0,
+        live_order_id="cancel-will-fail-oid")
+
+    def failing_cancel(oid):
+        raise RuntimeError("simulated cancel API failure")
+    trader.b.cancel = failing_cancel
+
+    result = bsn.normalize_primary_swing_qty(trader, log=log)
+
+    # Clamp still applied
+    assert result["clamped"] is True
+    assert trader.s.swing_qty == 0
+    assert trader.s.live_order_id is None
+    assert trader.s.state == State.HALTED
+    # halt_reason records the failure so operator sees it
+    assert "cancel_failed:RuntimeError" in (trader.s.halt_reason or "")
+
+
+def test_drift_clamp_when_no_stale_order_id(tmp_path):
+    """If live_order_id was already None, no cancel is attempted."""
+    trader, store, log = _make_trader(
+        tmp_path, cfg_swing_qty=0, state_swing_qty=2,
+        state_val=State.ARMED_BUY, filled_qty=0,
+        live_order_id=None)
+
+    cancel_calls = []
+    trader.b.cancel = lambda oid: cancel_calls.append(oid)
+
+    result = bsn.normalize_primary_swing_qty(trader, log=log)
+
+    assert result["clamped"] is True
+    assert cancel_calls == [], "no order to cancel; broker should not be called"
+    assert "not_attempted" in (trader.s.halt_reason or "")
+
+
 def test_drift_clamped_when_halted_and_no_fill(tmp_path):
     """Drift with state=HALTED + filled_qty=0 is also safe to clamp."""
     trader, store, log = _make_trader(

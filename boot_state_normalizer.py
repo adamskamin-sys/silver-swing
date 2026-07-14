@@ -70,17 +70,35 @@ def normalize_primary_swing_qty(trader, *, log=None, notifier=None) -> dict:
         return {"drifted": True, "clamped": False,
                 "from": current, "to": current, "reason": reason}
 
-    # Safe clamp: reset to config, clear any stale resting order, HALT
-    # with an audit trail so the operator sees this on next boot.
+    # Safe clamp: reset to config, cancel stale exchange order (best-effort),
+    # clear tracking, HALT with an audit trail.
     trader.s.swing_qty = cfg_target
     stale_oid = trader.s.live_order_id
+
+    # Auditor 2026-07-14 must-verify #1: cancel the stale exchange order
+    # explicitly rather than relying only on the orphan_order reconciliation
+    # finding. best-effort — an already-cancelled or already-filled order
+    # will raise; we swallow + log both outcomes.
+    cancel_result = "not_attempted"
+    if stale_oid:
+        try:
+            cancel_fn = getattr(trader.b, "cancel", None)
+            if callable(cancel_fn):
+                cancel_fn(stale_oid)
+                cancel_result = "cancelled"
+            else:
+                cancel_result = "broker_missing_cancel"
+        except Exception as e:
+            cancel_result = f"cancel_failed:{type(e).__name__}:{e}"
+
     trader.s.live_order_id = None
     trader.s.state = State.HALTED
     prev_reason = trader.s.halt_reason or ""
     trader.s.halt_reason = (
         f"boot-normalize {int(time.time())}: state.swing_qty was {current}, "
-        f"clamped to config.swing_qty={cfg_target}. Any stale resting order "
-        f"({stale_oid}) cleared. Resume manually after Coinbase-side reconciliation."
+        f"clamped to config.swing_qty={cfg_target}. Stale resting order "
+        f"({stale_oid}) cancel: {cancel_result}. Resume manually after "
+        f"Coinbase-side verification."
         + (f" | prev: {prev_reason}" if prev_reason else "")
     )
     trader._save_state()
@@ -90,7 +108,8 @@ def normalize_primary_swing_qty(trader, *, log=None, notifier=None) -> dict:
             log.record("boot_state_normalize_clamped",
                        tenant=trader.tenant_id, symbol=trader.symbol,
                        field="swing_qty", from_=current, to=cfg_target,
-                       filled_qty=filled, stale_live_order_id=stale_oid)
+                       filled_qty=filled, stale_live_order_id=stale_oid,
+                       cancel_result=cancel_result)
         except Exception:
             pass
     if notifier:

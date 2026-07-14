@@ -389,17 +389,14 @@ def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
                 _refresh_contract_spec_into_config(store, live_tenant, pid)
             except Exception as e:
                 _log(f"[{live_tenant}/{pid}] spec refresh skipped: {type(e).__name__}: {e}")
-        # Force core_qty=0 on every Live holding — Live is a portfolio mirror,
-        # not a swing bot, so there's no "protected core" to defend. Old
-        # configs seeded before this rule still had core_qty=10 stuck, which
-        # blocked every sleeve add with 'available 0 (position N - core N)'.
-        try:
-            cur = dict(store.get_config(live_tenant, pid) or {})
-            if int(cur.get("core_qty") or 0) != 0:
-                cur["core_qty"] = 0
-                store.put_config(live_tenant, pid, cur)
-        except Exception:
-            pass
+        # NOTE (auditor 2026-07-14 must-verify #3): the previous version of
+        # this loop force-cleared core_qty=0 on every Live holding on every
+        # sync. That was a legacy migration for configs seeded before
+        # _default_live_holding_config set core_qty=0 by default. It has
+        # since become a BUG: it overwrites user-set core_qty (Adam holds
+        # 1 SLR contract as a protected core, wants to swing 1-2 around it).
+        # Removed. New holdings still default to core_qty=0 via
+        # _default_live_holding_config; user-set core_qty now sticks.
 
     # Also compute + persist the structured portfolio snapshot so the Live
     # tab can render the Coinbase-style Cash / Derivatives / Crypto view.

@@ -526,6 +526,77 @@ def test_shadow_mode_emits_would_action_event(tmp_path, monkeypatch):
     assert shadow.get("would_action") == "reanchor"
 
 
+def test_shadow_mode_compound_reanchor_and_expire_zero_broker_calls(tmp_path, monkeypatch):
+    """AUDITOR 2026-07-14 CONDITIONAL for shadow enable: a single scenario
+    where the shadow path is exercised through BOTH a reanchor decision
+    AND an expire decision (three ticks total, decision sequence:
+    reanchor → hold → expire) must produce ZERO broker calls TOTAL.
+
+    'Labeled-safe ≠ safe.' This test proves the label matches the
+    behavior across every non-hold action shadow can encounter."""
+    trader, store, log = _make_trader(tmp_path, mode="shadow")
+    sc, ss = _get_sleeve(trader)
+    _prime_history(trader, sc.id, [75.0 - i * 0.01 for i in range(60)])
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = "resting-compound-shadow"
+    ss.last_sell_fill_price = 75.0
+    ss.armed_buy_since_ts = time.time() - 3600
+    ss.pre_halt_state = None
+    mock = _MockBroker()
+    trader.b = mock
+
+    import reentry_reeval
+    # Tick 1: force reanchor decision
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="reanchor", new_buy_px=74.5, why="compound-tick1-reanchor"))
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+    calls_after_reanchor = list(mock.calls)
+
+    # Tick 2: force hold decision (no shadow_action, no broker calls)
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="hold", new_buy_px=75.0, why="compound-tick2-hold"))
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+    calls_after_hold = list(mock.calls)
+
+    # Tick 3: force expire decision (would-be HALTED transition + cancel)
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="expire", new_buy_px=0.0, why="compound-tick3-expire"))
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+    calls_after_expire = list(mock.calls)
+
+    # ASSERTIONS — the CONDITIONAL
+    assert calls_after_reanchor == [], (
+        f"shadow reanchor made broker calls: {calls_after_reanchor}")
+    assert calls_after_hold == [], (
+        f"shadow hold made broker calls: {calls_after_hold}")
+    assert calls_after_expire == [], (
+        f"shadow expire made broker calls: {calls_after_expire}")
+    assert mock.calls == [], (
+        f"shadow compound scenario made ZERO broker calls; got {mock.calls}")
+
+    # Sleeve state must be preserved across all three ticks
+    assert ss.state == SleeveStateEnum.ARMED_BUY, (
+        f"shadow compound: sleeve state transitioned to {ss.state}")
+    assert ss.live_order_id == "resting-compound-shadow", (
+        "shadow compound: live_order_id was rewritten")
+    assert ss.halt_reason is None, (
+        f"shadow compound: halt_reason was set to {ss.halt_reason!r}")
+
+    # Trade log must show all three decision events + 2 shadow_action events
+    # (tick 1 reanchor + tick 3 expire; tick 2 hold does NOT emit shadow_action)
+    events = list(log.events())
+    decision_events = [e for e in events if e.get("event_type") == "reentry_reeval_decision"]
+    shadow_events = [e for e in events if e.get("event_type") == "reentry_reeval_shadow_action"]
+    assert len(decision_events) == 3, (
+        f"expected 3 decision events (all shadow), got {len(decision_events)}")
+    assert all(e.get("mode") == "shadow" for e in decision_events)
+    assert len(shadow_events) == 2, (
+        f"expected 2 shadow_action events (reanchor+expire), got {len(shadow_events)}")
+
+
 def test_shadow_mode_hold_still_logs_decision(tmp_path, monkeypatch):
     """A 'hold' decision under shadow mode still logs the decision event
     (so the operator can audit how often the reeval fires + decides hold),
