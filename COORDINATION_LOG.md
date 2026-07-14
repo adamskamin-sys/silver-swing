@@ -54,6 +54,30 @@ Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
 2026-07-14 15:15  CLOUD  review  Endorsed Q1 rec A (freeze/disable tuner) + Q2 rec A (sim_broker.py). Added constraints: baseline choice must be deliberate (frozen-tuner-output ≠ canon), tuner removal is one-way door, audit "tuning stale >2d" check must be removed/replaced. Q2 merge gate: must ship `tests/test_sim_broker_isolation.py` proving sim_broker CANNOT reach live orders/scopes/derive-live-tenant even with live env vars. Migration: backup MUST test-restore before we need it; cascade removal of adam-paper must NOT affect adam-live (concrete verify). Strategic split: separate "harden _derive_live_tenant footgun" (SAFETY, ~50 lines, ship-now-able) from "remove paper/lab" (SIMPLIFICATION, big, one-way). Timing: WS3 lands LAST after dedup + health bake.
 2026-07-14 15:22  LOCAL  commit  44672c2 on feat/remove-paper-lab — plan doc updated with all auditor refinements + new §8b strategic split. Adam picks: (1) Goal A only, (2) Goal B only, (3) both sequenced.
 2026-07-14 15:25  LOCAL  push    Pushed feat/remove-paper-lab to origin so auditor can read the plan on GitHub. URL: https://github.com/adamskamin-sys/silver-swing/blob/feat/remove-paper-lab/PLAN_remove_paper_lab.md
+2026-07-14 15:35  CLOUD  review  Post-merge review of 305aa63 (WS2). Verdict: STAY MERGED. Two fix-on-tops: (1) front_month record_ok BEFORE roll-branch break; (2) portfolio_refresh drop redundant trade-log event, keep __health__ scope write.
+2026-07-14 15:38  LOCAL  commit  ca0e510 — WS2 fix-on-tops per auditor. Pushed to origin/main.
+2026-07-14 15:40  DIAG   finding  New live-money bug: adam-live/SLR primary state has swing_qty=2 despite config=0 — every tick re-arms sell 2 @ $65.25 after Adam cancels. Different bug than multi-writer; runtime state drift.
+2026-07-14 15:42  LOCAL  commit  a2a09e4 — diag_fix_slr_primary.py (preview + --confirm, HALT primary + zero swing_qty + clear live_order_id).
+2026-07-14 15:50  CLOUD  review  Second WS3 plan review. Endorsed direction. Broker fate: pick B1 rename-and-strip OR B2 delete-and-fresh, LOCAL rec B2. Q1: pick Q1-Frozen OR Q1-Offline (refactor tuner to run on downloaded Coinbase candles); expert_tuner.py refactored not deleted in EITHER path; LOCAL rec Q1-Offline. Audit tuning-freshness check must match chosen Q1. Goal A ships FIRST as its own change, separate day from Goal B.
+2026-07-14 15:55  LOCAL  commit  af14b86 on feat/remove-paper-lab — plan doc updated with auditor's second-review refinements. Pushed.
+2026-07-14 16:00  CLOUD  deliver expectancy_tracker.py (measure R-expectancy per sleeve/symbol, sort by best).
+2026-07-14 16:02  LOCAL  commit  59a3097 on feat/expectancy-tracker — expectancy_tracker.py saved. Pushed.
+2026-07-14 16:10  CLOUD  deliver reentry_reeval.py (decision logic for stale ARMED_BUY; CANCEL-REPLACE discipline; anti-chase ceiling).
+2026-07-14 16:12  CLOUD  deliver test_sim_broker_cannot_reach_live.py (5-tripwire merge gate for WS3).
+2026-07-14 16:15  ADAM   action  ran diag_fix_slr_primary.py --confirm on Render. Primary HALTED, swing_qty=0, live_order_id cleared. LIVE-MONEY re-arm loop stopped. Adam still needs to cancel open Coinbase order 64acee2a manually.
+2026-07-14 16:18  ADAM   go      Approved §3 answers: B2 (delete-and-fresh sim_broker) + Q1-Offline (refactor tuner for downloaded Coinbase candles). WS3 code phase unblocked.
+2026-07-14 16:20  LOCAL  plan    Wrote plan file /Users/adamkamin/.claude/plans/zazzy-discovering-dijkstra.md. Adam approved via ExitPlanMode. Auto mode enabled.
+2026-07-14 16:25  LOCAL  commit  df25173 on feat/reentry-reeval — reentry_reeval.py saved. Pushed.
+2026-07-14 16:30  LOCAL  commit  65f329f on feat/ws3-merge-gate — sim_broker.py (fresh, ~380 lines, no live-client / no state_store imports) + tests/test_sim_broker_cannot_reach_live.py with corrected CONFIG per Explore. All 5 tripwires GREEN (8 test cases). Broader suite 431/431. Pushed.
+2026-07-14 16:32  CLOUD  deliver reconciliation_monitor.py (read-only defense: duplicate_order + orphan_order + missing_order + position_mismatch + stale_entry).
+2026-07-14 16:35  LOCAL  commit  e3f23af on feat/reconciliation-monitor — reconciliation_monitor.py + 17 tests. All green. Pushed.
+
+## Branches ready for review + merge (auditor's merge order: dedup → health → reconciliation_monitor → expectancy_tracker → WS3-merge-gate → WS3-phase-2)
+- feat/expectancy-tracker · 59a3097 (auditor read-only)
+- feat/reentry-reeval · df25173 (decision logic, wiring TBD Phase 2)
+- feat/reconciliation-monitor · e3f23af (read-only defense, wiring TBD)
+- feat/ws3-merge-gate · 65f329f (sim_broker + 5 tripwires; needs auditor sign-off before merge)
+- feat/remove-paper-lab · af14b86 (plan doc; code Phase 2 not started)
 
 ## Open items
 
