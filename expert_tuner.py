@@ -53,7 +53,7 @@ def tune_product(coinbase_client, product_id: str, days: int = 30) -> Optional[d
       or None if we couldn't get enough data.
     """
     from backtest import fetch_candles, run_backtest
-    from paper_broker import PaperConfig
+    from sim_broker import SimConfig as PaperConfig  # WS3: sim_broker replaces paper_broker
     from expert_params import compute_atr, asset_class_of, multipliers_for
 
     end = datetime.now(timezone.utc)
@@ -166,7 +166,7 @@ def _make_trader_factory(cfg: dict, tenant_symbol: str, seed_price: float):
 
     def factory(broker):
         # Seed a position so the strategy has something to swing on.
-        from paper_broker import Lot, PaperPosition
+        from sim_broker import SimLot as Lot, SimPosition as PaperPosition  # WS3
         import uuid
         seed_qty = int(cfg.get("swing_qty") or 0)
         if seed_qty > 0:

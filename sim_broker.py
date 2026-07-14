@@ -145,7 +145,12 @@ class SimBroker:
                     post_only: bool = False) -> str:
         """Place a limit order. post_only is accepted for signature parity
         with CoinbaseBroker but a sim has no maker/taker distinction."""
-        self._require_running()
+        # Silently refuse orders when halted (return an empty order-id).
+        # Raising here breaks the backtest engine's halt-and-break flow
+        # because trader.step() runs BEFORE the loop checks broker._halted
+        # (backtest.py:146-150).
+        if self._halted:
+            return ""
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"invalid side: {side}")
@@ -166,7 +171,12 @@ class SimBroker:
         """Market order — fills next tick at best-opposing-top plus slippage.
         Represented internally as a limit with a very aggressive price so
         the tick loop matches it immediately."""
-        self._require_running()
+        # Silently refuse orders when halted (return an empty order-id).
+        # Raising here breaks the backtest engine's halt-and-break flow
+        # because trader.step() runs BEFORE the loop checks broker._halted
+        # (backtest.py:146-150).
+        if self._halted:
+            return ""
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"invalid side: {side}")
@@ -245,6 +255,12 @@ class SimBroker:
 
         for oid in to_close:
             self.history.append(self.open_orders.pop(oid))
+
+        # Margin-call auto-halt — MTM check, not a fill event. A price
+        # crash against a resting long position can blow the account
+        # without a single order filling. Behavioral parity with
+        # paper_broker._check_margin_call() (paper_broker.py:369).
+        self._check_margin_call()
 
         # Update HWM + drawdown on the marked-to-market equity curve.
         eq = self.equity()
@@ -418,3 +434,18 @@ class SimBroker:
         """Deliberate halt — e.g. margin call in the sim."""
         self._halted = True
         self._halt_reason = reason
+
+    def _check_margin_call(self) -> None:
+        """Auto-halt when equity falls below required margin. Cancels every
+        resting order on halt (matches paper_broker semantics — no new fills
+        can occur while halted anyway)."""
+        if self.position.qty == 0:
+            return
+        if self.equity() < self.margin_used():
+            self._halted = True
+            self._halt_reason = (
+                f"margin call: equity ${self.equity():.2f} < "
+                f"required ${self.margin_used():.2f}"
+            )
+            for oid in list(self.open_orders.keys()):
+                self.cancel(oid)

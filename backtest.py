@@ -39,7 +39,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from paper_broker import PaperBroker, PaperConfig
+# WS3 (2026-07-14): switched from paper_broker to sim_broker (fresh module
+# with no live-client / no state-store imports; proven by
+# tests/test_sim_broker_cannot_reach_live.py). Aliased to old names so this
+# file's downstream references don't need touching. paper_broker.py will be
+# deleted at end of Phase 6 once all consumers + tests have migrated.
+from sim_broker import SimBroker as PaperBroker, SimConfig as PaperConfig
 
 
 @dataclass
