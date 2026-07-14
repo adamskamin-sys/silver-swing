@@ -1505,6 +1505,248 @@ class SwingTrader:
         except Exception as e:
             self._record("avg_down_alert_error", sleeve_id=sc.id, error=str(e))
 
+    def _reentry_mode(self) -> str:
+        """Read the __reentry_mode__ scope for this tenant. Returns 'expert'
+        or 'legacy' (default). Fail-safe: any store error → 'legacy'."""
+        try:
+            m = (self.store.get_state(self.tenant_id, "__reentry_mode__") or {})
+            return str(m.get("mode") or "legacy").lower()
+        except Exception:
+            return "legacy"
+
+    def _maybe_reeval_pending_arm(self, sc, ss, last_price: float) -> None:
+        """Wire reentry_reeval.evaluate_pending into the ARMED_BUY tick per
+        auditor review gate 2026-07-14. Cancel-replace with confirmation.
+        WS1 dedup lock. Anti-thrash. Cache-coherent state persist. Feature-
+        flagged behind __reentry_mode__ == 'expert'; OFF by default = byte-
+        for-byte legacy behavior.
+
+        Called on every sleeve tick in the ARMED_BUY branch. Returns early
+        unless: sleeve is ARMED_BUY, has a live resting order to re-evaluate,
+        and the tenant has __reentry_mode__ scope set to 'expert'."""
+        # Preconditions — legacy path is byte-for-byte identical when any fails.
+        if ss.state != SleeveStateEnum.ARMED_BUY:
+            return
+        if not ss.live_order_id:
+            return  # no resting order to re-evaluate
+        if self._reentry_mode() != "expert":
+            return
+
+        try:
+            import reentry_reeval as _rr
+            import time as _t
+            prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(prices) < 30:
+                return  # insufficient history for reeval features
+
+            now = _t.time()
+            armed_at = ss.armed_buy_since_ts or now
+            # elapsed_bars: approximate 1 bar = 60s (bot ticks are sub-second,
+            # so this is a coarse metric — acceptable given reeval's staleness
+            # threshold is in the 20+ range).
+            elapsed_bars = int((now - armed_at) / 60)
+
+            # ATR-14 approximation from sleeve price history
+            recent = prices[-15:]
+            if len(recent) < 2:
+                return
+            atr = sum(abs(recent[i] - recent[i - 1])
+                      for i in range(1, len(recent))) / (len(recent) - 1)
+            if atr <= 0:
+                return
+
+            # htf_slope: last price vs mean of last 60 (higher-timeframe drift)
+            htf_window = prices[-60:] if len(prices) >= 60 else prices
+            htf_slope = float(last_price) - (sum(htf_window) / len(htf_window))
+
+            # trend_strength: prefer regime.classify_regime's efficiency_ratio;
+            # fall back to a neutral 0.3 (below the default threshold, so no
+            # spurious "strong trend" declaration on missing data).
+            trend_strength = 0.3
+            try:
+                import regime as _regime
+                reg = _regime.classify_regime([{"close": p} for p in prices])
+                er = reg.get("efficiency_ratio")
+                if er is not None:
+                    trend_strength = float(er)
+            except Exception:
+                pass
+
+            # dc_high: 20-bar Donchian high
+            dc_high = max(prices[-20:])
+
+            # fast_ema: 21-period EMA (standard formula)
+            k = 2.0 / (21 + 1)
+            ema = prices[0]
+            for p in prices[1:]:
+                ema = p * k + ema * (1 - k)
+            fast_ema = ema
+
+            # near_expiry: parse contract_expiry from the sleeve's product config
+            near_expiry = False
+            try:
+                cfg_raw = self.store.get_config(self.tenant_id, self.symbol) or {}
+                expiry_str = cfg_raw.get("contract_expiry")
+                if expiry_str:
+                    from datetime import datetime, timezone
+                    ex_norm = str(expiry_str).replace("Z", "+00:00")
+                    expiry_dt = datetime.fromisoformat(ex_norm)
+                    days_to_expiry = (expiry_dt - datetime.now(timezone.utc)).days
+                    near_expiry = days_to_expiry <= 3
+            except Exception:
+                pass
+
+            dec = _rr.evaluate_pending(
+                elapsed_bars=elapsed_bars, price=float(last_price),
+                last_sale_px=float(ss.last_sell_fill_price or sc.buy_px),
+                resting_buy_px=float(sc.buy_px),
+                atr=float(atr), htf_slope=float(htf_slope),
+                trend_strength=float(trend_strength),
+                dc_high=float(dc_high), fast_ema=float(fast_ema),
+                near_expiry=bool(near_expiry),
+                params=_rr.ReevalParams(),
+            )
+        except Exception as e:
+            self._record("reentry_reeval_error", sleeve_id=sc.id,
+                         sleeve_name=sc.name, error=str(e))
+            return
+
+        # Log every decision (Tier 3 requirement) — action + why + old/new px
+        self._record(
+            "reentry_reeval_decision",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            action=dec.action, old_buy_px=float(sc.buy_px),
+            new_buy_px=dec.new_buy_px, why=dec.why,
+            elapsed_bars=elapsed_bars,
+        )
+
+        if dec.action == "hold":
+            return
+
+        if dec.action in ("reanchor", "breakout"):
+            self._reeval_cancel_replace(sc, ss, dec, last_price)
+            return
+
+        if dec.action == "expire":
+            self._reeval_expire(sc, ss, dec)
+            return
+
+    def _reeval_cancel_replace(self, sc, ss, dec, last_price: float) -> None:
+        """CANCEL-first-CONFIRM-then-PLACE. Anti-thrash reset. Persist
+        both in-memory and Redis. Uses shared arm_level helper so the
+        reanchor pullback logic is unified with expert_reentry."""
+        import time as _t
+        # Use the shared level helper (Tier 2 #3 — unified with expert_reentry)
+        try:
+            import arm_level
+            spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
+            sold_ref = float(ss.last_sell_fill_price or sc.buy_px)
+            unified_buy_px = arm_level.pullback_buy_px(
+                list(self._sleeve_price_history.get(sc.id, []) or []),
+                spread=spread, sold_price=sold_ref)
+            # If unified helper produces a price, use it. Else fall back to
+            # reeval's own suggestion — but the invariant (buy < sold_ref)
+            # must still hold.
+            new_buy_px = unified_buy_px if unified_buy_px is not None else float(dec.new_buy_px)
+            # Snap to tick
+            try:
+                new_buy_px = self._snap_to_tick(float(new_buy_px))
+            except Exception:
+                pass
+        except Exception:
+            new_buy_px = float(dec.new_buy_px)
+
+        # WS1 dedup lock (Tier 1 #2)
+        try:
+            import arm_dedup
+            tick_size = float(getattr(self.cfg, "tick_size", 0.0001) or 0.0001)
+            lock = arm_dedup.try_acquire_arm_lock(
+                self.store, self.tenant_id, self.symbol,
+                "BUY", new_buy_px, tick_size)
+            if not lock.get("acquired"):
+                self._record("reentry_reeval_lock_blocked",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             new_buy_px=new_buy_px,
+                             reason=lock.get("reason"),
+                             error=lock.get("error"))
+                return
+        except Exception as e:
+            self._record("reentry_reeval_lock_error",
+                         sleeve_id=sc.id, error=str(e))
+            return
+
+        # CANCEL FIRST — must confirm no exception before placing (Tier 1 #1)
+        old_oid = ss.live_order_id
+        try:
+            self.b.cancel(old_oid)
+        except Exception as e:
+            self._record("reentry_reeval_cancel_failed",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         old_order_id=old_oid, error=str(e))
+            return  # DO NOT place if cancel didn't succeed
+
+        # THEN PLACE new order at the reeval price
+        try:
+            new_oid = self.b.place_limit("BUY", int(sc.qty), float(new_buy_px))
+        except Exception as e:
+            self._record("reentry_reeval_place_failed",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         new_buy_px=new_buy_px, error=str(e))
+            # Cancel succeeded but place failed — sleeve is now orphaned.
+            # Clear live_order_id and persist so state is coherent.
+            ss.live_order_id = None
+            self._save_state()
+            return
+
+        # Update sleeve state — memory FIRST, then persist to Redis (Tier 2 #1)
+        old_buy_px = float(sc.buy_px)
+        ss.live_order_id = new_oid
+        sc.buy_px = float(new_buy_px)
+        sc.sell_px = float(new_buy_px) + max(0.005, float(sc.sell_px) - old_buy_px)
+        ss.armed_buy_since_ts = _t.time()  # anti-thrash reset (Tier 1 #3)
+        # Also update persisted config so next boot has the new prices
+        try:
+            cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+            sleeves = list(cfg.get("sleeves") or [])
+            for s in sleeves:
+                if s.get("id") == sc.id:
+                    s["buy_px"] = float(new_buy_px)
+                    s["sell_px"] = float(sc.sell_px)
+                    break
+            cfg["sleeves"] = sleeves
+            self.store.put_config(self.tenant_id, self.symbol, cfg)
+        except Exception:
+            pass
+        # Redis state write
+        self._save_state()
+
+        self._record("reentry_reeval_replaced",
+                     sleeve_id=sc.id, sleeve_name=sc.name,
+                     action=dec.action, why=dec.why,
+                     old_order_id=old_oid, new_order_id=new_oid,
+                     old_buy_px=old_buy_px, new_buy_px=new_buy_px,
+                     unified_via_arm_level=(unified_buy_px is not None
+                                             if 'unified_buy_px' in dir() else False))
+
+    def _reeval_expire(self, sc, ss, dec) -> None:
+        """Clean expire: cancel resting order, transition sleeve to HALTED
+        (no re-arm next tick per Tier 2 #2), persist state."""
+        old_oid = ss.live_order_id
+        try:
+            if old_oid:
+                self.b.cancel(old_oid)
+        except Exception:
+            pass  # best-effort cancel; may already be gone
+        ss.live_order_id = None
+        if ss.state != SleeveStateEnum.HALTED:
+            ss.pre_halt_state = ss.state.value
+        ss.state = SleeveStateEnum.HALTED
+        ss.halt_reason = f"reentry_reeval expire: {dec.why}"
+        self._save_state()
+        self._record("reentry_reeval_expired",
+                     sleeve_id=sc.id, sleeve_name=sc.name,
+                     old_order_id=old_oid, why=dec.why)
+
     def _maybe_reanchor_new_channel(self, sc, ss, last_price: float) -> None:
         """[crew] After a confirmed + settled structural drop, walk the sleeve's
         whole channel (buy/sell/trail + stop reference) DOWN to the new channel
@@ -2090,6 +2332,14 @@ class SwingTrader:
         # whole channel (buy/sell/trail + stop) down to the new level so nothing
         # strands above price. Opt-in; cannot fire mid-crash. Off by default.
         self._maybe_reanchor_new_channel(sc, ss, last_price)
+
+        # [crew 2026-07-14] reentry_reeval — re-evaluate a PENDING ARMED_BUY
+        # entry when it goes stale OR when a new higher trend has formed
+        # above the last sale (CU/copper case). Feature-flagged
+        # (__reentry_mode__ scope = "expert") — OFF by default. Cancel-
+        # replace with dedup lock, anti-thrash armed_at reset, expire
+        # exits cleanly. See tests/test_reentry_reeval_wiring.py.
+        self._maybe_reeval_pending_arm(sc, ss, last_price)
 
         # [crew] Average-down GREEN LIGHT alert (notification only). Opt-in.
         self._maybe_avg_down_alert(sc, ss, last_price)
