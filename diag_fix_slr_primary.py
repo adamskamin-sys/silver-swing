@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 
 from state_store import make_store
@@ -67,24 +68,45 @@ def main() -> None:
     store = make_store(os.getenv("SWING_DATA_DIR", "data"))
     state = store.get_state(TENANT, SYMBOL) or {}
 
-    # Safety: refuse --confirm if bot is heartbeating. Running bot has
-    # in-memory state that overwrites Redis writes on every tick. Fix has
-    # to run WHILE BOT IS SUSPENDED.
+    # Safety: refuse --confirm if bot is actively managing this scope.
+    # Running bot has in-memory state that overwrites Redis writes on every
+    # tick. Fix has to run WHILE BOT IS SUSPENDED. Two-signal guard —
+    # either signal being alive => bot alive => refuse.
     if args.confirm and not args.force:
+        refuse_reasons = []
+        # Signal 1: live_order_id set = bot has active order = alive
+        loid = state.get("live_order_id")
+        if loid:
+            refuse_reasons.append(
+                f"state.live_order_id = {loid!r} (bot has an active order — "
+                f"means bot is running and managing this scope)"
+            )
+        # Signal 2: fresh heartbeat (kept as belt-and-suspenders)
         hb = state.get("last_heartbeat_ts")
         if hb is not None:
             try:
                 age = time.time() - float(hb)
-                if age < 30.0:
-                    print(f"REFUSING --confirm: bot is alive (last_heartbeat_ts "
-                          f"was {age:.1f}s ago, threshold 30s).")
-                    print("Bot in-memory state will overwrite this write within seconds.")
-                    print()
-                    print("SUSPEND silver-swing-bot-live on Render FIRST, then re-run.")
-                    print("(If you know what you're doing, add --force to override.)")
-                    sys.exit(2)
+                if age < 60.0:  # loosened from 30 → 60 (bot may write less often)
+                    refuse_reasons.append(
+                        f"last_heartbeat_ts was {age:.1f}s ago (threshold 60s)"
+                    )
             except (TypeError, ValueError):
                 pass
+        if refuse_reasons:
+            print("REFUSING --confirm:")
+            for r in refuse_reasons:
+                print(f"  * {r}")
+            print()
+            print("The bot's in-memory state will overwrite this write within seconds")
+            print("if it's running. CORRECT SEQUENCE:")
+            print("  1. Render → silver-swing-bot-live → Suspend Service")
+            print("  2. Wait ~15s for the pod to fully stop")
+            print("  3. Re-run: python3 diag_fix_slr_primary.py --confirm")
+            print("  4. Cancel the open Coinbase order")
+            print("  5. Render → Resume Service")
+            print()
+            print("(If you're sure the bot is stopped, add --force to override.)")
+            sys.exit(2)
 
     print(f"BEFORE ({TENANT}/{SYMBOL}):")
     keep = ["state", "swing_qty", "live_order_id", "halt_reason",
