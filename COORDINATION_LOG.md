@@ -48,6 +48,8 @@ Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
 2026-07-14 14:37  CLOUD  review  Reviewed WS1 (redis-dedup-lock) design. Endorsed dedup-first ordering. Two blocking notes: (1) SETNX must be ON TOP OF the 2423 in-process guard, not replace it; (2) fail-closed on Redis unavailable. Also WS3: PLAN doc must answer where multipliers come from post-tuner-removal AND how signals are validated without backtest/CC before code lands. Merge order: dedup → health → paper-removal.
 2026-07-14 14:45  LOCAL  commit  95ec8de — WS1 dedup lock (arm_dedup.py + swing_leg.py:2801 + 11 tests). Both auditor notes addressed. Sent to auditor for review.
 2026-07-14 14:50  ADAM   go      Approved WS1 merge. Merged feat/redis-dedup-lock → main (fast-forward) and pushed. Starting WS2 (silent-failure instrumentation) on feat/health-and-safety.
+2026-07-14 15:00  LOCAL  commit  305aa63 — WS2 silent-failure instrumentation (health.py + 10 sites in live_runner.py + main.py + 9 tests, all never-raise verified). Sent to auditor for review.
+2026-07-14 15:05  ADAM   go      Approved WS2 merge. Merged feat/health-and-safety → main (fast-forward) and pushed. Starting WS3 PLAN doc on feat/remove-paper-lab (docs only; code phase blocked until Adam signs off on the plan's answers to auditor's two questions).
 
 ## Open items
 
