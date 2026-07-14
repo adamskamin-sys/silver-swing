@@ -44,6 +44,10 @@ Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
 2026-07-14 14:20  ADAM   action  SUSPENDED silver-swing-bot-paper service on Render. Live writer path now: silver-swing-bot-live only. Multi-writer bug closed.
 2026-07-14 14:20  OPEN   pending  Cancel duplicate orders on Coinbase: SLVR 27 AUG 26 (2 @ $65.25, one of two), OIL 20 JUL 26 (Buy 5 @ $74.76 stale), OIL 20 JUL 26 (Buy 1 @ $74.75 stale). Also: Adam step 1 (REDIS_URL on Mac) still pending. Also: "B authorized" sentence still pending.
 2026-07-14 14:24  ADAM   action  CONFIRMED — duplicate orders cancelled on Coinbase, no new duplicates observed post-suspension. Multi-writer bug fully resolved and verified in practice.
+2026-07-14 14:33  LOCAL  push    Pushed 5 commits (a88a499..836702b) to origin/main. Cloud auditor can now read AGENTS.md + COORDINATION_LOG.md on GitHub.
+2026-07-14 14:37  CLOUD  review  Reviewed WS1 (redis-dedup-lock) design. Endorsed dedup-first ordering. Two blocking notes: (1) SETNX must be ON TOP OF the 2423 in-process guard, not replace it; (2) fail-closed on Redis unavailable. Also WS3: PLAN doc must answer where multipliers come from post-tuner-removal AND how signals are validated without backtest/CC before code lands. Merge order: dedup → health → paper-removal.
+2026-07-14 14:45  LOCAL  commit  95ec8de — WS1 dedup lock (arm_dedup.py + swing_leg.py:2801 + 11 tests). Both auditor notes addressed. Sent to auditor for review.
+2026-07-14 14:50  ADAM   go      Approved WS1 merge. Merged feat/redis-dedup-lock → main (fast-forward) and pushed. Starting WS2 (silent-failure instrumentation) on feat/health-and-safety.
 
 ## Open items
 
