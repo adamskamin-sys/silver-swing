@@ -309,6 +309,18 @@ def run() -> int:
     trader = SwingTrader(broker, store, TENANT, SYMBOL,
                          trade_log=log, kill_switch=ks, notifier=notifier)
 
+    # Boot-time state coherence check — prevents the 2026-07-14 SLR class of bug
+    # where runtime state.swing_qty drifts above config.swing_qty and gets stuck
+    # re-arming an unwanted position after cancellation. Only clamps in provably
+    # safe conditions (no live position tracked, not mid-cycle). Notifies CRIT.
+    try:
+        from boot_state_normalizer import normalize_primary_swing_qty
+        _r = normalize_primary_swing_qty(trader, log=log, notifier=notifier)
+        if _r["drifted"]:
+            _log(f"boot state normalize: {_r['reason']}")
+    except Exception as e:
+        _log(f"WARN: boot_state_normalizer failed: {type(e).__name__}: {e}")
+
     # Sync EVERY product's contract_size + fees from Coinbase before the
     # trader takes its first step. Without this, dashboard modals and slider
     # math for non-primary products (BIT, NOL, XLP, everything else) run
