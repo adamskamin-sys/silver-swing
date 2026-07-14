@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
+import health as _health  # background-job health tracker; never-raise
+
 
 TENANT = os.getenv("SWING_TENANT", "adam")
 SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
@@ -384,8 +386,10 @@ def run() -> int:
                             pass
                         stopping = True
                         break
+                    _health.record_ok(store, "front_month", TENANT)
                 except Exception as e:
                     _log(f"front-month recheck failed ({type(e).__name__}: {e})")
+                    _health.record_error(store, "front_month", TENANT, e, trade_log=log)
             scanner_worker.tick()
             # [crew:#4] Periodic reconcile — trust the exchange, not memory.
             # Credits fills that happened outside the step loop and halts on a
@@ -395,8 +399,10 @@ def run() -> int:
                 last_reconcile = now
                 try:
                     trader.reconcile()
+                    _health.record_ok(store, "reconcile", TENANT)
                 except Exception as e:
                     _log(f"periodic reconcile failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "reconcile", TENANT, e, trade_log=log)
             # [crew] Expert-params drift guard — is the live config still using
             # the expert data (expert_params x tuned multipliers)? Alerts on
             # drift. Read-only; a transient failure never stops the loop.
@@ -410,15 +416,19 @@ def run() -> int:
                     drifted = [r["symbol"] for r in reports if r.get("drifts")]
                     if drifted:
                         _log(f"expert_guard: DRIFT on {drifted} — alerted")
+                    _health.record_ok(store, "expert_guard", TENANT)
                 except Exception as e:
                     _log(f"expert_guard failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "expert_guard", TENANT, e, trade_log=log)
             if now - last_sentinel >= SENTINEL_INTERVAL_SECS:
                 last_sentinel = now
                 try:
                     import risk_sentinel
                     risk_sentinel.run_sentinel(store, TENANT, log, now, notifier=notifier)
+                    _health.record_ok(store, "risk_sentinel", TENANT)
                 except Exception as e:
                     _log(f"risk_sentinel failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "risk_sentinel", TENANT, e, trade_log=log)
             # Periodic sweep so no product's contract_size/fees can silently
             # drift for more than SPEC_REFRESH_SECS (6h default).
             if now - last_spec_refresh >= SPEC_REFRESH_SECS:
@@ -426,8 +436,10 @@ def run() -> int:
                 try:
                     n = _refresh_all_specs(store)
                     _log(f"periodic spec refresh: {n} product(s) refreshed")
+                    _health.record_ok(store, "spec_refresh", TENANT)
                 except Exception as e:
                     _log(f"periodic spec refresh failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "spec_refresh", TENANT, e, trade_log=log)
             # Portfolio circuit breaker — Van Tharp 'stop trading when things
             # go wrong'. Runs on the same cadence as snapshot so it can see
             # fresh mark prices when computing unrealized. Cheap: single
@@ -440,8 +452,10 @@ def run() -> int:
                         _log(f"portfolio_risk: {change.get('kind')} — "
                              f"drawdown {change.get('drawdown_pct', 0):.1f}% "
                              f"(${change.get('drawdown_dollars', 0):.2f})")
+                    _health.record_ok(store, "portfolio_risk_tick", TENANT)
                 except Exception as e:
                     _log(f"portfolio_risk tick failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "portfolio_risk_tick", TENANT, e, trade_log=log)
             # Twitter shadow scanner — polls a curated watchlist, detects
             # would-block / would-alert signals, evaluates outcomes at
             # 1h/6h/24h. Runs every TWITTER_POLL_SECS. SHADOW ONLY: the
@@ -463,8 +477,14 @@ def run() -> int:
                     n_refreshed = refresh_portfolio_snapshot(store, live_tenant)
                     if n_refreshed > 0:
                         pass  # silent success — logging every 30s is noisy
+                    # refresh_portfolio_snapshot already records
+                    # portfolio_snapshot_error internally + updates its own
+                    # snapshot flags (see main.py:261). We add the health
+                    # record here for the wrapper site itself.
+                    _health.record_ok(store, "portfolio_refresh", TENANT)
                 except Exception as e:
                     _log(f"portfolio refresh failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "portfolio_refresh", TENANT, e, trade_log=log)
             if now - last_twitter_poll >= TWITTER_POLL_SECS:
                 last_twitter_poll = now
                 try:

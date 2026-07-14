@@ -27,6 +27,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+import health as _health  # background-job health tracker; never-raise
+
 
 TENANT = os.getenv("SWING_TENANT", "adam")
 SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
@@ -338,8 +340,10 @@ def _sync_live_portfolio(store, live_tenant: str) -> list[str]:
         seed = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
         broker = CoinbaseBroker(BrokerConfig(product_id=seed))
         holdings = broker.list_all_holdings()
+        _health.record_ok(store, "live_portfolio_sync", live_tenant)
     except Exception as e:
         _log(f"[{live_tenant}] live portfolio sync failed: {type(e).__name__}: {e}")
+        _health.record_error(store, "live_portfolio_sync", live_tenant, e)
         return []
 
     upserted: list[str] = []
@@ -732,8 +736,10 @@ def _discover_tracked_symbols(store, tenant: str, primary_symbol: str) -> list[s
     /api/track-symbol without setting SWING_SYMBOL for them."""
     try:
         found = store.list_symbols(tenant) or []
+        _health.record_ok(store, "discover_symbols", tenant)
     except Exception as e:
         _log(f"discover_tracked_symbols failed: {type(e).__name__}: {e}")
+        _health.record_error(store, "discover_symbols", tenant, e)
         found = []
     # Primary first, others alphabetical after — order matters for consistent
     # log output but no functional dependency.
@@ -1036,8 +1042,10 @@ def run_paper_mode() -> int:
                         elif requested:
                             # User request also counts as a fresh auto tick.
                             last_scanner_auto = now
+                        _health.record_ok(store, "scanner_refresh", TENANT)
                 except Exception as e:
                     _log(f"scanner refresh failed: {type(e).__name__}: {e}")
+                    _health.record_error(store, "scanner_refresh", TENANT, e, trade_log=log)
                     last_scanner = now  # back off on repeated failure
 
             time.sleep(LOOP_INTERVAL_SECS)
