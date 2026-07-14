@@ -106,6 +106,25 @@ Delete the paper and lab tenants entirely — Adam picked Option B over the UI-o
 
 Both preserve safety infrastructure. Both eliminate paper as a tenant/mode concept. Delta from Adam's original ask: `paper_broker.py` code survives (renamed `sim_broker.py`, tenant-write paths stripped). If Adam wants literal "no paper_broker code at all," we accept losing the backtest engine — that's the raw B path but with maximal risk.
 
+### Auditor refinements (2026-07-14 15:15 review)
+
+**Q1 clarifications** (before freezing):
+- **Which baseline?** "Frozen last-tuner-output" ≠ "canon published values". These are different things. Choose deliberately:
+  - **Baseline B1**: freeze whatever is currently in `__tuned_params__` (last tuner run's house snapshot). Preserves whatever adaptive tuning caught. Risk: if the last tuner run overfit, we freeze overfit.
+  - **Baseline B2**: revert to `expert_params.py` published canon (Le Beau chandelier, Van Tharp 0.5R, etc.) — the reference values before any Layer-2 tuning. Loses adaptive gains, gains publish-worthy defensibility.
+  - **Baseline B3**: hand-pick per product from a tuner report reviewed by Adam. Most work, most defensible.
+  - LOCAL default recommendation: **B2** for cleanest reasoning (canon values are the audit trail); can rerun tuner offline via sim_broker later if adaptive tuning wanted back.
+- **One-way door.** Deleting `expert_tuner.py` infrastructure means auto-tuning can only be restored by re-authoring it. Accept explicitly.
+- **Audit staleness check.** `expert_guard.py` (or the daily audit's "tuning stale >2d" check) will false-alarm forever once the tuner is off by design. Must be removed or replaced with a "tuner intentionally frozen" mode.
+
+**Q2 merge gate** (before sim_broker code lands):
+- **Test contract**: `tests/test_sim_broker_isolation.py` MUST include tests asserting `SimBroker` CANNOT:
+  1. Place a live order (mock Coinbase client, assert no `place_limit` / `place_market` calls)
+  2. Write to any live-tenant scope in Redis (mock store, assert no `put_state`/`put_config` calls where tenant contains "live")
+  3. Reach `_derive_live_tenant` via any import path (static check: `grep -r "derive_live_tenant" sim_broker.py` returns empty)
+  Even given live env vars (`SWING_TENANT=adam-live`, `SWING_LIVE_CONFIRM=I_UNDERSTAND`), these paths must be dead code.
+- **Auditor's rationale**: "Stripped the paths" is not evidence. Prove it. This is exactly the footgun that caused the incident.
+
 ---
 
 ## 4. Migration plan (only starts after §3 answered)
@@ -113,6 +132,8 @@ Both preserve safety infrastructure. Both eliminate paper as a tenant/mode conce
 ### Phase 0: Prep (docs + safeties, no live changes)
 - [ ] Adam signs off on §3 answers.
 - [ ] Snapshot every Redis scope: `adam-live/*`, `adam-paper/*`, `adam-lab/*` → JSON backup in `backups/pre-remove-paper-lab-<timestamp>.json`.
+- [ ] **Test-restore the backup** (auditor requirement 2026-07-14 15:15). Run migration `--restore` on a scratch Redis key or a local file store; verify all keys re-materialize with identical content. Rollback is only valid if the restore path is proven.
+- [ ] **Confirm removing `adam-paper` has NO cascade to `adam-live`** (auditor). Static analysis: verify no runtime code path reads `adam-paper` state and writes to `adam-live` scope. Test: delete `adam-paper` scopes in a scratch store, run one live tick, assert live behavior unchanged.
 - [ ] Cancel all open orders on Coinbase (Adam, dashboard).
 - [ ] Suspend `silver-swing-bot-live` service briefly during cutover (~5 min planned downtime).
 
@@ -187,6 +208,41 @@ The state that MUST survive migration (Adam explicitly asked about this):
 **Preservation approach:** the migration script touches ONLY `adam-paper` and `adam-lab` scopes. `adam-live` is not modified. Sleeve state survives untouched. Adam does NOT need to re-arm sleeves if backup + migration are clean.
 
 **Contingency:** if migration accidentally touches `adam-live` (bug), the JSON backup contains everything needed to restore.
+
+---
+
+## 8b. STRATEGIC DECISION — split the ask (auditor 2026-07-14 15:15)
+
+Auditor raised a sharp question Adam should answer BEFORE any code:
+
+**Two independent goals are getting merged in this plan.** They're separable:
+
+### Goal A — "Harden the `_derive_live_tenant` footgun" (SAFETY)
+- **What**: prevent the multi-writer bug from ever recurring architecturally, regardless of paper/lab existence.
+- **How**: add explicit config (e.g. `SWING_TENANT_ROLE=writer|readonly`, or refuse to run if `_derive_live_tenant(SWING_TENANT)` collides with another running service's declared tenant) + startup assertion + Redis dedup lock (already shipped `95ec8de`).
+- **Cost**: ~50 lines, one branch, ships in an hour.
+- **Blast radius**: near-zero. Adds a guard, doesn't change existing semantics.
+- **Reversible**: fully. Config toggle.
+
+### Goal B — "Remove paper/lab" (SIMPLIFICATION)
+- **What**: eliminate paper + lab tenants + concepts entirely per this plan.
+- **How**: as documented in §4.
+- **Cost**: 1-2 dev days + 1 day observation.
+- **Blast radius**: high — architectural change on live-money infrastructure.
+- **Reversible**: expensive (rollback via git + Redis restore).
+
+### Do you need both?
+
+- **If your reason for wanting B was safety** — Goal A gets you 90% there for 5% of the risk. The current setup (paper suspended, live-writer isolated, dedup lock live) is already safe post-suspension. Add Goal A on top and multi-writer is architecturally impossible, not just conventionally avoided.
+- **If your reason for wanting B was simplification** — the tabs, the tenants, the concept — then B is the answer. Goal A doesn't touch what you see in the dashboard.
+- **If both** — do Goal A first (SAFETY, this week), then B when there's a clear-day window (SIMPLIFICATION, next week or beyond).
+
+**Auditor's timing**: "land WS3 LAST, after dedup-lock + health have baked and the bot is confirmed stable post-incident. No same-day rush on the highest-risk change."
+
+**Adam's call**: which of these three?
+- **(1) Goal A only** — ship safety fix now; leave paper/lab in place; revisit B later or never.
+- **(2) Goal B only** — full removal per §4, wait until dedup + health have baked ~24-48h.
+- **(3) Both, sequenced** — Goal A now; Goal B in a scheduled cutover next week.
 
 ---
 
