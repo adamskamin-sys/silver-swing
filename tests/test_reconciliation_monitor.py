@@ -190,3 +190,53 @@ def test_format_alert_names_critical_count():
     assert "2 total" in msg
     assert "duplicate_order" in msg
     assert "orphan_order" in msg
+
+
+# ---- state_config_drift — SLR-incident class (auditor 2026-07-14) --------
+
+def test_state_config_drift_flags_slr_ghost():
+    """SLR bug: config.swing_qty=0 but state.swing_qty=2. Bot re-arms
+    from stale in-memory qty."""
+    findings = rm.check_state_config_drift([
+        {"symbol": "SLR-27AUG26-CDE",
+         "state_swing_qty": 2, "config_swing_qty": 0},
+        {"symbol": "OIL-20JUL26-CDE",
+         "state_swing_qty": 0, "config_swing_qty": 0},
+    ])
+    assert len(findings) == 1
+    assert findings[0].severity == "critical"
+    assert findings[0].kind == "state_config_drift"
+    assert findings[0].symbol == "SLR-27AUG26-CDE"
+
+
+def test_state_config_drift_no_flag_when_agree():
+    findings = rm.check_state_config_drift([
+        {"symbol": "OIL", "state_swing_qty": 1, "config_swing_qty": 1},
+        {"symbol": "SLR", "state_swing_qty": 0, "config_swing_qty": 0},
+    ])
+    assert findings == []
+
+
+def test_state_config_drift_handles_none_and_missing():
+    """Robust to missing/None values — no NameError, no false-positive."""
+    findings = rm.check_state_config_drift([
+        {"symbol": "X", "state_swing_qty": None, "config_swing_qty": None},
+        {"symbol": "Y"},  # missing keys → default 0/0 → agree → no finding
+    ])
+    assert findings == []
+
+
+def test_reconcile_includes_state_config_drift_when_pairs_provided():
+    findings = rm.reconcile(
+        open_orders=[], exch_positions={}, sleeves=[], now_ts=10000,
+        state_config_pairs=[
+            {"symbol": "SLR", "state_swing_qty": 2, "config_swing_qty": 0}])
+    kinds = [f.kind for f in findings]
+    assert "state_config_drift" in kinds
+
+
+def test_reconcile_skips_drift_when_pairs_none():
+    """Backwards-compat: reconcile without state_config_pairs = old behavior."""
+    findings = rm.reconcile(
+        open_orders=[], exch_positions={}, sleeves=[], now_ts=10000)
+    assert findings == []

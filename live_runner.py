@@ -531,11 +531,28 @@ def run() -> int:
                             open_orders_data = list_orders_fn() or []
                     except Exception as _e:
                         _log(f"reconciliation_monitor: list_open_orders failed: {_e}")
+                    # Build state-vs-config drift pairs — auditor 2026-07-14
+                    # SLR-incident agenda item. Bot's runtime state.swing_qty
+                    # can drift from config.swing_qty (e.g. after a scale-up
+                    # or a config change made while bot was down). This check
+                    # would have caught the SLR ghost automatically.
+                    state_config_pairs = []
+                    for sym in syms:
+                        if sym.startswith("__"):
+                            continue
+                        st = store.get_state(live_tenant, sym) or {}
+                        cfg = store.get_config(live_tenant, sym) or {}
+                        state_config_pairs.append({
+                            "symbol": sym,
+                            "state_swing_qty": st.get("swing_qty"),
+                            "config_swing_qty": cfg.get("swing_qty"),
+                        })
                     findings = rmon.reconcile(
                         open_orders=open_orders_data,
                         exch_positions=exch_positions,
                         sleeves=sleeves_data,
                         now_ts=now,
+                        state_config_pairs=state_config_pairs,
                     )
                     alert = rmon.format_alert(findings)
                     if alert:

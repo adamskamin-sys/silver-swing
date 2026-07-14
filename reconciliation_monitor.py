@@ -88,14 +88,53 @@ def check_stale_entries(sleeves, now_ts, stale_after_s=3600, price_lookup=None, 
     return out
 
 
+def check_state_config_drift(state_config_pairs):
+    """Auditor 2026-07-14 SLR-incident agenda item — flag when runtime
+    state.swing_qty disagrees with persisted config.swing_qty.
+
+    The SLR ghost class: config said swing_qty=0 (primary disabled) but
+    state had swing_qty=2 from a prior config value that never cleared.
+    Bot re-armed sell 2 @ $65.25 every tick after user cancellation.
+
+    Args:
+        state_config_pairs: list of dicts with keys:
+            symbol, state_swing_qty, config_swing_qty
+    Returns:
+        list of Finding — critical when state disagrees with config.
+    """
+    out = []
+    for p in state_config_pairs or []:
+        try:
+            s = int(p.get("state_swing_qty") or 0)
+            c = int(p.get("config_swing_qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if s != c:
+            out.append(Finding(
+                "critical", "state_config_drift", p.get("symbol", "?"),
+                f"state.swing_qty={s} but config.swing_qty={c} — bot's "
+                f"in-memory qty is stale and will re-arm until state is "
+                f"corrected (SUSPEND service + fix Redis + RESUME)."
+            ))
+    return out
+
+
 def reconcile(*, open_orders, exch_positions, sleeves, now_ts,
-              price_tick=None, stale_after_s=3600, price_lookup=None):
-    """Run all checks; return findings, critical first."""
+              price_tick=None, stale_after_s=3600, price_lookup=None,
+              state_config_pairs=None):
+    """Run all checks; return findings, critical first.
+
+    New parameter (2026-07-14):
+        state_config_pairs — optional list of {symbol, state_swing_qty,
+            config_swing_qty} dicts. When provided, runs the
+            check_state_config_drift check (SLR-incident class).
+    """
     findings = []
     findings += check_duplicate_orders(open_orders, price_tick)
     findings += check_orphans_and_missing(open_orders, sleeves)
     findings += check_position_mismatch(exch_positions, sleeves)
     findings += check_stale_entries(sleeves, now_ts, stale_after_s, price_lookup)
+    findings += check_state_config_drift(state_config_pairs)
     rank = {"critical": 0, "warn": 1, "info": 2}
     findings.sort(key=lambda f: rank.get(f.severity, 3))
     return findings
