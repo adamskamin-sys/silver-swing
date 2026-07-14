@@ -125,6 +125,28 @@ Both preserve safety infrastructure. Both eliminate paper as a tenant/mode conce
   Even given live env vars (`SWING_TENANT=adam-live`, `SWING_LIVE_CONFIRM=I_UNDERSTAND`), these paths must be dead code.
 - **Auditor's rationale**: "Stripped the paths" is not evidence. Prove it. This is exactly the footgun that caused the incident.
 
+### Auditor refinement (2026-07-14 15:50 — second review)
+
+**Broker fate — pick ONE, doc was ambiguous.** LOCAL said three different things across the plan: "delete paper_broker.py entirely" (§1), "rename → sim_broker.py, strip tenant-write paths" (Phase 1), "lightweight in-memory SimBroker" (Q2 recommendation). These are different approaches with different risk profiles. Adam picks:
+
+- **B1 — Rename-and-strip**: keep `paper_broker.py` file, rename to `sim_broker.py`, delete the tenant-write / Coinbase-touching code paths inside. Risk: RESIDUAL LIVE PATH could survive if we miss a code path. Merge-gate test mitigates.
+- **B2 — Delete-and-write-fresh**: delete `paper_broker.py`, write a brand-new `sim_broker.py` from scratch — pure Python fill simulator with a well-defined interface (no legacy paths). Risk: NEW SIM BUGS could produce misleading backtest results. Same merge-gate test contract.
+
+Both paths require the Q2 merge-gate test contract above. LOCAL recommendation: **B2** (delete-and-fresh). A fresh ~200-line module we own is easier to audit than a stripped-down ~500-line legacy file where "we removed the live path" is a claim without proof at the code level.
+
+**Q1 sharpened — Adam picks the actual mechanism, not just "approve freeze."** Auditor: the word "freeze" was too loose. The real choice is:
+
+- **Q1-Frozen**: freeze the tuning baseline (either B1 last-tuner-output, B2 canon values, or B3 hand-picked per §3 Q1 above). `expert_tuner.py` refactored to NOT run automatically; can still be invoked manually as a one-shot report. Kills adaptive tuning permanently unless re-authored.
+- **Q1-Offline**: refactor `expert_tuner.py` to run on downloaded Coinbase candles (no tenant needed). Preserves adaptive tuning. Aligns with "everything expert-driven" — tuner keeps producing new numbers on a schedule, `__tuned_params__` scope stays live, tuner runs against real market data instead of a paper-tenant simulation.
+
+`expert_tuner.py` is refactored in EITHER path — not deleted (auditor correction; the plan earlier said "delete tuner infra"). LOCAL recommendation update per auditor's steer: **Q1-Offline**. Preserves the adaptive-tuning premise of the codebase; if Van Tharp's "stop tuning" wisdom is preferred later, Adam can flip a `TUNER_DISABLED=1` env var without a code change. Cheaper to have and not use than the reverse.
+
+**Audit tuning-freshness check must match the chosen Q1 path:**
+- If **Q1-Frozen**: DROP the "tuning stale >2d" check from the daily audit (it will false-alarm forever by design).
+- If **Q1-Offline**: repoint the check at the offline tuner's `tuned_at` timestamp (not the live-tenant tuner's cache).
+
+**Goal A/B sequencing (auditor emphasis): Goal A ships FIRST as its own change, on a separate day from Goal B.** Multi-writer safety hardening (§8b Goal A) is not gated on Goal B. Do it now, deploy independently, verify. Goal B is a separate deliberate cutover — auditor: "not the same day."
+
 ---
 
 ## 4. Migration plan (only starts after §3 answered)
