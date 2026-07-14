@@ -373,6 +373,12 @@ def run() -> int:
                 try:
                     from roll import resolve_front_month
                     latest = resolve_front_month(coinbase, SYMBOL_FAMILY, fallback=SYMBOL)
+                    # Stamp last_ok_ts BEFORE the roll-branch break. Auditor
+                    # 2026-07-14 15:35: the daily audit uses last_ok_ts
+                    # staleness as a liveness check; a clean roll must still
+                    # stamp OK or front_month gets false-flagged as dead
+                    # during a normal contract rotation.
+                    _health.record_ok(store, "front_month", TENANT)
                     if latest and latest != SYMBOL:
                         msg = (f"front-month rolled: {SYMBOL} → {latest}. "
                                "Restarting to pick up new contract.")
@@ -386,7 +392,6 @@ def run() -> int:
                             pass
                         stopping = True
                         break
-                    _health.record_ok(store, "front_month", TENANT)
                 except Exception as e:
                     _log(f"front-month recheck failed ({type(e).__name__}: {e})")
                     _health.record_error(store, "front_month", TENANT, e, trade_log=log)
@@ -484,7 +489,15 @@ def run() -> int:
                     _health.record_ok(store, "portfolio_refresh", TENANT)
                 except Exception as e:
                     _log(f"portfolio refresh failed: {type(e).__name__}: {e}")
-                    _health.record_error(store, "portfolio_refresh", TENANT, e, trade_log=log)
+                    # NOTE: no trade_log= arg here. refresh_portfolio_snapshot
+                    # (main.py:261) already records `portfolio_snapshot_error`
+                    # to the trade log on failure. Adding a second
+                    # `portfolio_refresh_error` event double-counts in the
+                    # auditor's safety-event tally and splits one failure
+                    # across two event names. We keep the __health__ scope
+                    # write so cockpit chip + daily audit still see the
+                    # failure. (Auditor fix-on-top 2026-07-14 15:35.)
+                    _health.record_error(store, "portfolio_refresh", TENANT, e)
             if now - last_twitter_poll >= TWITTER_POLL_SECS:
                 last_twitter_poll = now
                 try:
