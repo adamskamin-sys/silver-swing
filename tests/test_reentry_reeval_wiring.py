@@ -63,8 +63,8 @@ def _make_broker():
 def _make_trader(tmp_path, mode="legacy"):
     store = JsonFileStateStore(tmp_path / "store.json")
     store.put_config(TENANT, SYMBOL, _default_cfg())
-    if mode == "expert":
-        store.put_state(TENANT, "__reentry_mode__", {"mode": "expert"})
+    if mode in ("expert", "shadow"):
+        store.put_state(TENANT, "__reentry_mode__", {"mode": mode})
     log = TradeLog(tmp_path / "trades.jsonl")
     trader = SwingTrader(_make_broker(), store, TENANT, SYMBOL, trade_log=log)
     return trader, store, log
@@ -113,6 +113,12 @@ def test_flag_reads_expert_from_scope(tmp_path):
     # And 'legacy' when absent
     trader2, _, _ = _make_trader(tmp_path / "legacy", mode="legacy")
     assert trader2._reentry_mode() == "legacy"
+
+
+def test_flag_reads_shadow_from_scope(tmp_path):
+    """Auditor 2026-07-14 SHADOW MODE: verify flag reader picks up 'shadow'."""
+    trader, store, log = _make_trader(tmp_path, mode="shadow")
+    assert trader._reentry_mode() == "shadow"
 
 
 def test_flag_off_by_default(tmp_path):
@@ -421,6 +427,129 @@ def test_tier2_no_rearm_after_expire(tmp_path, monkeypatch):
     # No additional broker calls between first and second (second was a no-op)
     assert mock.calls == calls_after_first, (
         f"Second call after expire made broker calls: {mock.calls[len(calls_after_first):]}")
+
+
+# ---- SHADOW MODE (auditor 2026-07-14) -----------------------------------
+# Third __reentry_mode__ that computes + logs decisions without touching the
+# broker. Runs 24-48h on live to validate decisions before turning execution
+# on for one small sleeve. Everything the "expert" path would do — feature
+# computation, evaluate_pending call, decision logging — must happen. Only
+# broker.cancel + broker.place_limit and state transitions to HALTED are
+# blocked.
+
+
+def test_shadow_mode_no_broker_calls_on_reanchor(tmp_path, monkeypatch):
+    """Shadow mode with a reanchor decision: broker MUST NOT be touched."""
+    trader, store, log = _make_trader(tmp_path, mode="shadow")
+    sc, ss = _get_sleeve(trader)
+    _prime_history(trader, sc.id, [75.0 - i * 0.01 for i in range(60)])
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = "resting-shadow-reanchor"
+    ss.last_sell_fill_price = 75.0
+    ss.armed_buy_since_ts = time.time() - 3600
+    ss.pre_halt_state = None
+    mock = _MockBroker()
+    trader.b = mock
+    import reentry_reeval
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="reanchor", new_buy_px=74.5, why="would-reanchor"))
+
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+
+    # Broker untouched
+    assert mock.calls == [], f"shadow mode touched broker: {mock.calls}"
+    # State unchanged
+    assert ss.live_order_id == "resting-shadow-reanchor"
+    assert ss.state == SleeveStateEnum.ARMED_BUY
+    assert sc.buy_px != 74.5  # config buy_px NOT rewritten
+
+
+def test_shadow_mode_no_broker_calls_on_expire(tmp_path, monkeypatch):
+    """Shadow mode with an expire decision: sleeve MUST NOT transition to
+    HALTED. Broker MUST NOT be touched."""
+    trader, store, log = _make_trader(tmp_path, mode="shadow")
+    sc, ss = _get_sleeve(trader)
+    _prime_history(trader, sc.id, [75.0 - i * 0.01 for i in range(60)])
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = "resting-shadow-expire"
+    ss.last_sell_fill_price = 75.0
+    ss.armed_buy_since_ts = time.time() - 3600
+    ss.pre_halt_state = None
+    mock = _MockBroker()
+    trader.b = mock
+    import reentry_reeval
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="expire", new_buy_px=0.0, why="would-expire"))
+
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+
+    # State + broker untouched — no HALTED transition, no cancel
+    assert ss.state == SleeveStateEnum.ARMED_BUY, (
+        "shadow mode transitioned sleeve to HALTED")
+    assert ss.halt_reason is None
+    assert mock.calls == []
+
+
+def test_shadow_mode_emits_would_action_event(tmp_path, monkeypatch):
+    """Every shadow tick emits BOTH the standard decision event (tagged
+    mode='shadow') AND a dedicated shadow_action event with would_new_buy_px.
+    The dedicated event lets audit separate would-have-been from actual
+    actions on the same code path."""
+    trader, store, log = _make_trader(tmp_path, mode="shadow")
+    sc, ss = _get_sleeve(trader)
+    _prime_history(trader, sc.id, [75.0 - i * 0.01 for i in range(60)])
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = "resting-shadow-event"
+    ss.last_sell_fill_price = 75.0
+    ss.armed_buy_since_ts = time.time() - 3600
+    ss.pre_halt_state = None
+    trader.b = _MockBroker()
+    import reentry_reeval
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="reanchor", new_buy_px=74.5, why="shadow-emits-event"))
+
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+
+    events = list(log.events())
+    kinds = [e.get("event_type") for e in events]
+    assert "reentry_reeval_decision" in kinds
+    assert "reentry_reeval_shadow_action" in kinds
+    # The decision event should be tagged with mode='shadow'
+    decision = next(e for e in events if e.get("event_type") == "reentry_reeval_decision")
+    assert decision.get("mode") == "shadow"
+    # The shadow_action event should carry the would-be buy_px
+    shadow = next(e for e in events if e.get("event_type") == "reentry_reeval_shadow_action")
+    assert shadow.get("would_new_buy_px") == 74.5
+    assert shadow.get("would_action") == "reanchor"
+
+
+def test_shadow_mode_hold_still_logs_decision(tmp_path, monkeypatch):
+    """A 'hold' decision under shadow mode still logs the decision event
+    (so the operator can audit how often the reeval fires + decides hold),
+    but does NOT emit a shadow_action (nothing would have happened)."""
+    trader, store, log = _make_trader(tmp_path, mode="shadow")
+    sc, ss = _get_sleeve(trader)
+    _prime_history(trader, sc.id, [75.0 - i * 0.01 for i in range(60)])
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = "resting-shadow-hold"
+    ss.last_sell_fill_price = 75.0
+    ss.armed_buy_since_ts = time.time() - 3600
+    ss.pre_halt_state = None
+    trader.b = _MockBroker()
+    import reentry_reeval
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="hold", new_buy_px=63.0, why="shadow-hold"))
+
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)
+
+    kinds = [e.get("event_type") for e in log.events()]
+    assert "reentry_reeval_decision" in kinds
+    assert "reentry_reeval_shadow_action" not in kinds, (
+        "hold decisions should not emit shadow_action — nothing would have happened")
 
 
 # ---- Tier 2 (a) — halt-recovery skips reentry_reeval expire halts --------

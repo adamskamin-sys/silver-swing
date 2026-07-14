@@ -1516,8 +1516,10 @@ class SwingTrader:
             self._record("avg_down_alert_error", sleeve_id=sc.id, error=str(e))
 
     def _reentry_mode(self) -> str:
-        """Read the __reentry_mode__ scope for this tenant. Returns 'expert'
-        or 'legacy' (default). Fail-safe: any store error → 'legacy'."""
+        """Read the __reentry_mode__ scope for this tenant. Returns one of
+        'expert' (execute the reeval decision), 'shadow' (compute + log the
+        decision only — NEVER touch the broker), or 'legacy' (default).
+        Fail-safe: any store error → 'legacy'."""
         try:
             m = (self.store.get_state(self.tenant_id, "__reentry_mode__") or {})
             return str(m.get("mode") or "legacy").lower()
@@ -1528,18 +1530,21 @@ class SwingTrader:
         """Wire reentry_reeval.evaluate_pending into the ARMED_BUY tick per
         auditor review gate 2026-07-14. Cancel-replace with confirmation.
         WS1 dedup lock. Anti-thrash. Cache-coherent state persist. Feature-
-        flagged behind __reentry_mode__ == 'expert'; OFF by default = byte-
-        for-byte legacy behavior.
+        flagged behind __reentry_mode__ — 'legacy' (default) is byte-for-byte
+        original behavior, 'shadow' logs the would-be decision without
+        touching the broker (24-48h burn-in per auditor 2026-07-14), 'expert'
+        executes the decision.
 
         Called on every sleeve tick in the ARMED_BUY branch. Returns early
         unless: sleeve is ARMED_BUY, has a live resting order to re-evaluate,
-        and the tenant has __reentry_mode__ scope set to 'expert'."""
+        and the tenant has __reentry_mode__ set to 'expert' or 'shadow'."""
         # Preconditions — legacy path is byte-for-byte identical when any fails.
         if ss.state != SleeveStateEnum.ARMED_BUY:
             return
         if not ss.live_order_id:
             return  # no resting order to re-evaluate
-        if self._reentry_mode() != "expert":
+        mode = self._reentry_mode()
+        if mode not in ("expert", "shadow"):
             return
 
         try:
@@ -1621,18 +1626,36 @@ class SwingTrader:
                          sleeve_name=sc.name, error=str(e))
             return
 
-        # Log every decision (Tier 3 requirement) — action + why + old/new px
+        # Log every decision (Tier 3 requirement) — action + why + old/new px.
+        # `mode` field lets the operator distinguish shadow observations from
+        # executed decisions when auditing the trade log.
         self._record(
             "reentry_reeval_decision",
             sleeve_id=sc.id, sleeve_name=sc.name,
             action=dec.action, old_buy_px=float(sc.buy_px),
             new_buy_px=dec.new_buy_px, why=dec.why,
-            elapsed_bars=elapsed_bars,
+            elapsed_bars=elapsed_bars, mode=mode,
         )
 
         if dec.action == "hold":
             return
 
+        # SHADOW MODE — auditor 2026-07-14: compute + log the decision but
+        # place/cancel NOTHING. Used to burn in 24-48h of observed decisions
+        # on live before turning execution on for one small sleeve. Emits a
+        # dedicated event so audit can separate would-have-been actions from
+        # actual actions on the exact same code path.
+        if mode == "shadow":
+            self._record(
+                "reentry_reeval_shadow_action",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                would_action=dec.action, old_buy_px=float(sc.buy_px),
+                would_new_buy_px=dec.new_buy_px, why=dec.why,
+                elapsed_bars=elapsed_bars,
+            )
+            return
+
+        # EXPERT MODE — execute the decision.
         if dec.action in ("reanchor", "breakout"):
             self._reeval_cancel_replace(sc, ss, dec, last_price)
             return
