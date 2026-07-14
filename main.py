@@ -580,7 +580,7 @@ class _Track:
     def __init__(self, store, log, ks, tenant: str, symbol: str, starting_balance: float):
         from feed import LiveTickerFeed
         from microstructure import MicrostructureFilter
-        from paper_broker import PaperBroker, PaperConfig
+        from sim_broker import SimBroker as PaperBroker, SimConfig as PaperConfig  # WS3: sim_broker replaces paper_broker
         from swing_leg import SwingTrader
 
         _seed_config_if_missing(store, tenant, symbol)
@@ -1063,7 +1063,7 @@ def run_backtest_mode() -> int:
     """Backtest over a fixed window. Configure via SWING_BACKTEST_DAYS."""
     from backtest import fetch_candles, run_backtest
     from broker import CoinbaseBroker, BrokerConfig
-    from paper_broker import PaperConfig
+    from sim_broker import SimConfig as PaperConfig  # WS3: sim_broker replaces paper_broker
     from safety import TradeLog
     from state_store import JsonFileStateStore
     from swing_leg import SwingTrader
