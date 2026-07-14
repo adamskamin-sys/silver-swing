@@ -498,10 +498,37 @@ function renderCockpit(store) {
     }
   }
 
+  // [crew 2026-07-14] reconciliation_monitor findings — counts critical +
+  // warn reconciliation_* events in the last 15min window scoped to the
+  // active tenant. Surfaces the auditor's read-only defense visually.
+  // Critical = red chip, warn only = amber, clean = quiet checkmark.
+  const reconCutoff = nowSec - 15 * 60;
+  let reconCrit = 0, reconWarn = 0;
+  const reconKinds = new Set();
+  for (const e of (lastTradeEvents || [])) {
+    if (!e || !e.event_type) continue;
+    if (!String(e.event_type).startsWith('reconciliation_')) continue;
+    if (e.tenant && e.tenant !== tenant) continue;
+    const ts = Number(e.ts) || 0;
+    if (ts < reconCutoff) continue;
+    if (e.severity === 'critical') reconCrit++;
+    else if (e.severity === 'warn') reconWarn++;
+    reconKinds.add(String(e.event_type).replace('reconciliation_', ''));
+  }
+  const reconTip = reconCrit || reconWarn
+    ? `Last 15 min: ${reconCrit} critical, ${reconWarn} warn. Kinds: ${[...reconKinds].join(', ')}. See trade log for full detail.`
+    : 'Reconciliation monitor: no findings in last 15 min. Diffs exchange orders/positions vs bot state every 5 min.';
+  const reconValue = reconCrit
+    ? `<span class="ck-chip ck-danger" title="${escapeHtml(reconTip)}">🚨 ${reconCrit}</span>${reconWarn ? ` <span class="ck-chip ck-warn" style="font-size:var(--fs-xs)">⚠ ${reconWarn}</span>` : ''}`
+    : reconWarn
+      ? `<span class="ck-chip ck-warn" title="${escapeHtml(reconTip)}">⚠ ${reconWarn}</span>`
+      : `<span class="ck-chip ck-ok" title="${escapeHtml(reconTip)}">✓</span>`;
+
   return `<div class="cockpit-row">
     <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
     <div class="ck-tile" title="Realized P&amp;L across all sleeve + primary cycles that fired in the last 24 hours on the ${activeMode} tenant. Sums sleeve_cycle_completed.cycle_pnl and cycle_completed (gross − fees)."><div class="ck-label">24h realized</div><div class="ck-value ${classForValue(realized24h)}">${realized24h >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realized24h))}</div></div>
+    <div class="ck-tile"><div class="ck-label">reconciliation</div><div class="ck-value">${reconValue}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
     <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
