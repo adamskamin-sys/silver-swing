@@ -43,6 +43,7 @@ Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
 2026-07-14 14:15  DIAG   finding  Confirmed multi-writer at RENDER level: silver-swing-bot-paper (SWING_TENANT=adam-paper, SWING_MODE=paper, SWING_LIVE_ENGINE=1, SWING_LIVE_CONFIRM=I_UNDERSTAND) was deriving adam-live via `_derive_live_tenant` and running live engine on it — in parallel with silver-swing-bot-live (SWING_TENANT=adam-live, SWING_MODE=live). Two Render services × one adam-live scope = duplicate orders.
 2026-07-14 14:20  ADAM   action  SUSPENDED silver-swing-bot-paper service on Render. Live writer path now: silver-swing-bot-live only. Multi-writer bug closed.
 2026-07-14 14:20  OPEN   pending  Cancel duplicate orders on Coinbase: SLVR 27 AUG 26 (2 @ $65.25, one of two), OIL 20 JUL 26 (Buy 5 @ $74.76 stale), OIL 20 JUL 26 (Buy 1 @ $74.75 stale). Also: Adam step 1 (REDIS_URL on Mac) still pending. Also: "B authorized" sentence still pending.
+2026-07-14 14:24  ADAM   action  CONFIRMED — duplicate orders cancelled on Coinbase, no new duplicates observed post-suspension. Multi-writer bug fully resolved and verified in practice.
 
 ## Open items
 
