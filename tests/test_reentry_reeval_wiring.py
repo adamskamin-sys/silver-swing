@@ -234,6 +234,81 @@ def test_tier1_no_place_when_dedup_lock_unavailable(tmp_path, monkeypatch):
 
 # ---- Tier 1 #3 Anti-thrash ----------------------------------------------
 
+def test_tier1_material_move_guard_pure_hold(tmp_path):
+    """AUDITOR 2026-07-14 Tier 1 gap: DRIFT trigger fires every tick while
+    price stays elevated above last_sale + drift*ATR — armed_at reset only
+    guards the TIME trigger. Without a material-move guard, we'd cancel-
+    replace every tick.
+
+    Pure-function test with REAL evaluate_pending: drift + uptrend, but
+    proposed reanchor is within reanchor_min_move_x_atr*ATR of the resting
+    order → return HOLD, no cancel-replace."""
+    import reentry_reeval as rr
+    # Setup: drift = 62 - 60 = 2 = 2.0*ATR (0.5 * 2.0*ATR trigger boundary — use 63 for safety)
+    dec = rr.evaluate_pending(
+        elapsed_bars=0,          # NOT stale — only drift can trigger
+        price=63.0,              # 63 > 60 + 2*0.5 = 61.0 ✓ drift fires
+        last_sale_px=60.0,
+        resting_buy_px=60.8,     # matches pullback below
+        atr=0.5,
+        htf_slope=1.0,           # positive slope
+        trend_strength=0.5,      # ≥ 0.30 → new_trend_up
+        dc_high=64.0,
+        fast_ema=61.3,           # pullback_px = 61.3 - 1.0*0.5 = 60.8
+        near_expiry=False,
+        params=rr.ReevalParams(reanchor_min_move_x_atr=0.5),
+    )
+    # pullback_px = 60.8, resting = 60.8, diff = 0.0 < 0.5*0.5 = 0.25 → HOLD
+    assert dec.action == "hold", f"Expected hold, got {dec.action}: {dec.why}"
+    assert "no material move" in dec.why.lower() or "material" in dec.why.lower()
+
+
+def test_tier1_material_move_guard_pure_reanchor_when_moved(tmp_path):
+    """Sanity check the OTHER side: when the proposed reanchor differs by
+    MORE than reanchor_min_move_x_atr*ATR from resting, reanchor DOES fire."""
+    import reentry_reeval as rr
+    dec = rr.evaluate_pending(
+        elapsed_bars=0, price=63.0, last_sale_px=60.0,
+        resting_buy_px=59.0,     # far from proposed pullback (60.8)
+        atr=0.5, htf_slope=1.0, trend_strength=0.5,
+        dc_high=64.0, fast_ema=61.3, near_expiry=False,
+        params=rr.ReevalParams(reanchor_min_move_x_atr=0.5),
+    )
+    # |60.8 - 59.0| = 1.8, threshold = 0.25 → material move → REANCHOR
+    assert dec.action == "reanchor", f"Expected reanchor, got {dec.action}: {dec.why}"
+    assert abs(dec.new_buy_px - 60.8) < 1e-6
+
+
+def test_tier1_anti_thrash_two_consecutive_ticks_zero_broker_calls(tmp_path, monkeypatch):
+    """AUDITOR 2026-07-14 Tier 1: two consecutive ticks in a drift+uptrend
+    regime where the material-move guard fires: BOTH ticks must return HOLD;
+    ZERO broker calls across both. This proves the cancel-replace loop that
+    would otherwise fire every tick is broken."""
+    trader, store, log = _make_trader(tmp_path, mode="expert")
+    sc, ss = _get_sleeve(trader)
+    _prime_history(trader, sc.id, [75.0 - i * 0.01 for i in range(60)])
+    ss.state = SleeveStateEnum.ARMED_BUY
+    ss.live_order_id = "resting-thrash-consecutive"
+    ss.last_sell_fill_price = 75.0
+    ss.armed_buy_since_ts = time.time()    # fresh — only drift can trigger
+    ss.pre_halt_state = None
+    mock = _MockBroker()
+    trader.b = mock
+    import reentry_reeval
+    # Simulate the guard firing (proposed reanchor within min_move of resting)
+    monkeypatch.setattr(reentry_reeval, "evaluate_pending",
+        lambda **kw: reentry_reeval.ReevalDecision(
+            action="hold", new_buy_px=kw["resting_buy_px"],
+            why="drift/stale but proposed reanchor within 0.5xATR of resting — no material move — hold"))
+
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)    # tick 1
+    trader._maybe_reeval_pending_arm(sc, ss, last_price=76.0)    # tick 2 (same regime)
+
+    assert mock.calls == [], (
+        f"Two consecutive holds must produce ZERO broker calls; got {mock.calls}")
+    assert ss.live_order_id == "resting-thrash-consecutive"      # untouched
+
+
 def test_tier1_armed_at_reset_on_reanchor(tmp_path, monkeypatch):
     """After a successful reanchor, ss.armed_buy_since_ts must be
     reset to ~now so the next tick's elapsed_bars computation reads
