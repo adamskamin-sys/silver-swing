@@ -71,6 +71,23 @@ Newest at bottom. Format: `YYYY-MM-DD HH:MM  ACTOR  ACTION  DETAIL`.
 2026-07-14 16:30  LOCAL  commit  65f329f on feat/ws3-merge-gate — sim_broker.py (fresh, ~380 lines, no live-client / no state_store imports) + tests/test_sim_broker_cannot_reach_live.py with corrected CONFIG per Explore. All 5 tripwires GREEN (8 test cases). Broader suite 431/431. Pushed.
 2026-07-14 16:32  CLOUD  deliver reconciliation_monitor.py (read-only defense: duplicate_order + orphan_order + missing_order + position_mismatch + stale_entry).
 2026-07-14 16:35  LOCAL  commit  e3f23af on feat/reconciliation-monitor — reconciliation_monitor.py + 17 tests. All green. Pushed.
+2026-07-14 17:00  LOCAL  merge   4 branches merged to main (cbfce22): feat/reconciliation-monitor, feat/expectancy-tracker, feat/reentry-reeval, feat/ws3-merge-gate. Pushed. Auditor's merge order respected.
+2026-07-14 17:15  LOCAL  commit  602418a — WS3 Phase 2: swapped 6 production consumers (backtest, expert_tuner, run_champion_challenger, run_go_live_check, scripts/run_backtest, main.py) from paper_broker to sim_broker via `as` aliases. SimBroker gained margin-call auto-halt + SimPosition.product_id for parity. place_limit/place_market silently refuse on halt. 448/448 pass. Merged to main + pushed.
+2026-07-14 17:20  LOCAL  commit  eded381 — diag_fix_slr_primary.py refuses --confirm when bot heartbeat is fresh (<30s). Prevents the cache-coherence bug where bot's in-memory state overwrites Redis writes. Explicit "SUSPEND service first" sequence documented. --force override for edge cases.
+2026-07-14 17:25  ADAM   action  Correct sequence to fix SLR ghost: Suspend service → Wait 10s → run diag --confirm → cancel Coinbase order → Resume service. Not yet performed by Adam per LOCAL's understanding; reconciliation_monitor (wired below) will catch the ghost automatically once deployed.
+2026-07-14 17:30  LOCAL  commit  13ef8aa — Wired reconciliation_monitor into live_runner.py at 5-min cadence. Data: exch_positions from __portfolio__ snapshot, sleeves walked from state_store scopes, open_orders TODO (see next). health.record_ok/error + notifier alert + trade log per finding. Would catch SLR ghost class automatically (position_mismatch).
+2026-07-14 17:35  LOCAL  commit  5cf1fb5 — Dashboard hamburger: removed Paper + Lab items. Only Live/Scanner/Signals now visible. Under-the-hood code paths (isLive branching, 15+ paper refs in app.js) untouched — defensive, Phase 6 cleanup.
+2026-07-14 17:45  LOCAL  commit  01f898b — CoinbaseBroker.list_open_orders() added + wired into reconciliation_monitor. Now the monitor has full coverage: duplicate_order + orphan_order + missing_order + position_mismatch + stale_entry. 448/448 pass.
+
+## Auditor agenda item (for next handoff)
+
+CACHE COHERENCE (2026-07-14 SLR incident) — Redis state writes don't affect running processes because the bot has authoritative in-memory state that overwrites Redis every tick. Symptom: diag scripts appear to write successfully, then get undone within seconds. Also blocks: any dashboard-side edit to state (kill switch, halt reasons, sleeve state) unless bot is suspended.
+
+WORKAROUND (in place): diag_fix_slr_primary.py refuses --confirm if last_heartbeat_ts <30s old; requires operator to Suspend service, wait, apply fix, Resume.
+
+LONG-TERM (auditor's recommendation, deferred): per-scope __reload_requested__ marker read at top-of-tick, atomic, after state ownership defined. Do NOT do blanket Redis polling (multi-writer hazard).
+
+ADD: reconciliation_monitor check for runtime-state vs persisted-config drift (partially covered by position_mismatch; explicit swing_qty-state-vs-config check would strengthen).
 
 ## Branches ready for review + merge (auditor's merge order: dedup → health → reconciliation_monitor → expectancy_tracker → WS3-merge-gate → WS3-phase-2)
 - feat/expectancy-tracker · 59a3097 (auditor read-only)
