@@ -599,6 +599,16 @@ class SwingTrader:
             self._record("resume", cleared_reason=intent.get("previous_reason"))
         for sid, ss in self.s.sleeves.items():
             if ss.state == SleeveStateEnum.HALTED:
+                # Auditor 2026-07-14 Tier 2 (a): reentry_reeval expire halts are
+                # deliberate near-expiry exits, NOT safety halts to auto-recover.
+                # Resuming them re-arms a buy that will just expire again next
+                # tick. Skip; require the user to roll the contract + re-enable
+                # the sleeve explicitly.
+                import reentry_reeval as _rr
+                if _rr.is_expire_halt(ss.halt_reason):
+                    self._record("sleeve_resume_skipped_expire",
+                                 sleeve_id=sid, halt_reason=ss.halt_reason)
+                    continue
                 # Restore whatever the sleeve was doing before the halt so a
                 # sleeve that halted while ARMED_BUY (mid-cycle, holding no
                 # contracts, waiting to rebuy) resumes as ARMED_BUY. Falling
@@ -1741,7 +1751,8 @@ class SwingTrader:
         if ss.state != SleeveStateEnum.HALTED:
             ss.pre_halt_state = ss.state.value
         ss.state = SleeveStateEnum.HALTED
-        ss.halt_reason = f"reentry_reeval expire: {dec.why}"
+        import reentry_reeval as _rr
+        ss.halt_reason = f"{_rr.EXPIRE_HALT_PREFIX} {dec.why}"
         self._save_state()
         self._record("reentry_reeval_expired",
                      sleeve_id=sc.id, sleeve_name=sc.name,

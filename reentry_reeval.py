@@ -23,6 +23,20 @@ Discipline (why this isn't FOMO):
 from dataclasses import dataclass
 
 
+# Public sentinel prefix — swing_leg + any future halt-recovery / audit code
+# uses is_expire_halt(reason) to identify halts placed by evaluate_pending's
+# "expire" branch so they aren't auto-resumed / counted as safety halts.
+EXPIRE_HALT_PREFIX = "reentry_reeval expire:"
+
+
+def is_expire_halt(reason) -> bool:
+    """True iff `reason` is a halt placed by the reentry_reeval expire path.
+    Used by halt-recovery loops and by audit/reconciliation counts that should
+    NOT treat these as safety halts (they are legitimate near-expiry exits,
+    not a reversible bot error)."""
+    return isinstance(reason, str) and reason.startswith(EXPIRE_HALT_PREFIX)
+
+
 @dataclass
 class ReevalParams:
     stale_after_bars: int = 20         # time trigger: re-evaluate after this many bars unfilled
@@ -49,6 +63,14 @@ class ReevalDecision:
     why: str
 
 
+def _material_move(new_px, resting_px, atr, min_move_x_atr):
+    """True only if the new level differs from the resting order by a meaningful amount.
+    Anti-thrash gate (auditor 2026-07-14 Tier 1): the DRIFT trigger fires
+    every tick while price stays elevated; without this, a proposed reanchor
+    that's ~equal to the resting price would cancel-replace every tick."""
+    return resting_px is None or abs(new_px - resting_px) >= min_move_x_atr * atr
+
+
 def evaluate_pending(*, elapsed_bars, price, last_sale_px, resting_buy_px,
                      atr, htf_slope, trend_strength, dc_high, fast_ema,
                      near_expiry, params: ReevalParams) -> ReevalDecision:
@@ -67,22 +89,14 @@ def evaluate_pending(*, elapsed_bars, price, last_sale_px, resting_buy_px,
         return ReevalDecision("hold", resting_buy_px, "stale but no confirmed new uptrend; keep waiting")
 
     ceiling = last_sale_px + params.max_reanchor_x_atr * atr      # anti-chase cap
-    min_move = params.reanchor_min_move_x_atr * atr                # material-move gate (Tier 1 anti-thrash)
 
     # 3. Re-anchor to a PULLBACK in the new trend (buy the dip, not the chase).
     pullback_px = fast_ema - params.reentry_x_atr * atr
     new_buy_px = min(pullback_px, ceiling)
     if new_buy_px < price:                                        # genuine pullback: we wait BELOW price
-        # Anti-thrash (auditor 2026-07-14 Tier 1 fix): if the proposed new
-        # buy_px is within reanchor_min_move_x_atr * ATR of the current
-        # resting order, no material change — HOLD to prevent the
-        # cancel-replace loop that would otherwise fire every tick while
-        # price stays elevated above last_sale + drift_trigger_x_atr*ATR.
-        if abs(new_buy_px - resting_buy_px) < min_move:
+        if not _material_move(new_buy_px, resting_buy_px, atr, params.reanchor_min_move_x_atr):
             return ReevalDecision("hold", resting_buy_px,
-                f"drift/stale but proposed reanchor ({new_buy_px:.6f}) "
-                f"within {params.reanchor_min_move_x_atr}xATR of resting "
-                f"({resting_buy_px:.6f}); no material move — hold")
+                                  "new level within min-move of resting; no reanchor (anti-thrash)")
         return ReevalDecision("reanchor", round(new_buy_px, 6),
                               "re-anchor to pullback in new uptrend (capped)")
 
@@ -92,12 +106,9 @@ def evaluate_pending(*, elapsed_bars, price, last_sale_px, resting_buy_px,
     if params.allow_breakout_when_stale and stale and trend_strength >= params.trend_strength_min:
         bo_px = min(dc_high, ceiling)                            # Turtle breakout, still capped
         if bo_px <= ceiling:
-            # Same material-move guard for breakouts (Tier 1 anti-thrash).
-            if abs(bo_px - resting_buy_px) < min_move:
+            if not _material_move(bo_px, resting_buy_px, atr, params.reanchor_min_move_x_atr):
                 return ReevalDecision("hold", resting_buy_px,
-                    f"breakout candidate ({bo_px:.6f}) within "
-                    f"{params.reanchor_min_move_x_atr}xATR of resting "
-                    f"({resting_buy_px:.6f}); no material move — hold")
+                                      "breakout level within min-move of resting; no replace (anti-thrash)")
             return ReevalDecision("breakout", round(bo_px, 6),
                                   "Turtle breakout continuation (strong trend, pullback never came)")
     return ReevalDecision("hold", resting_buy_px, "extended beyond chase cap; wait for pullback/expiry")

@@ -260,7 +260,7 @@ def test_tier1_material_move_guard_pure_hold(tmp_path):
     )
     # pullback_px = 60.8, resting = 60.8, diff = 0.0 < 0.5*0.5 = 0.25 → HOLD
     assert dec.action == "hold", f"Expected hold, got {dec.action}: {dec.why}"
-    assert "no material move" in dec.why.lower() or "material" in dec.why.lower()
+    assert "anti-thrash" in dec.why.lower() or "min-move" in dec.why.lower()
 
 
 def test_tier1_material_move_guard_pure_reanchor_when_moved(tmp_path):
@@ -421,6 +421,58 @@ def test_tier2_no_rearm_after_expire(tmp_path, monkeypatch):
     # No additional broker calls between first and second (second was a no-op)
     assert mock.calls == calls_after_first, (
         f"Second call after expire made broker calls: {mock.calls[len(calls_after_first):]}")
+
+
+# ---- Tier 2 (a) — halt-recovery skips reentry_reeval expire halts --------
+
+def test_tier2a_is_expire_halt_helper():
+    """The public helper identifies expire halts + nothing else."""
+    import reentry_reeval as rr
+    assert rr.is_expire_halt("reentry_reeval expire: near-expiry")
+    assert rr.is_expire_halt(f"{rr.EXPIRE_HALT_PREFIX} anything")
+    assert not rr.is_expire_halt("safety halt: drawdown")
+    assert not rr.is_expire_halt("")
+    assert not rr.is_expire_halt(None)
+
+
+def test_tier2a_resume_skips_expire_halt(tmp_path, monkeypatch):
+    """When the user hits Resume via resume_intent, sleeves halted with a
+    reentry_reeval expire reason must be SKIPPED — resuming would just
+    re-arm a buy that expires next tick (contract still near expiry)."""
+    trader, store, log = _make_trader(tmp_path, mode="expert")
+    sc, ss = _get_sleeve(trader)
+    # Simulate the sleeve was already expired by reentry_reeval
+    import reentry_reeval as rr
+    ss.state = SleeveStateEnum.HALTED
+    ss.halt_reason = f"{rr.EXPIRE_HALT_PREFIX} extended, no pullback room before expiry"
+    ss.pre_halt_state = SleeveStateEnum.ARMED_BUY.value
+    ss.live_order_id = None
+    # Trigger the Resume path: dashboard writes resume_intent, bot consumes
+    store.put_resume_intent(TENANT, SYMBOL, {"halt": False, "previous_reason": "expired"})
+    trader._maybe_consume_resume_intent()
+
+    # Sleeve should STILL be HALTED (skipped, not resumed)
+    assert ss.state == SleeveStateEnum.HALTED, (
+        f"Expire halt should not auto-resume; got {ss.state}")
+    assert ss.halt_reason and ss.halt_reason.startswith(rr.EXPIRE_HALT_PREFIX)
+    # A "skipped" event should be recorded
+    events = list(log.events())
+    kinds = [e.get("event_type") for e in events]
+    assert "sleeve_resume_skipped_expire" in kinds
+
+
+def test_tier2a_resume_works_for_non_expire_halts(tmp_path):
+    """Positive control: a non-expire halt (e.g. safety halt) DOES resume."""
+    trader, store, log = _make_trader(tmp_path, mode="expert")
+    sc, ss = _get_sleeve(trader)
+    ss.state = SleeveStateEnum.HALTED
+    ss.halt_reason = "portfolio drawdown breach"
+    ss.pre_halt_state = SleeveStateEnum.ARMED_BUY.value
+    ss.live_order_id = None
+    store.put_resume_intent(TENANT, SYMBOL, {"halt": False, "previous_reason": "drawdown"})
+    trader._maybe_consume_resume_intent()
+    # Should have resumed to pre_halt_state
+    assert ss.state == SleeveStateEnum.ARMED_BUY
 
 
 # ---- Tier 3 — trade-log event emitted per action ------------------------
