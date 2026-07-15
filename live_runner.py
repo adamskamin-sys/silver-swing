@@ -383,14 +383,23 @@ def run() -> int:
     class _NonPrimaryTrack:
         __slots__ = ("product_id", "feed", "trader",
                      "consecutive_step_failures", "last_step_ok_ts",
-                     "last_tick_seen_ts")
+                     "last_tick_seen_ts", "spawn_ts")
         def __init__(self, product_id, feed, trader):
             self.product_id = product_id
             self.feed = feed
             self.trader = trader
             self.consecutive_step_failures = 0
-            self.last_step_ok_ts = time.time()
+            # Adam 2026-07-15: init to 0 (was time.time()). Prior init to
+            # spawn time made a Track that spawned but never stepped look
+            # 'recently active' for the first 5 min. That defeated the
+            # zombie check — a Track whose feed never produces a ticker
+            # got a false 'alive' signal until 5 min after spawn.
+            # Now: last_step_ok_ts stays 0 until step() actually succeeds.
+            # The zombie check treats 0 as "infinite age" → detects
+            # immediately. spawn_ts preserved for observability.
+            self.last_step_ok_ts = 0.0
             self.last_tick_seen_ts = 0.0
+            self.spawn_ts = time.time()
         def close(self):
             try: self.feed.stop()
             except Exception: pass
