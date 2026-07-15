@@ -293,12 +293,14 @@ function escapeHtml(s) {
 // ---- asset class inference ----------------------------------------------
 
 function assetClassOf(symbol) {
-  // Coinbase CFM nano futures: SLR = silver, NOL = nano oil, GC = gold, etc.
-  // Traditional futures tickers (CL/NG/BZ) covered too. Crypto perps look
-  // like BTC-PERP-INTX.
-  if (/^(SLR|SIL|GC|GOLD|PA|PL|HG|COPPER)/.test(symbol)) return 'metals';
-  if (/^(NOL|CL|NG|BZ|RB|HO)/.test(symbol)) return 'energy';
-  if (/-PERP-/.test(symbol) || /^(BTC|ETH|SOL|BCH|LTC|XRP)-/.test(symbol)) return 'crypto';
+  // Adam 2026-07-15: expanded to mirror correlation.CORRELATION_FAMILIES
+  // (Python). Prior regex missed SLVR, COPR, CU, PLAT, NGS, BIT, HYP,
+  // HYF, XLM, XLP, ZEC, NER, SUI, AVE, ENA, PEP — every crypto perp
+  // + several metals fell through to 'other', hiding cluster risk.
+  if (/^(SLR|SIL|SLVR|GC|GOLD|GLD|PA|PL|PT|HG|COPPER|COPR|CU|PLAT)/.test(symbol)) return 'metals';
+  if (/^(NOL|CL|NG|BZ|RB|HO|OIL|NGS|NAT_GAS)/.test(symbol)) return 'energy';
+  if (/-PERP-/.test(symbol) ||
+      /^(BTC|BIT|ETH|SOL|BCH|LTC|XRP|ZEC|HYP|HYPE|HYF|XLM|XLP|NER|NEAR|SUI|AVE|ENA|PEP|DOGE|LINK|UNI|MATIC)-/.test(symbol)) return 'crypto';
   if (/^(ES|NQ|YM|RTY)/.test(symbol)) return 'equity';
   return 'other';
 }
@@ -526,6 +528,49 @@ function renderCockpit(store) {
     }
   }
 
+  // Adam 2026-07-15: cluster-exposure tile — flag when one asset class
+  // holds an outsized share of held notional. Correlated peers crash
+  // together (BTC dumps → crypto perps all follow), so cross-sleeve
+  // concentration is real risk that per-sleeve Kelly doesn't see.
+  // Reads live per-product portfolio snapshot for held-position notional.
+  // Reports the biggest cluster with % of total. Green < 40%, amber
+  // 40-60%, red > 60%. Doesn't gate anything — observational so Adam
+  // can decide whether to add a hard cap.
+  const clusterNotional = {};
+  let clusterTotal = 0;
+  const portfolioEntry = tenantStore['__portfolio__'] || {};
+  const portfolioState = portfolioEntry.state || {};
+  for (const [productId, snap] of Object.entries(portfolioState)) {
+    if (!snap || typeof snap !== 'object') continue;
+    if (productId.startsWith('__')) continue;
+    const qty = Math.abs(Number(snap.position_qty) || 0);
+    const mark = Number(snap.last_mark) || 0;
+    const contractSize = Number(snap.contract_size) || 1;
+    const notional = qty * mark * contractSize;
+    if (notional <= 0) continue;
+    const cls = assetClassOf(productId);
+    clusterNotional[cls] = (clusterNotional[cls] || 0) + notional;
+    clusterTotal += notional;
+  }
+  let clusterTop = null;
+  let clusterTopPct = 0;
+  for (const [cls, val] of Object.entries(clusterNotional)) {
+    const pct = clusterTotal > 0 ? val / clusterTotal : 0;
+    if (pct > clusterTopPct) { clusterTop = cls; clusterTopPct = pct; }
+  }
+  const clusterPctStr = clusterTop ? `${(clusterTopPct * 100).toFixed(0)}%` : '—';
+  const clusterCls = clusterTopPct >= 0.60 ? 'ck-danger'
+                    : clusterTopPct >= 0.40 ? 'ck-warn'
+                    : 'ck-ok';
+  const clusterTip = clusterTop
+    ? `Biggest cluster: ${clusterTop} = ${clusterPctStr} of held notional ($${fmtMoney(clusterNotional[clusterTop] || 0)} / $${fmtMoney(clusterTotal)}). All held products: ` +
+      Object.entries(clusterNotional).map(([c, v]) => `${c} $${fmtMoney(v)}`).join(', ') +
+      '. Green < 40%, amber 40-60%, red > 60% (correlated tail risk).'
+    : 'No held positions — cluster exposure N/A.';
+  const clusterValue = clusterTop
+    ? `<span class="ck-chip ${clusterCls}" title="${escapeHtml(clusterTip)}">${clusterTop} ${clusterPctStr}</span>`
+    : '<span class="ck-chip ck-ok" title="No held positions.">—</span>';
+
   // [crew 2026-07-14] reconciliation_monitor findings — counts critical +
   // warn reconciliation_* events in the last 15min window scoped to the
   // active tenant. Surfaces the auditor's read-only defense visually.
@@ -557,6 +602,7 @@ function renderCockpit(store) {
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
     <div class="ck-tile" title="Realized P&amp;L across all sleeve + primary cycles that fired in the last 24 hours on the ${activeMode} tenant. Sums sleeve_cycle_completed.cycle_pnl and cycle_completed (gross − fees)."><div class="ck-label">24h realized</div><div class="ck-value ${classForValue(realized24h)}">${realized24h >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realized24h))}</div></div>
     <div class="ck-tile" title="Total realized P&amp;L since bot start (all sleeve + primary cycles ever completed on the ${activeMode} tenant). ${realizedSinceStartCycles} cycles. Reads persisted state, so survives log rotation and reflects any state_patch backfills."><div class="ck-label">total realized</div><div class="ck-value ${classForValue(realizedSinceStart)}">${realizedSinceStart >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realizedSinceStart))}<span style="font-size:0.6em;opacity:0.6;margin-left:0.3em;font-weight:normal">${realizedSinceStartCycles}c</span></div></div>
+    <div class="ck-tile"><div class="ck-label">cluster risk</div><div class="ck-value">${clusterValue}</div></div>
     <div class="ck-tile"><div class="ck-label">reconciliation</div><div class="ck-value">${reconValue}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
