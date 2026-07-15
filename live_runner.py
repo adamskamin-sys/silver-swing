@@ -361,57 +361,227 @@ def run() -> int:
     # Cache one SwingTrader per non-primary product; each shares the tenant
     # kill switch + trade log but has its own CoinbaseBroker (broker is
     # tied to a product_id). Traders are created lazily on first tick.
-    _non_primary_traders: dict[str, SwingTrader] = {}
-    def _get_or_create_non_primary_trader(product_id: str):
+    # 2026-07-14 full parity refactor. Each held non-primary product gets
+    # its own {feed, trader, failure counter}. Structurally treats all
+    # products equally (per project_silver_not_special.md) — the only
+    # remaining "primary" concept is the boot-time SYMBOL that seeds the
+    # dedicated WS feed above. All others get sub-second WS ticks too.
+    class _NonPrimaryTrack:
+        __slots__ = ("product_id", "feed", "trader",
+                     "consecutive_step_failures", "last_step_ok_ts",
+                     "last_tick_seen_ts")
+        def __init__(self, product_id, feed, trader):
+            self.product_id = product_id
+            self.feed = feed
+            self.trader = trader
+            self.consecutive_step_failures = 0
+            self.last_step_ok_ts = time.time()
+            self.last_tick_seen_ts = 0.0
+        def close(self):
+            try: self.feed.stop()
+            except Exception: pass
+
+    _non_primary_tracks: dict[str, "_NonPrimaryTrack"] = {}
+    # problem-scout #3 (v2): cooldown between an eviction and a re-creation
+    # attempt on the same product. Prevents infinite create-fail-evict
+    # loops that would burn Coinbase auth handshakes and could rate-limit
+    # us off the primary feed too.
+    _non_primary_last_evict_ts: dict[str, float] = {}
+    EVICT_COOLDOWN_SECS = float(os.getenv("SWING_EVICT_COOLDOWN_SECS", "900.0"))  # 15 min
+    # Aggressive re-sync threshold: if a product's WS feed hasn't produced
+    # a tick in this many seconds (and it's been alive that long),
+    # tear down and restart the feed. Adam's 2026-07-14 rule: "catch up
+    # + sync, never halt."
+    FEED_STALE_THRESHOLD_SECS = float(os.getenv("SWING_FEED_STALE_SECS", "60.0"))
+    # After N consecutive step failures on a track, evict + log a WARN so
+    # a silently-broken trader doesn't sit forever pretending to work.
+    STEP_FAILURE_EVICT_THRESHOLD = int(os.getenv("SWING_STEP_FAIL_EVICT", "10"))
+    # Reconcile fills that predate this many hours are treated as stale
+    # (clear the live_order_id, don't credit as fresh) — problem-scout #3.
+    # 24h default covers "sleeve went silent overnight and orders may have
+    # filled at Coinbase" without swallowing legitimate recent activity.
+    STALE_HEARTBEAT_HOURS = float(os.getenv("SWING_STALE_HEARTBEAT_HOURS", "24.0"))
+
+    def _clear_stale_sleeve_order_ids(product_id: str) -> None:
+        """problem-scout #3 (v2, post-review): before creating a new trader,
+        clear any live_order_ids on sleeves whose last activity is older
+        than STALE_HEARTBEAT_HOURS. Prevents `_on_fill` from crediting a
+        months-old FILLED order as a fresh cycle, which would pollute
+        realized_pnl + cycles + trigger an expert-reanchor at a stale
+        basis and possibly place a live-crossing buy.
+
+        Field names verified against sleeves.py: sleeves have
+        `armed_buy_since_ts`, not `last_heartbeat_ts` or `armed_at`.
+        Parent SwingState has `last_heartbeat_ts` (updated on every
+        _save_state) — use it as the "did this trader tick lately"
+        signal when the sleeve has no armed_buy_since_ts."""
+        try:
+            st = store.get_state(TENANT, product_id) or {}
+            sleeves = st.get("sleeves") or {}
+            if not sleeves:
+                return
+            now_ts = time.time()
+            cutoff = STALE_HEARTBEAT_HOURS * 3600
+            parent_hb = float(st.get("last_heartbeat_ts") or 0)
+            dirty = False
+            for sid, ss in sleeves.items():
+                if not ss.get("live_order_id"):
+                    continue
+                # Sleeve's own heartbeat first (when ARMED_BUY), else fall
+                # back to the parent trader's heartbeat — if the whole
+                # trader hasn't ticked lately, all sleeve state is stale.
+                sleeve_hb = float(ss.get("armed_buy_since_ts") or 0)
+                hb = sleeve_hb or parent_hb
+                if hb and (now_ts - hb) > cutoff:
+                    _log(f"[non-primary] {product_id}/{sid}: clearing stale "
+                         f"live_order_id={ss['live_order_id']} "
+                         f"({(now_ts - hb) / 3600:.1f}h old)")
+                    ss["live_order_id"] = None
+                    dirty = True
+            if dirty:
+                st["sleeves"] = sleeves
+                store.put_state(TENANT, product_id, st)
+        except Exception as e:
+            _log(f"[non-primary] {product_id}: stale-heartbeat guard failed: "
+                 f"{type(e).__name__}: {e}")
+
+    def _get_or_create_non_primary_track(product_id: str):
+        """Lazy-instantiate a per-product WebSocket feed + SwingTrader.
+        Returns None if the product should be skipped (primary, reserved
+        key, no config, kill switch active, in eviction cooldown, or
+        creation error)."""
         if product_id == SYMBOL or product_id.startswith("__"):
             return None
-        if product_id in _non_primary_traders:
-            return _non_primary_traders[product_id]
-        # 2026-07-14 problem-scout #2: refuse creation for products with
-        # no config. SwingConfig defaults are SLR-calibrated (core=10,
-        # swing_qty=2, sell_px=65, abort=60/70) — wrong for BTC ($65k),
-        # gas ($2), etc. Would fire CRIT halts + potentially place limit
-        # orders at nonsense prices on the first tick. main.py's
-        # _sync_live_portfolio seeds configs for every held product; if
-        # one arrives here without a config, a HUMAN needs to fix it in
-        # the dashboard before we tick.
+        if product_id in _non_primary_tracks:
+            return _non_primary_tracks[product_id]
+        # problem-scout #3 (v2): eviction cooldown. If we evicted this
+        # product recently, don't re-create it until the cooldown expires
+        # — else a persistent per-product failure (bad config, delisted,
+        # auth error) becomes an infinite create/fail/evict loop that
+        # would burn Coinbase auth handshakes and could get us rate-
+        # limited off the primary feed.
+        last_evict = _non_primary_last_evict_ts.get(product_id, 0.0)
+        if last_evict and (time.time() - last_evict) < EVICT_COOLDOWN_SECS:
+            return None  # silent — we already logged the eviction
+        # problem-scout #2: refuse creation with no config (SwingConfig
+        # defaults are SLR-calibrated → wrong for other products).
         cfg = store.get_config(TENANT, product_id) or {}
         if not cfg:
-            _log(f"[non-primary] {product_id}: no config in store, SKIPPING "
-                 f"trader creation (configure via dashboard first)")
+            _log(f"[non-primary] {product_id}: no config, SKIPPING "
+                 f"(configure via dashboard first)")
             return None
-        # 2026-07-14 problem-scout #5: kill switch check. The primary
-        # trader gets full preflight (kill-switch, session, roll, position
-        # vs floor) BEFORE construction. Non-primary must at minimum
-        # respect the kill switch, since reconcile() below can trigger
-        # _sleeve_on_fill → _maybe_expert_reanchor_after_sell which can
-        # place orders. The kill switch is Adam's "everything stop NOW."
+        # problem-scout #5: respect the kill switch before construction.
         try:
             if ks.is_active():
-                _log(f"[non-primary] {product_id}: kill switch active, "
-                     f"SKIPPING trader creation")
+                _log(f"[non-primary] {product_id}: kill switch active, SKIPPING")
                 return None
         except Exception:
-            pass  # be permissive on the check itself — don't block creation
+            pass
         try:
+            # problem-scout #3 (v2): clear stale sleeve order IDs BEFORE
+            # reconcile so _sleeve_on_fill can't credit ancient fills as
+            # fresh cycles (would pollute realized_pnl + cycles + trigger
+            # an expert-reanchor at a stale basis).
+            _clear_stale_sleeve_order_ids(product_id)
             prod_coinbase = CoinbaseBroker(BrokerConfig(product_id=product_id))
             prod_broker = DryRunBroker(prod_coinbase) if dry_run else prod_coinbase
             prod_trader = SwingTrader(prod_broker, store, TENANT, product_id,
                                       trade_log=log, kill_switch=ks, notifier=notifier)
-            # Reconcile once so the trader credits any fills that happened
-            # while this product had no active trader (paper-suspended window).
+            # problem-scout #4 (v2): DO NOT call normalize_primary_swing_qty
+            # on non-primary traders. The normalizer HALTs on drift; for
+            # non-primary products (which mostly run swing_qty=0 + sleeves
+            # only), a HALT would silently freeze the sleeve overnight —
+            # the opposite of the goal. Instead: LOG drift but don't act.
+            # A human sees the log line and can decide whether to clamp.
+            try:
+                st = store.get_state(TENANT, product_id) or {}
+                cfg_sq = int(cfg.get("swing_qty") or 0)
+                st_sq = int(st.get("swing_qty") or 0)
+                if st_sq != cfg_sq:
+                    _log(f"[non-primary] {product_id} state.swing_qty={st_sq} "
+                         f"drifted from config.swing_qty={cfg_sq} — LOGGING "
+                         f"ONLY (not halting; manual clamp via dashboard "
+                         f"if needed)")
+            except Exception:
+                pass
+            # Initial reconcile (safe now — stale ids cleared above).
             try:
                 prod_trader.reconcile()
             except Exception as e:
                 _log(f"[non-primary] {product_id} initial reconcile failed: "
                      f"{type(e).__name__}: {e}")
-            _non_primary_traders[product_id] = prod_trader
-            _log(f"[non-primary] created trader for {product_id}")
-            return prod_trader
+            # Per-product WebSocket feed for sub-second ticks. Non-blocking
+            # start; we don't wait_for_first_tick (would serialize boot
+            # across 10+ products). If no tick has arrived on a given loop
+            # iteration, that product simply skips this tick.
+            prod_feed = LiveTickerFeed(product_id)
+            try:
+                prod_feed.start()
+            except Exception as e:
+                # problem-scout #8: don't leak a started feed on partial init.
+                try: prod_feed.stop()
+                except Exception: pass
+                raise
+            track = _NonPrimaryTrack(product_id, prod_feed, prod_trader)
+            _non_primary_tracks[product_id] = track
+            _log(f"[non-primary] track online: {product_id} (feed started)")
+            return track
         except Exception as e:
-            _log(f"[non-primary] {product_id} trader creation failed: "
+            _log(f"[non-primary] {product_id} track creation failed: "
                  f"{type(e).__name__}: {e}")
             return None
+
+    def _maybe_resync_stale_feed(track) -> None:
+        """Adam's 2026-07-14 marks-in-sync rule: never halt on stale data
+        — aggressively re-sync. If the feed hasn't produced a fresh tick
+        in FEED_STALE_THRESHOLD_SECS (and the track has been alive long
+        enough for that to be diagnostic, not startup lag), tear down
+        and restart the feed.
+
+        problem-scout #2 (v2): use time.time() when we see any ticker
+        (rather than parsing t['ts'] which is an ISO string from Coinbase
+        that float() can't parse — would silently ValueError every tick)."""
+        try:
+            t = track.feed.latest_ticker()
+            now_ts = time.time()
+            if t is not None:
+                # Fresh tick received (any ticker at all counts as "not
+                # stale") — mark the seen-at time as now.
+                track.last_tick_seen_ts = now_ts
+            reference_ts = track.last_tick_seen_ts or track.last_step_ok_ts
+            age = now_ts - reference_ts
+            if age > FEED_STALE_THRESHOLD_SECS:
+                _log(f"[non-primary] {track.product_id}: feed stale "
+                     f"({age:.1f}s), restarting")
+                try: track.feed.stop()
+                except Exception: pass
+                new_feed = LiveTickerFeed(track.product_id)
+                new_feed.start()
+                track.feed = new_feed
+                # Give the new feed one full staleness window before we'd
+                # decide to restart it again — prevents restart-storm on
+                # a persistently broken feed.
+                track.last_tick_seen_ts = now_ts
+        except Exception as e:
+            _log(f"[non-primary] {track.product_id}: feed re-sync failed: "
+                 f"{type(e).__name__}: {e}")
+
+    def _evict_track(product_id: str, reason: str) -> None:
+        track = _non_primary_tracks.pop(product_id, None)
+        if track is None:
+            return
+        try: track.close()
+        except Exception: pass
+        # Record eviction time for the cooldown check in the create path
+        # (problem-scout #3 v2 — prevents infinite create/evict loops).
+        _non_primary_last_evict_ts[product_id] = time.time()
+        _log(f"[non-primary] {product_id}: EVICTED ({reason}) — cooldown "
+             f"{int(EVICT_COOLDOWN_SECS)}s before re-create attempt")
+        try:
+            _health.record_error(store, "non_primary_track", TENANT,
+                                 RuntimeError(f"{product_id}: {reason}"))
+        except Exception:
+            pass
 
     # Boot-time state coherence check — prevents the 2026-07-14 SLR class of bug
     # where runtime state.swing_qty drifts above config.swing_qty and gets stuck
@@ -498,8 +668,48 @@ def run() -> int:
             if t is None:
                 time.sleep(0.1)
                 continue
-            trader.step(t["price"])
+            # problem-scout #6 (v2): wrap the primary step so a transient
+            # error (e.g. Coinbase 500 during order_status) doesn't crash
+            # the loop and take down every non-primary sibling track with
+            # it via process restart. Mirror the non-primary wrapper.
+            try:
+                trader.step(t["price"])
+            except Exception as e:
+                _log(f"[primary] {SYMBOL} step failed: {type(e).__name__}: {e}")
+                try:
+                    _health.record_error(store, "primary_step", TENANT, e,
+                                         trade_log=log)
+                except Exception:
+                    pass
             now = time.time()
+            # 2026-07-14 full parity: tick each non-primary track on the
+            # SAME loop cadence as the primary, using each product's own
+            # WS-ticker price. Sub-second reactions for all products.
+            # Wrapped so one bad product can never take down siblings or
+            # the primary loop. Failure counter evicts traders that fail
+            # STEP_FAILURE_EVICT_THRESHOLD ticks in a row.
+            if TICK_NON_PRIMARY:
+                _to_evict = []
+                for _pid, _track in list(_non_primary_tracks.items()):
+                    # Aggressive re-sync if the feed has gone quiet.
+                    _maybe_resync_stale_feed(_track)
+                    _tt = _track.feed.latest_ticker()
+                    if _tt is None:
+                        continue  # WS still spinning up, skip this iter
+                    try:
+                        _track.trader.step(float(_tt["price"]))
+                        _track.consecutive_step_failures = 0
+                        _track.last_step_ok_ts = now
+                    except Exception as e:
+                        _track.consecutive_step_failures += 1
+                        _log(f"[non-primary] {_pid} step failed "
+                             f"({_track.consecutive_step_failures}/"
+                             f"{STEP_FAILURE_EVICT_THRESHOLD}): "
+                             f"{type(e).__name__}: {e}")
+                        if _track.consecutive_step_failures >= STEP_FAILURE_EVICT_THRESHOLD:
+                            _to_evict.append(_pid)
+                for _pid in _to_evict:
+                    _evict_track(_pid, f"{STEP_FAILURE_EVICT_THRESHOLD} consecutive step failures")
             # Periodic front-month recheck. If Coinbase has rolled the family,
             # halt with a clear reason so the next restart picks up the new
             # symbol. We don't hot-swap the WS feed mid-session (real risk of
@@ -550,9 +760,9 @@ def run() -> int:
                 # ticks). Each product wrapped so one bad reconcile can never
                 # take down siblings.
                 if TICK_NON_PRIMARY:
-                    for _pid, _npt in list(_non_primary_traders.items()):
+                    for _pid, _tr in list(_non_primary_tracks.items()):
                         try:
-                            _npt.reconcile()
+                            _tr.trader.reconcile()
                         except Exception as e:
                             _log(f"[non-primary] {_pid} periodic reconcile "
                                  f"failed: {type(e).__name__}: {e}")
@@ -766,37 +976,18 @@ def run() -> int:
                     # snapshot flags (see main.py:261). We add the health
                     # record here for the wrapper site itself.
                     _health.record_ok(store, "portfolio_refresh", TENANT)
-                    # 2026-07-14 non-primary tick — piggyback on the fresh
-                    # portfolio snapshot. For each held non-primary product,
-                    # get-or-create its SwingTrader and step() it with the
-                    # just-fetched Coinbase mark. Each product step is wrapped
-                    # so one bad product can never take down siblings or the
-                    # primary loop.
+                    # 2026-07-14 full parity — discovery only here. Each
+                    # non-primary product's actual tick happens on the outer
+                    # loop cadence (below) using its own WS feed, not the
+                    # portfolio poll. This block just ensures a track exists
+                    # for every currently held product.
                     if TICK_NON_PRIMARY:
                         snap = store.get_config(live_tenant, "__portfolio__") or {}
                         for deriv in (snap.get("derivatives") or []):
                             pid = deriv.get("product_id")
-                            mark = (deriv.get("mark_price")
-                                    or deriv.get("mark")
-                                    or deriv.get("last"))
-                            if not pid or mark is None or pid == SYMBOL:
+                            if not pid or pid == SYMBOL or pid.startswith("__"):
                                 continue
-                            if pid.startswith("__"):
-                                continue
-                            try:
-                                mark_f = float(mark)
-                            except (TypeError, ValueError):
-                                continue
-                            if mark_f <= 0:
-                                continue
-                            np_trader = _get_or_create_non_primary_trader(pid)
-                            if np_trader is None:
-                                continue
-                            try:
-                                np_trader.step(mark_f)
-                            except Exception as e:
-                                _log(f"[non-primary] {pid} step failed: "
-                                     f"{type(e).__name__}: {e}")
+                            _get_or_create_non_primary_track(pid)
                 except Exception as e:
                     _log(f"portfolio refresh failed: {type(e).__name__}: {e}")
                     # NOTE: no trade_log= arg here. refresh_portfolio_snapshot
@@ -855,6 +1046,12 @@ def run() -> int:
 
     finally:
         feed.stop()
+        # 2026-07-14 full parity: cleanly close every per-product WS feed
+        # on shutdown so we don't leak connections back to Coinbase across
+        # deploys/restarts.
+        for _pid, _tr in list(_non_primary_tracks.items()):
+            try: _tr.close()
+            except Exception: pass
         log.record("bot_stopped", mode=("dry_run" if dry_run else "live"))
     return 0
 
