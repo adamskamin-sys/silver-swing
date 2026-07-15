@@ -1734,6 +1734,46 @@ class SwingTrader:
             source="arm_level.pullback_buy_px (Chan OU + Connors)",
         )
 
+        # 2026-07-15 Phase 1 tile visibility: also write the FULL expert
+        # snapshot (7-expert chain: Kaufman + Elder + Ehlers + Chan OU +
+        # Connors + VPIN + Vince + KAMA + Fisher) to Redis so the dashboard
+        # can render "what the experts say right now" in the sleeve editor.
+        # Fail-safe — if compute_reentry errors, we've already done the
+        # refresh, so just skip the snapshot write.
+        try:
+            import experts_reentry as _er
+            sold_ref = float(last_price)  # current market — matches auto-refresh anchor
+            snapshot_result = _er.compute_reentry(
+                prices=history, sold_price=sold_ref, spread=current_spread,
+                strategy_qty=int(getattr(sc, "qty", 1) or 1),
+            )
+            snapshot_payload = {
+                "product_id": self.symbol,
+                "tenant": self.tenant_id,
+                "sleeve_id": sc.id,
+                "generated_at": now,
+                "current_market": float(last_price),
+                "auto_refresh_last_buy_px": new_buy_px,
+                "auto_refresh_last_sell_px": new_sell_px,
+                "recommended_buy_px": snapshot_result.get("buy_px"),
+                "recommended_sell_px": snapshot_result.get("sell_px"),
+                "should_arm": snapshot_result.get("should_arm"),
+                "reasons": snapshot_result.get("reasons"),
+                "expert_snapshot": snapshot_result.get("expert_snapshot"),
+            }
+            # Write directly to Redis if the store is Redis-backed. Falls
+            # back gracefully for JSON-file test envs.
+            try:
+                if hasattr(self.store, "_r"):
+                    import json as _json
+                    key = f"expert_snapshot:{self.tenant_id}:{self.symbol}"
+                    self.store._r.set(key, _json.dumps(snapshot_payload), ex=300)
+            except Exception:
+                pass
+        except Exception as e:
+            self._record("expert_snapshot_write_error",
+                         sleeve_id=sc.id, error=str(e))
+
     def _maybe_reeval_pending_arm(self, sc, ss, last_price: float) -> None:
         """Wire reentry_reeval.evaluate_pending into the ARMED_BUY tick per
         auditor review gate 2026-07-14. Cancel-replace with confirmation.

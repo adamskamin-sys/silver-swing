@@ -807,6 +807,30 @@ export function makeApp({
   // Candles for the scanner's chart modal. Same Redis queue pattern as
   // backtest — dashboard queues, paper worker fetches from Coinbase, result
   // is cached ~60s so a re-open doesn't re-hit the API.
+  // 2026-07-15 Phase 1 tile visibility: read the latest expert snapshot
+  // written by the bot for a product. Bot writes on every successful auto-
+  // refresh (throttled to once/min per sleeve) with the full 7-expert chain
+  // output. Key TTL = 5 min so stale data doesn't linger.
+  app.get('/api/expert-live', requireAuth, async (req, res) => {
+    const tenant = String(req.query.tenant || '');
+    const product_id = String(req.query.product_id || '');
+    if (!tenant || !product_id) {
+      return res.status(400).json({ ok: false, error: 'tenant and product_id required' });
+    }
+    const r = await getRedis();
+    if (!r) return res.status(503).json({ ok: false, error: 'redis not configured' });
+    try {
+      const raw = await r.get(`expert_snapshot:${tenant}:${product_id}`);
+      if (!raw) {
+        return res.json({ ok: true, snapshot: null,
+                          note: 'no expert snapshot yet — will populate after next auto-refresh cycle (usually within 60s of sleeve becoming ARMED_BUY)' });
+      }
+      res.json({ ok: true, snapshot: JSON.parse(raw) });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   app.get('/api/candles', requireAuth, async (req, res) => {
     const product_id = String(req.query.product_id || '');
     const granularity = String(req.query.granularity || 'FIVE_MINUTE');
