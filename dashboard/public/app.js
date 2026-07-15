@@ -506,6 +506,26 @@ function renderCockpit(store) {
     }
   }
 
+  // Adam 2026-07-15: total realized SINCE bot start — sum every sleeve's
+  // realized_pnl + primary strategy realized_pnl across every product in
+  // the active tenant. Sources of truth are the persisted per-sleeve
+  // realized values (not the event log), so this survives log-rotation
+  // and reflects the state after any state_patch backfills.
+  let realizedSinceStart = 0;
+  let realizedSinceStartCycles = 0;
+  const tenantStore = (store || {})[tenant] || {};
+  for (const [symbol, entry] of Object.entries(tenantStore)) {
+    if (!entry || symbol.startsWith('__')) continue;
+    const st = entry.state || {};
+    realizedSinceStart += Number(st.realized_pnl) || 0;
+    realizedSinceStartCycles += Number(st.cycles) || 0;
+    const sleeves = st.sleeves || {};
+    for (const sid of Object.keys(sleeves)) {
+      realizedSinceStart += Number(sleeves[sid].realized_pnl) || 0;
+      realizedSinceStartCycles += Number(sleeves[sid].cycles) || 0;
+    }
+  }
+
   // [crew 2026-07-14] reconciliation_monitor findings — counts critical +
   // warn reconciliation_* events in the last 15min window scoped to the
   // active tenant. Surfaces the auditor's read-only defense visually.
@@ -536,6 +556,7 @@ function renderCockpit(store) {
     <div class="ck-tile"><div class="ck-label">${activeMode} status</div><div class="ck-value">${statusChip}</div></div>
     <div class="ck-tile"><div class="ck-label">unrealized P&amp;L</div><div class="ck-value ${classForValue(unreal)}">${unreal >= 0 ? '+' : '-'}${fmtMoney(Math.abs(unreal))}</div></div>
     <div class="ck-tile" title="Realized P&amp;L across all sleeve + primary cycles that fired in the last 24 hours on the ${activeMode} tenant. Sums sleeve_cycle_completed.cycle_pnl and cycle_completed (gross − fees)."><div class="ck-label">24h realized</div><div class="ck-value ${classForValue(realized24h)}">${realized24h >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realized24h))}</div></div>
+    <div class="ck-tile" title="Total realized P&amp;L since bot start (all sleeve + primary cycles ever completed on the ${activeMode} tenant). ${realizedSinceStartCycles} cycles. Reads persisted state, so survives log rotation and reflects any state_patch backfills."><div class="ck-label">total realized</div><div class="ck-value ${classForValue(realizedSinceStart)}">${realizedSinceStart >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realizedSinceStart))}<span style="font-size:0.6em;opacity:0.6;margin-left:0.3em;font-weight:normal">${realizedSinceStartCycles}c</span></div></div>
     <div class="ck-tile"><div class="ck-label">reconciliation</div><div class="ck-value">${reconValue}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
