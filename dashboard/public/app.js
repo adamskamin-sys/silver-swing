@@ -6553,12 +6553,14 @@ function renderCandleChart(candles, container, opts = {}) {
   const bbSeries   = indicatorOpts.bollinger ? computeBollingerSeries(closes) : null;
   const fisherSeries = indicatorOpts.fisher ? computeFisherSeries(closes) : null;
   const W = container.clientWidth || 900;
-  const H = 480;
+  const H = 500;  // bumped 480→500 to accommodate OHLC readout row
   // 2026-07-15 Coinbase-style layout: dedicated volume panel at the bottom.
   // If any candle has volume (index 5), reserve 60px for volume bars.
   const hasVolume = candles.some(c => c.length > 5 && Number(c[5]) > 0);
   const volH = hasVolume ? 60 : 0;
-  const padL = 80, padR = 20, padT = 20, padB = 40;
+  // 2026-07-15 Coinbase-style layout: reserve top row for OHLC readout
+  const ohlcH = 24;  // top row for OHLC readout (Coinbase-style)
+  const padL = 80, padR = 20, padT = 8 + ohlcH, padB = 40;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB - volH;
   const volTop = padT + plotH + 4;
@@ -6615,6 +6617,55 @@ function renderCandleChart(candles, container, opts = {}) {
 
   const parts = [];
   parts.push(`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">`);
+
+  // 2026-07-15 Coinbase-style OHLC readout at top-left. Shows the most
+  // recent candle's Open, High, Low, Close + absolute + pct change + volume.
+  // Color-coded green (close >= open) or red (close < open).
+  {
+    const lastC = candles[candles.length - 1];
+    if (lastC) {
+      const o = Number(lastC[1]);
+      const h = Number(lastC[2]);
+      const l = Number(lastC[3]);
+      const c = Number(lastC[4]);
+      const v = lastC.length > 5 ? Number(lastC[5]) || 0 : 0;
+      const chg = c - o;
+      const chgPct = o > 0 ? (chg / o) * 100 : 0;
+      const chgColor = chg >= 0 ? '#22c55e' : '#ef4444';
+      // Precision for the OHLC labels — use step precision if available,
+      // else fall back to yDec.
+      const px = (v) => v.toFixed(yDec);
+      const chgSign = chg >= 0 ? '+' : '';
+      const y = 14;  // baseline for OHLC row
+      let x = padL + 4;
+      const fs = 11;  // font-size
+      // Label pairs: [label, value, valueColor]
+      const items = [
+        { label: 'O', value: px(o), color: '#cbd5e1' },
+        { label: 'H', value: px(h), color: '#cbd5e1' },
+        { label: 'L', value: px(l), color: '#cbd5e1' },
+        { label: 'C', value: px(c), color: chgColor },
+      ];
+      for (const it of items) {
+        // Label (dim)
+        parts.push(`<text x="${x.toFixed(1)}" y="${y}" fill="#64748b" font-size="${fs}" font-family="ui-monospace,monospace">${it.label}</text>`);
+        x += (it.label.length * 7) + 4;  // approx label width + spacing
+        // Value (colored)
+        parts.push(`<text x="${x.toFixed(1)}" y="${y}" fill="${it.color}" font-size="${fs}" font-family="ui-monospace,monospace" font-weight="600">${it.value}</text>`);
+        x += (it.value.length * 7) + 10;  // approx value width + spacing
+      }
+      // Change amount + pct (colored)
+      const chgText = `${chgSign}${px(chg)} (${chgSign}${chgPct.toFixed(2)}%)`;
+      parts.push(`<text x="${x.toFixed(1)}" y="${y}" fill="${chgColor}" font-size="${fs}" font-family="ui-monospace,monospace" font-weight="600">${chgText}</text>`);
+      x += chgText.length * 7 + 10;
+      // Volume (if present)
+      if (v > 0) {
+        parts.push(`<text x="${x.toFixed(1)}" y="${y}" fill="#64748b" font-size="${fs}" font-family="ui-monospace,monospace">VOL</text>`);
+        x += 26;
+        parts.push(`<text x="${x.toFixed(1)}" y="${y}" fill="#cbd5e1" font-size="${fs}" font-family="ui-monospace,monospace" font-weight="600">${v.toFixed(0)}</text>`);
+      }
+    }
+  }
 
   // 2026-07-15 readability B: "nice" Y-axis. Instead of dividing the range
   // into 6 equal (arbitrary-decimal) slices, snap to human-readable step
