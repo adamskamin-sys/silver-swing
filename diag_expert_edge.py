@@ -133,15 +133,92 @@ def main() -> None:
                     "slippage_dollars": 0.0,
                 })
 
+    # Adam 2026-07-15: also pull from state store — trade log rotates but
+    # sleeve.recent_cycle_pnls (last 20 per sleeve) + cumulative realized_pnl
+    # survive. Merge both sources; dedupe not needed since sources are
+    # disjoint (log has ts, state list is trailing 20 without timestamps).
+    state_cycles = []
+    state_totals = {}   # {(sym, sid): {"cycles": N, "realized": $}}
+    try:
+        import state_store
+        store = state_store.make_store(os.getenv("SWING_DATA_DIR", "data"))
+        for tid in store.list_tenants():
+            if tid != tenant:
+                continue
+            for sym in store.list_symbols(tid):
+                if product_filter and sym != product_filter:
+                    continue
+                if sym.startswith("__"):
+                    continue
+                state = store.get_state(tid, sym) or {}
+                sleeves_state = state.get("sleeves") or {}
+                for sid, ss in sleeves_state.items():
+                    cycles_n = int(ss.get("cycles") or 0)
+                    realized = float(ss.get("realized_pnl") or 0)
+                    if cycles_n > 0:
+                        state_totals[(sym, sid)] = {
+                            "cycles": cycles_n,
+                            "realized": realized,
+                        }
+                    for p in (ss.get("recent_cycle_pnls") or []):
+                        try:
+                            state_cycles.append({
+                                "ts": 0.0,  # no ts in state
+                                "symbol": sym,
+                                "sleeve_id": sid,
+                                "cycle_pnl": float(p),
+                                "gross": float(p),
+                                "fees": 0.0,
+                                "slippage_dollars": 0.0,
+                            })
+                        except Exception:
+                            continue
+    except Exception as _e:
+        pass
+
+    if not all_cycles and not state_cycles:
+        print(f"\n· No completed cycles found in trade log or state.")
+        print(f"  Bot may be brand-new or state was reset.")
+        return
+
+    # If state has MORE cycles than log, prefer state for the sample.
+    # Merge: use log cycles when we have them (they have gross/fees/slippage
+    # detail), state cycles when log is empty for that sleeve.
+    log_sleeve_ns = defaultdict(int)
+    for c in all_cycles:
+        log_sleeve_ns[(c["symbol"], c["sleeve_id"])] += 1
+    added_from_state = 0
+    for c in state_cycles:
+        k = (c["symbol"], c["sleeve_id"])
+        state_total_n = state_totals.get(k, {}).get("cycles", 0)
+        # Only add state entries if state has MORE cycles than log has records
+        # for this sleeve (log is authoritative when it has the data).
+        if state_total_n > log_sleeve_ns[k]:
+            all_cycles.append(c)
+            added_from_state += 1
+    if added_from_state:
+        print(f"\n[note] Trade log had {sum(log_sleeve_ns.values())} cycles; "
+              f"merged {added_from_state} additional from state.recent_cycle_pnls "
+              f"(no timestamps on those — bucketed 'all-time').")
+
     if not all_cycles:
         print(f"\n· No completed cycles found in the trade log yet.")
         print(f"  Bot may be young or trade log rotated.")
         return
 
     all_cycles.sort(key=lambda x: x["ts"])
-    first_ts = all_cycles[0]["ts"]
-    last_ts = all_cycles[-1]["ts"]
-    days_running = max((last_ts - first_ts) / 86400.0, 1e-6)
+    # Time window: use only cycles WITH timestamps to compute days_running
+    # (state-only cycles have ts=0 and would break the calc).
+    ts_cycles = [c for c in all_cycles if c["ts"] > 0]
+    if ts_cycles:
+        first_ts = ts_cycles[0]["ts"]
+        last_ts = ts_cycles[-1]["ts"]
+        days_running = max((last_ts - first_ts) / 86400.0, 1e-6)
+    else:
+        # No timestamped data — approximate as 1 day per 20 cycles (bot
+        # typical rate). Very rough — real answer needs log to catch up.
+        first_ts = last_ts = time.time()
+        days_running = max(len(all_cycles) / 20.0, 1.0)
     total_cycles = len(all_cycles)
     total_pnl = sum(c["cycle_pnl"] for c in all_cycles)
     total_gross = sum(c["gross"] for c in all_cycles)
@@ -153,10 +230,21 @@ def main() -> None:
     win_cycles = sum(1 for c in all_cycles if c["cycle_pnl"] > 0)
     win_rate = win_cycles / total_cycles
 
+    # State-level ground truth: sum realized across all sleeves + cycles
+    state_realized_total = sum(s["realized"] for s in state_totals.values())
+    state_cycles_total = sum(s["cycles"] for s in state_totals.values())
+
     print(f"\n[1] PORTFOLIO-LEVEL — since first completed cycle:")
-    print(f"    Days running:        {days_running:.1f}")
-    print(f"    Total cycles:        {total_cycles}")
-    print(f"    Total realized:      {_fmt_money(total_pnl)}")
+    print(f"    Days running (log):  {days_running:.1f}"
+          + ("  ← ~approximate, log rotated" if not ts_cycles else ""))
+    print(f"    Sample cycles:       {total_cycles}  (log + state.recent_cycle_pnls)")
+    if state_cycles_total > 0:
+        print(f"    State total cycles:  {state_cycles_total}  (authoritative — never rotates)")
+        print(f"    State total realized:{_fmt_money(state_realized_total)}  (authoritative)")
+    print(f"    Sample realized:     {_fmt_money(total_pnl)}"
+          + (f"  ← diverges from state ${state_realized_total - total_pnl:+.2f}"
+             if state_cycles_total > 0 and abs(state_realized_total - total_pnl) > 0.01
+             else ""))
     print(f"    Total gross:         {_fmt_money(total_gross)}")
     print(f"    Total fees paid:     {_fmt_money(total_fees)}")
     print(f"    Fee drag on gross:   "
