@@ -8,9 +8,14 @@ the sleeve state so the bot picks up where it should have.
 
 Usage (Render silver-swing-bot-live shell):
     python3 diag_sync_order_id.py <PRODUCT_ID> <SLEEVE_ID> <ORDER_ID>
+    python3 diag_sync_order_id.py <PRODUCT_ID> <SLEEVE_ID> --clear
 
 Example (ZEC case, 2026-07-15):
     python3 diag_sync_order_id.py ZEC-20DEC30-CDE smrinj04e 0d127834-2999-4f60-977f-4aa4dfe95e7f
+
+--clear mode: null out the sleeve's live_order_id (use if you synced
+the wrong id — e.g., an order that already filled and shouldn't be
+polled anymore).
 
 Safety:
   * Refuses to overwrite an existing non-empty live_order_id (prevents
@@ -31,11 +36,13 @@ TENANT = "adam-live"
 
 def main() -> None:
     if len(sys.argv) < 4:
-        print("Usage: python3 diag_sync_order_id.py <PRODUCT_ID> <SLEEVE_ID> <ORDER_ID>")
+        print("Usage: python3 diag_sync_order_id.py <PRODUCT_ID> <SLEEVE_ID> <ORDER_ID_OR_--clear>")
         sys.exit(1)
     product_id = sys.argv[1]
     sleeve_id = sys.argv[2]
-    order_id = sys.argv[3]
+    third_arg = sys.argv[3]
+    clear_mode = (third_arg == "--clear")
+    order_id = None if clear_mode else third_arg
 
     store = make_store(os.getenv("SWING_DATA_DIR", "data"))
     state = store.get_state(TENANT, product_id) or {}
@@ -55,7 +62,30 @@ def main() -> None:
     print(f"  live_order_id = {current_oid or '(none)'}")
     print()
 
-    # Safety checks
+    # CLEAR mode — null out live_order_id (recovery for wrong-id syncs)
+    if clear_mode:
+        if not current_oid:
+            print("Nothing to clear — live_order_id already empty.")
+            return
+        print(f"CLEARING live_order_id={current_oid}...")
+        ss["live_order_id"] = None
+        ss["_manual_clear_ts"] = time.time()
+        ss["_manual_clear_note"] = "cleared via diag_sync_order_id.py --clear"
+        state["sleeves"] = sleeves_st
+        store.put_state(TENANT, product_id, state)
+        after = store.get_state(TENANT, product_id) or {}
+        after_ss = (after.get("sleeves") or {}).get(sleeve_id, {})
+        print()
+        print(f"AFTER ({TENANT}/{product_id}/{sleeve_id}):")
+        print(f"  state         = {after_ss.get('state')}")
+        print(f"  live_order_id = {after_ss.get('live_order_id') or '(none)'}")
+        print()
+        print("Bot's next tick will proceed as if no order is outstanding.")
+        print("If the sleeve is ARMED_SELL and holding a position, it will")
+        print("attempt to place a new SELL order via the normal arm path.")
+        return
+
+    # WRITE mode — safety checks
     if current_oid and str(current_oid).strip():
         print(f"REFUSING: sleeve already has live_order_id={current_oid}.")
         print("Cancel that order first (or verify it's the same one you're syncing)")
