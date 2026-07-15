@@ -89,9 +89,19 @@ def main() -> None:
         print(f"  to compare AS vs legacy across all sleeves before flipping")
         print(f"  to 'expert' mode per-sleeve.")
     elif new_mode == "expert":
-        print(f"\n  ⚠ EXPERT MODE not yet fully wired for APPLY step.")
-        print(f"  This flag is reserved for the future commit that adds")
-        print(f"  the buy_px/sell_px write-back. For now behaves like shadow.")
+        print(f"\n  ⚡ EXPERT MODE — on each post-sell reanchor across every")
+        print(f"  sleeve, Avellaneda-Stoikov's buy_px + sell_px will REPLACE")
+        print(f"  the legacy expert_reentry pick. Look for these events in")
+        print(f"  the trade log:")
+        print(f"    * expert_spread_expert_decision   (per reanchor)")
+        print(f"    * expert_spread_applied           (when AS actually overrode)")
+        print(f"    * expert_spread_apply_skipped_invalid (rare — AS returned")
+        print(f"        bad sanity: caller falls back to legacy pick)")
+        print(f"    * expert_spread_error             (rare — AS threw; falls")
+        print(f"        back to legacy pick)")
+        print(f"\n  Flip back if it misbehaves:")
+        print(f"    python3 diag_expert_spread_mode.py shadow --apply")
+        print(f"    python3 diag_expert_spread_mode.py off --apply")
     print("=" * 78)
 
 

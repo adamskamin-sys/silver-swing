@@ -3014,16 +3014,19 @@ class SwingTrader:
             expert_snapshot=decision.get("expert_snapshot"),
         )
 
-        # Adam 2026-07-15: SHADOW-mode Avellaneda-Stoikov spread computation.
-        # Records what the AS-derived buy/sell would be alongside the legacy
-        # expert reentry decision so we can compare 24-48h of live data
-        # before flipping any sleeve to EXPERT mode. Mirrors the reentry_reeval
-        # SHADOW → EXPERT rollout (commits fc46d1b → 21dc503).
-        #
+        # Adam 2026-07-15: Avellaneda-Stoikov spread computation.
         # Gated behind __expert_spread_mode__ tenant flag:
         #   'off'    (default) — this block does not run
         #   'shadow' — compute + log only, no state change
-        #   'expert' — future: actually apply the AS buy/sell targets
+        #   'expert' — compute + log AND apply AS buy/sell targets,
+        #              overriding the legacy experts_reentry pick below
+        #
+        # When EXPERT mode wins, the legacy `decision` values (buy_px /
+        # sell_px) are OVERWRITTEN in place with the AS values before the
+        # reanchor call fires. The rest of the pipeline (tick-snap, config
+        # persist, ARMED_BUY timer reset) is unchanged — the reanchor
+        # helper is agnostic to who picked the numbers.
+        as_decision_for_apply = None
         try:
             spread_mode = self._expert_spread_mode()
             if spread_mode in ("shadow", "expert"):
@@ -3088,6 +3091,9 @@ class SwingTrader:
                         as_inputs=as_decision.inputs,
                         mode=spread_mode,
                     )
+                    # EXPERT mode: hand off to the apply step below.
+                    if spread_mode == "expert":
+                        as_decision_for_apply = as_decision
         except Exception as _e:
             # Never let the spread expert crash the reanchor path.
             try:
@@ -3100,6 +3106,40 @@ class SwingTrader:
             return
         new_buy = decision.get("buy_px")
         new_sell = decision.get("sell_px")
+
+        # Adam 2026-07-15: EXPERT-mode APPLY. When __expert_spread_mode__
+        # is 'expert' and we got a valid AS decision above, override the
+        # legacy buy/sell with the Avellaneda-Stoikov values. The AS
+        # values already respect the cost floor (Cartea-Jaimungal 2015
+        # ch.8 §8.3.2) and are tick-snapped, so we can hand them straight
+        # to _reanchor_sleeve. Records expert_spread_applied event so the
+        # audit trail shows WHICH cycle used AS vs legacy.
+        if as_decision_for_apply is not None:
+            as_buy = as_decision_for_apply.buy_px
+            as_sell = as_decision_for_apply.sell_px
+            if (as_buy > 0 and as_sell > 0 and as_sell > as_buy):
+                self._record(
+                    "expert_spread_applied",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    replaced_legacy_buy_px=new_buy,
+                    replaced_legacy_sell_px=new_sell,
+                    as_buy_px=as_buy, as_sell_px=as_sell,
+                    as_spread=as_decision_for_apply.spread,
+                    as_expected_daily_pnl=as_decision_for_apply.expected_daily_pnl,
+                    method=as_decision_for_apply.method,
+                    citation=as_decision_for_apply.citation,
+                )
+                new_buy = as_buy
+                new_sell = as_sell
+            else:
+                self._record(
+                    "expert_spread_apply_skipped_invalid",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    as_buy_px=as_buy, as_sell_px=as_sell,
+                    reason="AS decision failed sanity: buy<=0, sell<=0, or sell<=buy",
+                    severity="warn",
+                )
+
         if new_buy is None or new_sell is None or new_sell <= new_buy:
             return
         # Snap to tick and reanchor. The reanchor helper handles both the
