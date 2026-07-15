@@ -739,10 +739,19 @@ def run() -> int:
                     )
                 except Exception:
                     pass
-                # Force-evict; cooldown will be set. Fresh spawn attempts
-                # respect the cooldown so we don't hammer a broken product.
+                # Force-evict. Cooldown gets set by _evict_track, but we
+                # want the IMMEDIATE respawn attempt to fire (not wait 15
+                # min) since we don't know yet whether respawn will fail.
+                # Cooldown protection is for repeated step-failure evictions
+                # (create-fail-evict loops); a zombie eviction is different
+                # — the current Track is proven dead, we want to try again
+                # right now. If respawn ALSO fails, that failure sets its
+                # own cooldown via the spawn error path.
                 try:
                     _evict_track(pid, "zombie: no ticks in threshold window")
+                    # Clear the just-set cooldown so the fall-through spawn
+                    # attempt below actually fires this cycle.
+                    _non_primary_last_evict_ts.pop(pid, None)
                 except Exception:
                     pass
                 # Fall through to the spawn-attempt path below.
