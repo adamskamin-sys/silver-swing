@@ -200,10 +200,10 @@ def main() -> None:
     print(f"\n[9] REPRODUCE _Track spawn for {product_id}:")
     try:
         from main import _Track, FEED_READY_TIMEOUT
-        from safety import make_trade_log, make_kill_switch
+        from safety import make_trade_log, KillSwitch
         import io, contextlib
         log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
-        ks = make_kill_switch(store, tenant)
+        ks = KillSwitch(store, tenant)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             try:
