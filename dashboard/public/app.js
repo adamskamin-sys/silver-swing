@@ -528,6 +528,52 @@ function renderCockpit(store) {
     }
   }
 
+  // Adam 2026-07-15: expert-spread (Avellaneda-Stoikov) status tile.
+  // Shows mode (off/shadow/expert) + count of decisions in the last 24h
+  // + average AS-vs-legacy spread delta. Lets Adam see at a glance
+  // whether AS is running tighter or wider than legacy without opening
+  // the diag_expert_spread_review script.
+  let esMode = 'off';
+  const esSnap = tenantStore['__expert_spread_mode__']?.state;
+  if (esSnap && esSnap.mode) esMode = String(esSnap.mode);
+  const esCutoff = nowSec - 24 * 3600;
+  let esCount = 0, esSumLegSpread = 0, esSumASSpread = 0, esSumDaily = 0;
+  for (const e of (lastTradeEvents || [])) {
+    if (!e || !e.event_type) continue;
+    if (e.tenant && e.tenant !== tenant) continue;
+    if ((Number(e.ts) || 0) < esCutoff) continue;
+    if (e.event_type === 'expert_spread_applied' ||
+        e.event_type === 'expert_spread_intra_cycle_applied' ||
+        e.event_type === 'expert_spread_shadow_decision' ||
+        e.event_type === 'expert_spread_expert_decision' ||
+        e.event_type === 'expert_spread_intra_cycle_decision' ||
+        e.event_type === 'expert_spread_intra_cycle_shadow') {
+      esCount++;
+      const legS = Number(e.legacy_spread) || 0;
+      const asS = Number(e.as_spread) || 0;
+      if (legS > 0 && asS > 0) {
+        esSumLegSpread += legS;
+        esSumASSpread += asS;
+      }
+      esSumDaily += Number(e.as_expected_daily_pnl) || 0;
+    }
+  }
+  const esSpreadDelta = esCount > 0 && esSumLegSpread > 0
+    ? ((esSumASSpread - esSumLegSpread) / esCount)
+    : 0;
+  const esCls = esMode === 'expert' ? 'ck-ok'
+              : esMode === 'shadow' ? 'ck-warn'
+              : '';
+  const esDeltaLabel = esCount > 0
+    ? ` · ${esSpreadDelta >= 0 ? 'wider' : 'tighter'} avg $${Math.abs(esSpreadDelta).toFixed(4)}`
+    : '';
+  const esTip = `Expert-spread mode: ${esMode}. ${esCount} decisions in last 24h. `
+              + (esCount > 0
+                 ? `AS avg spread ${esSpreadDelta >= 0 ? '+' : ''}$${esSpreadDelta.toFixed(4)} vs legacy. `
+                 : '')
+              + `Flip via diag_expert_spread_mode.py. Full detail: diag_expert_spread_review.py.`;
+  const esValue = `<span class="ck-chip ${esCls}" title="${escapeHtml(esTip)}">${esMode}${esCount ? ' · ' + esCount : ''}${esDeltaLabel}</span>`;
+
   // Adam 2026-07-15: cluster-exposure tile — flag when one asset class
   // holds an outsized share of held notional. Correlated peers crash
   // together (BTC dumps → crypto perps all follow), so cross-sleeve
@@ -603,6 +649,7 @@ function renderCockpit(store) {
     <div class="ck-tile" title="Realized P&amp;L across all sleeve + primary cycles that fired in the last 24 hours on the ${activeMode} tenant. Sums sleeve_cycle_completed.cycle_pnl and cycle_completed (gross − fees)."><div class="ck-label">24h realized</div><div class="ck-value ${classForValue(realized24h)}">${realized24h >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realized24h))}</div></div>
     <div class="ck-tile" title="Total realized P&amp;L since bot start (all sleeve + primary cycles ever completed on the ${activeMode} tenant). ${realizedSinceStartCycles} cycles. Reads persisted state, so survives log rotation and reflects any state_patch backfills."><div class="ck-label">total realized</div><div class="ck-value ${classForValue(realizedSinceStart)}">${realizedSinceStart >= 0 ? '+' : '-'}${fmtMoney(Math.abs(realizedSinceStart))}<span style="font-size:0.6em;opacity:0.6;margin-left:0.3em;font-weight:normal">${realizedSinceStartCycles}c</span></div></div>
     <div class="ck-tile"><div class="ck-label">cluster risk</div><div class="ck-value">${clusterValue}</div></div>
+    <div class="ck-tile"><div class="ck-label">expert spread</div><div class="ck-value">${esValue}</div></div>
     <div class="ck-tile"><div class="ck-label">reconciliation</div><div class="ck-value">${reconValue}</div></div>
     <div class="ck-tile"><div class="ck-label">cash / equity</div><div class="ck-value">${fmtMoney(cash)}</div></div>
     <div class="ck-tile"><div class="ck-label">open positions</div><div class="ck-value">${openPos}</div></div>
