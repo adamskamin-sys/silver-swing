@@ -4919,7 +4919,38 @@ class SwingTrader:
             # you sold contracts you owned, realized P/L happens NOW.
             try: fill = float(fill_price) if fill_price is not None else 0.0
             except (TypeError, ValueError): fill = 0.0
-            basis = float(ss.sell_entry_avg) if ss.sell_entry_avg is not None else float(sc.buy_px)
+            # Adam 2026-07-15 fix #7 (problem-scout audit): basis fallback chain.
+            # Priority: sell_entry_avg (captured at arm time — most accurate)
+            # → own_avg_entry (sleeve's own tracking) → broker.position.avg_entry
+            # (exchange truth, only valid if we still hold something) → sc.buy_px
+            # (config TARGET, not actual fill — last resort, logs a warn because
+            # it silently skews P&L when actual fill differed from target).
+            basis = None
+            basis_source = None
+            if ss.sell_entry_avg is not None:
+                basis = float(ss.sell_entry_avg)
+                basis_source = "sell_entry_avg"
+            elif ss.own_avg_entry is not None:
+                basis = float(ss.own_avg_entry)
+                basis_source = "own_avg_entry"
+            else:
+                try:
+                    broker_pos = self.b.position
+                    if getattr(broker_pos, "avg_entry", 0) > 0:
+                        basis = float(broker_pos.avg_entry)
+                        basis_source = "broker.position.avg_entry"
+                except Exception:
+                    pass
+            if basis is None:
+                basis = float(sc.buy_px)
+                basis_source = "sc.buy_px (config target — actual fill unknown)"
+                self._record("sleeve_on_fill_basis_fallback_to_config",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             fill_price=fill, config_buy_px=sc.buy_px,
+                             severity="warn",
+                             reason="no sell_entry_avg / own_avg_entry / broker "
+                                    "avg — realized P&L uses config target, will "
+                                    "differ from actual by fill_slippage")
             gross = (fill - basis) * self.cfg.contract_size * sc.qty
             ss.realized_pnl += gross - half_fee
             ss.cycles += 1
@@ -5013,10 +5044,40 @@ class SwingTrader:
             # Anchor the sleeve's own basis to the buy fill so subsequent
             # unrealized display reflects THIS sleeve's independent trading —
             # not the paper gain on lots it inherited from an existing position.
+            # Adam 2026-07-15 fix #7: fallback chain — actual fill_price →
+            # broker.position.avg_entry → sc.buy_px (last resort + warn).
+            # sc.buy_px is the config TARGET, not the actual fill. Using it
+            # silently skews the next cycle's realized P&L by fill_slippage.
+            own_avg = None
+            avg_source = None
             try:
-                ss.own_avg_entry = float(fill_price) if fill_price is not None else float(sc.buy_px)
+                if fill_price is not None:
+                    own_avg = float(fill_price)
+                    if own_avg > 0:
+                        avg_source = "fill_price"
+                    else:
+                        own_avg = None
             except (TypeError, ValueError):
-                ss.own_avg_entry = float(sc.buy_px)
+                own_avg = None
+            if own_avg is None:
+                try:
+                    broker_pos = self.b.position
+                    if getattr(broker_pos, "avg_entry", 0) > 0:
+                        own_avg = float(broker_pos.avg_entry)
+                        avg_source = "broker.position.avg_entry"
+                except Exception:
+                    pass
+            if own_avg is None:
+                own_avg = float(sc.buy_px)
+                avg_source = "sc.buy_px (config target — actual fill unknown)"
+                self._record("sleeve_rebuy_own_avg_fallback_to_config",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             fill_price=fill_price, config_buy_px=sc.buy_px,
+                             severity="warn",
+                             reason="fill_price missing AND broker avg unavailable "
+                                    "— own_avg_entry uses config target, next "
+                                    "cycle's realized will be off by fill_slippage")
+            ss.own_avg_entry = own_avg
             ss.state = SleeveStateEnum.ARMED_SELL
             self._record(
                 "sleeve_rebuy_completed",
@@ -5024,6 +5085,7 @@ class SwingTrader:
                 fill_price=fill_price, fees=half_fee,
                 realized_pnl_total=ss.realized_pnl,
                 own_avg_entry=ss.own_avg_entry,
+                own_avg_source=avg_source,
             )
 
     def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:
