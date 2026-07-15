@@ -3534,6 +3534,55 @@ class SwingTrader:
         stop_loss_px = float(getattr(sc, "stop_loss_px", 0) or 0)
         sell_px = float(getattr(sc, "sell_px", 0) or 0)
         trail_distance = float(getattr(sc, "trail_distance", 0) or 0)
+        # Adam 2026-07-15: live-adaptive trail_distance. When enabled per
+        # sleeve (sc.adaptive_trail_enabled), recompute trail_distance from
+        # recent realized vol × mid so the trail widens in chaotic markets
+        # (won't false-trigger on noise) and tightens in calm ones (locks
+        # profit faster). Chuck LeBeau chandelier standard: k×ATR where
+        # k=3. Vol-based equivalent: k×sigma×mid where k~2-3.
+        #
+        # Only rewrites when live estimate diverges >20% from static —
+        # avoids thrashing the trail on every tick. Logged so audit can
+        # see adaptation vs static behavior.
+        if trail_distance > 0 and getattr(sc, "adaptive_trail_enabled", False):
+            try:
+                import math as _math_at
+                _hist = list(self._sleeve_price_history.get(sc.id, []) or [])
+                if len(_hist) >= 10:
+                    _samples = _hist[-30:]
+                    _rets = [_math_at.log(_samples[i] / _samples[i - 1])
+                             for i in range(1, len(_samples))
+                             if _samples[i - 1] > 0 and _samples[i] > 0]
+                    if len(_rets) >= 5:
+                        _mean = sum(_rets) / len(_rets)
+                        _var = sum((r - _mean) ** 2 for r in _rets) / len(_rets)
+                        _sigma = _math_at.sqrt(_var)
+                        _k = float(getattr(sc, "adaptive_trail_k", 2.5) or 2.5)
+                        _live_dist = _k * _sigma * last_price
+                        # Cap: no wider than 5% of mark (chandelier max)
+                        _live_dist = min(_live_dist, last_price * 0.05)
+                        # Floor: at least 2 ticks
+                        _tick = float(getattr(self.cfg, "tick_size", 0) or 0)
+                        if _tick > 0:
+                            _live_dist = max(_live_dist, _tick * 2.0)
+                        # Only rewrite if divergence > 20% from static
+                        _delta_pct = abs(_live_dist - trail_distance) / trail_distance
+                        if _delta_pct > 0.20:
+                            self._record(
+                                "trail_distance_adapted",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                static_trail_distance=round(trail_distance, 6),
+                                live_trail_distance=round(_live_dist, 6),
+                                sigma=round(_sigma, 8),
+                                k=_k, last_price=last_price,
+                                delta_pct=round(_delta_pct * 100, 2),
+                                reason=("LeBeau chandelier vol-adaptive: "
+                                        "k×σ×price, capped at 5% of mark, "
+                                        "floor at 2 ticks"),
+                            )
+                            trail_distance = _live_dist
+            except Exception:
+                pass  # fall back to static — never fail-hard on the stop path
         target_px = None
         stage = None
         # Adam 2026-07-15: checkpoint-then-ratchet model.
