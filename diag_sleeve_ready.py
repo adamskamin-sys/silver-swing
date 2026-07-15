@@ -181,36 +181,49 @@ def main() -> None:
                         reason = f"[{age} ago] {et}: {why}"[:60]
                     else:
                         # Adam 2026-07-15: differentiate "no BLOCK events"
-                        # from "no ANY events." The latter means the Track
-                        # is dead (evicted / never spawned) — check any-
-                        # event count for this product in the 24h window.
-                        total_events = len(recent_events_by_symbol.get(sym, []))
+                        # from "no ANY events." Also break down sleeve-scoped
+                        # vs product-scoped — reconciliation monitor emits
+                        # product-scoped events every N seconds regardless
+                        # of whether the SwingTrader is ticking, so the
+                        # meaningful check is sleeve-scoped events.
+                        all_events = recent_events_by_symbol.get(sym, [])
+                        total_events = len(all_events)
+                        sleeve_events = sum(1 for _e in all_events
+                                            if _e.get("sleeve_id") == sid)
                         armed_since = ss.get("armed_buy_since_ts")
                         if armed_since:
                             age_s = int(time.time() - float(armed_since))
                             if age_s < 30:
                                 reason = f"just armed {age_s}s ago — waiting for next tick"
-                            elif total_events == 0:
-                                reason = (f"⚠ TRACK DEAD — 0 events for this product "
-                                          f"in 24h. Track was evicted or never spawned. "
-                                          f"Check live_runner logs.")
+                            elif sleeve_events == 0:
+                                # Zero sleeve-scoped events = SwingTrader.step
+                                # never ran for this sleeve in 24h. Product-
+                                # scoped events (reconciliation monitor) can
+                                # still be flowing at the live_runner level
+                                # independent of the Track. This IS the TRACK
+                                # DEAD case even if total_events > 0.
+                                reason = (f"⚠ TRACK DEAD — 0 sleeve-scoped events in 24h "
+                                          f"({total_events} product-level events came from "
+                                          f"reconciliation_monitor at live_runner level). "
+                                          f"SwingTrader.step never ran. Check live_runner "
+                                          f"logs for spawn/eviction of this product.")
                             elif age_s < 300:
                                 reason = (f"armed {age_s}s ago, no blocker event visible "
-                                          f"(saw {total_events} other events on this product)")
+                                          f"({sleeve_events} sleeve events)")
                             else:
                                 # Show top event types so we can see WHAT
                                 # the tick loop is doing even if none matched
-                                # our block-event list. That's the fingerprint
-                                # of the silent path.
+                                # our block-event list.
                                 from collections import Counter
                                 ev_types = Counter()
-                                for _e in recent_events_by_symbol.get(sym, []):
+                                for _e in all_events:
                                     if _e.get("sleeve_id") == sid or not _e.get("sleeve_id"):
                                         ev_types[_e.get("event_type", "?")] += 1
                                 top = ev_types.most_common(4)
                                 top_str = ", ".join(f"{k}={v}" for k, v in top)
                                 reason = (f"armed {_fmt_age(armed_since)} ago, "
-                                          f"{total_events} events / TOP TYPES: {top_str}")
+                                          f"{sleeve_events}/{total_events} sleeve/total events / "
+                                          f"TOP: {top_str}")
                         else:
                             reason = "no armed_buy_since_ts — never fully armed"
                 print(f"{sym:22} {sid:14} {state_val:11} ${buy_px:>9} ${mark:>9.4f} "
