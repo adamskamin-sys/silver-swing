@@ -1801,6 +1801,23 @@ class SwingTrader:
         except Exception:
             return "legacy"
 
+    def _expert_spread_mode(self) -> str:
+        """Read the __expert_spread_mode__ scope. Returns one of:
+          'off'    (default) — Avellaneda-Stoikov code path does not run
+          'shadow' — compute AS spread + log alongside legacy; NEVER apply
+          'expert' — compute AS spread + APPLY to buy_px / sell_px
+
+        Same rollout pattern as _reentry_mode: enable 'shadow' first,
+        observe 24-48h of expert_spread_shadow_decision events comparing
+        AS vs legacy, THEN flip to 'expert' for one sleeve at a time.
+
+        Fail-safe: any store error → 'off'."""
+        try:
+            m = (self.store.get_state(self.tenant_id, "__expert_spread_mode__") or {})
+            return str(m.get("mode") or "off").lower()
+        except Exception:
+            return "off"
+
     # [crew 2026-07-15] auto-refresh cadence config
     _AUTO_REFRESH_MIN_INTERVAL_SECS = 60.0      # don't fire more than once/min per sleeve
     _AUTO_REFRESH_MIN_DRIFT_PCT = 0.5           # skip if new buy_px within 0.5% of current
@@ -2996,6 +3013,89 @@ class SwingTrader:
             reasons=decision.get("reasons"),
             expert_snapshot=decision.get("expert_snapshot"),
         )
+
+        # Adam 2026-07-15: SHADOW-mode Avellaneda-Stoikov spread computation.
+        # Records what the AS-derived buy/sell would be alongside the legacy
+        # expert reentry decision so we can compare 24-48h of live data
+        # before flipping any sleeve to EXPERT mode. Mirrors the reentry_reeval
+        # SHADOW → EXPERT rollout (commits fc46d1b → 21dc503).
+        #
+        # Gated behind __expert_spread_mode__ tenant flag:
+        #   'off'    (default) — this block does not run
+        #   'shadow' — compute + log only, no state change
+        #   'expert' — future: actually apply the AS buy/sell targets
+        try:
+            spread_mode = self._expert_spread_mode()
+            if spread_mode in ("shadow", "expert"):
+                import expert_spread as _es
+                # Gather cycle-completion timestamps for arrival-rate estimate.
+                # Fall back to empty list if trade log unavailable — helper
+                # then uses the conservative _MIN_ARRIVAL_RATE_PER_HOUR floor.
+                cycle_ts = []
+                try:
+                    if hasattr(self, "trade_log") and self.trade_log:
+                        for e in self.trade_log.events():
+                            if not isinstance(e, dict):
+                                continue
+                            if e.get("event_type") != "sleeve_cycle_completed":
+                                continue
+                            if e.get("sleeve_id") != sc.id:
+                                continue
+                            ts = float(e.get("ts") or 0)
+                            if ts > 0:
+                                cycle_ts.append(ts)
+                except Exception:
+                    pass
+                # Position (inventory) — 0 if flat, +qty if long
+                inventory = 0
+                try:
+                    inventory = int(self.b.position_qty() or 0)
+                except Exception:
+                    pass
+                fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
+                tick = float(getattr(self.cfg, "tick_size", 0) or 0)
+                as_decision = _es.grid_search_optimal_gamma(
+                    mid_price=float(sold_price),
+                    price_history=prices,
+                    cycle_completion_ts=cycle_ts,
+                    fee_per_roundtrip=fee_rt,
+                    contract_size=float(self.cfg.contract_size),
+                    qty=int(sc.qty),
+                    tick_size=tick if tick > 0 else None,
+                    inventory=inventory,
+                )
+                if as_decision is not None:
+                    self._record(
+                        "expert_spread_shadow_decision" if spread_mode == "shadow"
+                        else "expert_spread_expert_decision",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        method=as_decision.method,
+                        citation=as_decision.citation,
+                        legacy_buy_px=decision.get("buy_px"),
+                        legacy_sell_px=decision.get("sell_px"),
+                        legacy_spread=(
+                            (decision.get("sell_px") or 0) -
+                            (decision.get("buy_px") or 0)),
+                        as_buy_px=as_decision.buy_px,
+                        as_sell_px=as_decision.sell_px,
+                        as_spread=as_decision.spread,
+                        as_reservation_price=as_decision.reservation_price,
+                        as_expected_cycles_per_day=as_decision.expected_cycles_per_day,
+                        as_expected_profit_per_cycle=as_decision.expected_profit_per_cycle,
+                        as_expected_daily_pnl=as_decision.expected_daily_pnl,
+                        as_cost_floor_binding=as_decision.cost_floor_binding,
+                        as_lambda_widening=as_decision.lambda_widening,
+                        as_inputs=as_decision.inputs,
+                        mode=spread_mode,
+                    )
+        except Exception as _e:
+            # Never let the spread expert crash the reanchor path.
+            try:
+                self._record("expert_spread_error",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
         if not decision.get("should_arm"):
             return
         new_buy = decision.get("buy_px")
