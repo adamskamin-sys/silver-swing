@@ -619,6 +619,12 @@ export function makeApp({
       }
       if (seededAny) {
         stateBlockOut.sleeves = existing;
+        // Adam 2026-07-15 fleet-wide rule: also seed the primary state key
+        // so SwingTrader._load_state() has all required fields on first
+        // tick. Missing primary state key caused a KeyError('state') on
+        // Track spawn — silently retried every 10s, sleeve never ticked.
+        // Only set when missing to preserve existing primary state.
+        if (!stateBlockOut.state) stateBlockOut.state = 'ARMED_SELL';
         store[tenant][symbol].state = stateBlockOut;
       }
 

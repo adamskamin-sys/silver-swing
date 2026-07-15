@@ -213,8 +213,14 @@ class SwingTrader:
             s.swing_qty = self.cfg.swing_qty
             s.sleeves = self._init_sleeves_state({})
             return s
+        # Adam 2026-07-15 fleet-wide rule: defensive against partial state
+        # blocks. Older code required d["state"] — a hard KeyError that
+        # stranded any sleeve whose state block was seeded with sleeves-only
+        # (e.g., Option B scanner arm auto-seed). Now defaults to ARMED_SELL
+        # (matches SwingState() default), so the primary state loads cleanly
+        # even when only the sleeve sub-dict was pre-seeded.
         state = SwingState(
-            state=State(d["state"]),
+            state=State(d.get("state") or "ARMED_SELL"),
             live_order_id=d.get("live_order_id"),
             filled_qty=d.get("filled_qty", 0),
             swing_qty=d.get("swing_qty", self.cfg.swing_qty),

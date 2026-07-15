@@ -906,10 +906,47 @@ def run_paper_mode() -> int:
             initial_symbols = _discover_tracked_symbols(store, tenant, SYMBOL)
         _log(f"[{tenant}] tracking {len(initial_symbols)} symbol(s) at boot: {initial_symbols}")
         for sym in initial_symbols:
-            track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
-            if track.start(FEED_READY_TIMEOUT):
+            # Adam 2026-07-15 fleet-wide rule: mirror the hot-add path —
+            # every spawn failure surfaces to the trade log so a stuck sleeve
+            # at boot doesn't require grep-hunting Render logs.
+            try:
+                track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
+            except Exception as _spawn_err:
+                try:
+                    log.record("track_spawn_failed", tenant=tenant, symbol=sym,
+                               phase="constructor",
+                               error=f"{type(_spawn_err).__name__}: {_spawn_err}",
+                               severity="critical")
+                except Exception:
+                    pass
+                _log(f"[{tenant}/{sym}] BOOT SPAWN FAILED (constructor): "
+                     f"{type(_spawn_err).__name__}: {_spawn_err}")
+                continue
+            try:
+                started = track.start(FEED_READY_TIMEOUT)
+            except Exception as _start_err:
+                try:
+                    log.record("track_spawn_failed", tenant=tenant, symbol=sym,
+                               phase="start",
+                               error=f"{type(_start_err).__name__}: {_start_err}",
+                               severity="critical")
+                except Exception:
+                    pass
+                _log(f"[{tenant}/{sym}] BOOT SPAWN FAILED (start): "
+                     f"{type(_start_err).__name__}: {_start_err}")
+                try: track.close()
+                except Exception: pass
+                continue
+            if started:
                 tracks[(tenant, sym)] = track
             else:
+                try:
+                    log.record("track_spawn_failed", tenant=tenant, symbol=sym,
+                               phase="feed_timeout",
+                               error=f"no ticks within {FEED_READY_TIMEOUT}s",
+                               severity="warn")
+                except Exception:
+                    pass
                 track.close()
 
     if not tracks:
@@ -974,10 +1011,60 @@ def run_paper_mode() -> int:
                     balance = _tenant_balance(tenant)
                     for sym in current - existing:
                         _log(f"[{tenant}] hot-adding new tracked symbol: {sym}")
-                        track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
-                        if track.start(FEED_READY_TIMEOUT):
+                        # Adam 2026-07-15 fleet-wide rule: any spawn failure
+                        # MUST surface to the trade log. Prior behavior only
+                        # hit stdout via _log() — a silent-failure class where
+                        # a stranded sleeve (state=ARMED_BUY, no live order,
+                        # zero events) required grep-hunting Render logs to
+                        # diagnose. Now every failure writes a `track_spawn_*`
+                        # event so the dashboard + auditors surface it.
+                        try:
+                            track = _Track(store, log, kill_switches[tenant], tenant, sym, balance)
+                        except Exception as _spawn_err:
+                            try:
+                                log.record(
+                                    "track_spawn_failed",
+                                    tenant=tenant, symbol=sym,
+                                    phase="constructor",
+                                    error=f"{type(_spawn_err).__name__}: {_spawn_err}",
+                                    severity="critical",
+                                )
+                            except Exception:
+                                pass
+                            _log(f"[{tenant}/{sym}] SPAWN FAILED (constructor): "
+                                 f"{type(_spawn_err).__name__}: {_spawn_err}")
+                            continue
+                        try:
+                            started = track.start(FEED_READY_TIMEOUT)
+                        except Exception as _start_err:
+                            try:
+                                log.record(
+                                    "track_spawn_failed",
+                                    tenant=tenant, symbol=sym,
+                                    phase="start",
+                                    error=f"{type(_start_err).__name__}: {_start_err}",
+                                    severity="critical",
+                                )
+                            except Exception:
+                                pass
+                            _log(f"[{tenant}/{sym}] SPAWN FAILED (start): "
+                                 f"{type(_start_err).__name__}: {_start_err}")
+                            try: track.close()
+                            except Exception: pass
+                            continue
+                        if started:
                             tracks[(tenant, sym)] = track
                         else:
+                            try:
+                                log.record(
+                                    "track_spawn_failed",
+                                    tenant=tenant, symbol=sym,
+                                    phase="feed_timeout",
+                                    error=f"no ticks within {FEED_READY_TIMEOUT}s",
+                                    severity="warn",
+                                )
+                            except Exception:
+                                pass
                             track.close()
                 last_discover = now
 
