@@ -490,9 +490,67 @@ def run() -> int:
         # defaults are SLR-calibrated → wrong for other products).
         cfg = store.get_config(TENANT, product_id) or {}
         if not cfg:
-            _log(f"[non-primary] {product_id}: no config, SKIPPING "
-                 f"(configure via dashboard first)")
-            return None
+            # Adam 2026-07-15: silent failure class — scanner-armed sleeves
+            # (Option-B) create sleeve state without a top-level config.
+            # Auto-recovery kept calling this function every 15s and getting
+            # None back without any trade-log event, making it look like
+            # "silent bug." Now we log the refusal + auto-seed a minimal
+            # config from Coinbase specs when sleeves exist.
+            state = store.get_state(TENANT, product_id) or {}
+            sleeves_state = state.get("sleeves") or {}
+            if sleeves_state:
+                # Seed a minimal config from Coinbase specs. Better than
+                # SLR-defaulted SwingConfig — pulls real tick_size,
+                # contract_size, fees. Sleeves preserved.
+                try:
+                    seed_broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
+                    spec = seed_broker.contract_spec() or {}
+                    seeded = {
+                        "product_id": product_id,
+                        "tick_size": float(spec.get("tick_size") or 0.01),
+                        "contract_size": float(spec.get("contract_size") or 1),
+                        "fee_per_contract_roundtrip": 0.5,   # conservative
+                        "swing_qty": 0,                       # sleeves only, no primary
+                        "core_qty": 0,                        # no protected core
+                        "abort_above": 0,                     # bands off — sleeve controls
+                        "abort_below": 0,
+                        "sleeves": [],                        # kept in state, not here
+                    }
+                    store.put_config(TENANT, product_id, seeded)
+                    try:
+                        log.record("non_primary_config_auto_seeded",
+                                   tenant=TENANT, symbol=product_id,
+                                   spec=spec, severity="warn",
+                                   reason="sleeves exist but no top-level config; auto-seeded from Coinbase specs to enable spawn")
+                    except Exception:
+                        pass
+                    _log(f"[non-primary] {product_id}: AUTO-SEEDED config "
+                         f"from Coinbase specs (was missing; sleeves exist)")
+                    cfg = seeded
+                except Exception as _seed_err:
+                    try:
+                        log.record("non_primary_config_auto_seed_failed",
+                                   tenant=TENANT, symbol=product_id,
+                                   error=f"{type(_seed_err).__name__}: {_seed_err}",
+                                   severity="critical",
+                                   reason="cannot seed config; spawn will keep failing")
+                    except Exception:
+                        pass
+                    _log(f"[non-primary] {product_id}: auto-seed FAILED: "
+                         f"{type(_seed_err).__name__}: {_seed_err}")
+                    return None
+            else:
+                # No sleeves either — genuinely nothing to spawn for
+                try:
+                    log.record("non_primary_spawn_refused_no_config",
+                               tenant=TENANT, symbol=product_id,
+                               reason="no top-level config AND no sleeve state",
+                               severity="info")
+                except Exception:
+                    pass
+                _log(f"[non-primary] {product_id}: no config, SKIPPING "
+                     f"(configure via dashboard first)")
+                return None
         # problem-scout #5: respect the kill switch before construction.
         try:
             if ks.is_active():
