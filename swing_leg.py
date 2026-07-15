@@ -577,6 +577,93 @@ class SwingTrader:
         finally:
             self.store.clear_cancel_intent(self.tenant_id, self.symbol)
 
+    # ---- state patch queue (diag scripts → bot in-memory state) -----------
+
+    def _maybe_consume_state_patch(self) -> None:
+        """Adam 2026-07-15: apply any pending state_patch to in-memory state
+        BEFORE the tick runs. Fixes the diag-vs-live race:
+
+            diag script writes state to disk (realized_pnl → $14.55)
+            ↓
+            bot's in-memory state still has old value (-$0.55)
+            ↓
+            next _save_state() clobbers disk back to -$0.55 = write lost
+
+        Now diag writes a PATCH (state_store.put_state_patch) instead of
+        the full state; this consumer merges the patch into ss/self.s
+        before any tick logic runs, then clears the patch. The next
+        _save_state() persists the merged (correct) value.
+
+        Patch shape:
+            {"sleeves": {"<sid>": {"realized_pnl": 14.55,
+                                    "recent_cycle_pnls_append": 15.10}},
+             "top_level": {"realized_pnl": 100.0},   # optional
+             "reason": "…",
+             "ts": epoch_seconds}
+
+        Field names ending in _append are appended to the target list
+        (bounded to 20 entries — matches recent_cycle_pnls convention).
+        Other fields are set. Unknown sleeve_ids ignored.
+        Records state_patch_applied for audit."""
+        if not hasattr(self.store, "get_state_patch"):
+            return
+        try:
+            patch = self.store.get_state_patch(self.tenant_id, self.symbol)
+        except Exception:
+            return
+        if not patch:
+            return
+        applied_summary = {"sleeves": {}, "top_level": {}}
+        try:
+            sleeve_patches = patch.get("sleeves") or {}
+            for sid, fields in sleeve_patches.items():
+                ss = (self.s.sleeves or {}).get(sid)
+                if ss is None:
+                    applied_summary["sleeves"][sid] = "skipped (unknown sleeve_id)"
+                    continue
+                applied_fields = {}
+                for k, v in fields.items():
+                    if k.endswith("_append"):
+                        base = k[:-len("_append")]
+                        cur = list(getattr(ss, base, None) or [])
+                        cur.append(v)
+                        if len(cur) > 20:
+                            cur = cur[-20:]
+                        setattr(ss, base, cur)
+                        applied_fields[base] = f"appended({v})"
+                    else:
+                        prev = getattr(ss, k, None)
+                        setattr(ss, k, v)
+                        applied_fields[k] = {"prev": prev, "new": v}
+                applied_summary["sleeves"][sid] = applied_fields
+            top_level = patch.get("top_level") or {}
+            for k, v in top_level.items():
+                prev = getattr(self.s, k, None)
+                setattr(self.s, k, v)
+                applied_summary["top_level"][k] = {"prev": prev, "new": v}
+        except Exception as e:
+            self._record("state_patch_apply_failed",
+                         reason=patch.get("reason"), error=str(e),
+                         severity="warn")
+            # Still clear — a broken patch would loop forever if left.
+            try:
+                self.store.clear_state_patch(self.tenant_id, self.symbol)
+            except Exception:
+                pass
+            return
+        self._record("state_patch_applied",
+                     reason=patch.get("reason"),
+                     source_ts=patch.get("ts"),
+                     applied=applied_summary,
+                     severity="info")
+        try:
+            self.store.clear_state_patch(self.tenant_id, self.symbol)
+        except Exception:
+            pass
+        # Persist immediately so a crash between now and next _save_state
+        # doesn't leave the patch stranded in-memory only.
+        self._save_state()
+
     # ---- reset intent (dashboard wipes paper state) -----------------------
 
     def _maybe_consume_sleeve_state_reset(self) -> None:
@@ -3014,6 +3101,13 @@ class SwingTrader:
     # ---- main loop -------------------------------------------------------
 
     def step(self, last_price: float) -> None:
+        # Adam 2026-07-15: consume any pending state-store patch FIRST.
+        # Solves the diag-vs-live race — diag scripts (force-credit backfill,
+        # etc.) write a patch that this consumer merges into in-memory state
+        # BEFORE the tick's own _save_state() runs and clobbers it.
+        # See _maybe_consume_state_patch docstring.
+        self._maybe_consume_state_patch()
+
         # Dashboard can request a full paper-state wipe. Consume BEFORE any
         # other work so a stale state doesn't try to run on the fresh account.
         self._maybe_consume_reset_intent()

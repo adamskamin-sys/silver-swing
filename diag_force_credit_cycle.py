@@ -92,40 +92,52 @@ def main() -> None:
         print("\n(dry-run — pass --apply to persist)")
         return
 
-    # Apply
-    ss["realized_pnl"] = new_realized
-    # Also append to recent_cycle_pnls if the field exists (used for
-    # loss-streak detection + TCA display)
-    try:
-        recent = list(ss.get("recent_cycle_pnls") or [])
-        recent.append(profit)
-        if len(recent) > 20:
-            recent = recent[-20:]
-        ss["recent_cycle_pnls"] = recent
-    except Exception:
-        pass
-    sleeves_state[sleeve_id] = ss
-    state["sleeves"] = sleeves_state
-    store.put_state(tenant, product_id, state)
+    # Adam 2026-07-15: write a state_patch instead of full put_state so the
+    # live bot's next tick applies our correction to in-memory state BEFORE
+    # its own _save_state clobbers our write. See _maybe_consume_state_patch
+    # in swing_leg.py. Requires the bot to be running (or restart) for the
+    # patch to land.
+    if not hasattr(store, "put_state_patch"):
+        print("\n✗ store lacks put_state_patch — this bot is running an old "
+              "state_store. Deploy the latest and retry.")
+        return
+    patch = {
+        "sleeves": {
+            sleeve_id: {
+                "realized_pnl": round(new_realized, 6),
+                "recent_cycle_pnls_append": round(profit, 6),
+            }
+        },
+        "reason": (f"force_credit_backfill: {product_id}/{sleeve_id} — "
+                   f"fill ${fill_price} vs own_avg ${own_avg} × {qty} × "
+                   f"{contract_size} = ${round(profit, 2)} (original credit "
+                   f"ran with own_avg_entry=None or in a race)"),
+        "ts": int(time.time()),
+    }
+    store.put_state_patch(tenant, product_id, patch)
     # Log the backfill event so the audit trail shows it
     try:
         from safety import make_trade_log
         log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
         log.record(
-            "force_credit_backfill",
+            "force_credit_backfill_queued",
             tenant=tenant, symbol=product_id, sleeve_id=sleeve_id,
             fill_price=fill_price, own_avg_entry=own_avg,
             qty=qty, contract_size=contract_size,
             profit=round(profit, 2),
             new_realized_pnl=round(new_realized, 2),
-            reason="manual correction — original credit ran with own_avg_entry=None",
+            reason="manual correction queued via state_patch — "
+                   "bot will apply on next tick",
             severity="info",
         )
     except Exception as e:
         print(f"\n(note: trade log record failed: {e})")
 
-    print(f"\n✓ APPLIED. Sleeve {sleeve_id} realized_pnl now ${new_realized:.2f}")
-    print("  Refresh the dashboard — REALIZED column should reflect the new number.")
+    print(f"\n✓ QUEUED state_patch for {tenant}/{product_id}.")
+    print(f"  Bot will apply on next tick and record "
+          f"'state_patch_applied' in the trade log.")
+    print(f"  Sleeve {sleeve_id} realized_pnl will become ${new_realized:.2f}")
+    print(f"  Refresh the dashboard in ~5-10s (after next tick fires).")
 
 
 if __name__ == "__main__":

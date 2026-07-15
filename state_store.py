@@ -173,6 +173,32 @@ class JsonFileStateStore:
             del block["cancel_intent"]
             self._save(data)
 
+    def get_state_patch(self, tenant_id: str, symbol: str) -> Optional[dict]:
+        """Adam 2026-07-15: diag-writes/bot-reads pending state correction.
+
+        Solves the diag-vs-live race: diag script writes state → live bot's
+        in-memory state is stale → next _save_state clobbers our write.
+
+        Patch shape:
+            {"sleeves": {"<sid>": {"realized_pnl": 14.55,
+                                    "recent_cycle_pnls_append": 15.10}},
+             "reason": "…", "ts": …}
+
+        Bot consumes at start of each step() BEFORE any tick logic runs,
+        applies via _apply_state_patch, then clears. Fields ending in
+        _append are appended to the target list (bounded); others are set."""
+        return self._get_scope(tenant_id, symbol, "state_patch")
+
+    def put_state_patch(self, tenant_id: str, symbol: str, patch: dict) -> None:
+        self._put_scope(tenant_id, symbol, "state_patch", patch)
+
+    def clear_state_patch(self, tenant_id: str, symbol: str) -> None:
+        data = self._load()
+        block = data.get(tenant_id, {}).get(symbol, {})
+        if "state_patch" in block:
+            del block["state_patch"]
+            self._save(data)
+
     def list_symbols(self, tenant_id: str) -> list[str]:
         return sorted((self._load().get(tenant_id) or {}).keys())
 
@@ -301,6 +327,9 @@ class RedisJsonStore:
     def clear_reset_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "reset_intent")
     def get_cancel_intent(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "cancel_intent")
     def clear_cancel_intent(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "cancel_intent")
+    def get_state_patch(self, tenant_id, symbol): return self._get_scope(tenant_id, symbol, "state_patch")
+    def put_state_patch(self, tenant_id, symbol, patch): self._put_scope(tenant_id, symbol, "state_patch", patch)
+    def clear_state_patch(self, tenant_id, symbol): self._clear_scope(tenant_id, symbol, "state_patch")
 
     def list_symbols(self, tenant_id):
         return sorted((self._load().get(tenant_id) or {}).keys())
