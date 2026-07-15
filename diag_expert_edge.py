@@ -319,11 +319,30 @@ def main() -> None:
 
     # Bottom line
     print(f"\n[5] BOTTOM LINE:")
-    projected_year = pnl_per_day * 252  # trading-day count
-    projected_month = pnl_per_day * 21
-    print(f"    Extrapolated (naive): ${projected_month:.2f}/month · "
-          f"${projected_year:.2f}/year at current rate")
-    print(f"    {_verdict_for_edge(pnl_per_day, p_val, total_cycles, avg_per_cycle)}")
+    # Honest extrapolation: use state-authoritative realized divided by
+    # an assumed cycles/day pace. Log-based days_running is unreliable
+    # when the log has rotated (only shows recent hours). Instead: assume
+    # a plausible sustainable pace (10-20 cycles/day) and back out $/day
+    # from state total.
+    if state_cycles_total > 0 and state_realized_total != 0:
+        # Range: pace of 10-20 cycles/day is typical
+        low_days = state_cycles_total / 20.0
+        high_days = state_cycles_total / 10.0
+        low_per_day = state_realized_total / high_days   # conservative
+        high_per_day = state_realized_total / low_days  # optimistic
+        avg_est = (low_per_day + high_per_day) / 2.0
+        print(f"    Realistic $/day (state-based): ${low_per_day:.2f} to "
+              f"${high_per_day:.2f} (mid ~${avg_est:.2f})")
+        print(f"    Monthly at mid pace:  ${avg_est * 21:.2f}")
+        print(f"    Annual at mid pace:   ${avg_est * 252:.2f}")
+        print(f"    (Log-window rate ${pnl_per_day:.2f}/day is UNRELIABLE — trade")
+        print(f"     log rotated, only sees recent hours. State total is truth.)")
+    else:
+        projected_year = pnl_per_day * 252
+        projected_month = pnl_per_day * 21
+        print(f"    Extrapolated (naive): ${projected_month:.2f}/month · "
+              f"${projected_year:.2f}/year at current rate")
+    print(f"\n    {_verdict_for_edge(pnl_per_day, p_val, total_cycles, avg_per_cycle)}")
     if total_fees > 0 and total_gross > 0:
         fee_drag_pct = 100.0 * total_fees / total_gross
         if fee_drag_pct > 30:
