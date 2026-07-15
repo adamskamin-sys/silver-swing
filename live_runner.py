@@ -667,9 +667,42 @@ def run() -> int:
             should_track |= should_track_regular
 
         # For each product that should be tracked but isn't: log + attempt.
+        # Adam 2026-07-15: also detect ZOMBIE Tracks — in _non_primary_tracks
+        # but not producing ticks (WS feed silent). If last_step_ok_ts is
+        # older than ZOMBIE_THRESHOLD_SECS, force eviction + fresh spawn.
+        # Prior version only detected products NOT in the dict, which
+        # missed the case where boot spawned a Track whose feed then never
+        # produced a tick (silent zombie).
+        ZOMBIE_THRESHOLD_SECS = 300.0  # 5 min without a tick = zombie
         for pid in sorted(should_track):
-            if pid in _non_primary_tracks:
-                continue
+            existing = _non_primary_tracks.get(pid)
+            if existing is not None:
+                # Check for zombie: has this Track produced a tick recently?
+                last_ok = float(getattr(existing, "last_step_ok_ts", 0) or 0)
+                last_tick = float(getattr(existing, "last_tick_seen_ts", 0) or 0)
+                most_recent = max(last_ok, last_tick)
+                age = now - most_recent if most_recent > 0 else float("inf")
+                if age < ZOMBIE_THRESHOLD_SECS:
+                    continue  # actively ticking — not a zombie
+                # ZOMBIE detected — force evict + respawn
+                try:
+                    log.record(
+                        "track_zombie_detected",
+                        tenant=TENANT, symbol=pid,
+                        last_step_ok_age_secs=round(age, 1),
+                        threshold_secs=ZOMBIE_THRESHOLD_SECS,
+                        reason="Track in _non_primary_tracks but no ticks / no successful step in threshold window — WS feed died silently",
+                        severity="critical",
+                    )
+                except Exception:
+                    pass
+                # Force-evict; cooldown will be set. Fresh spawn attempts
+                # respect the cooldown so we don't hammer a broken product.
+                try:
+                    _evict_track(pid, "zombie: no ticks in threshold window")
+                except Exception:
+                    pass
+                # Fall through to the spawn-attempt path below.
             last_evict = _non_primary_last_evict_ts.get(pid, 0.0)
             cooldown_remaining = (max(0.0, EVICT_COOLDOWN_SECS - (now - last_evict))
                                    if last_evict else 0.0)
