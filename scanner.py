@@ -391,6 +391,57 @@ def score_product_swings(
         best_frontrun["tile_label"] = "FRONT-RUN"
         tiles.append(best_frontrun)
     best = best_expert
+
+    # Adam 2026-07-15: Avellaneda-Stoikov tile — computes optimal spread
+    # from vol + arrival rate + inventory (using expert_spread module).
+    # Adds a third tile with the AS pick + expected $/day forecast so
+    # the operator can compare EMPIRICAL (scanner grid) vs MODEL
+    # (Avellaneda-Stoikov formula). When they agree, high confidence.
+    # When they diverge, one may be catching what the other misses.
+    #
+    # Fail-safe: any AS error just skips the tile — scanner output
+    # unchanged for the other two tiles.
+    as_tile = None
+    try:
+        import expert_spread as _es
+        # Use monthly prices when available (larger sample) else daily.
+        # Arrival rate: approximated from empirical rt_daily on the best
+        # candidate — that's the closest cycles-per-day estimate we have
+        # for this product pre-arm.
+        est_arrival_per_sec = None
+        if best and best.get("roundtrips"):
+            est_arrival_per_sec = float(best["roundtrips"]) / 86400.0
+        mid_px = (prices[-1] if prices else 0.0)
+        as_dec = _es.grid_search_optimal_gamma(
+            mid_price=float(mid_px),
+            price_history=list(monthly_prices or prices or []),
+            cycle_completion_ts=None,  # let module use its floor
+            fee_per_roundtrip=fee_rt,
+            contract_size=float(contract_size),
+            qty=1,   # scanner always scores at 1-contract
+            tick_size=float(tick_size),
+        )
+        if as_dec is not None:
+            as_tile = {
+                "spread": round(as_dec.spread, 6),
+                "spread_mult": round(as_dec.spread / tick_size) if tick_size > 0 else None,
+                "roundtrips": round(as_dec.expected_cycles_per_day, 2),
+                "net_per_rt": round(as_dec.expected_profit_per_cycle, 4),
+                "score": round(as_dec.expected_daily_pnl, 4),
+                "avg_swing": None,
+                "regime_robustness": None,
+                "tile_kind": "avellaneda_stoikov",
+                "fee_rt_used": round(fee_rt, 4),
+                "tile_label": "AS",
+                "method": as_dec.method,
+                "citation": as_dec.citation,
+                "cost_floor_binding": as_dec.cost_floor_binding,
+                "reservation_price": round(as_dec.reservation_price, 6),
+            }
+            tiles.append(as_tile)
+    except Exception:
+        pass
+
     return {
         "best_spread": best["spread"] if best else None,
         "best_spread_mult": best["spread_mult"] if best else None,
@@ -398,6 +449,10 @@ def score_product_swings(
         "best_net_per_rt": best["net_per_rt"] if best else 0.0,
         "best_score": best["score"] if best else 0.0,
         "best_avg_swing": best["avg_swing"] if best else 0.0,
+        # AS side-by-side comparison fields (None if AS couldn't compute)
+        "as_best_spread": as_tile["spread"] if as_tile else None,
+        "as_best_score": as_tile["score"] if as_tile else None,
+        "as_expected_cycles_per_day": as_tile["roundtrips"] if as_tile else None,
         "candidates": tiles,
     }
 
