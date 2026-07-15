@@ -397,9 +397,10 @@ class SwingTrader:
                 # and returns False — we DON'T clear own_avg_entry or
                 # resting_stop_oid so post-mortem has full context.
                 credited = self._credit_stop_fill(sc, ss, fill_price,
-                                                  filled_qty, source="reconcile")
+                                                  filled_qty, source="reconcile",
+                                                  oid=ss.resting_stop_oid)
                 if not credited:
-                    continue  # halted; state left intact for review
+                    continue  # halted OR dedup-skipped; state left intact
                 ss.own_avg_entry = None
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
@@ -3476,7 +3477,7 @@ class SwingTrader:
 
     def _credit_stop_fill(self, sc: SleeveConfig, ss: SleeveState,
                           fill_price: float, filled_qty: int,
-                          source: str) -> bool:
+                          source: str, oid: Optional[str] = None) -> bool:
         """Adam 2026-07-15 CRITICAL: shared helper for both the tick-side
         credit (_maybe_credit_resting_stop_fill) and the reconcile sweeper.
 
@@ -3489,13 +3490,46 @@ class SwingTrader:
         cycles++ fired anyway, and the $15 profit vanished into a phantom
         cycle. Manual fix: diag_force_credit_cycle.py.
 
+        Dedup: consults ss.credited_oids and skips if the passed oid is
+        already there. Prevents the tick-vs-reconcile double-credit race
+        (both paths poll order_status independently; same FILLED oid
+        could get credited twice, inflating realized_pnl in the OPPOSITE
+        direction from the HYPE silent-zero bug). Appends oid on success
+        (bounded to last 50).
+
         Returns True on success (caller then clears position tracking +
-        advances state), False on halt-for-review (caller returns without
-        clearing anything so post-mortem has full context).
+        advances state), False on halt-for-review OR duplicate-skip.
 
         source: 'tick' or 'reconcile' — recorded on the event so telemetry
         can distinguish which path credited the fill.
         """
+        # Dedup guard: skip if we've already credited this order_id from
+        # either path this session. Also serves as an idempotency check for
+        # replays after crash-recovery. When we DO skip, we clear the
+        # resting_stop_* tracking ourselves + advance state (the fill IS
+        # already credited; the caller shouldn't do it again) so the tick
+        # loop doesn't keep polling the same OID forever.
+        if oid is not None:
+            credited = list(getattr(ss, "credited_oids", None) or [])
+            if oid in credited:
+                import time as _time_dedup
+                self._record("resting_stop_credit_dedup_skipped",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             oid=oid, source=source,
+                             reason="oid already in credited_oids — "
+                                    "prevents double-credit race",
+                             severity="info")
+                # Clear tracking + advance state — the fill has already been
+                # credited by the other path or a prior boot. Leaving it as
+                # ARMED_SELL with a stale resting_stop_oid would burn API
+                # calls polling a permanently-FILLED order.
+                ss.own_avg_entry = None
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
+                ss.state = SleeveStateEnum.ARMED_BUY
+                ss.armed_buy_since_ts = _time_dedup.time()
+                return False
         if fill_price is None or fill_price <= 0:
             self._record("resting_stop_credit_fill_price_missing",
                          sleeve_id=sc.id, sleeve_name=sc.name,
@@ -3554,12 +3588,21 @@ class SwingTrader:
         # Reset consecutive-stops on a successful credit (whether profit or loss,
         # the fill closed the cycle cleanly).
         ss.consecutive_stops = 0
+        # Dedup: record this oid so a subsequent race path (tick or reconcile)
+        # doesn't credit the same fill twice. Bounded to last 50 to prevent
+        # unbounded state growth.
+        if oid is not None:
+            credited = list(getattr(ss, "credited_oids", None) or [])
+            credited.append(oid)
+            if len(credited) > 50:
+                credited = credited[-50:]
+            ss.credited_oids = credited
         self._record(
             "resting_stop_filled_credited",
             sleeve_id=sc.id, sleeve_name=sc.name,
             source=source, fill_price=fill_price,
             own_avg_entry=own_avg, avg_source=avg_source,
-            filled_qty=filled_qty, profit=profit,
+            filled_qty=filled_qty, profit=profit, oid=oid,
             new_realized=ss.realized_pnl, new_cycles=ss.cycles,
         )
         return True
@@ -3604,7 +3647,7 @@ class SwingTrader:
             old_oid = ss.resting_stop_oid
             old_stage = ss.resting_stop_stage
             credited = self._credit_stop_fill(sc, ss, fill_price, filled_qty,
-                                              source="tick")
+                                              source="tick", oid=old_oid)
             if not credited:
                 # Sleeve is now HALTED with the missing-avg event. Don't clear
                 # own_avg_entry or resting_stop_oid — leaves full context for
