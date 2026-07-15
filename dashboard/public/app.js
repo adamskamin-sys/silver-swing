@@ -29,6 +29,14 @@ let lastTradeEvents = []; // [crew] recent trade events, for the cockpit reversa
 let modeMenuOpen = false;
 let modeMenuOutsideHandlerAttached = false;
 const tradeLogEl = document.getElementById('trade-log');
+// [crew 2026-07-15] Trade-log filter panel — text + severity filter over
+// the recent-events list. Stateful so filters survive the 2s poll cycle.
+const tradeLogFilterEl = document.getElementById('trade-log-filter');
+const tradeLogSeverityEl = document.getElementById('trade-log-severity');
+const tradeLogCopyEl = document.getElementById('trade-log-copy');
+const tradeLogCountEl = document.getElementById('trade-log-count');
+let tradeLogFilter = '';
+let tradeLogSeverity = '';
 const haltBanner = document.getElementById('halt-banner');
 const killBanner = document.getElementById('kill-banner');
 const stopLossBanner = document.getElementById('stop-loss-banner');
@@ -2819,6 +2827,25 @@ function priorityClass(eventType) {
   return '';
 }
 
+// [crew 2026-07-15] Category matchers for the trade-log severity dropdown.
+// Text filter is applied separately on the JSON-stringified event.
+function eventMatchesSeverity(ev, sev) {
+  if (!sev) return true;
+  const t = String(ev.event_type || '').toLowerCase();
+  if (sev === 'crit') return priorityClass(ev.event_type) === 'crit';
+  if (sev === 'warn') return priorityClass(ev.event_type) === 'warn';
+  if (sev === 'reconciliation') return t.includes('reconcile') || t.includes('reconciliation');
+  if (sev === 'ghost') return t.includes('ghost');
+  if (sev === 'fill') return t.includes('fill');
+  return true;
+}
+
+function eventMatchesText(ev, needle) {
+  if (!needle) return true;
+  const hay = JSON.stringify(ev).toLowerCase();
+  return hay.includes(needle.toLowerCase());
+}
+
 function renderTradeEvent(ev) {
   const li = document.createElement('li');
   li.className = priorityClass(ev.event_type);
@@ -3170,8 +3197,20 @@ async function refreshOnce() {
   }
 
   tradeLogEl.innerHTML = '';
-  for (const ev of (trades.events || []).slice().reverse()) {
+  const allEvents = (trades.events || []).slice().reverse();
+  let visibleCount = 0;
+  for (const ev of allEvents) {
+    if (!eventMatchesSeverity(ev, tradeLogSeverity)) continue;
+    if (!eventMatchesText(ev, tradeLogFilter)) continue;
     tradeLogEl.appendChild(renderTradeEvent(ev));
+    visibleCount += 1;
+  }
+  if (tradeLogCountEl) {
+    if (tradeLogFilter || tradeLogSeverity) {
+      tradeLogCountEl.textContent = `showing ${visibleCount} of ${allEvents.length}`;
+    } else {
+      tradeLogCountEl.textContent = `${allEvents.length} events`;
+    }
   }
 
   lastUpdated.textContent = `updated ${new Date().toLocaleTimeString()}`;
@@ -7275,6 +7314,69 @@ loginForm.addEventListener('submit', async (e) => {
 logoutBtn.addEventListener('click', logout);
 resetPaperBtn.addEventListener('click', resetPaperTrading);
 stopLossToggleBtn.addEventListener('click', toggleStopLoss);
+
+// [crew 2026-07-15] Trade-log filter listeners. Filter/severity re-render
+// from cached lastTradeEvents so keystrokes are instant (no /api/trades
+// roundtrip). If lastTradeEvents is empty (pre-first-poll) we no-op.
+function rerenderTradeLogFromCache() {
+  if (!tradeLogEl) return;
+  const events = (lastTradeEvents || []).slice().reverse();
+  tradeLogEl.innerHTML = '';
+  let visibleCount = 0;
+  for (const ev of events) {
+    if (!eventMatchesSeverity(ev, tradeLogSeverity)) continue;
+    if (!eventMatchesText(ev, tradeLogFilter)) continue;
+    tradeLogEl.appendChild(renderTradeEvent(ev));
+    visibleCount += 1;
+  }
+  if (tradeLogCountEl) {
+    if (tradeLogFilter || tradeLogSeverity) {
+      tradeLogCountEl.textContent = `showing ${visibleCount} of ${events.length}`;
+    } else {
+      tradeLogCountEl.textContent = `${events.length} events`;
+    }
+  }
+}
+if (tradeLogFilterEl) {
+  tradeLogFilterEl.addEventListener('input', (e) => {
+    tradeLogFilter = String(e.target.value || '').trim();
+    rerenderTradeLogFromCache();
+  });
+}
+if (tradeLogSeverityEl) {
+  tradeLogSeverityEl.addEventListener('change', (e) => {
+    tradeLogSeverity = String(e.target.value || '').trim();
+    rerenderTradeLogFromCache();
+  });
+}
+if (tradeLogCopyEl) {
+  tradeLogCopyEl.addEventListener('click', async () => {
+    // Copy the CURRENTLY VISIBLE events (i.e., after filters) as one
+    // tab-separated block per line: ISO-time  event_type  symbol  JSON
+    const events = (lastTradeEvents || []).slice().reverse();
+    const lines = [];
+    for (const ev of events) {
+      if (!eventMatchesSeverity(ev, tradeLogSeverity)) continue;
+      if (!eventMatchesText(ev, tradeLogFilter)) continue;
+      const ts = new Date((ev.ts || 0) * 1000).toISOString();
+      const et = ev.event_type || '?';
+      const sym = ev.symbol || '';
+      const detail = { ...ev };
+      delete detail.ts; delete detail.event_type; delete detail.tenant; delete detail.symbol;
+      lines.push(`${ts}\t${et}\t${sym}\t${JSON.stringify(detail)}`);
+    }
+    const payload = lines.join('\n');
+    try {
+      await navigator.clipboard.writeText(payload);
+      showToast(`copied ${lines.length} events to clipboard`, 'info');
+    } catch (err) {
+      showToast('clipboard copy failed — check browser permissions', 'error');
+    }
+  });
+}
+// Keep in-flight filter state alive across the 2s auto-refresh: the render
+// loop above reads tradeLogFilter/tradeLogSeverity when it rebuilds the list.
+lastTradeEvents = lastTradeEvents || [];
 
 // ---- boot ---------------------------------------------------------------
 

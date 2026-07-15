@@ -77,7 +77,22 @@
         </table>
       </section>
       <section id="trades-section">
-        <h2>recent events</h2>
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px;">
+          <h2 style="margin:0;">recent events</h2>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+            <input id="trade-log-filter" type="text" placeholder="filter (product, event, keyword)" style="padding:4px 8px;background:var(--panel-2, #0a1119);border:1px solid #1e2a3a;border-radius:4px;color:#cbd5e1;font-size:12px;width:220px;font-family:ui-monospace,monospace;">
+            <select id="trade-log-severity" style="padding:4px 8px;background:var(--panel-2, #0a1119);border:1px solid #1e2a3a;border-radius:4px;color:#cbd5e1;font-size:12px;">
+              <option value="">all</option>
+              <option value="crit">crit only</option>
+              <option value="warn">warn only</option>
+              <option value="reconciliation">reconciliation only</option>
+              <option value="ghost">ghost events</option>
+              <option value="fill">fills only</option>
+            </select>
+            <button id="trade-log-copy" class="small ghost" title="Copy the currently visible events to clipboard (formatted for paste)">📋 copy visible</button>
+            <span id="trade-log-count" style="color:#64748b;font-size:11px;"></span>
+          </div>
+        </div>
         <ol id="trade-log"></ol>
       </section>
     </section>
