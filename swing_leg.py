@@ -3620,6 +3620,23 @@ class SwingTrader:
                     )
                     return
 
+                # Adam 2026-07-15 CRITICAL fleet-wide rule: when resting_stop_enabled=True,
+                # the exchange-side resting stop-limit is the SOLE exit path for this
+                # sleeve. DO NOT also fire bot-side sells (hybrid market-timeout,
+                # trailing_stop market exit). Doing both creates a double-fire: at
+                # the moment mark crosses sell_px, the resting stop triggers AND the
+                # bot fires its own market sell. Both flatten one contract each, taking
+                # a +1 LONG to -1 SHORT in a single tick. CU 2026-07-15 12:34:34
+                # incident: exactly this race. Broker no-short guard caught subsequent
+                # sells but the position was already at -1 by then, and the hybrid
+                # loop kept retrying every 5s (each refused) burning API calls.
+                # If exit_mode is fixed_limit / percentage_swing, no bot-side market
+                # sell fires anyway — the resting_stop coexists with a resting limit
+                # sell peacefully. Only hybrid + trailing_stop need the exclusion.
+                if (getattr(sc, "resting_stop_enabled", True)
+                        and sc.exit_mode in ("hybrid", "trailing_stop")):
+                    return  # exchange stop is the sole exit; bot-side skipped
+
                 # Mode-specific arm price.
                 # fixed_limit / percentage_swing: sell resting at sc.sell_px.
                 # trailing_stop: wait for trigger, then track high water, place a
@@ -3932,7 +3949,25 @@ class SwingTrader:
             set_src("strategy", strategy_id=sc.id)
         place_market = getattr(self.b, "place_market", None)
         if callable(place_market):
-            ss.live_order_id = self.b.place_market("SELL", sc.qty)
+            # Adam 2026-07-15 CRITICAL: if the broker refuses (typically the
+            # no-short guard — position already ≤ 0 so this sell would go
+            # negative), HALT the sleeve immediately instead of returning
+            # silently. Otherwise the caller (_sleeve_hybrid_step) loops
+            # every 5s trying the same refused sell forever. CU 2026-07-15
+            # ran this loop for minutes before Adam manually intervened.
+            try:
+                ss.live_order_id = self.b.place_market("SELL", sc.qty)
+            except Exception as _e:
+                self._record("sleeve_market_sell_refused",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    side="SELL", qty=sc.qty, price=last_price,
+                    trail_exit=trail_exit, hybrid_timeout=hybrid_timeout,
+                    error=f"{type(_e).__name__}: {_e}",
+                    severity="critical")
+                self._sleeve_halt(sc, ss,
+                    f"market sell refused: {type(_e).__name__}: {_e} "
+                    f"— sleeve state may be desynced with position; manual review")
+                return
             self._record("sleeve_order_placed",
                 sleeve_id=sc.id, sleeve_name=sc.name,
                 side="SELL", qty=sc.qty, price=last_price,
