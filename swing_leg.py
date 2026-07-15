@@ -353,6 +353,71 @@ class SwingTrader:
                 cleared_sleeves.append((sid, ss.live_order_id, status))
                 ss.live_order_id = None
                 ss.filled_qty = 0
+        # Adam 2026-07-15: also sweep resting_stop_oid — the ratchet-stop
+        # can fire on Coinbase and the tick loop may drop the product from
+        # active ticking (ZEC-style: pos→0 → not ticked → _maybe_credit_
+        # resting_stop_fill never runs). Reconcile runs periodically from
+        # live_runner regardless of tick activity, so it's the right hook
+        # for the sweeper. Same code path as _maybe_credit_resting_stop_fill.
+        import time as _time_recon
+        credited_stops = []
+        for sid, ss in self.s.sleeves.items():
+            if not ss.resting_stop_oid:
+                continue
+            sc = sleeves_cfg_by_id.get(sid)
+            if sc is None:
+                # Sleeve config gone — best-effort clear the id
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
+                continue
+            try:
+                st = self.b.order_status(ss.resting_stop_oid)
+            except Exception:
+                continue  # transient, retry next reconcile
+            status = (st or {}).get("status")
+            if status == "OPEN":
+                continue  # still resting
+            if status == "FILLED":
+                try:
+                    fill_price = float(st.get("average_filled_price") or 0)
+                except Exception:
+                    fill_price = 0.0
+                filled_qty = int(st.get("filled_qty") or sc.qty or 1)
+                own_avg = float(ss.own_avg_entry or 0)
+                profit = 0.0
+                if own_avg > 0 and fill_price > 0:
+                    try:
+                        contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
+                    except Exception:
+                        contract_size = 1.0
+                    profit = (fill_price - own_avg) * filled_qty * contract_size
+                credited_stops.append((sid, ss.resting_stop_oid, fill_price, profit))
+                # Credit
+                ss.realized_pnl = float(ss.realized_pnl or 0) + profit
+                ss.cycles = int(ss.cycles or 0) + 1
+                ss.last_sell_qty = filled_qty
+                ss.last_sell_fill_price = fill_price
+                try:
+                    recent = list(ss.recent_cycle_pnls or [])
+                    recent.append(profit)
+                    if len(recent) > 20:
+                        recent = recent[-20:]
+                    ss.recent_cycle_pnls = recent
+                except Exception:
+                    pass
+                ss.own_avg_entry = None
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
+                ss.state = SleeveStateEnum.ARMED_BUY
+                ss.armed_buy_since_ts = _time_recon.time()
+            elif status in ("CANCELLED", "EXPIRED"):
+                # External cancel — clear so _maintain_resting_stop places
+                # a fresh one next tick (if the sleeve gets ticked at all)
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
         self._record(
             "reconciled",
             actual_position=pos,
@@ -361,6 +426,7 @@ class SwingTrader:
             cleared_sleeves=cleared_sleeves,
             credited_sleeves=credited_sleeves,
             credited_primary=credited_primary,
+            credited_stops=credited_stops if credited_stops else None,
         )
         self._save_state()
 
