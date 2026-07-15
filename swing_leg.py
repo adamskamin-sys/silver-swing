@@ -1090,6 +1090,20 @@ class SwingTrader:
                               f"stop-loss at {last_price} (≤ {effective_stop}) but core floor "
                               f"{self.cfg.core_qty} blocks the sell (pos={pos})")
             return True
+        # Adam 2026-07-15 CRITICAL: mutual exclusion with exchange resting stop.
+        # If resting_stop_enabled=True, Coinbase already has a stop-limit sitting
+        # at effective_stop. When mark crosses, IT fires — and if we ALSO
+        # place_market SELL here, both flatten one contract each, taking a +1
+        # LONG to -1 SHORT. CU 2026-07-15 12:34:34 double-fire race — problem-
+        # scout found this bot-side path was NOT guarded, only the arm-new-order
+        # path was. Same fix pattern as swing_leg.py:3653.
+        if getattr(sc, "resting_stop_enabled", True) and ss.resting_stop_oid:
+            self._record("sleeve_stop_loss_skipped_resting_stop_active",
+                         sleeve_id=sc.id, price=last_price,
+                         trigger=effective_stop,
+                         resting_stop_oid=ss.resting_stop_oid,
+                         resting_stop_px=ss.resting_stop_px)
+            return False
         was_ratcheted = effective_stop > float(sc.stop_loss_px or 0.0)
         sell_ok = False
         try:
@@ -2730,14 +2744,31 @@ class SwingTrader:
             clamped_buy = float(last_sale) - max(spread / 4.0,
                                                  float(last_sale) * 0.0005)
         clamped_sell = clamped_buy + spread
-        self._record(
-            "sleeve_reanchor_clamped_below_last_sale",
-            sleeve_id=sc.id, sleeve_name=sc.name,
-            source=source,
-            requested_buy=round(float(new_buy_px), 6),
-            clamped_buy=round(float(clamped_buy), 6),
-            last_sale=round(float(last_sale), 6),
-        )
+        # Adam 2026-07-15: rate-limit to 5 min per sleeve. Was firing every
+        # 5s per sleeve (once for each _sleeve_step call), spamming the
+        # trade log with a purely informational clamp event. Real signal
+        # still surfaces (once per 5min), noise stops.
+        import time as _t_clamp
+        try:
+            key = f"reanchor_clamp_{sc.id}"
+            store = getattr(self, "_reanchor_clamp_last_ts", None)
+            if store is None:
+                self._reanchor_clamp_last_ts = {}
+                store = self._reanchor_clamp_last_ts
+            last_ts = int(store.get(key, 0) or 0)
+            cur = int(_t_clamp.time())
+            if cur - last_ts > 300:
+                self._record(
+                    "sleeve_reanchor_clamped_below_last_sale",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    source=source,
+                    requested_buy=round(float(new_buy_px), 6),
+                    clamped_buy=round(float(clamped_buy), 6),
+                    last_sale=round(float(last_sale), 6),
+                )
+                store[key] = cur
+        except Exception:
+            pass  # never let logging break the clamp itself
         return clamped_buy, clamped_sell
 
     def _maybe_expert_reanchor_after_sell(self, sc: "SleeveConfig",
@@ -2951,6 +2982,20 @@ class SwingTrader:
                 f"core floor {self.cfg.core_qty} blocks the sell (pos={pos})"
             )
             return True
+        # Adam 2026-07-15 CRITICAL: mutual exclusion with any sleeve-level
+        # resting stops that are also live at Coinbase. If ANY sleeve on this
+        # product has resting_stop_oid set, Coinbase already has protective
+        # sells sitting on the book. Firing a primary market SELL here on top
+        # of that = the double-fire race (CU 2026-07-15 12:34:34) at the
+        # product level. Skip the bot-side sell; the exchange stops carry it.
+        active_resting = [ss.resting_stop_oid
+                          for ss in (self.s.sleeves or {}).values()
+                          if getattr(ss, "resting_stop_oid", None)]
+        if active_resting:
+            self._record("stop_loss_skipped_resting_stop_active",
+                         price=last_price, trigger=trigger,
+                         resting_stop_oids=list(active_resting))
+            return False
         try:
             source = getattr(self.b, "set_pending_source", None)
             if callable(source):
@@ -3537,6 +3582,17 @@ class SwingTrader:
                     ms_snap, rets, "LONG",
                     {"guard_enabled": True, "flip_enabled": flip_on})
                 if assess.get("action") in ("FLATTEN", "FLATTEN_AND_FLIP"):
+                    # Adam 2026-07-15 CRITICAL: same mutual-exclusion rule as
+                    # stop-loss paths. If the sleeve has a live resting stop
+                    # on Coinbase, that IS our crash protection — don't also
+                    # market-sell (double-fire → short).
+                    if (getattr(sc, "resting_stop_enabled", True)
+                            and getattr(ss, "resting_stop_oid", None)):
+                        self._record("crash_guard_flatten_skipped_resting_stop_active",
+                                     sleeve_id=sc.id, sleeve_name=sc.name,
+                                     resting_stop_oid=ss.resting_stop_oid,
+                                     severity=assess.get("severity"))
+                        return
                     self._record("crash_guard_flatten", sleeve_id=sc.id, sleeve_name=sc.name,
                                  severity=assess.get("severity"), direction=assess.get("direction"),
                                  fired=assess.get("fired"))
