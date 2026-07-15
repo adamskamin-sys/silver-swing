@@ -1161,13 +1161,20 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           const revBadge = revArmed
             ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="Reversal watch armed — a crash flatten would log a shadow short signal (paper-only, no live order)">↺</span>`
             : '';
-          // Trail-active badge — sleeve is actively riding a trailing stop
-          // (hybrid trail armed OR ratcheting stop-loss climbing). Green
-          // because it's a profit-lock state.
-          const trailInfo = r.kind === 'futures' ? productTrailActiveInfo(liveTenant, r.product) : null;
-          const trailBadge = trailInfo
-            ? ` <span class="ck-chip ck-ok" style="font-size:0.7em;padding:1px 4px" title="${escapeHtml(trailInfo.kind === 'trail' ? 'HYBRID TRAIL' : 'RATCHET STOP')} ACTIVE — ${trailInfo.sleeveName} · HWM $${fmtPrice(trailInfo.hwm)} · effective stop $${fmtPrice(trailInfo.stopPx)} (distance $${fmtPrice(trailInfo.dist)}). Sells when mark drops to the effective stop.">🔒 TRAIL $${fmtPrice(trailInfo.stopPx)}</span>`
-            : '';
+          // Trail-active badges — one per active protection. Returns an array:
+          //   { kind: 'trail'|'ratchet', stopPx, hwm, dist, sleeveName }
+          // 🔒 TRAIL = hybrid trail (aggressive exit, market sell on pullback)
+          // ⬆ STOP = ratcheting stop-loss (protective, only fires on drawdown)
+          // Same product can show both if both mechanisms are active.
+          const trailList = r.kind === 'futures' ? productTrailActiveInfo(liveTenant, r.product) : null;
+          let trailBadge = '';
+          if (Array.isArray(trailList)) {
+            for (const t of trailList) {
+              const label = t.kind === 'trail' ? '🔒 TRAIL' : '⬆ STOP';
+              const kindName = t.kind === 'trail' ? 'HYBRID TRAIL (aggressive — sells on any pullback)' : 'RATCHETING STOP (protective — only fires on real drawdown)';
+              trailBadge += ` <span class="ck-chip ck-ok" style="font-size:0.7em;padding:1px 4px" title="${kindName} · ${escapeHtml(t.sleeveName)} · HWM $${fmtPrice(t.hwm)} · effective stop $${fmtPrice(t.stopPx)} (distance $${fmtPrice(t.dist)}).">${label} $${fmtPrice(t.stopPx)}</span>`;
+            }
+          }
           // Average-down signal — 🟢 when the expert stack says "this is the
           // one to add to." 🟡 when watching but not all conditions met. See
           // avg_down_signal.py — requires mean-revert regime + at channel
@@ -1584,47 +1591,60 @@ function productHasReversalArmed(tenant, productId) {
   return sleeves.some(s => s && s.reversal_enabled === true);
 }
 
-// Trail-active detector for the portfolio row badge. Only fires when a
-// sleeve is CURRENTLY HOLDING (state=ARMED_SELL + a live sell order on the
-// book) AND the trail state is actively engaged (not leftover HWM from a
-// prior cycle). Prior version fired on any sleeve with a populated HWM,
-// which lit up NGS + BIT even though those trails weren't actually running.
+// Trail-active detector. Returns null OR an array of active protections
+// on this product. Each entry:
+//   { kind: 'trail' | 'ratchet', stopPx, hwm, dist, sleeveName }
+// GATE: sleeve must be state=ARMED_SELL (currently holding contracts).
+// We DON'T require live_order_id, because hybrid-trail exits are
+// market-on-trigger — the bot tracks HWM internally and fires a market
+// SELL when mark drops below stopPx. No resting order until it fires.
+// Prior gate (require live_order_id) hid HYPE's real trail.
+//
+// Returns BOTH types when active on the same product so the badge can
+// distinguish "🔒 TRAIL" (hybrid — aggressive exit) from "⬆ STOP" (ratchet
+// — protective climb). BTC has ratchet active but NO hybrid trail; HYPE
+// has hybrid trail active. Same product may show both.
 function productTrailActiveInfo(tenant, productId) {
   const block = currentStore?.[tenant]?.[productId];
   if (!block) return null;
   const sleeves = Array.isArray(block.config?.sleeves) ? block.config.sleeves : [];
   const sleeveStates = (block.state || {}).sleeves || {};
-  let best = null;  // pick the tightest (highest) trail stop across sleeves
+  const out = [];
   for (const s of sleeves) {
     const ss = sleeveStates[s.id] || {};
-    // Gate: sleeve must be actively holding contracts + have a live sell
-    // order (i.e., a real armed exit) — otherwise HWM is stale.
-    const holdingWithLiveExit = String(ss.state) === 'ARMED_SELL' && !!ss.live_order_id;
-    if (!holdingWithLiveExit) continue;
-    // (a) Hybrid exit trail — armed AND enabled + hwm running
+    // GATE: sleeve must be currently holding a position (ARMED_SELL).
+    // No live_order_id check — trails don't rest on the book.
+    if (String(ss.state) !== 'ARMED_SELL') continue;
+    // (a) Hybrid exit trail — trail_armed=true means mark has crossed
+    //     trail_activation_px and HWM is being tracked. Sell fires when
+    //     mark drops trail_distance below HWM.
     const trailArmed = ss.trail_armed === true;
     const hwm = Number(ss.trail_high_water_price) || 0;
     const trailDist = Number(s.trail_distance) || 0;
     if (trailArmed && hwm > 0 && trailDist > 0) {
-      const stopPx = hwm - trailDist;
-      if (best === null || stopPx > best.stopPx) {
-        best = { stopPx, hwm, dist: trailDist, kind: 'trail', sleeveName: s.name || s.id };
-      }
+      out.push({
+        kind: 'trail',
+        stopPx: hwm - trailDist,
+        hwm, dist: trailDist,
+        sleeveName: s.name || s.id,
+      });
     }
-    // (b) Ratcheting stop-loss — requires sc.stop_loss_enabled AND
-    //     sc.stop_loss_ratchet_enabled AND consecutive_stops == 0 AND
-    //     an armed ratchet HWM. Skipping when stop_loss is disabled by
-    //     user (e.g., NGS — Adam's explicit no-stop directive).
+    // (b) Ratcheting stop-loss — enabled + ratchet enabled + hwm climbing.
+    //     Only shown if stop_loss_enabled is true (respects NGS no-stop
+    //     directive). The ratchet raises the stop as mark rises but ONLY
+    //     fires on real drawdown, not on minor pullback.
     const slHwm = Number(ss.stop_loss_hwm) || 0;
     const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
     if (s.stop_loss_enabled && s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
-      const stopPx = slHwm - ratchetDist;
-      if (best === null || stopPx > best.stopPx) {
-        best = { stopPx, hwm: slHwm, dist: ratchetDist, kind: 'ratchet', sleeveName: s.name || s.id };
-      }
+      out.push({
+        kind: 'ratchet',
+        stopPx: slHwm - ratchetDist,
+        hwm: slHwm, dist: ratchetDist,
+        sleeveName: s.name || s.id,
+      });
     }
   }
-  return best;
+  return out.length ? out : null;
 }
 
 // Next price that would fire a sleeve action on this product — the closest
@@ -6059,6 +6079,16 @@ function openScannerDetail(row) {
           // loss for a position that doesn't exist.
           let ifStoppedCell = '<span class="dim">—</span>';
           const ownAvg2 = Number(ss.own_avg_entry) || 0;
+          // Adam 2026-07-15: IF STOPPED should surface the TRAIL exit price
+          // too (not just the stop-loss), in a distinct color so we can see
+          // at a glance whether the projected exit is from a trail-stop
+          // (aggressive, locks profit) or a base/ratchet stop-loss (protective,
+          // takes loss). For a long, the HIGHER of the two fires first.
+          const qty2 = Number(s.qty) || 0;
+          const cfg2 = currentStore[row._live_tenant]?.[row.product_id]?.config || {};
+          const sellFee = Number(cfg2.fee_per_fill_sell) || ((Number(cfg2.fee_per_contract_roundtrip) || 0) / 2);
+          // Compute both candidate exits — winner is the higher price for a long.
+          let slEff = 0;
           if (s.stop_loss_enabled && ownAvg2 > 0) {
             const baseStop2 = Number(s.stop_loss_px) || 0;
             const hwm2 = Number(ss.stop_loss_hwm) || 0;
@@ -6067,15 +6097,29 @@ function openScannerDetail(row) {
             const unrl2 = hwm2 - ownAvg2;
             const armed2 = unrl2 >= activation2;
             const floor2 = (s.stop_loss_ratchet_enabled && hwm2 > 0 && ratchetDist2 > 0 && armed2) ? hwm2 - ratchetDist2 : 0;
-            const eff2 = Math.max(baseStop2, floor2);
-            if (eff2 > 0) {
-              const qty2 = Number(s.qty) || 0;
-              const cfg2 = currentStore[row._live_tenant]?.[row.product_id]?.config || {};
-              const sellFee = Number(cfg2.fee_per_fill_sell) || ((Number(cfg2.fee_per_contract_roundtrip) || 0) / 2);
-              const stopPnl = (eff2 - ownAvg2) * liveContractSize * qty2;
-              const projected = realized + stopPnl - sellFee * qty2;
-              ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(eff2)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
-            }
+            slEff = Math.max(baseStop2, floor2);
+          }
+          let trailEff = 0;
+          const trailModes2 = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
+          if (trailModes2 && ownAvg2 > 0) {
+            const peak2 = Number(ss.trail_high_water_price) || 0;
+            const trailDist2 = Number(s.trail_distance) || 0;
+            if (peak2 > 0 && trailDist2 > 0) trailEff = peak2 - trailDist2;
+          }
+          // Winner = higher exit for a long. If trail is engaged and above
+          // the stop-loss, trail fires first (locks profit). Otherwise
+          // stop-loss is the active exit.
+          if (trailEff > 0 && trailEff >= slEff && ownAvg2 > 0 && qty2 > 0) {
+            const trailPnl = (trailEff - ownAvg2) * liveContractSize * qty2;
+            const projected = realized + trailPnl - sellFee * qty2;
+            // Distinct color: trail-locked profit = amber-gold (locked-in gain)
+            // vs stop-loss = red/green. Amber signals "this is the trail exit,
+            // it's a good thing — a locked-in profit, not a forced loss."
+            ifStoppedCell = `<span class="mono" style="color:#f59e0b;font-weight:600" title="TRAIL EXIT projection — sells at $${fmtPrice(trailEff)} if pullback triggers. Locks in this profit. Realized ${fmtMoney(realized)} + (${fmtPrice(trailEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}. Amber = trail (locks profit); green/red = base stop-loss.">🔒 ${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+          } else if (slEff > 0 && ownAvg2 > 0 && qty2 > 0) {
+            const stopPnl = (slEff - ownAvg2) * liveContractSize * qty2;
+            const projected = realized + stopPnl - sellFee * qty2;
+            ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
           }
           // Trail cell — grey pill with arm price when trail isn't engaged;
           // green pill with peak + effective stop when it is. Same source as
@@ -6090,9 +6134,13 @@ function openScannerDetail(row) {
             const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
             if (peak > 0 && trailDist > 0) {
               const effectiveStop = peak - trailDist;
-              trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">$${fmtPrice(peak)}</span></span>`;
+              // 2026-07-15 Adam UX: prior render showed two same-size numbers
+              // ($67.75  $68.01) that were easy to misread. Now clearly labels
+              // the FIRST as EXIT (where the market SELL fires) and the SECOND
+              // as PEAK/HWM (running high). Same info, unmistakable meaning.
+              trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED — peak $${fmtPrice(peak)}. Sells at $${fmtPrice(effectiveStop)} (peak − $${fmtPrice(trailDist)} pullback). Every new high lifts the exit.">EXIT <b>$${fmtPrice(effectiveStop)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
             } else if (armPx > 0) {
-              trailCell = `<span class="mono trail-pill-off" title="Not yet activated — trail arms once price crosses $${fmtPrice(armPx)}">$${fmtPrice(armPx)}</span>`;
+              trailCell = `<span class="mono trail-pill-off" title="Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).">arms at $${fmtPrice(armPx)}</span>`;
             }
           }
           // Halt reason lives on the product-level state (not per-sleeve) when
