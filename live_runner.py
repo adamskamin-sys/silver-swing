@@ -580,6 +580,92 @@ def run() -> int:
             _log(f"[non-primary] {track.product_id}: feed re-sync failed: "
                  f"{type(e).__name__}: {e}")
 
+    # Adam 2026-07-15: Track health auto-recovery. Prior to this, if a Track
+    # got evicted (STEP_FAILURE_EVICT_THRESHOLD or feed error) the eviction
+    # cooldown blocked re-spawn for 15 min. AFTER cooldown, nothing kicked
+    # off a new spawn attempt — the product just sat silent forever unless
+    # a new sleeve got armed (which triggers spawn via the arm-time path)
+    # or Render restarted. HYF sat dead 9+ hours in 2026-07-15 for exactly
+    # this reason; PT (Platinum) same class.
+    #
+    # This periodic check walks state + portfolio, finds every product with
+    # an ARMED sleeve OR a held position that DOESN'T have a live Track,
+    # and force-attempts _make_non_primary_track. Respects the eviction
+    # cooldown (won't hammer a persistently failing spawn). Logs
+    # track_silent_detected on find + track_auto_respawn_attempted on
+    # each spawn attempt so operator gets proactive visibility.
+    _last_track_health_check_ts = [0.0]  # box so nested funcs can mutate
+    TRACK_HEALTH_INTERVAL_SECS = float(os.getenv(
+        "SWING_TRACK_HEALTH_INTERVAL_SECS", "60.0"))
+
+    def _maybe_recover_dead_tracks() -> None:
+        now = time.time()
+        if now - _last_track_health_check_ts[0] < TRACK_HEALTH_INTERVAL_SECS:
+            return
+        _last_track_health_check_ts[0] = now
+        # Discover products that SHOULD be tracked but aren't.
+        should_track: set[str] = set()
+        try:
+            for sym in store.list_symbols(TENANT):
+                if sym.startswith("__"):
+                    continue
+                if sym == SYMBOL:
+                    continue  # primary handled separately
+                st = store.get_state(TENANT, sym) or {}
+                sleeves = st.get("sleeves") or {}
+                for ss in sleeves.values():
+                    sstate = str(ss.get("state") or "")
+                    if sstate in ("ARMED_BUY", "ARMED_SELL"):
+                        should_track.add(sym)
+                        break
+        except Exception:
+            pass
+        # Also add any product with a held position (per __portfolio__ snap)
+        try:
+            pf = store.get_state(TENANT, "__portfolio__") or {}
+            for sym, snap in pf.items():
+                if sym.startswith("__") or sym == SYMBOL:
+                    continue
+                if isinstance(snap, dict) and float(snap.get("position_qty") or 0) != 0:
+                    should_track.add(sym)
+        except Exception:
+            pass
+
+        # For each product that should be tracked but isn't: log + attempt.
+        for pid in sorted(should_track):
+            if pid in _non_primary_tracks:
+                continue
+            last_evict = _non_primary_last_evict_ts.get(pid, 0.0)
+            cooldown_remaining = (max(0.0, EVICT_COOLDOWN_SECS - (now - last_evict))
+                                   if last_evict else 0.0)
+            try:
+                log.record(
+                    "track_silent_detected",
+                    tenant=TENANT, symbol=pid,
+                    reason=("product has armed sleeve or held position but "
+                            "no live Track in _non_primary_tracks"),
+                    cooldown_remaining_secs=round(cooldown_remaining, 1),
+                    severity=("warn" if cooldown_remaining > 0 else "critical"),
+                )
+            except Exception:
+                pass
+            if cooldown_remaining > 0:
+                continue  # respect the cooldown; try again next health cycle
+            # Attempt recovery via the existing spawn path (handles all guards
+            # + failure paths). We don't bypass its checks — if config missing
+            # or spawn fails, _make_non_primary_track returns None + logs it.
+            track = _make_non_primary_track(pid)
+            try:
+                log.record(
+                    "track_auto_respawn_attempted",
+                    tenant=TENANT, symbol=pid,
+                    success=(track is not None),
+                    severity=("info" if track is not None else "warn"),
+                    reason=("auto-recovery from silent-Track detection"),
+                )
+            except Exception:
+                pass
+
     def _evict_track(product_id: str, reason: str) -> None:
         track = _non_primary_tracks.pop(product_id, None)
         if track is None:
@@ -703,6 +789,14 @@ def run() -> int:
             # the primary loop. Failure counter evicts traders that fail
             # STEP_FAILURE_EVICT_THRESHOLD ticks in a row.
             if TICK_NON_PRIMARY:
+                # Adam 2026-07-15: auto-recover any dead Tracks BEFORE the
+                # tick sweep so a fresh spawn attempt goes through the tick
+                # loop this iteration instead of waiting one more cycle.
+                try:
+                    _maybe_recover_dead_tracks()
+                except Exception as _rerr:
+                    _log(f"[non-primary] track health check failed: "
+                         f"{type(_rerr).__name__}: {_rerr}")
                 _to_evict = []
                 for _pid, _track in list(_non_primary_tracks.items()):
                     # Aggressive re-sync if the feed has gone quiet.
