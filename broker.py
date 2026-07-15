@@ -25,6 +25,11 @@ from typing import Optional
 from dotenv import load_dotenv
 from coinbase.rest import RESTClient
 
+# [crew 2026-07-15] Central budget allocator. On approve = call proceeds;
+# on defer, LOW/MEDIUM callers back off so CRITICAL order-placement
+# retains headroom. Fail-open — controller errors never block a trade.
+from rate_limit_controller import EndpointKind, Priority, get_controller
+
 
 # Map Coinbase Advanced Trade order statuses to the vocabulary swing_leg.py checks against
 # (FILLED / CANCELLED / EXPIRED / UNKNOWN). OPEN is added so the strategy can distinguish
@@ -89,6 +94,39 @@ class CoinbaseBroker:
             )
         self.client = RESTClient(key_file=key_path)
 
+    # ---- Rate-limit helper -----------------------------------------------
+    # Every REST call passes through _rl_call — records the call in the
+    # sliding-window tracker (so utilization is accurate for later gating
+    # decisions) and hands back any 429 to the controller for backoff. For
+    # LOW/MEDIUM callers we ALSO check acquire() first and abort/defer if
+    # we're near the budget cap. CRITICAL always proceeds — a breakout
+    # order-placement is worth an occasional 429.
+    def _rl_call(self, priority: Priority, kind: str, fn, *args, **kwargs):
+        ctrl = get_controller()
+        # For non-critical, give the controller a chance to defer. If deferred,
+        # we still make the call (fail-open behavior — never block a legit
+        # trade because our controller thinks we're busy), but the deny is
+        # recorded so telemetry shows how much throttling would have happened.
+        if priority != Priority.CRITICAL:
+            ctrl.acquire(priority, kind)  # advisory record, we proceed regardless
+        else:
+            ctrl.acquire(priority, kind)  # always True for CRITICAL
+        try:
+            resp = fn(*args, **kwargs)
+            # Record successful call — controller sees status_code=200
+            ctrl.record_response(kind, status_code=200)
+            return resp
+        except Exception as e:
+            # If the SDK raises with an HTTP status attached, extract for
+            # backoff — else just note as a non-2xx.
+            code = getattr(e, "status_code", None) or getattr(e, "code", None)
+            try:
+                code = int(code) if code is not None else None
+            except (TypeError, ValueError):
+                code = None
+            ctrl.record_response(kind, status_code=code)
+            raise
+
     # ---- Broker Protocol -------------------------------------------------
 
     def place_limit(self, side: str, qty: int, price: float,
@@ -123,7 +161,8 @@ class CoinbaseBroker:
         }
         if post_only:
             kwargs["post_only"] = True
-        resp = _dump(method(**kwargs))
+        # CRITICAL — order placement always proceeds even under budget pressure.
+        resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
         if resp.get("success"):
             oid = (resp.get("success_response") or {}).get("order_id")
             if oid:
@@ -146,7 +185,8 @@ class CoinbaseBroker:
             "product_id": self.cfg.product_id,
             "base_size": str(int(qty)),
         }
-        resp = _dump(method(**kwargs))
+        # CRITICAL — market orders always proceed (worth a 429 to hit the top).
+        resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
         if resp.get("success"):
             oid = (resp.get("success_response") or {}).get("order_id")
             if oid:
@@ -168,7 +208,11 @@ class CoinbaseBroker:
                 "raw_status": "STALE_LOCAL_ID",
                 "average_filled_price": None,
             }
-        order = _dump(self.client.get_order(order_id)).get("order") or {}
+        # HIGH — status check on a live order (needed to trip fills/cancels).
+        order = _dump(
+            self._rl_call(Priority.HIGH, EndpointKind.PRIVATE,
+                          self.client.get_order, order_id)
+        ).get("order") or {}
         raw = order.get("status") or "UNKNOWN"
         try:
             filled = int(float(order.get("filled_size") or 0))
