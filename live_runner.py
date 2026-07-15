@@ -595,41 +595,76 @@ def run() -> int:
     # track_silent_detected on find + track_auto_respawn_attempted on
     # each spawn attempt so operator gets proactive visibility.
     _last_track_health_check_ts = [0.0]  # box so nested funcs can mutate
+    # Adam 2026-07-15: tightened from 60s → 15s. In a fast-moving market a
+    # newly-dead Track could miss fills during the detection gap. 15s is
+    # short enough to bound the exposure while keeping the state-walk cost
+    # low (typically <5ms per check on a small tenant).
     TRACK_HEALTH_INTERVAL_SECS = float(os.getenv(
-        "SWING_TRACK_HEALTH_INTERVAL_SECS", "60.0"))
+        "SWING_TRACK_HEALTH_INTERVAL_SECS", "15.0"))
+    # Critical-detection interval — for products with HELD POSITIONS
+    # (unprotected money vs unprotected opportunity). If mark moves against
+    # a held long and there's no Track, the stop can't fire. Check every
+    # 5s or every tick — whichever is longer.
+    TRACK_HEALTH_CRITICAL_INTERVAL_SECS = float(os.getenv(
+        "SWING_TRACK_HEALTH_CRITICAL_SECS", "5.0"))
+    _last_track_health_critical_ts = [0.0]
 
     def _maybe_recover_dead_tracks() -> None:
         now = time.time()
-        if now - _last_track_health_check_ts[0] < TRACK_HEALTH_INTERVAL_SECS:
+        # Adam 2026-07-15: two-tier detection. Held-position dead Tracks
+        # are money-at-risk (stop can't fire without a Track) so they check
+        # every CRITICAL_INTERVAL (5s). Armed-sleeve dead Tracks are
+        # missed-opportunity (annoying but not dangerous) so they check
+        # every regular INTERVAL (15s).
+        do_critical = (now - _last_track_health_critical_ts[0] >=
+                       TRACK_HEALTH_CRITICAL_INTERVAL_SECS)
+        do_regular = (now - _last_track_health_check_ts[0] >=
+                      TRACK_HEALTH_INTERVAL_SECS)
+        if not do_critical and not do_regular:
             return
-        _last_track_health_check_ts[0] = now
+        if do_critical:
+            _last_track_health_critical_ts[0] = now
+        if do_regular:
+            _last_track_health_check_ts[0] = now
         # Discover products that SHOULD be tracked but aren't.
-        should_track: set[str] = set()
-        try:
-            for sym in store.list_symbols(TENANT):
-                if sym.startswith("__"):
-                    continue
-                if sym == SYMBOL:
-                    continue  # primary handled separately
-                st = store.get_state(TENANT, sym) or {}
-                sleeves = st.get("sleeves") or {}
-                for ss in sleeves.values():
-                    sstate = str(ss.get("state") or "")
-                    if sstate in ("ARMED_BUY", "ARMED_SELL"):
-                        should_track.add(sym)
-                        break
-        except Exception:
-            pass
-        # Also add any product with a held position (per __portfolio__ snap)
+        # Split into (a) held-position (critical) and (b) armed-sleeve (regular).
+        should_track_critical: set[str] = set()
+        should_track_regular: set[str] = set()
+        # Held positions first — always considered critical
         try:
             pf = store.get_state(TENANT, "__portfolio__") or {}
             for sym, snap in pf.items():
                 if sym.startswith("__") or sym == SYMBOL:
                     continue
                 if isinstance(snap, dict) and float(snap.get("position_qty") or 0) != 0:
-                    should_track.add(sym)
+                    should_track_critical.add(sym)
         except Exception:
             pass
+        # Armed sleeves — regular priority (unless product already in critical)
+        try:
+            for sym in store.list_symbols(TENANT):
+                if sym.startswith("__"):
+                    continue
+                if sym == SYMBOL:
+                    continue
+                if sym in should_track_critical:
+                    continue  # already flagged
+                st = store.get_state(TENANT, sym) or {}
+                sleeves = st.get("sleeves") or {}
+                for ss in sleeves.values():
+                    sstate = str(ss.get("state") or "")
+                    if sstate in ("ARMED_BUY", "ARMED_SELL"):
+                        should_track_regular.add(sym)
+                        break
+        except Exception:
+            pass
+        # Merge into single set for spawn attempts, gated by which interval
+        # actually fired this iteration.
+        should_track: set[str] = set()
+        if do_critical:
+            should_track |= should_track_critical
+        if do_regular:
+            should_track |= should_track_regular
 
         # For each product that should be tracked but isn't: log + attempt.
         for pid in sorted(should_track):
