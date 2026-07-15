@@ -2289,18 +2289,30 @@ class SwingTrader:
         # Verified via diag_missed_fills.py: 2 confirmed in-gap misses
         # from churn where new_buy_px differed by <0.1%.
         current_buy_px = float(sc.buy_px or 0)
+        drift_pct = None
         if current_buy_px > 0:
             drift_pct = abs(float(new_buy_px) - current_buy_px) / current_buy_px * 100
-            if drift_pct < self._REEVAL_MIN_DRIFT_PCT:
-                self._record(
-                    "reentry_reeval_replace_skipped_below_drift",
-                    sleeve_id=sc.id, sleeve_name=sc.name,
-                    current_buy_px=current_buy_px, new_buy_px=float(new_buy_px),
-                    drift_pct=round(drift_pct, 4),
-                    threshold_pct=self._REEVAL_MIN_DRIFT_PCT,
-                    reeval_action=getattr(dec, "action", None),
-                )
-                return
+        # Always emit the check so we can debug why the gate does/doesn't fire.
+        self._record(
+            "reentry_reeval_drift_check",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            current_buy_px=current_buy_px, new_buy_px=float(new_buy_px),
+            dec_new_buy_px=float(dec.new_buy_px) if getattr(dec, "new_buy_px", None) is not None else None,
+            drift_pct=(round(drift_pct, 4) if drift_pct is not None else None),
+            threshold_pct=self._REEVAL_MIN_DRIFT_PCT,
+            will_skip=(drift_pct is not None and drift_pct < self._REEVAL_MIN_DRIFT_PCT),
+            reeval_action=getattr(dec, "action", None),
+        )
+        if drift_pct is not None and drift_pct < self._REEVAL_MIN_DRIFT_PCT:
+            self._record(
+                "reentry_reeval_replace_skipped_below_drift",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                current_buy_px=current_buy_px, new_buy_px=float(new_buy_px),
+                drift_pct=round(drift_pct, 4),
+                threshold_pct=self._REEVAL_MIN_DRIFT_PCT,
+                reeval_action=getattr(dec, "action", None),
+            )
+            return
 
         # WS1 dedup lock (Tier 1 #2)
         try:

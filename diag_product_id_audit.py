@@ -125,6 +125,87 @@ def _query_coinbase_products() -> list[str]:
         return []
 
 
+def _query_coinbase_futures_details() -> dict[str, dict]:
+    """Get expiry + product-family info for every FUTURE at Coinbase.
+    Returns {product_id: {expiry_iso, days_to_expiry, base_symbol, ...}}.
+    Adam 2026-07-15: needed for roll detection (CDE futures expire and
+    the next-generation contract has a different product_id we must
+    migrate our sleeves to)."""
+    from datetime import datetime, timezone
+    import re
+    details: dict[str, dict] = {}
+    try:
+        from coinbase.rest import RESTClient
+        from dotenv import load_dotenv
+        load_dotenv()
+        key_path = os.getenv("COINBASE_API_KEY_JSON_PATH")
+        if not key_path:
+            return {}
+        client = RESTClient(key_file=key_path)
+        resp = client.get_products(product_type="FUTURE")
+        payload = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        now_utc = datetime.now(timezone.utc)
+        for p in (payload.get("products") or []):
+            pid = p.get("product_id") or p.get("product_type_id")
+            if not pid:
+                continue
+            fpd = p.get("future_product_details") or {}
+            expiry = fpd.get("contract_expiry")
+            days = None
+            expiry_dt = None
+            if expiry:
+                try:
+                    expiry_dt = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+                    days = (expiry_dt - now_utc).days
+                except Exception:
+                    pass
+            # Base symbol = strip -{expiry}-CDE / -INTX / -PERP suffixes
+            # Common shapes: HYP-20DEC30-CDE, BIT-31JUL26-CDE, HYPE-PERP-CDE
+            base = None
+            m = re.match(r"^([A-Z0-9]+)-(?:\d{1,2}[A-Z]{3}\d{2}|PERP)-", pid)
+            if m:
+                base = m.group(1)
+            details[pid] = {
+                "expiry": expiry,
+                "expiry_dt": expiry_dt,
+                "days_to_expiry": days,
+                "base_symbol": base,
+                "session_open": (p.get("fcm_trading_session_details") or {}).get("is_session_open"),
+                "current_price": p.get("price"),
+            }
+        return details
+    except Exception as e:
+        print(f"  WARN: could not fetch Coinbase futures details: {e}")
+        return {}
+
+
+def _find_roll_candidates(stored_id: str, stored_details: dict,
+                          all_details: dict[str, dict]) -> list[dict]:
+    """Given one stored product_id, find newer-expiry siblings on Coinbase
+    (same base_symbol, expiry later than stored). Returns list of candidate
+    dicts with product_id + days_to_expiry, sorted by nearest expiry."""
+    base = (stored_details or {}).get("base_symbol")
+    stored_expiry_dt = (stored_details or {}).get("expiry_dt")
+    if not base or not stored_expiry_dt:
+        return []
+    candidates = []
+    for pid, det in all_details.items():
+        if pid == stored_id:
+            continue
+        if det.get("base_symbol") != base:
+            continue
+        det_expiry = det.get("expiry_dt")
+        if not det_expiry or det_expiry <= stored_expiry_dt:
+            continue
+        candidates.append({
+            "product_id": pid,
+            "days_to_expiry": det.get("days_to_expiry"),
+            "expiry": det.get("expiry"),
+        })
+    candidates.sort(key=lambda x: x["days_to_expiry"] if x["days_to_expiry"] is not None else 9999)
+    return candidates
+
+
 def main() -> None:
     filter_arg = sys.argv[1] if len(sys.argv) > 1 else ""
     print("=" * 70)
