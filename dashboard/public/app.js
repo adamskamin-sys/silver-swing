@@ -5644,6 +5644,7 @@ const scannerDetailTimeframes = document.getElementById('scanner-detail-timefram
 const scannerDetailChart = document.getElementById('scanner-detail-chart');
 const scannerDetailWarning = document.getElementById('scanner-detail-warning');
 const scannerBuyBtn = document.getElementById('scanner-buy-btn');
+const scannerArmSleeveBtn = document.getElementById('scanner-arm-sleeve-btn');
 
 // {product_id, price, high_24h, low_24h, vol_pct, volume_24h}
 let scannerDetailContext = null;
@@ -5732,6 +5733,134 @@ function computeFisherSeries(closes, period = 10) {
     out[i] = 0.5 * Math.log((1 + clipped) / (1 - clipped));
   }
   return out;
+}
+
+// [crew 2026-07-15] Expert recommendations for the scanner detail modal.
+// Derives sleeve-ready levels from the scanner's best_spread + current mark
+// using the expert stack's conventions:
+//   buy/sell centered at mark ± spread/2 (symmetric around price)
+//   stop-loss at 3× spread below entry (Van Tharp asymmetric-payoff — target
+//     R = 1, stop R = 3 so a losing trade costs less than 3 winners recover)
+//   trail activates just past sell target, follows at 30% of spread
+//   ratchet locks in gains as price runs
+// Returns null when the scanner hasn't ranked this product yet (best_spread
+// missing) — caller shows a "no data yet" toast in that case.
+function computeExpertRecommendations(row) {
+  const mark = Number(row.price) || 0;
+  const spread = Number(row.best_spread) || 0;
+  if (mark <= 0 || spread <= 0) return null;
+  return {
+    mark,
+    spread,
+    buy_px: mark - spread / 2,
+    sell_px: mark + spread / 2,
+    stop_loss_px: Math.max(0, mark - spread * 3),
+    trail_activation_px: mark + spread * 1.05,
+    trail_distance: spread * 0.3,
+    stop_loss_ratchet_distance: spread * 1.5,
+    stop_loss_ratchet_activation: spread * 0.5,
+    expected_rt_per_day: Number(row.best_roundtrips) || 0,
+    expected_net_per_rt: Number(row.best_net_per_rt) || 0,
+    expected_per_day: Number(row.best_score) || 0,
+    weekly_score: Number(row.weekly_score) || 0,
+    monthly_score: Number(row.monthly_score) || 0,
+  };
+}
+
+function renderExpertRecommendationsPanel(rec) {
+  const perDay = rec.expected_per_day > 0
+    ? `<b class="pos">$${fmtNum(rec.expected_per_day, 2)}/day</b>` : '<span class="dim">no history</span>';
+  const perWk = rec.weekly_score > 0
+    ? `$${fmtNum(rec.weekly_score, 2)}/wk` : '';
+  const perMo = rec.monthly_score > 0
+    ? `$${fmtNum(rec.monthly_score, 2)}/mo` : '';
+  const perfLine = [perDay, perWk, perMo].filter(Boolean).join(' <span class="dim">·</span> ');
+  return `
+    <div class="scanner-detail-expert" style="margin-top:8px;padding:10px 12px;background:rgba(96,165,250,0.06);border:1px solid rgba(96,165,250,0.2);border-radius:4px;">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">
+        <b style="color:#60a5fa;">EXPERT RECOMMENDATION</b>
+        <span style="font-size:11px;">${perfLine}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-family:ui-monospace,monospace;font-size:12px;">
+        <div><span class="dim">Buy</span> <b class="mono" style="color:#60a5fa;">$${fmtNum(rec.buy_px, 4)}</b></div>
+        <div><span class="dim">Sell</span> <b class="mono" style="color:#4ade80;">$${fmtNum(rec.sell_px, 4)}</b></div>
+        <div><span class="dim">Stop</span> <b class="mono" style="color:#f43f5e;">$${fmtNum(rec.stop_loss_px, 4)}</b></div>
+        <div><span class="dim">Trail arms at</span> <b class="mono">$${fmtNum(rec.trail_activation_px, 4)}</b></div>
+        <div><span class="dim">Trail distance</span> <b class="mono">$${fmtNum(rec.trail_distance, 4)}</b></div>
+        <div><span class="dim">Ratchet dist</span> <b class="mono">$${fmtNum(rec.stop_loss_ratchet_distance, 4)}</b></div>
+        <div><span class="dim">Ratchet arms at</span> <b class="mono">$${fmtNum(rec.stop_loss_ratchet_activation, 4)}</b></div>
+        <div><span class="dim">Spread</span> <b class="mono">$${fmtNum(rec.spread, 4)}</b></div>
+      </div>
+      <div style="margin-top:6px;font-size:11px;color:#94a3b8;">
+        Symmetric around mark: <b>buy = mark − spread/2</b>, <b>sell = mark + spread/2</b>. Stop at 3× spread (Van Tharp 3R). Trail arms 5% past sell, follows at 30% of spread. Click <b>arm as sleeve</b> to attach with these levels.
+      </div>
+    </div>
+  `;
+}
+
+async function armScannerAsSleeve() {
+  const row = scannerDetailContext;
+  if (!row) { showToast('no scanner context', 'error'); return; }
+  const rec = computeExpertRecommendations(row);
+  if (!rec) { showToast('no scanner spread yet — wait for next scan or click Refresh', 'error'); return; }
+  const mode = selectedScannerBuyMode();
+  const tenant = tenantForMode(mode);
+  if (!tenant) { showToast(`no tenant configured for ${mode} mode`, 'error'); return; }
+  const symbol = row.product_id;
+  const qty = Math.max(1, Math.min(100, parseInt(document.getElementById('scanner-buy-qty')?.value || '1', 10) || 1));
+
+  const existing = (currentStore[tenant]?.[symbol]?.config?.sleeves || []).slice();
+  const id = `scan-${Date.now().toString(36)}`;
+  const newSleeve = {
+    id,
+    name: `Scanner ${new Date().toISOString().slice(11, 16)}`,
+    qty,
+    exit_mode: 'hybrid',
+    sell_px: Number(rec.sell_px.toFixed(6)),
+    buy_px: Number(rec.buy_px.toFixed(6)),
+    trail_distance: Number(rec.trail_distance.toFixed(6)),
+    trail_activation_px: Number(rec.trail_activation_px.toFixed(6)),
+    hybrid_delay_secs: 5.0,
+    reanchor_threshold: rec.spread * 2,
+    stop_loss_enabled: true,
+    stop_loss_px: Number(rec.stop_loss_px.toFixed(6)),
+    stop_loss_ratchet_enabled: true,
+    stop_loss_ratchet_distance: Number(rec.stop_loss_ratchet_distance.toFixed(6)),
+    stop_loss_ratchet_activation: Number(rec.stop_loss_ratchet_activation.toFixed(6)),
+    anchor_type: 'current_market',  // new sleeves anchor to Current Market
+  };
+
+  if (mode === 'live') {
+    const ok = confirm(
+      `REAL-MONEY SLEEVE on ${symbol}\n\n` +
+      `Buy: $${rec.buy_px.toFixed(4)}    Sell: $${rec.sell_px.toFixed(4)}\n` +
+      `Stop: $${rec.stop_loss_px.toFixed(4)}    Trail arms: $${rec.trail_activation_px.toFixed(4)}\n` +
+      `Qty: ${qty} contract${qty > 1 ? 's' : ''}\n` +
+      `Expected: ${rec.expected_rt_per_day}rt/day @ $${rec.expected_net_per_rt.toFixed(2)}/rt = ~$${rec.expected_per_day.toFixed(2)}/day\n\n` +
+      `The bot will arm this sleeve on the next tick and start cycling.\n\nProceed?`
+    );
+    if (!ok) return;
+  }
+
+  const armBtn = document.getElementById('scanner-arm-sleeve-btn');
+  const origLabel = armBtn ? armBtn.textContent : '';
+  if (armBtn) { armBtn.disabled = true; armBtn.textContent = 'arming…'; }
+  try {
+    const res = await putJson('/api/sleeves', { tenant, symbol, sleeves: [...existing, newSleeve] });
+    if (res._unauthorized) { showLogin(); return; }
+    if (res.ok) {
+      showToast(`sleeve armed on ${symbol} (${mode}) — will start cycling on next tick`, 'info');
+      scannerDetailModal.hidden = true;
+      refreshOnce();
+    } else {
+      const issues = (res.issues || []).map(i => `${i.field}: ${i.message}`).join('\n');
+      showToast(res.error || issues || 'sleeve save failed', 'error');
+    }
+  } catch (err) {
+    showToast('network error saving sleeve: ' + err.message, 'error');
+  } finally {
+    if (armBtn) { armBtn.disabled = false; armBtn.textContent = origLabel || 'arm as sleeve'; }
+  }
 }
 
 function openScannerDetail(row) {
@@ -5965,6 +6094,12 @@ function openScannerDetail(row) {
 
   const liveIndicator = row._live_tenant
     ? `<span class="scanner-detail-price-live">LIVE</span>` : '';
+  // [crew 2026-07-15] Expert recommendations panel — derives buy/sell/stop/
+  // trail from scanner's best_spread + current mark. Powers the "arm as
+  // sleeve" button. If no scanner data yet (best_spread missing), the
+  // panel is skipped and the arm button will show a "no data yet" toast.
+  const expertRec = computeExpertRecommendations(row);
+  const expertPanel = expertRec ? renderExpertRecommendationsPanel(expertRec) : '';
   scannerDetailSummary.innerHTML = `
     <div class="scanner-detail-price">
       <span class="mono">$${fmtNum(row.price, 4)}</span>
@@ -5973,6 +6108,7 @@ function openScannerDetail(row) {
       <span class="scanner-detail-vol"><b>${fmtNum(row.vol_pct, 2)}%</b> range</span>
     </div>
     ${specStrip}
+    ${expertPanel}
     ${liveStrip}
     ${sleevesStrip}
   `;
@@ -6367,6 +6503,10 @@ function tenantForMode(mode) {
     if (modeOfTenant(t) === target) return t;
   }
   return null;
+}
+
+if (scannerArmSleeveBtn) {
+  scannerArmSleeveBtn.addEventListener('click', armScannerAsSleeve);
 }
 
 scannerBuyBtn.addEventListener('click', async () => {
