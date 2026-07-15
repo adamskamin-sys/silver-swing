@@ -6031,9 +6031,9 @@ function openScannerDetail(row) {
   scannerDetailContext = row;
   scannerChartWindow = { days: 1, granularity: 'FIVE_MINUTE' };
   scannerDetailTitle.textContent = prettyProductName(row.product_id);
-  // Default the mode chooser to whatever tab the user's on if it's meaningful,
-  // else fall back to paper (safer default for accidental clicks).
-  const defaultMode = ['live', 'lab', 'paper'].includes(activeMode) ? activeMode : 'paper';
+  // 2026-07-15 Adam: paper/lab tenants retired — everything is live now.
+  // Any mode selection falls through to 'live'.
+  const defaultMode = 'live';
   document.querySelectorAll('input[name="scanner-buy-mode"]').forEach(r => {
     r.checked = (r.value === defaultMode);
     r.onchange = () => updateScannerBuyButton();
@@ -6680,8 +6680,9 @@ function selectedScannerOrderType() {
 }
 
 function selectedScannerBuyMode() {
+  // 2026-07-15 Adam: paper/lab retired — always live.
   const checked = document.querySelector('input[name="scanner-buy-mode"]:checked');
-  return checked ? checked.value : 'paper';
+  return checked ? checked.value : 'live';
 }
 
 function selectedScannerSide() {
