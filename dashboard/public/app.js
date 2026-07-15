@@ -445,7 +445,10 @@ function renderCockpit(store) {
   // diag_track_health_fleet.py.
   let deadTracks = 0;
   const deadTrackSyms = new Set();
-  const deadCutoff = nowSec - 300;  // last 5 min
+  // Adam 2026-07-15: use a LOCAL nowSec — the one at line 423 is const-
+  // scoped inside `if (pf) { ... }` and undefined out here. Referencing
+  // it crashed the whole render pipeline → blank dashboard bug.
+  const deadCutoff = (Date.now() / 1000) - 300;  // last 5 min
   for (const e of (lastTradeEvents || [])) {
     if (!e || e.event_type !== 'track_silent_detected') continue;
     if (e.tenant && e.tenant !== tenant) continue;
