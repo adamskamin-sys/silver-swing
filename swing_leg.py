@@ -1614,6 +1614,160 @@ class SwingTrader:
                          error=str(e))
             return 0
 
+    # [crew 2026-07-15] Stop-loss auto-refresh config
+    _STOP_AUTO_REFRESH_INTERVAL_SECS = 60.0    # throttle to 1/min per sleeve
+    _STOP_AUTO_REFRESH_MIN_DRIFT_PCT = 5.0     # skip if new stop within 5% of current
+    _STOP_AUTO_REFRESH_MIN_HISTORY = 30        # need >=30 bars for ATR
+
+    def _maybe_auto_refresh_stop_loss(self, sc, ss, last_price: float) -> None:
+        """Auto-refresh stop_loss_px against current ATR-derived expert
+        distance. Fires for sleeves with stop_loss_enabled=True, both
+        WAITING (ARMED_BUY) and HELD (ARMED_SELL) states.
+
+        Formula (matches sleeve editor's `applyExpertCanonToForm`):
+            new_stop_px = current_price - (expertATR × stop_x_atr)
+
+        expertATR is estimated from the sleeve's own price history
+        (rolling std × sqrt(period) proxy for ATR when we don't have
+        the tile ATR directly available in the tick loop).
+
+        Safety guards:
+          1. Never move stop_loss_px ABOVE current_price (would insta-trigger)
+          2. Never move stop_loss_px UP by more than 3% of current price
+             per refresh (avoid abrupt tightening)
+          3. Only fires if stop_loss_enabled=True on the sleeve
+          4. Throttled to once/minute per sleeve (cadence gate)
+          5. Skips if drift < 5% of current price (avoid churn)
+          6. Skips sleeves with anchor_type=your_contract_avg (Option B —
+             defensive sleeves are intentionally static)
+
+        Aligned with north-star rule (maximize profit × cycles): a stop
+        sized to CURRENT vol prevents premature stop-outs in high-vol
+        regimes AND locks in more profit in low-vol regimes. Both help
+        cycle profitability.
+        """
+        import time as _t
+        now = _t.time()
+
+        # Gate 1: stop-loss must be enabled
+        if not getattr(sc, "stop_loss_enabled", False):
+            return
+        try:
+            current_stop = float(sc.stop_loss_px or 0)
+        except (TypeError, ValueError):
+            return
+        if current_stop <= 0:
+            return
+
+        # Gate 2: Option B anchor-aware skip
+        anchor = str(getattr(sc, "anchor_type", "current_market")).lower()
+        if anchor == "your_contract_avg":
+            return
+
+        # Gate 3: cadence throttle
+        last_refresh = float(getattr(ss, "_last_stop_refresh_ts", 0.0) or 0.0)
+        if last_refresh and (now - last_refresh) < self._STOP_AUTO_REFRESH_INTERVAL_SECS:
+            return
+
+        # Gate 4: sufficient history for ATR estimation
+        history = list(self._sleeve_price_history.get(sc.id, []) or [])
+        if len(history) < self._STOP_AUTO_REFRESH_MIN_HISTORY:
+            # Backfill attempt (same as buy_px auto-refresh)
+            backfilled = self._backfill_sleeve_history_from_coinbase(sc)
+            if backfilled > 0:
+                history = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(history) < self._STOP_AUTO_REFRESH_MIN_HISTORY:
+                ss._last_stop_refresh_ts = now
+                return
+
+        # Compute ATR estimate from history: mean(|delta|) is a reasonable
+        # proxy for 1-bar ATR when we don't have OHLC. Wilder ATR is more
+        # rigorous but requires H/L/C — we only have closes here.
+        deltas = [abs(history[i] - history[i - 1]) for i in range(1, len(history))]
+        if not deltas:
+            ss._last_stop_refresh_ts = now
+            return
+        # ATR-14-ish: average of last 14 deltas (or all if fewer)
+        recent_deltas = deltas[-14:]
+        atr_est = sum(recent_deltas) / len(recent_deltas)
+        if atr_est <= 0:
+            ss._last_stop_refresh_ts = now
+            return
+
+        # Multiplier: derived from asset class if we can determine it,
+        # else fall back to a reasonable default matching the tile logic.
+        # 2.0×ATR is the Turtle canonical; 2.5-3.0× is common for
+        # crypto/volatile assets.
+        stop_x_atr = 2.5  # default; matches tile's crypto class ballpark
+        try:
+            import expert_params
+            asset_class = expert_params.asset_class_for(self.symbol) if hasattr(
+                expert_params, "asset_class_for") else None
+            if asset_class:
+                params = expert_params.params_for_class(asset_class) if hasattr(
+                    expert_params, "params_for_class") else {}
+                if params and "stop_x_atr" in params:
+                    stop_x_atr = float(params["stop_x_atr"])
+        except Exception:
+            pass  # fallback default is fine
+
+        new_stop_px = float(last_price) - (atr_est * stop_x_atr)
+        try:
+            new_stop_px = self._snap_to_tick(new_stop_px)
+        except Exception:
+            pass
+
+        # Safety guard 1: never above current price
+        if new_stop_px >= float(last_price):
+            ss._last_stop_refresh_ts = now
+            return
+
+        # Safety guard 2: never tighten by more than 3% of current price in
+        # one refresh (avoid abrupt stops)
+        max_tighten = float(last_price) * 0.03
+        if new_stop_px > current_stop:  # tightening (moving stop up)
+            if (new_stop_px - current_stop) > max_tighten:
+                new_stop_px = current_stop + max_tighten
+                try:
+                    new_stop_px = self._snap_to_tick(new_stop_px)
+                except Exception:
+                    pass
+
+        # Gate 5: min drift — skip if new stop is within 5% of current
+        drift_pct = abs(new_stop_px - current_stop) / max(abs(current_stop), 1e-9) * 100
+        if drift_pct < self._STOP_AUTO_REFRESH_MIN_DRIFT_PCT:
+            ss._last_stop_refresh_ts = now
+            return
+
+        # Persist: update in-memory + store
+        old_stop = current_stop
+        sc.stop_loss_px = float(new_stop_px)
+        try:
+            cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+            sleeves = list(cfg.get("sleeves") or [])
+            for s in sleeves:
+                if s.get("id") == sc.id:
+                    s["stop_loss_px"] = float(new_stop_px)
+                    break
+            cfg["sleeves"] = sleeves
+            self.store.put_config(self.tenant_id, self.symbol, cfg)
+        except Exception as e:
+            self._record("stop_auto_refresh_persist_error",
+                         sleeve_id=sc.id, error=str(e))
+            return
+
+        ss._last_stop_refresh_ts = now
+        self._record(
+            "sleeve_stop_auto_refresh",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            old_stop_px=old_stop, new_stop_px=new_stop_px,
+            atr_estimate=round(atr_est, 6),
+            stop_x_atr=stop_x_atr,
+            current_market=float(last_price),
+            drift_pct=round(drift_pct, 3),
+            source="mean-abs-delta × class stop_x_atr",
+        )
+
     def _maybe_auto_refresh_stale_sleeve(self, sc, ss, last_price: float) -> None:
         """Universal Level 2 auto-refresh — for any sleeve in ARMED_BUY
         WITHOUT a live order (i.e., waiting to arm but no order placed
@@ -2633,6 +2787,13 @@ class SwingTrader:
         # Anchored on CURRENT market price (not ancient last_sell_fill_
         # price which was locking sleeves out of new price regimes).
         self._maybe_auto_refresh_stale_sleeve(sc, ss, last_price)
+
+        # [crew 2026-07-15] Auto-refresh stop_loss_px against current ATR.
+        # Adam: stop_loss should adapt to regime change (vol expansion
+        # widens stop; vol contraction tightens). Same pattern as the
+        # buy_px auto-refresh but for stop_loss_px. Safety guards
+        # prevent immediate stop-triggering.
+        self._maybe_auto_refresh_stop_loss(sc, ss, last_price)
 
         # [crew] Average-down GREEN LIGHT alert (notification only). Opt-in.
         self._maybe_avg_down_alert(sc, ss, last_price)
