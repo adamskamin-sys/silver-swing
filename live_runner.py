@@ -182,6 +182,20 @@ class DryRunBroker:
         _log(f"[DRY RUN] would market {side} {qty} @ ~{mark} → fake order {oid}")
         return oid
 
+    def place_stop_limit(self, side, qty, stop_price, limit_price, client_order_id=None):
+        # Adam 2026-07-15: DryRun stub for the ratchet-stop primitive.
+        # Without this, calls fall through __getattr__ to the real client
+        # and would submit REAL stop-limit orders in dry-run mode.
+        self._counter += 1
+        oid = f"dry-run-stop-{self._counter}"
+        self._fake_orders[oid] = {
+            "side": side, "qty": qty, "price": limit_price,
+            "stop_price": stop_price, "limit_price": limit_price,
+            "status": "OPEN", "filled_qty": 0,
+        }
+        _log(f"[DRY RUN] would place STOP_LIMIT {side} {qty} stop={stop_price} limit={limit_price} → fake order {oid}")
+        return oid
+
     def order_status(self, order_id):
         if order_id in self._fake_orders:
             o = self._fake_orders[order_id]

@@ -147,6 +147,9 @@ class CoinbaseBroker:
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
+        if s == "SELL":
+            self._no_short_check(qty, kind="place_limit")
         method = self.client.limit_order_gtc_buy if s == "BUY" else self.client.limit_order_gtc_sell
         # [crew:#7] Accept a caller-supplied client_order_id. Coinbase dedupes on
         # this id, so a caller that persists it can safely retry an ambiguous
@@ -179,6 +182,9 @@ class CoinbaseBroker:
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
+        if s == "SELL":
+            self._no_short_check(qty, kind="place_market")
         method = self.client.market_order_buy if s == "BUY" else self.client.market_order_sell
         kwargs = {
             "client_order_id": client_order_id or str(uuid.uuid4()),  # [crew:#7] caller can supply for idempotent retry
@@ -193,6 +199,74 @@ class CoinbaseBroker:
                 return oid
         err = resp.get("error_response") or resp.get("failure_reason") or resp
         raise RuntimeError(f"place_market failed: {err}")
+
+    def place_stop_limit(self, side: str, qty: int, stop_price: float,
+                         limit_price: float, client_order_id=None) -> str:
+        """Place a STOP_LIMIT (GTC) order. Coinbase-side triggered exit.
+
+        For a LONG protective stop, call with side='SELL' and
+        stop_price=trail_or_stop_level, limit_price slightly below stop_price
+        (typically stop_price - one tick) so the resulting limit fills
+        immediately after trigger.
+
+        stop_direction is inferred: SELL → STOP_DIRECTION_STOP_DOWN
+        (trigger when price falls to stop_price), BUY → STOP_DIRECTION_STOP_UP.
+
+        Adam 2026-07-15: this is the ratchet-stop primitive. The strategy
+        layer maintains ONE resting order per product, cancel+replaces on
+        ratchet-up, never lowers. Fires as a real Coinbase order — protects
+        us even if the bot process dies.
+        """
+        s = side.upper()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        if s == "SELL":
+            self._no_short_check(qty, kind="place_stop_limit")
+        stop_dir = "STOP_DIRECTION_STOP_DOWN" if s == "SELL" else "STOP_DIRECTION_STOP_UP"
+        cfg = {
+            "stop_limit_stop_limit_gtc": {
+                "base_size": str(int(qty)),
+                "limit_price": f"{limit_price:.{self.cfg.price_decimals}f}",
+                "stop_price": f"{stop_price:.{self.cfg.price_decimals}f}",
+                "stop_direction": stop_dir,
+            }
+        }
+        coid = client_order_id or str(uuid.uuid4())
+        # Prefer explicit create_order (available on every SDK version). Some
+        # SDKs also expose stop_limit_order_gtc_{buy,sell} convenience methods,
+        # but create_order + order_configuration is the reliable path.
+        resp = _dump(self._rl_call(
+            Priority.CRITICAL, EndpointKind.PRIVATE,
+            self.client.create_order,
+            client_order_id=coid, product_id=self.cfg.product_id,
+            side=s, order_configuration=cfg,
+        ))
+        if resp.get("success"):
+            oid = (resp.get("success_response") or {}).get("order_id")
+            if oid:
+                return oid
+        err = resp.get("error_response") or resp.get("failure_reason") or resp
+        raise RuntimeError(f"place_stop_limit failed: {err}")
+
+    def _no_short_check(self, sell_qty: int, kind: str) -> None:
+        """Refuse a SELL whose qty > current LONG position. Prevents any
+        code path (trail exit, stop-loss, sleeve arm, manual sell) from
+        opening a short. Reads position from Coinbase — one HIGH-priority
+        API call per SELL. Fail-CLOSED: if position read fails, we still
+        refuse (fail-safe = don't accidentally short)."""
+        try:
+            pos = int(self.position_qty() or 0)
+        except Exception as e:
+            raise RuntimeError(
+                f"no_short_check: position read failed ({e}); refusing {kind} SELL {sell_qty} "
+                "to avoid accidental short"
+            ) from e
+        # LONG position is positive. Short would be negative.
+        if int(sell_qty) > max(pos, 0):
+            raise RuntimeError(
+                f"no_short_check: {kind} SELL {sell_qty} exceeds LONG position {pos} "
+                f"on {self.cfg.product_id} — refused (would net short)"
+            )
 
     def order_status(self, order_id: str) -> dict:
         """Return {'status': mapped, 'filled_qty': int, 'raw_status': ..., 'average_filled_price': ...}."""

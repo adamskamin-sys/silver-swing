@@ -237,6 +237,17 @@ class SleeveConfig:
     # streak. 0 = disabled.
     auto_disable_after_losses: int = 0
 
+    # Ratchet-stop-on-Coinbase (2026-07-15 Adam). When True and position>0,
+    # the SwingTrader maintains a REAL STOP_LIMIT SELL order on Coinbase
+    # that ratchets UP through three stages:
+    #   Stage 1 (hard bottom):  stop_px = stop_loss_px
+    #   Stage 2 (profit lock):  stop_px = sell_px  (after mark crosses sell_px)
+    #   Stage 3 (trail ratchet): stop_px = trail_stop_px (HWM − trail_distance)
+    # NEVER lowers. Cancel+replace on meaningful UP moves. Protects the
+    # position even if the bot process dies — Coinbase itself fires the exit.
+    # Falls back to bot-side market-on-trigger if the exchange rejects.
+    resting_stop_enabled: bool = True
+
     # Cross-asset correlation gate: don't fresh-long silver into a copper
     # crash. Reads correlation.CORRELATION_FAMILIES; if any peer in the
     # same family (metals, energy, crypto_major, crypto_perp) has dropped
@@ -504,6 +515,8 @@ class SleeveConfig:
             book_imbalance_sell_threshold=float(d.get("book_imbalance_sell_threshold") or 0.65),
             book_imbalance_buy_threshold=float(d.get("book_imbalance_buy_threshold") or 0.65),
             auto_disable_after_losses=int(d.get("auto_disable_after_losses") or 0),
+            # 2026-07-15 Adam: default ON for existing + new sleeves.
+            resting_stop_enabled=bool(d.get("resting_stop_enabled", True)),
             correlation_gate_enabled=bool(d.get("correlation_gate_enabled") or False),
             correlation_window_secs=float(d.get("correlation_window_secs") or 3600.0),
             correlation_crash_pct=float(d.get("correlation_crash_pct") or 3.0),
@@ -660,6 +673,18 @@ class SleeveState:
     post_trail_stage_b_ts: Optional[float] = None
     post_trail_stage_b_ref_high: float = 0.0
 
+    # Ratchet-stop-on-Coinbase state (2026-07-15 Adam).
+    #   resting_stop_oid       — Coinbase order_id of the active resting stop,
+    #                            or None if we don't have one on the book.
+    #   resting_stop_px        — stop_price of the currently-resting order,
+    #                            so we can compare against a fresh target
+    #                            without a Coinbase round-trip on every tick.
+    #   resting_stop_stage     — 'hard_bottom' | 'profit_lock' | 'trail'
+    #                            (informational, for the trade-log audit).
+    resting_stop_oid: Optional[str] = None
+    resting_stop_px: Optional[float] = None
+    resting_stop_stage: Optional[str] = None
+
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
         return cls(
@@ -697,6 +722,10 @@ class SleeveState:
             recent_cycle_pnls=list(d.get("recent_cycle_pnls") or []),
             buy_trail_armed=bool(d.get("buy_trail_armed") or False),
             buy_trail_low_water=float(d.get("buy_trail_low_water") or 0.0),
+            # 2026-07-15 Adam: ratchet-stop-on-Coinbase state.
+            resting_stop_oid=d.get("resting_stop_oid"),
+            resting_stop_px=d.get("resting_stop_px"),
+            resting_stop_stage=d.get("resting_stop_stage"),
         )
 
     def to_dict(self) -> dict:

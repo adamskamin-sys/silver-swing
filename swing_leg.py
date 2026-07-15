@@ -2938,6 +2938,135 @@ class SwingTrader:
 
         self._save_state()
 
+    def _maintain_resting_stop(self, sc: SleeveConfig, ss: SleeveState,
+                               last_price: float) -> None:
+        """Three-stage Coinbase resting stop-limit ratchet (Adam 2026-07-15).
+
+        Stage 1 (hard bottom):  stop_px = sc.stop_loss_px — while position
+                                is held and mark hasn't crossed sc.sell_px.
+        Stage 2 (profit lock):  stop_px = sc.sell_px — once mark crosses
+                                the take-profit level. Locks in the win.
+        Stage 3 (trail ratchet): stop_px = HWM − trail_distance — once trail
+                                is armed. Ratchets UP with every meaningful
+                                HWM tick, never DOWN.
+
+        Cancel+replace on meaningful UP moves. NEVER lowers.
+        Fails open — if Coinbase rejects, bot-side triggers remain the
+        backstop (the market-on-trigger paths in _sleeve_step still fire).
+        No-short guard in broker.place_stop_limit ensures qty ≤ position."""
+        if not getattr(sc, "resting_stop_enabled", True):
+            return
+        # Only maintain a resting stop while we have a real position.
+        try:
+            pos_qty = int(self.b.position_qty() or 0)
+        except Exception:
+            pos_qty = 0
+        sleeve_qty = int(getattr(sc, "qty", 1) or 1)
+        if pos_qty <= 0 or sleeve_qty <= 0:
+            # Position closed — cancel any lingering resting stop and clear state.
+            if ss.resting_stop_oid:
+                try:
+                    self.b.cancel(ss.resting_stop_oid)
+                except Exception as e:
+                    self._record("resting_stop_cancel_failed", sleeve_id=sc.id,
+                                 sleeve_name=sc.name, oid=ss.resting_stop_oid,
+                                 error=str(e))
+                self._record("resting_stop_cleared", sleeve_id=sc.id,
+                             sleeve_name=sc.name, reason="no_position")
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
+            return
+        # Resolve stage + target price.
+        hwm = float(ss.trail_high_water_price or 0.0)
+        trail_engaged = bool(ss.trail_armed)
+        stop_loss_px = float(getattr(sc, "stop_loss_px", 0) or 0)
+        sell_px = float(getattr(sc, "sell_px", 0) or 0)
+        trail_distance = float(getattr(sc, "trail_distance", 0) or 0)
+        target_px = None
+        stage = None
+        if trail_engaged and hwm > 0 and trail_distance > 0:
+            target_px = hwm - trail_distance
+            stage = "trail"
+        elif sell_px > 0 and (hwm >= sell_px or last_price >= sell_px):
+            target_px = sell_px
+            stage = "profit_lock"
+        elif stop_loss_px > 0:
+            target_px = stop_loss_px
+            stage = "hard_bottom"
+        if not target_px or target_px <= 0:
+            return
+        try:
+            target_px = self._snap_to_tick(float(target_px))
+        except Exception:
+            pass
+        tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
+        # limit_price one tick below stop for reliable fill after trigger.
+        limit_px = max(0.0, target_px - tick)
+        # Sanity: never place a stop at or above current mark (would fire
+        # immediately as a limit sell against the book — that's a market sell,
+        # not a protective stop). This can happen briefly if the market gaps
+        # past our intended stop; let bot-side triggers handle it.
+        if target_px >= last_price:
+            self._record("resting_stop_skipped_above_mark",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         target_px=target_px, last_price=last_price, stage=stage)
+            return
+        # Fresh place — no existing resting order.
+        if not ss.resting_stop_oid:
+            try:
+                oid = self.b.place_stop_limit("SELL", sleeve_qty,
+                                              float(target_px), float(limit_px))
+                ss.resting_stop_oid = oid
+                ss.resting_stop_px = float(target_px)
+                ss.resting_stop_stage = stage
+                self._record("resting_stop_placed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             stage=stage, target_px=float(target_px),
+                             limit_px=float(limit_px), qty=sleeve_qty, oid=oid)
+            except Exception as e:
+                # Fallback: bot-side trigger stays armed as backstop.
+                self._record("resting_stop_place_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             stage=stage, target_px=float(target_px),
+                             error=str(e))
+            return
+        # Existing resting order — check if we need to ratchet UP.
+        current_px = float(ss.resting_stop_px or 0)
+        # Meaningful move up = at least one tick higher than current.
+        if target_px > current_px + (tick * 0.5):
+            old_oid = ss.resting_stop_oid
+            try:
+                self.b.cancel(old_oid)
+            except Exception as e:
+                self._record("resting_stop_ratchet_cancel_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             old_oid=old_oid, error=str(e))
+                # Continue anyway — old order may have already filled/been
+                # cancelled; the place below will either succeed (new stop)
+                # or fail (we clear tracking, retry next tick).
+            try:
+                new_oid = self.b.place_stop_limit("SELL", sleeve_qty,
+                                                  float(target_px), float(limit_px))
+                self._record("resting_stop_ratcheted",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             from_px=current_px, to_px=float(target_px),
+                             stage=stage, old_oid=old_oid, new_oid=new_oid,
+                             qty=sleeve_qty)
+                ss.resting_stop_oid = new_oid
+                ss.resting_stop_px = float(target_px)
+                ss.resting_stop_stage = stage
+            except Exception as e:
+                self._record("resting_stop_ratchet_place_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             from_px=current_px, to_px=float(target_px),
+                             error=str(e))
+                # Clear tracking so next tick attempts a fresh place.
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
+        # target_px <= current_px → never lower (ratchet-up-only invariant)
+
     def _sleeve_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
         """Independent state machine for one additional sleeve. Shares broker,
         position, and floor guard with siblings and with the primary strategy."""
@@ -2946,6 +3075,11 @@ class SwingTrader:
 
         # Track price for volatility signal & update HWM for ratcheting stop.
         self._sleeve_track_price(sc, last_price)
+
+        # [Adam 2026-07-15] Three-stage Coinbase resting stop-limit ratchet.
+        # Runs BEFORE the trigger-check paths so a fresh HWM tick propagates
+        # to Coinbase within one tick. Failure falls back to bot-side stops.
+        self._maintain_resting_stop(sc, ss, last_price)
 
         # [crew] Channel re-anchor: after a confirmed + settled drop, walk the
         # whole channel (buy/sell/trail + stop) down to the new level so nothing

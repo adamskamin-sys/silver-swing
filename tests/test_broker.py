@@ -30,11 +30,25 @@ def make_broker(client=None):
     )
 
 
+def _mock_long_pos(client, qty: int, product_id: str = "SLR-27AUG26-CDE"):
+    """Set list_futures_positions to return a LONG position of the given qty
+    so the broker's no-short guard (added 2026-07-15) lets SELL tests proceed.
+    Without this, every SELL test refuses with 'would net short'."""
+    client.list_futures_positions.return_value = FakeResponse({
+        "positions": [{
+            "product_id": product_id,
+            "number_of_contracts": str(int(qty)),
+            "side": "LONG",
+        }]
+    })
+
+
 # ---- place_limit ------------------------------------------------------------
 
 
 def test_place_limit_sell_returns_order_id():
     c = MagicMock()
+    _mock_long_pos(c, 2)
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": True,
         "success_response": {"order_id": "abc-123", "product_id": "SLR-27AUG26-CDE"},
@@ -60,6 +74,7 @@ def test_place_limit_buy_uses_buy_endpoint():
 
 def test_place_limit_lowercase_side_normalizes():
     c = MagicMock()
+    _mock_long_pos(c, 2)
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": True, "success_response": {"order_id": "x"},
     })
@@ -73,6 +88,7 @@ def test_place_limit_bad_side_raises():
 
 def test_place_limit_failure_raises_with_error_body():
     c = MagicMock()
+    _mock_long_pos(c, 2)
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": False,
         "error_response": {"error": "insufficient funds"},
@@ -83,6 +99,7 @@ def test_place_limit_failure_raises_with_error_body():
 
 def test_place_limit_generates_distinct_client_order_ids():
     c = MagicMock()
+    _mock_long_pos(c, 2)
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": True, "success_response": {"order_id": "x"},
     })
@@ -95,12 +112,70 @@ def test_place_limit_generates_distinct_client_order_ids():
 
 def test_place_limit_price_decimals_configurable():
     c = MagicMock()
+    _mock_long_pos(c, 1, product_id="X")
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": True, "success_response": {"order_id": "x"},
     })
     b = CoinbaseBroker(BrokerConfig(product_id="X", price_decimals=5), client=c)
     b.place_limit("SELL", 1, 62.80)
     assert c.limit_order_gtc_sell.call_args.kwargs["limit_price"] == "62.80000"
+
+
+# ---- no-short guard + stop_limit (Adam 2026-07-15) --------------------------
+
+
+def test_no_short_guard_refuses_sell_bigger_than_long():
+    """Broker must refuse any SELL whose qty exceeds current LONG position.
+    Prevents any code path from accidentally opening a short."""
+    c = MagicMock()
+    _mock_long_pos(c, 1)  # LONG 1 contract
+    with pytest.raises(RuntimeError, match="would net short"):
+        make_broker(c).place_limit("SELL", 2, 65.0)  # sell 2 > pos 1
+
+
+def test_no_short_guard_refuses_when_position_read_fails():
+    """Fail-CLOSED: if we can't confirm current position, refuse the SELL
+    rather than risk an accidental short."""
+    c = MagicMock()
+    c.list_futures_positions.side_effect = RuntimeError("api down")
+    with pytest.raises(RuntimeError, match="position read failed"):
+        make_broker(c).place_limit("SELL", 1, 65.0)
+
+
+def test_no_short_guard_allows_sell_within_position():
+    """LONG 3, sell 2 → allowed (still LONG 1 after fill)."""
+    c = MagicMock()
+    _mock_long_pos(c, 3)
+    c.limit_order_gtc_sell.return_value = FakeResponse({
+        "success": True, "success_response": {"order_id": "ok"},
+    })
+    assert make_broker(c).place_limit("SELL", 2, 65.0) == "ok"
+
+
+def test_place_stop_limit_sell_uses_stop_down_direction():
+    """SELL stop-limit → STOP_DIRECTION_STOP_DOWN (trigger on price falling)."""
+    c = MagicMock()
+    _mock_long_pos(c, 1)
+    c.create_order.return_value = FakeResponse({
+        "success": True, "success_response": {"order_id": "stop-1"},
+    })
+    oid = make_broker(c).place_stop_limit("SELL", 1, 67.84, 67.83)
+    assert oid == "stop-1"
+    kwargs = c.create_order.call_args.kwargs
+    assert kwargs["side"] == "SELL"
+    cfg = kwargs["order_configuration"]["stop_limit_stop_limit_gtc"]
+    assert cfg["base_size"] == "1"
+    assert cfg["stop_price"] == "67.840"
+    assert cfg["limit_price"] == "67.830"
+    assert cfg["stop_direction"] == "STOP_DIRECTION_STOP_DOWN"
+
+
+def test_place_stop_limit_refuses_short_qty():
+    """Stop-limit SELL also respects the no-short guard."""
+    c = MagicMock()
+    _mock_long_pos(c, 0)  # flat
+    with pytest.raises(RuntimeError, match="would net short"):
+        make_broker(c).place_stop_limit("SELL", 1, 67.84, 67.83)
 
 
 # ---- order_status -----------------------------------------------------------
