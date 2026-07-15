@@ -41,7 +41,7 @@ TENANT = os.getenv("SWING_TENANT", "adam")
 SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
 SYMBOL_FAMILY = os.getenv("SWING_SYMBOL_FAMILY", "").strip() or None
 DATA_DIR = os.getenv("SWING_DATA_DIR", "data")
-LOOP_INTERVAL_SECS = float(os.getenv("SWING_LOOP_INTERVAL", "1.0"))
+LOOP_INTERVAL_SECS = float(os.getenv("SWING_LOOP_INTERVAL", "0.25"))
 FEED_READY_TIMEOUT = float(os.getenv("SWING_FEED_TIMEOUT", "15.0"))
 SNAPSHOT_INTERVAL = float(os.getenv("SWING_SNAPSHOT_INTERVAL", "5.0"))
 # How often (seconds) to re-check the front-month contract when family mode
