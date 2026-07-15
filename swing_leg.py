@@ -3241,27 +3241,37 @@ class SwingTrader:
         trail_distance = float(getattr(sc, "trail_distance", 0) or 0)
         target_px = None
         stage = None
-        if trail_engaged and hwm > 0 and trail_distance > 0:
-            # Adam 2026-07-15: trail must NEVER exit below the original SELL
-            # target once profit-locked. Rule: "trails stopping shouldn't
-            # change my sell number until it reaches the original sell goal."
-            # HYPE 2026-07-15 case: mark ran to $68.80, HWM=$68.80,
-            # trail_distance=$0.45 → naive trail = $68.35, which is $0.34
-            # BELOW the sell_px goal $68.69. If mark dropped back, trail would
-            # exit at $68.35 giving 40¢ profit vs the $58¢ profit the goal
-            # promised. Floor the trail at sell_px so trail can only tighten
-            # (fire at a HIGHER price) as HWM rises — never below the goal.
-            raw_trail = hwm - trail_distance
-            if sell_px > 0 and raw_trail < sell_px:
-                target_px = sell_px
-                stage = "trail_floored_at_sell"
+        # Adam 2026-07-15: checkpoint-then-ratchet model.
+        # Before sell_px goal → protective stop only (hard bottom). Trail
+        #   dormant. The strategy hasn't earned the right to trail yet — it
+        #   still needs the goal to be reached to lock in profit.
+        # At/after sell_px goal → trail owns the exit, ratcheting up from a
+        #   sell_px baseline. Never exits below sell_px (would give up
+        #   already-locked-in profit).
+        #
+        # trail_engaged bot-side flag is ignored here — the resting stop's
+        # stage is driven purely by whether HWM has actually crossed the
+        # goal, not by when the bot-side trail-arm flag flipped. That's
+        # what Adam meant by "trail stopping should take effect once the
+        # trail stop reaches the desired sell gap" — the checkpoint is the
+        # goal, not an internal flag.
+        goal_reached = (sell_px > 0 and (hwm >= sell_px or last_price >= sell_px))
+        if goal_reached:
+            if trail_distance > 0:
+                # Trail active — ratchet from HWM but never below the goal.
+                raw_trail = hwm - trail_distance
+                if raw_trail < sell_px:
+                    target_px = sell_px
+                    stage = "trail_floored_at_sell"
+                else:
+                    target_px = raw_trail
+                    stage = "trail"
             else:
-                target_px = raw_trail
-                stage = "trail"
-        elif sell_px > 0 and (hwm >= sell_px or last_price >= sell_px):
-            target_px = sell_px
-            stage = "profit_lock"
+                # No trail configured — just lock in at the goal.
+                target_px = sell_px
+                stage = "profit_lock"
         elif stop_loss_px > 0:
+            # Below goal — protective stop only.
             target_px = stop_loss_px
             stage = "hard_bottom"
         if not target_px or target_px <= 0:
