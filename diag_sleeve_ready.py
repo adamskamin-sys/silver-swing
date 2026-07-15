@@ -32,6 +32,18 @@ BLOCK_EVENT_KEYWORDS = [
     "reentry_reeval_replaced",
     "sleeve_reanchored",
     "sleeve_stop_loss_triggered",
+    # Adam 2026-07-15: extra block events discovered while hunting the
+    # CU/HYF/ZEC "no CB order + no events" silent bug.
+    "buy_trail_waiting_for_dip",
+    "buy_trail_waiting_for_bounce",
+    "buy_trail_armed",
+    "buy_trail_bounce_confirmed",
+    "sleeve_trend_gate_blocked",
+    "sleeve_ms_pause",
+    "sleeve_ms_size_taper",
+    "velocity_gate_error",
+    "sleeve_order_cleared",
+    "sleeve_credited_partial_before_clear",
 ]
 
 
@@ -47,9 +59,13 @@ def _fmt_age(ts) -> str:
         return "?"
 
 
-def _find_last_blocker(events, sleeve_id, product_id, since_secs=600):
+def _find_last_blocker(events, sleeve_id, product_id, since_secs=86400):
     """Walk events (already filtered to this product+sleeve) newest-first
-    and return the first event whose event_type is a known blocker."""
+    and return the first event whose event_type is a known blocker.
+
+    Adam 2026-07-15: default 24h window (was 10min). Sleeves can be armed
+    for hours before hitting a state where they need to be diagnosed —
+    HYF armed 6h, ZEC 7h. A 10min window missed the block reasons entirely."""
     cutoff = time.time() - since_secs
     for e in reversed(events):  # newest last in log; reverse for newest first
         ts = float(e.get("ts") or 0)
@@ -86,11 +102,13 @@ def main() -> None:
     except Exception as e:
         print(f"\n⚠ broker.list_open_orders failed: {e}")
 
-    # Pre-load trade log events, filter by symbol as we walk
+    # Pre-load trade log events, filter by symbol as we walk.
+    # 24h window — sleeves can be armed for hours before hitting the
+    # state the operator wants to diagnose (HYF armed 6h, ZEC 7h).
     try:
         from safety import make_trade_log
         log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
-        cutoff = time.time() - 600  # 10min window
+        cutoff = time.time() - 86400
         recent_events_by_symbol: dict[str, list] = {}
         for e in log.events():
             if not isinstance(e, dict):
