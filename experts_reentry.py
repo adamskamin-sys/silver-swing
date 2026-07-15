@@ -246,7 +246,40 @@ def compute_reentry(prices: Sequence[float],
 
     sell_px = buy_px + spread
 
-    # --- 7. Vince optimal-f qty cap ---
+    # --- 7. KAMA (Kaufman Adaptive Moving Average) — advisory ---
+    # Adds a KAMA-based trend signal to the snapshot. Advisory only —
+    # does not veto. Kaufman 2013 Ch. 17 — KAMA speeds up in trends,
+    # slows in chop; price above KAMA in an uptrend = pullback buy
+    # candidate. Complements the Kaufman efficiency ratio in regime.py.
+    try:
+        import kama as _kama
+        kama_sig = _kama.kama_signal(ps)
+        if kama_sig:
+            snapshot["kama"] = kama_sig
+            # Soft veto — if KAMA says trend down + we're trying to buy,
+            # flag it (Kaufman: don't buy against a genuine downtrend).
+            if kama_sig.get("signal") == "sell":
+                reasons.append(f"KAMA: {kama_sig.get('reason')}")
+    except Exception:
+        snapshot["kama"] = {"error": "module unavailable"}
+
+    # --- 8. Ehlers Fisher Transform — advisory cycle-inflection signal ---
+    # Amplifies extremes; crossover of Fisher vs its 1-bar lag detects
+    # cycle inflection with higher signal-to-noise than RSI/Stoch.
+    # Complements Ehlers cycle_phase — cycle_phase says WHERE you are,
+    # Fisher says IF a turn has occurred.
+    try:
+        import ehlers_fisher as _fisher
+        fisher_sig = _fisher.fisher_transform(ps)
+        if fisher_sig:
+            snapshot["fisher"] = fisher_sig
+            # Fisher "up" crossover from negative territory = mean-reversion buy signal
+            if fisher_sig.get("crossover") == "down":
+                reasons.append(f"Fisher: {fisher_sig.get('reason')}")
+    except Exception:
+        snapshot["fisher"] = {"error": "module unavailable"}
+
+    # --- 9. Vince optimal-f qty cap ---
     capped_qty = strategy_qty
     try:
         if recent_cycle_pnls and account_equity > 0 and worst_loss_per_contract > 0:
