@@ -231,7 +231,14 @@ def _attach_expert_params(broker, portfolio_snap: dict) -> None:
 
 
 _last_tuner_run_ts: dict[str, float] = {}
-_TUNER_INTERVAL_SECS = 24 * 3600  # daily
+# Adam 2026-07-15: tune interval configurable via env, default 6h (was 24h).
+# Rationale: regime can shift within a day; tuned params should track. Daily
+# was fine for slow markets but crypto perps + energy can change regime in
+# hours. 6h = 4× per day, still bounded API cost (30d grid × N products
+# ≈ a few hundred candle calls).
+# Set SWING_TUNER_INTERVAL_SECS to override (e.g. 3600 for hourly, but be
+# aware of Coinbase API budget).
+_TUNER_INTERVAL_SECS = float(os.getenv("SWING_TUNER_INTERVAL_SECS", str(6 * 3600)) or (6 * 3600))
 
 
 def _maybe_run_tuner(store, live_tenant: str) -> None:
