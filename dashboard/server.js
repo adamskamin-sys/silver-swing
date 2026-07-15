@@ -439,7 +439,13 @@ export function makeApp({
   // We validate that ceiling here; the bot re-checks it on every arm as the
   // last line of defense.
   app.put('/api/sleeves', requireAuth, async (req, res) => {
-    const { tenant, symbol, sleeves } = req.body || {};
+    // Adam 2026-07-15 (Option B): sleeve is a full trade plan, not a claim
+    // on existing inventory. Brand-new sleeves default to ARMED_BUY and the
+    // tick loop places the entry buy on Coinbase. The optional `sleeve_states`
+    // block lets the client seed initial state (state, armed_buy_since_ts,
+    // etc.) for sleeve ids that don't yet exist in the state block. Never
+    // overwrites existing state — safe for legacy sleeves.
+    const { tenant, symbol, sleeves, sleeve_states } = req.body || {};
     if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
     if (!Array.isArray(sleeves)) return res.status(400).json({ ok: false, error: 'sleeves must be an array' });
 
@@ -545,8 +551,17 @@ export function makeApp({
         const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
         if (posRow) pos = Math.abs(Number(posRow.qty)) || 0;
       }
+      // Adam 2026-07-15 (Option B): a sleeve consumes position-budget ONLY
+      // when it's currently HOLDING contracts. A brand-new sleeve with no
+      // persisted state is a full trade plan that will BUY its own qty on
+      // the next tick — it does NOT claim from existing inventory. So
+      // sleeves with no state row don't count toward the budget. Existing
+      // sleeves that were pre-Option-B (state persisted as ARMED_SELL to
+      // claim from an existing position) still count as before.
       const activeSleeveQty = sleeves.reduce((n, s) => {
-        const st = sleeveStates[s.id]?.state || 'ARMED_SELL';
+        const ss = sleeveStates[s.id];
+        if (!ss) return n;                          // brand new → opens own position
+        const st = ss.state || 'ARMED_SELL';
         return n + (st === 'ARMED_SELL' ? Number(s.qty) : 0);
       }, 0);
       const budget = pos - core;
@@ -575,6 +590,30 @@ export function makeApp({
 
       cfg.sleeves = sleeves;
       store[tenant][symbol].config = cfg;
+
+      // Adam 2026-07-15 (Option B): if the caller passed sleeve_states,
+      // seed them for NEW sleeve ids only. Never overwrite existing state —
+      // legacy sleeves keep their persisted state (own_avg_entry, cycles,
+      // realized_pnl, etc.) untouched. This is how the scanner arm-as-sleeve
+      // flow initializes a new sleeve to ARMED_BUY so the tick loop places
+      // the entry buy on Coinbase without the sleeve appearing ARMED_SELL
+      // by default.
+      if (sleeve_states && typeof sleeve_states === 'object') {
+        const stateBlockOut = store[tenant][symbol].state || {};
+        const existing = stateBlockOut.sleeves || {};
+        let seededAny = false;
+        for (const [sid, seedVals] of Object.entries(sleeve_states)) {
+          if (existing[sid]) continue;              // never overwrite existing state
+          if (!seedVals || typeof seedVals !== 'object') continue;
+          existing[sid] = { id: sid, ...seedVals };
+          seededAny = true;
+        }
+        if (seededAny) {
+          stateBlockOut.sleeves = existing;
+          store[tenant][symbol].state = stateBlockOut;
+        }
+      }
+
       await writeStoreAtomic(storePath, store);
       res.json({ ok: true, auto_fixed: autoFixed });
     } catch (err) {

@@ -6001,7 +6001,16 @@ async function armScannerAsSleeve() {
   const origLabel = armBtn ? armBtn.textContent : '';
   if (armBtn) { armBtn.disabled = true; armBtn.textContent = 'arming…'; }
   try {
-    const res = await putJson('/api/sleeves', { tenant, symbol, sleeves: [...existing, newSleeve] });
+    // Adam 2026-07-15 (Option B): seed the new sleeve's state to ARMED_BUY
+    // so the tick loop places the entry buy on Coinbase at buy_px instead
+    // of defaulting to ARMED_SELL (which would try to sell contracts we
+    // don't hold yet). Server merges into existing state only for NEW
+    // sleeve ids — never overwrites legacy state.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const seedStates = { [newSleeve.id]: { state: 'ARMED_BUY', armed_buy_since_ts: nowSec } };
+    const res = await putJson('/api/sleeves', {
+      tenant, symbol, sleeves: [...existing, newSleeve], sleeve_states: seedStates,
+    });
     if (res._unauthorized) { showLogin(); return; }
     if (res.ok) {
       showToast(`sleeve armed on ${symbol} (${mode}) — will start cycling on next tick`, 'info');
