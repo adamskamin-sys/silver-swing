@@ -1444,9 +1444,22 @@ class SwingTrader:
             prices = list(self._sleeve_price_history.get(sc.id, []) or [])
             if len(prices) < 24:
                 return
-            candles = [{"close": p} for p in prices]
+            # 2026-07-15 fix: filter out None prices to prevent float(None)
+            # errors inside scanner_signals.entry_assessment.
+            candles = [{"close": float(p)} for p in prices if p is not None]
+            if len(candles) < 24:
+                return
             ms_snap = self.ms.snapshot() if self.ms else {}
-            ofi = (ms_snap or {}).get("trade_ofi_60s") or (ms_snap or {}).get("ofi")
+            # 2026-07-15 fix: coerce ofi to a real float (default 0.0) so
+            # entry_assessment's downstream float() calls don't blow up
+            # when the microstructure snapshot lacks OFI data.
+            raw_ofi = (ms_snap or {}).get("trade_ofi_60s") or (ms_snap or {}).get("ofi")
+            ofi = 0.0
+            if raw_ofi is not None:
+                try:
+                    ofi = float(raw_ofi)
+                except (TypeError, ValueError):
+                    pass
             a = scanner_signals.entry_assessment(candles, ms=ms_snap, ofi=ofi)
             rec = a.get("recommendation")
             if rec in ("TREND-ENTER", "SWING-OK"):
@@ -1457,8 +1470,10 @@ class SwingTrader:
                 light = "amber"
             if light != self._entry_light.get(sc.id):   # edge-triggered
                 self._entry_light[sc.id] = light
+                # 2026-07-15 fix: don't pass symbol=self.symbol explicitly —
+                # _record() already auto-adds tenant + symbol. Duplicate
+                # caused "multiple values for keyword argument 'symbol'".
                 self._record("entry_quality_light", sleeve_id=sc.id, sleeve_name=sc.name,
-                             symbol=self.symbol,
                              light=light, recommendation=rec,
                              entry_quality=a.get("entry_quality"), regime=a.get("regime"),
                              reason=a.get("reason"))
@@ -1519,8 +1534,10 @@ class SwingTrader:
             light = sig.get("light")
             if light != self._avg_down_light.get(sc.id):   # edge-triggered
                 self._avg_down_light[sc.id] = light
+                # 2026-07-15 fix: symbol=self.symbol removed — _record()
+                # auto-adds it. Duplicate caused RedisTradeLog.record()
+                # "multiple values for keyword argument 'symbol'".
                 self._record("avg_down_light", sleeve_id=sc.id, sleeve_name=sc.name,
-                             symbol=self.symbol,
                              light=light, reason=(sig.get("reasons") or [""])[0],
                              checks=sig.get("checks"))
                 if light == "green":
@@ -1766,6 +1783,120 @@ class SwingTrader:
             current_market=float(last_price),
             drift_pct=round(drift_pct, 3),
             source="mean-abs-delta × class stop_x_atr",
+        )
+
+    # [crew 2026-07-15] Ghost force-arm config
+    _GHOST_ARM_MIN_ARMED_SECS = 60.0      # only fire on sleeves armed >60s (give normal path a chance)
+    _GHOST_ARM_INTERVAL_SECS = 60.0       # throttle: once per minute per sleeve
+
+    def _maybe_force_arm_ghost_order(self, sc, ss) -> None:
+        """Detect and revive ghost sleeves (state=ARMED_BUY/SELL with
+        live_order_id=None) by placing the missing order at Coinbase.
+
+        Same logic as diag_force_arm_missing_orders.py, but runs on the
+        tick loop so ghosts never linger more than ~60s. Adam's north-
+        star rule (maximize profit × cycles): every minute a sleeve is
+        ghosted is a minute of lost cycle potential.
+
+        Five gates prevent inappropriate placement:
+          1. State must be ARMED_BUY or ARMED_SELL
+          2. live_order_id must be None (ghost)
+          3. Sleeve must have been armed >60s (give normal path a chance)
+          4. Cadence throttle: once/min per sleeve
+          5. buy_px/sell_px must be > 0
+        """
+        import time as _t
+        now = _t.time()
+
+        # Gate 1: must be armed state
+        try:
+            state_val = str(ss.state.value if hasattr(ss.state, "value") else ss.state).upper()
+        except Exception:
+            return
+        if state_val not in ("ARMED_BUY", "ARMED_SELL"):
+            return
+
+        # Gate 2: must be a ghost (no live order)
+        if ss.live_order_id:
+            return
+
+        # Gate 3: only fire if armed >60s AND we know when it was armed.
+        # If armed_since_ts is missing/0, the sleeve was JUST armed by an
+        # upstream transition that hasn't stamped a timestamp yet — the
+        # normal arm path is about to run in this same tick. Skip and let
+        # it work. This prevents the ghost force-arm from racing normal
+        # transitions (e.g., reanchor + arm on the same step).
+        ts_field = "armed_buy_since_ts" if state_val == "ARMED_BUY" else "armed_sell_since_ts"
+        armed_ts = 0.0
+        try:
+            armed_ts = float(getattr(ss, ts_field, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        if armed_ts <= 0:
+            return   # unknown arm time — assume freshly armed, skip
+        if (now - armed_ts) < self._GHOST_ARM_MIN_ARMED_SECS:
+            return
+
+        # Gate 4: cadence throttle
+        last_arm_ts = float(getattr(ss, "_last_ghost_arm_ts", 0.0) or 0.0)
+        if last_arm_ts and (now - last_arm_ts) < self._GHOST_ARM_INTERVAL_SECS:
+            return
+
+        # Gate 5: price + qty must be valid
+        try:
+            if state_val == "ARMED_BUY":
+                side = "BUY"
+                price = float(sc.buy_px or 0)
+            else:
+                side = "SELL"
+                price = float(sc.sell_px or 0)
+            qty = int(sc.qty or 0)
+        except (TypeError, ValueError):
+            return
+        if price <= 0 or qty <= 0:
+            return
+
+        # Snap price to tick_size before placing (avoid INVALID_PRICE_PRECISION)
+        try:
+            snapped_px = self._snap_to_tick(price)
+        except Exception:
+            snapped_px = price
+
+        # Idempotency: re-check live_order_id (a race with the normal path
+        # could have placed since our gate check above)
+        if ss.live_order_id:
+            return
+
+        # Place the order
+        try:
+            oid = self.b.place_limit(side, qty, snapped_px)
+        except Exception as e:
+            self._record("ghost_arm_place_failed",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         side=side, price=snapped_px, error=str(e))
+            ss._last_ghost_arm_ts = now
+            return
+
+        # place_limit returns the order_id as a plain string
+        if not oid or not isinstance(oid, str):
+            self._record("ghost_arm_place_no_id",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         side=side, price=snapped_px,
+                         returned_type=type(oid).__name__,
+                         returned_val=str(oid)[:80])
+            ss._last_ghost_arm_ts = now
+            return
+
+        # Update sleeve state with the new order_id
+        ss.live_order_id = oid
+        ss._last_ghost_arm_ts = now
+        self._record(
+            "sleeve_ghost_armed",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            side=side, price=snapped_px, qty=qty,
+            order_id=oid,
+            armed_hours_ago=round((now - armed_ts) / 3600, 2) if armed_ts > 0 else None,
+            reason="normal arm path failed; ghost detected and force-armed on tick loop",
         )
 
     def _maybe_auto_refresh_stale_sleeve(self, sc, ss, last_price: float) -> None:
@@ -2794,6 +2925,15 @@ class SwingTrader:
         # buy_px auto-refresh but for stop_loss_px. Safety guards
         # prevent immediate stop-triggering.
         self._maybe_auto_refresh_stop_loss(sc, ss, last_price)
+
+        # [crew 2026-07-15] TICK-LEVEL GHOST RESURRECTION. Adam: the
+        # bot's normal arm-to-place path silently fails for some sleeves
+        # (state=ARMED_BUY/SELL, live_order_id=None). Result: price
+        # crosses trigger, nothing fills, cycles lost forever. The diag
+        # force-arm resurrected 12+ ghosts in one session. This puts the
+        # same logic on every tick so ghosts never linger >60s. Root-
+        # cause fix pending; this is the safety net.
+        self._maybe_force_arm_ghost_order(sc, ss)
 
         # [crew] Average-down GREEN LIGHT alert (notification only). Opt-in.
         self._maybe_avg_down_alert(sc, ss, last_price)
