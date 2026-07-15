@@ -634,7 +634,14 @@ def run() -> int:
                 last_portfolio_refresh = now
                 try:
                     from main import refresh_portfolio_snapshot
-                    live_tenant = f"{TENANT}-live"
+                    # Match the reconcile guard on line 495: if TENANT already
+                    # ends with '-live' (Adam's live worker has SWING_TENANT=
+                    # adam-live), do NOT append another '-live' — else every
+                    # refresh writes to the ghost 'adam-live-live' scope while
+                    # the dashboard reads 'adam-live' and stays frozen at the
+                    # startup snapshot. Root cause of 2026-07-14 stale-mark
+                    # incident that missed PLAT sell + trail.
+                    live_tenant = f"{TENANT}-live" if not TENANT.endswith("-live") else TENANT
                     n_refreshed = refresh_portfolio_snapshot(store, live_tenant)
                     if n_refreshed > 0:
                         pass  # silent success — logging every 30s is noisy
