@@ -5719,13 +5719,17 @@ const scannerArmSleeveBtn = document.getElementById('scanner-arm-sleeve-btn');
 // {product_id, price, high_24h, low_24h, vol_pct, volume_24h}
 let scannerDetailContext = null;
 // {days, granularity}
-let scannerChartWindow = { days: 1, granularity: 'FIVE_MINUTE' };
+// 2026-07-15: default to 1D at FIFTEEN_MINUTE. Prior default (5m over 1 day)
+// returned mostly-empty charts for low-liquidity perps where nothing traded
+// in most 5m windows — Adam saw a 1-candle chart on HYPE. 1D×15m gives
+// ~96 potential bars, usually 30-90 have real trades — a readable chart.
+let scannerChartWindow = { days: 1, granularity: 'FIFTEEN_MINUTE' };
 
 const TIMEFRAMES = [
   { label: '5m',  minutes: 5,   granularity: 'ONE_MINUTE' },
   { label: '30m', minutes: 30,  granularity: 'ONE_MINUTE' },
   { label: '1H',  minutes: 60,  granularity: 'FIVE_MINUTE' },
-  { label: '1D',  days: 1,      granularity: 'FIVE_MINUTE' },
+  { label: '1D',  days: 1,      granularity: 'FIFTEEN_MINUTE' },
   { label: '7D',  days: 7,      granularity: 'FIVE_MINUTE' },
   { label: '30D', days: 30,     granularity: 'ONE_HOUR' },
 ];
@@ -6787,7 +6791,8 @@ async function loadScannerChart() {
       if (Number(s.buy_px) > 0) targetLines.push({ price: Number(s.buy_px), label: 'BUY', color: '#3b82f6' });
       if (s.stop_loss_enabled && Number(s.stop_loss_px) > 0) targetLines.push({ price: Number(s.stop_loss_px), label: 'STOP', color: '#ef4444' });
     }
-    renderCandleChart(data.candles || [], scannerDetailChart, {
+    const candleArr = data.candles || [];
+    renderCandleChart(candleArr, scannerDetailChart, {
       fills,
       fillsDiag,
       symbol: product_id,
@@ -6796,6 +6801,19 @@ async function loadScannerChart() {
       contractSize: Number(cfg.contract_size) || 0,
       indicators: { ...scannerChartIndicators },
     });
+    // Sparse-data warning: if we got very few candles, the chart is
+    // mostly empty — either a low-liquidity product where most 5m windows
+    // have zero trades, OR the product_id is stale and Coinbase's candles
+    // API returned near-nothing. Bug the user to pick a bigger timeframe
+    // OR verify the product ID.
+    if (candleArr.length > 0 && candleArr.length < 10) {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'margin-top:8px;padding:8px 12px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:4px;color:#fbbf24;font-size:12px;';
+      banner.innerHTML = `⚠️ Only ${candleArr.length} candle${candleArr.length === 1 ? '' : 's'} returned for <b>${escapeHtml(product_id)}</b>. ` +
+        `Either this product has low trading activity in the selected timeframe, or the product_id is stale (Coinbase would return more data if it matched a real market). ` +
+        `Try a longer timeframe (1D → 7D → 30D) or run <code>python3 diag_product_id_audit.py</code> to verify the product_id.`;
+      scannerDetailChart.appendChild(banner);
+    }
   } catch (err) {
     scannerDetailChart.innerHTML = `<div class="chart-status error">chart failed: ${escapeHtml(String(err.message || err))}</div>`;
   }
