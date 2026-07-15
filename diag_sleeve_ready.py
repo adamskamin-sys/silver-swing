@@ -198,9 +198,19 @@ def main() -> None:
                                 reason = (f"armed {age_s}s ago, no blocker event visible "
                                           f"(saw {total_events} other events on this product)")
                             else:
+                                # Show top event types so we can see WHAT
+                                # the tick loop is doing even if none matched
+                                # our block-event list. That's the fingerprint
+                                # of the silent path.
+                                from collections import Counter
+                                ev_types = Counter()
+                                for _e in recent_events_by_symbol.get(sym, []):
+                                    if _e.get("sleeve_id") == sid or not _e.get("sleeve_id"):
+                                        ev_types[_e.get("event_type", "?")] += 1
+                                top = ev_types.most_common(4)
+                                top_str = ", ".join(f"{k}={v}" for k, v in top)
                                 reason = (f"armed {_fmt_age(armed_since)} ago, "
-                                          f"{total_events} events on this product but 0 "
-                                          f"blockers — silent code path, deep-dive needed")
+                                          f"{total_events} events / TOP TYPES: {top_str}")
                         else:
                             reason = "no armed_buy_since_ts — never fully armed"
                 print(f"{sym:22} {sid:14} {state_val:11} ${buy_px:>9} ${mark:>9.4f} "
