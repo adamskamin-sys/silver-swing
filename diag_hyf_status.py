@@ -194,6 +194,45 @@ def main() -> None:
     except Exception as e:
         print(f"    ✗ feed init/start FAILED: {type(e).__name__}: {e}")
 
+    # Step 9: reproduce the discover-loop hot-add. Same call sequence
+    # as main.py:975-981 — constructor + start(). This is what fails
+    # silently in the running bot when the sleeve never ticks.
+    print(f"\n[9] REPRODUCE _Track spawn for {product_id}:")
+    try:
+        from main import _Track, FEED_READY_TIMEOUT
+        from safety import make_trade_log, make_kill_switch
+        import io, contextlib
+        log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
+        ks = make_kill_switch(store, tenant)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                track = _Track(store, log, ks, tenant, product_id, 100000.0)
+                print(f"    ✓ _Track constructor OK (trader={type(track.trader).__name__})")
+                started = track.start(FEED_READY_TIMEOUT)
+                if started:
+                    print(f"    ✓ track.start(FEED_READY_TIMEOUT={FEED_READY_TIMEOUT}s) returned True")
+                    print(f"    → Track WOULD be added to tracks dict and tick normally.")
+                    print(f"      The running bot's spawn attempt must be failing at a")
+                    print(f"      different step. Check Render logs for '[{product_id}]'")
+                    track.close()
+                else:
+                    print(f"    ✗ track.start() returned False after {FEED_READY_TIMEOUT}s")
+                    print(f"    → This is the exact failure. See captured output below.")
+                    track.close()
+            except Exception as e:
+                print(f"    ✗ SPAWN THREW: {type(e).__name__}: {e}")
+                import traceback
+                print("    ---traceback---")
+                print(traceback.format_exc())
+        captured = buf.getvalue()
+        if captured.strip():
+            print("    ---captured stdout/stderr from spawn---")
+            for line in captured.strip().splitlines()[-30:]:
+                print(f"    | {line}")
+    except Exception as e:
+        print(f"    ✗ spawn setup failed: {type(e).__name__}: {e}")
+
     print("\n" + "=" * 78)
     print("DIAGNOSIS")
     print("=" * 78)
