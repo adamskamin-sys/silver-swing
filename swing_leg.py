@@ -1532,6 +1532,71 @@ class SwingTrader:
     _AUTO_REFRESH_STALE_AFTER_SECS = 1200.0     # only refresh if armed > 20 min
     _AUTO_REFRESH_MIN_HISTORY = 30              # need >=30 price history entries
 
+    def _backfill_sleeve_history_from_coinbase(self, sc) -> int:
+        """Populate `_sleeve_price_history[sc.id]` with recent closes fetched
+        from Coinbase's candles endpoint, so gated features (auto-refresh,
+        reentry_reeval, experts_reentry) can fire immediately after process
+        restart without waiting for live ticks to refill the in-memory deque.
+
+        Adam 2026-07-15: "why do we need to wait since we have the historical
+        data?" Right — the tick loop takes 20-30 min to refill 30 entries
+        for thinly-traded products (XLP), but Coinbase has the history sitting
+        there. This helper closes that gap.
+
+        Returns the number of prices backfilled (0 on failure). Safe to call
+        even if history already has entries — appends only new closes past
+        what's already in the deque.
+        """
+        try:
+            from collections import deque as _deque
+            import time as _t
+            # Ensure the deque exists
+            if sc.id not in self._sleeve_price_history:
+                window = int(getattr(sc, "reentry_range_window", 60) or 60) * 4
+                self._sleeve_price_history[sc.id] = _deque(maxlen=window)
+            ph = self._sleeve_price_history[sc.id]
+            if len(ph) >= ph.maxlen // 2:
+                return 0  # already has plenty
+            # Fetch last 4 hours of 5-min candles from broker
+            end = int(_t.time())
+            start = end - (4 * 3600)
+            resp = self.b.client.get_candles(
+                product_id=self.symbol,
+                start=str(start),
+                end=str(end),
+                granularity="FIVE_MINUTE",
+            )
+            candles = getattr(resp, "candles", None) or resp.get("candles", [])
+            closes = []
+            for c in candles:
+                close = c.get("close") if isinstance(c, dict) else getattr(c, "close", None)
+                if close is not None:
+                    try:
+                        closes.append(float(close))
+                    except (TypeError, ValueError):
+                        pass
+            closes.reverse()  # Coinbase returns newest-first
+            # Only backfill if we got a meaningful number
+            if len(closes) < 5:
+                return 0
+            # Prepend to deque so live ticks continue appending on top
+            existing = list(ph)
+            ph.clear()
+            for c in closes:
+                ph.append(c)
+            for e in existing:
+                ph.append(e)
+            self._record("sleeve_history_backfilled",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         closes_fetched=len(closes),
+                         source="coinbase.get_candles(5m, last 4h)")
+            return len(closes)
+        except Exception as e:
+            self._record("sleeve_history_backfill_error",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         error=str(e))
+            return 0
+
     def _maybe_auto_refresh_stale_sleeve(self, sc, ss, last_price: float) -> None:
         """Universal Level 2 auto-refresh — for any sleeve in ARMED_BUY
         WITHOUT a live order (i.e., waiting to arm but no order placed
@@ -1577,10 +1642,20 @@ class SwingTrader:
         if last_refresh and (now - last_refresh) < self._AUTO_REFRESH_MIN_INTERVAL_SECS:
             return
 
-        # Gate 4: sufficient price history.
+        # Gate 4: sufficient price history. On process restart, the in-memory
+        # deque is empty — attempt backfill from Coinbase candles ONCE before
+        # giving up (Adam 2026-07-15: "why wait if we have the historical
+        # data?"). Cadence gate below ensures we don't hammer this.
         history = list(self._sleeve_price_history.get(sc.id, []) or [])
         if len(history) < self._AUTO_REFRESH_MIN_HISTORY:
-            return
+            backfilled = self._backfill_sleeve_history_from_coinbase(sc)
+            if backfilled > 0:
+                history = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(history) < self._AUTO_REFRESH_MIN_HISTORY:
+                # Still short — record the cadence tick so we don't retry
+                # backfill on every tick (respects the once/min throttle).
+                ss._last_auto_refresh_ts = now
+                return
 
         # Compute fresh buy_px via arm_level (Chan OU + Connors).
         # CRITICAL: use current market as sold_ref, NOT ancient
