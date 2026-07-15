@@ -175,8 +175,12 @@ def _handle_candles_job(r, job_id: str) -> None:
         end = datetime.now(timezone.utc)
         start = end - (timedelta(minutes=minutes) if minutes is not None else timedelta(days=days))
         candles = fetch_candles(client, product_id, start, end, granularity=granularity)
-        # Compact form: [ts, open, high, low, close] tuples. Skip volume for size.
-        packed = [[c.ts, c.open, c.high, c.low, c.close] for c in candles]
+        # 2026-07-15: include volume. Payload cost is minor (one float per bar),
+        # and unlocks VWAP / Anchored VWAP / CVD / volume-bar rendering on the
+        # frontend chart. Old [ts, o, h, l, c] format still readable by
+        # existing code — new consumers can index [5] for volume.
+        packed = [[c.ts, c.open, c.high, c.low, c.close, getattr(c, "volume", 0) or 0]
+                  for c in candles]
         result_payload = {
             "ok": True,
             "product_id": product_id,
