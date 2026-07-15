@@ -46,7 +46,9 @@ class SleeveConfig:
     # margin_per_contract × scale_up_buffer_mult. Mirrors the primary's
     # scale-up mechanism but scoped to this sleeve's own realized_pnl —
     # so each strategy compounds independently.
-    accumulate_enabled: bool = False
+    # 2026-07-15 Adam: default ON for new sleeves (all 7 safety+alert
+    # features). Existing sleeves respect their stored value.
+    accumulate_enabled: bool = True
     max_qty: int = 0                          # 0 or <= qty disables
     scale_up_buffer_mult: float = 1.5
     # Accumulation mode: 'qty' (increment this sleeve's contract count) OR
@@ -72,7 +74,10 @@ class SleeveConfig:
     #   all      → flatten this sleeve's held contracts (respecting core)
     #   original → sell only the sleeve's starting cfg.qty
     #   custom   → user-specified qty
-    stop_loss_enabled: bool = False
+    # 2026-07-15 Adam: default ON for NEW sleeves. Existing sleeves keep
+    # their stored value via from_dict's `d.get(...) or False` fallback —
+    # NGS (Adam's conviction hold, no-stop-loss directive) is protected.
+    stop_loss_enabled: bool = True
     stop_loss_px: float = 0.0
     stop_loss_qty_mode: str = "all"           # "all" | "original" | "custom"
     stop_loss_qty_custom: int = 0
@@ -395,17 +400,18 @@ class SleeveConfig:
     # Enabling it ALSO turns on the cascade re-entry gate (cascade_state.py):
     # after a crash the sleeve refuses to rebuy into an active crash or a
     # dead-cat bounce, waiting for a signal-based all-clear (VPIN subsided +
-    # volatility contracting) before re-arming the buy. OFF by default — no
-    # behavior change until enabled per-sleeve.
-    crash_guard_enabled: bool = False
+    # volatility contracting) before re-arming the buy.
+    # 2026-07-15 Adam: default ON for NEW sleeves; existing sleeves preserved.
+    crash_guard_enabled: bool = True
     # [crew] OFFENSIVE reversal — SHADOW ONLY. When on, a crash that flattens
     # the long ALSO records a `reversal_signal` telemetry event (the
     # hypothetical short entry) so paper/backtest can score the flip and feed
     # the go-live gauntlet. It does NOT place a live short: the sleeve has no
     # short-holding state machine yet, and per the safety rules that execution
-    # engine must be built + paper-validated before any real order. OFF by
-    # default.
-    reversal_enabled: bool = False
+    # engine must be built + paper-validated before any real order.
+    # 2026-07-15 Adam: default ON for NEW sleeves (shadow-only telemetry is
+    # safe by design — no live short order can fire); existing sleeves preserved.
+    reversal_enabled: bool = True
     # [crew] Channel re-anchor. When on, after a confirmed + settled drop
     # (channel_finder: structural break + volatility contracted) the sleeve
     # walks its whole channel — buy/sell/trail AND the stop reference — down to
@@ -416,20 +422,25 @@ class SleeveConfig:
     # [crew] Average-down GREEN LIGHT alert. When on, while HOLDING an underwater
     # long the sleeve computes avg_down_signal (mean-revert regime + at the
     # channel floor + calm flow + margin) and pings you when it turns green — a
-    # notification only, never an order. OFF by default.
-    avg_down_alert_enabled: bool = False
+    # notification only, never an order.
+    # 2026-07-15 Adam: default ON for NEW sleeves (notification-only, no
+    # execution risk); existing sleeves preserved.
+    avg_down_alert_enabled: bool = True
     # [crew] Entry-quality GREEN LIGHT alert. When on, while WAITING to buy the
     # sleeve scores the current moment (scanner_signals: regime + channel floor +
     # microstructure) and pings you when it's a good time to enter — green =
     # clean trend or calm swing near support, red = chop / toxic flow / crash.
-    # Notification only, never an order. OFF by default.
-    entry_quality_alert_enabled: bool = False
+    # Notification only, never an order.
+    # 2026-07-15 Adam: default ON for NEW sleeves; existing sleeves preserved.
+    entry_quality_alert_enabled: bool = True
     # [crew] Velocity guard on entries (knife_gate). When on, the buy fills at
     # the target normally but is HELD while price is dropping too fast for this
     # instrument's own volatility (Lee-Mykland jump) or into toxic/one-sided flow
     # (VPIN/OFI/Kyle/OBI) — then released. Self-scaling per instrument; replaces
-    # the blanket bounce-wait (buy_trail). OFF by default.
-    velocity_gate_enabled: bool = False
+    # the blanket bounce-wait (buy_trail).
+    # 2026-07-15 Adam: default ON for NEW sleeves (defensive gate; only
+    # delays buys, never places new orders); existing sleeves preserved.
+    velocity_gate_enabled: bool = True
 
     # NOTE: mean_reversion / Bollinger / momentum fields deliberately not
     # declared here yet — those exit_modes aren't wired in swing_leg._sleeve_step,
