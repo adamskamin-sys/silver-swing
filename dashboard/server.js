@@ -591,27 +591,35 @@ export function makeApp({
       cfg.sleeves = sleeves;
       store[tenant][symbol].config = cfg;
 
-      // Adam 2026-07-15 (Option B): if the caller passed sleeve_states,
-      // seed them for NEW sleeve ids only. Never overwrite existing state —
-      // legacy sleeves keep their persisted state (own_avg_entry, cycles,
-      // realized_pnl, etc.) untouched. This is how the scanner arm-as-sleeve
-      // flow initializes a new sleeve to ARMED_BUY so the tick loop places
-      // the entry buy on Coinbase without the sleeve appearing ARMED_SELL
-      // by default.
-      if (sleeve_states && typeof sleeve_states === 'object') {
-        const stateBlockOut = store[tenant][symbol].state || {};
-        const existing = stateBlockOut.sleeves || {};
-        let seededAny = false;
-        for (const [sid, seedVals] of Object.entries(sleeve_states)) {
-          if (existing[sid]) continue;              // never overwrite existing state
-          if (!seedVals || typeof seedVals !== 'object') continue;
-          existing[sid] = { id: sid, ...seedVals };
-          seededAny = true;
-        }
-        if (seededAny) {
-          stateBlockOut.sleeves = existing;
-          store[tenant][symbol].state = stateBlockOut;
-        }
+      // Adam 2026-07-15 (Option B): auto-seed EVERY brand-new sleeve id
+      // (no persisted state) with state=ARMED_BUY so the tick loop places
+      // the entry buy at buy_px on Coinbase instead of defaulting to
+      // ARMED_SELL (which would try to sell contracts we don't hold yet).
+      // Optional sleeve_states from the client can override individual
+      // seed fields (e.g., armed_buy_since_ts) but the default seed still
+      // applies for new sleeves the client didn't call out explicitly.
+      // Never overwrites existing state — legacy sleeves keep their own_avg_entry,
+      // cycles, realized_pnl, etc. untouched.
+      const clientSeeds = (sleeve_states && typeof sleeve_states === 'object') ? sleeve_states : {};
+      const stateBlockOut = store[tenant][symbol].state || {};
+      const existing = stateBlockOut.sleeves || {};
+      const nowSec = Math.floor(Date.now() / 1000);
+      let seededAny = false;
+      for (const s of sleeves) {
+        if (!s.id || existing[s.id]) continue;      // never overwrite existing state
+        const clientSeed = clientSeeds[s.id];
+        const seed = {
+          id: s.id,
+          state: 'ARMED_BUY',
+          armed_buy_since_ts: nowSec,
+          ...(clientSeed && typeof clientSeed === 'object' ? clientSeed : {}),
+        };
+        existing[s.id] = seed;
+        seededAny = true;
+      }
+      if (seededAny) {
+        stateBlockOut.sleeves = existing;
+        store[tenant][symbol].state = stateBlockOut;
       }
 
       await writeStoreAtomic(storePath, store);
