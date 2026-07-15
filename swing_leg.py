@@ -3242,8 +3242,22 @@ class SwingTrader:
         target_px = None
         stage = None
         if trail_engaged and hwm > 0 and trail_distance > 0:
-            target_px = hwm - trail_distance
-            stage = "trail"
+            # Adam 2026-07-15: trail must NEVER exit below the original SELL
+            # target once profit-locked. Rule: "trails stopping shouldn't
+            # change my sell number until it reaches the original sell goal."
+            # HYPE 2026-07-15 case: mark ran to $68.80, HWM=$68.80,
+            # trail_distance=$0.45 → naive trail = $68.35, which is $0.34
+            # BELOW the sell_px goal $68.69. If mark dropped back, trail would
+            # exit at $68.35 giving 40¢ profit vs the $58¢ profit the goal
+            # promised. Floor the trail at sell_px so trail can only tighten
+            # (fire at a HIGHER price) as HWM rises — never below the goal.
+            raw_trail = hwm - trail_distance
+            if sell_px > 0 and raw_trail < sell_px:
+                target_px = sell_px
+                stage = "trail_floored_at_sell"
+            else:
+                target_px = raw_trail
+                stage = "trail"
         elif sell_px > 0 and (hwm >= sell_px or last_price >= sell_px):
             target_px = sell_px
             stage = "profit_lock"
