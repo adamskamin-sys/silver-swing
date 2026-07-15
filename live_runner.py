@@ -641,14 +641,28 @@ def run() -> int:
         except Exception:
             pass
         # Armed sleeves — regular priority (unless product already in critical)
+        # Adam 2026-07-15: per-product try/except (was outer wrapper). Outer
+        # wrapper caused the "only AVE detected" bug — if get_state raised
+        # for BIT (third in sorted order), the exception bailed the whole
+        # loop and everything after BIT was skipped. Per-product try isolates
+        # a bad state entry so it doesn't drop all following products.
         try:
-            for sym in store.list_symbols(TENANT):
-                if sym.startswith("__"):
-                    continue
-                if sym == SYMBOL:
-                    continue
-                if sym in should_track_critical:
-                    continue  # already flagged
+            symbols_to_scan = list(store.list_symbols(TENANT))
+        except Exception as _e:
+            symbols_to_scan = []
+            try:
+                log.record("track_health_list_symbols_failed",
+                           tenant=TENANT, error=str(_e), severity="warn")
+            except Exception:
+                pass
+        for sym in symbols_to_scan:
+            if sym.startswith("__"):
+                continue
+            if sym == SYMBOL:
+                continue
+            if sym in should_track_critical:
+                continue  # already flagged
+            try:
                 st = store.get_state(TENANT, sym) or {}
                 sleeves = st.get("sleeves") or {}
                 for ss in sleeves.values():
@@ -656,8 +670,18 @@ def run() -> int:
                     if sstate in ("ARMED_BUY", "ARMED_SELL"):
                         should_track_regular.add(sym)
                         break
-        except Exception:
-            pass
+            except Exception as _sym_err:
+                # One bad product must not skip all following ones — log the
+                # failure per-symbol so the operator sees WHICH product is
+                # corrupt without losing discovery for everyone else.
+                try:
+                    log.record("track_health_discovery_failed_per_symbol",
+                               tenant=TENANT, symbol=sym,
+                               error=f"{type(_sym_err).__name__}: {_sym_err}",
+                               severity="warn")
+                except Exception:
+                    pass
+                continue
         # Merge into single set for spawn attempts, gated by which interval
         # actually fired this iteration.
         should_track: set[str] = set()
