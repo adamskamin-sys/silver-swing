@@ -1867,6 +1867,38 @@ class SwingTrader:
         if ss.live_order_id:
             return
 
+        # CRITICAL SAFETY (2026-07-15): don't over-accumulate. If sleeve is
+        # ARMED_BUY but Coinbase already shows a position we own, the sleeve
+        # state is stale (should be ARMED_SELL) — reconciliation, not a new
+        # BUY, is the correct fix. Placing another BUY here would double-
+        # count. Adam observed 3 ZEC contracts when sleeve qty=1 because
+        # this guard didn't exist.
+        if side == "BUY":
+            try:
+                current_pos = int(self.b.position_qty() or 0)
+                # If we already hold at-or-above the sleeve's intended qty
+                # (plus any core position on this product), don't add more.
+                # Compare against sc.qty + tenant core_qty (the "protect the
+                # core" invariant means position can legitimately be > qty).
+                intended_position = int(getattr(sc, "qty", 1) or 1) + int(
+                    getattr(self.cfg, "core_qty", 0) or 0)
+                if current_pos >= intended_position:
+                    self._record(
+                        "ghost_arm_skipped_position_full",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        current_position=current_pos,
+                        intended_position=intended_position,
+                        reason="already at-or-above target position; ghost arm would over-accumulate",
+                    )
+                    ss._last_ghost_arm_ts = now
+                    return
+            except Exception as e:
+                # If we can't check position, be conservative — don't place
+                self._record("ghost_arm_position_check_failed",
+                             sleeve_id=sc.id, error=str(e))
+                ss._last_ghost_arm_ts = now
+                return
+
         # Place the order
         try:
             oid = self.b.place_limit(side, qty, snapped_px)
