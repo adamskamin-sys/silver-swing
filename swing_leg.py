@@ -390,28 +390,16 @@ class SwingTrader:
                 except Exception:
                     fill_price = 0.0
                 filled_qty = int(st.get("filled_qty") or sc.qty or 1)
-                own_avg = float(ss.own_avg_entry or 0)
-                profit = 0.0
-                if own_avg > 0 and fill_price > 0:
-                    try:
-                        contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
-                    except Exception:
-                        contract_size = 1.0
-                    profit = (fill_price - own_avg) * filled_qty * contract_size
-                credited_stops.append((sid, ss.resting_stop_oid, fill_price, profit))
-                # Credit
-                ss.realized_pnl = float(ss.realized_pnl or 0) + profit
-                ss.cycles = int(ss.cycles or 0) + 1
-                ss.last_sell_qty = filled_qty
-                ss.last_sell_fill_price = fill_price
-                try:
-                    recent = list(ss.recent_cycle_pnls or [])
-                    recent.append(profit)
-                    if len(recent) > 20:
-                        recent = recent[-20:]
-                    ss.recent_cycle_pnls = recent
-                except Exception:
-                    pass
+                credited_stops.append((sid, ss.resting_stop_oid, fill_price, None))
+                # Adam 2026-07-15 CRITICAL: use the shared _credit_stop_fill
+                # helper so we get the same never-silent-$0 protection as the
+                # tick path. If own_avg unresolvable, helper halts the sleeve
+                # and returns False — we DON'T clear own_avg_entry or
+                # resting_stop_oid so post-mortem has full context.
+                credited = self._credit_stop_fill(sc, ss, fill_price,
+                                                  filled_qty, source="reconcile")
+                if not credited:
+                    continue  # halted; state left intact for review
                 ss.own_avg_entry = None
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
@@ -3392,6 +3380,96 @@ class SwingTrader:
             new_stop_loss_px=float(own_avg),
         )
 
+    def _credit_stop_fill(self, sc: SleeveConfig, ss: SleeveState,
+                          fill_price: float, filled_qty: int,
+                          source: str) -> bool:
+        """Adam 2026-07-15 CRITICAL: shared helper for both the tick-side
+        credit (_maybe_credit_resting_stop_fill) and the reconcile sweeper.
+
+        Never credits $0 silently. If own_avg_entry is unresolvable at
+        credit time, tries sell_entry_avg as a fallback (captured when the
+        sell was armed). If still unknown, emits severity=critical event
+        and halts the sleeve for review — DOES NOT credit, DOES NOT
+        increment cycles, DOES NOT clear own_avg_entry. Prevents the HYPE
+        2026-07-15 class of bug where profit=0 was silently added,
+        cycles++ fired anyway, and the $15 profit vanished into a phantom
+        cycle. Manual fix: diag_force_credit_cycle.py.
+
+        Returns True on success (caller then clears position tracking +
+        advances state), False on halt-for-review (caller returns without
+        clearing anything so post-mortem has full context).
+
+        source: 'tick' or 'reconcile' — recorded on the event so telemetry
+        can distinguish which path credited the fill.
+        """
+        if fill_price is None or fill_price <= 0:
+            self._record("resting_stop_credit_fill_price_missing",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         source=source, filled_qty=filled_qty,
+                         severity="critical",
+                         reason="average_filled_price missing/invalid")
+            self._sleeve_halt(sc, ss,
+                              f"resting stop-limit reported FILLED but fill_price "
+                              f"invalid ({fill_price}); manual reconcile required")
+            return False
+        own_avg = float(ss.own_avg_entry or 0)
+        avg_source = "own_avg_entry"
+        if own_avg <= 0:
+            # Fallback: sell_entry_avg captured when the sell was armed
+            sell_avg = float(getattr(ss, "sell_entry_avg", 0) or 0)
+            if sell_avg > 0:
+                own_avg = sell_avg
+                avg_source = "sell_entry_avg"
+                self._record("resting_stop_credit_avg_fallback_used",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             fallback_source=avg_source, used_avg=own_avg,
+                             source=source, severity="warn")
+        if own_avg <= 0:
+            # No usable entry — halt for review. This is the HYPE 2026-07-15
+            # class: cycles++ would have fired with profit=0 and the missing
+            # $15 would vanish forever. Halt loudly instead.
+            self._record("resting_stop_credit_own_avg_missing",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         source=source, fill_price=fill_price,
+                         filled_qty=filled_qty, severity="critical",
+                         reason=("own_avg_entry AND sell_entry_avg both missing "
+                                 "— cannot compute realized P&L. Halted; use "
+                                 "diag_force_credit_cycle.py to backfill."))
+            self._sleeve_halt(sc, ss,
+                              f"resting stop-limit fill @ ${fill_price} but own_avg "
+                              f"unknown; run diag_force_credit_cycle.py {self.symbol} "
+                              f"{sc.id} <fill> <buy_avg> to reconcile")
+            return False
+        try:
+            contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
+        except Exception:
+            contract_size = 1.0
+        profit = (fill_price - own_avg) * filled_qty * contract_size
+        ss.realized_pnl = float(ss.realized_pnl or 0) + profit
+        ss.cycles = int(ss.cycles or 0) + 1
+        ss.last_sell_qty = filled_qty
+        ss.last_sell_fill_price = fill_price
+        try:
+            recent = list(ss.recent_cycle_pnls or [])
+            recent.append(profit)
+            if len(recent) > 20:
+                recent = recent[-20:]
+            ss.recent_cycle_pnls = recent
+        except Exception:
+            pass
+        # Reset consecutive-stops on a successful credit (whether profit or loss,
+        # the fill closed the cycle cleanly).
+        ss.consecutive_stops = 0
+        self._record(
+            "resting_stop_filled_credited",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            source=source, fill_price=fill_price,
+            own_avg_entry=own_avg, avg_source=avg_source,
+            filled_qty=filled_qty, profit=profit,
+            new_realized=ss.realized_pnl, new_cycles=ss.cycles,
+        )
+        return True
+
     def _maybe_credit_resting_stop_fill(self, sc: SleeveConfig, ss: SleeveState) -> None:
         """Adam 2026-07-15: post-fill state reconciler for the ratchet-stop.
 
@@ -3402,10 +3480,12 @@ class SwingTrader:
         shows 'phantom profit' from own_avg_entry that we no longer own.
 
         Runs each tick. When resting_stop_oid exists, polls its status.
-        If FILLED: credits the fill (cycles++, realized_pnl += profit,
-        own_avg_entry cleared, resting_stop_* cleared, state → ARMED_BUY
-        ready for next cycle). If CANCELLED externally: clears the oid
-        so _maintain_resting_stop places a fresh one next tick.
+        If FILLED: credits the fill via _credit_stop_fill (which halts
+        the sleeve if own_avg unresolvable — no silent $0 credit).
+        On success: cycles++, realized_pnl += profit, own_avg_entry
+        cleared, resting_stop_* cleared, state → ARMED_BUY.
+        If CANCELLED externally: clears the oid so _maintain_resting_stop
+        places a fresh one next tick.
         """
         import time as _time
         if not ss.resting_stop_oid:
@@ -3421,37 +3501,23 @@ class SwingTrader:
         if status == "OPEN":
             return  # still resting, nothing to do
         if status == "FILLED":
-            # Compute fill price + credit as exit.
             fill_price = status_info.get("average_filled_price")
             try:
                 fill_price = float(fill_price) if fill_price is not None else 0.0
             except Exception:
                 fill_price = 0.0
             filled_qty = int(status_info.get("filled_qty") or sc.qty or 1)
-            own_avg = float(ss.own_avg_entry or 0)
-            profit = 0.0
-            if own_avg > 0 and fill_price > 0:
-                try:
-                    contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
-                except Exception:
-                    contract_size = 1.0
-                profit = (fill_price - own_avg) * filled_qty * contract_size
-            ss.realized_pnl = float(ss.realized_pnl or 0) + profit
-            ss.cycles = int(ss.cycles or 0) + 1
-            ss.last_sell_qty = filled_qty
-            ss.last_sell_fill_price = fill_price
-            # Track for the recent-cycles list (loss-streak detection)
-            try:
-                recent = list(ss.recent_cycle_pnls or [])
-                recent.append(profit)
-                if len(recent) > 20:
-                    recent = recent[-20:]
-                ss.recent_cycle_pnls = recent
-            except Exception:
-                pass
-            # Clear position tracking + resting stop, advance state
             old_oid = ss.resting_stop_oid
             old_stage = ss.resting_stop_stage
+            credited = self._credit_stop_fill(sc, ss, fill_price, filled_qty,
+                                              source="tick")
+            if not credited:
+                # Sleeve is now HALTED with the missing-avg event. Don't clear
+                # own_avg_entry or resting_stop_oid — leaves full context for
+                # the operator running diag_force_credit_cycle.py.
+                self._save_state()
+                return
+            # Success: clear position tracking + advance state
             ss.own_avg_entry = None
             ss.resting_stop_oid = None
             ss.resting_stop_px = None
@@ -3459,14 +3525,6 @@ class SwingTrader:
             ss.state = SleeveStateEnum.ARMED_BUY
             ss.armed_buy_since_ts = _time.time()
             self._save_state()
-            self._record(
-                "resting_stop_filled_credited",
-                sleeve_id=sc.id, sleeve_name=sc.name,
-                oid=old_oid, stage=old_stage,
-                fill_price=fill_price, own_avg_entry=own_avg,
-                filled_qty=filled_qty, profit=profit,
-                new_realized=ss.realized_pnl, new_cycles=ss.cycles,
-            )
             return
         if status in ("CANCELLED", "EXPIRED"):
             # External cancel — just clear the oid so _maintain_resting_stop
