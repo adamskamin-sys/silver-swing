@@ -193,8 +193,24 @@ class LiveTickerFeed:
     def start(self) -> None:
         if self._started:
             return
-        self._ws.open()
-        self._ws.ticker(product_ids=[self.product_id])
+        # Adam 2026-07-15: telemetry — log when open/subscribe succeeds.
+        # Helps trace where lifecycle silently fails for certain products
+        # (AVE/HYF/NGS class). Prints go to Render logs; each stage is
+        # tagged so operator can follow the lifecycle.
+        try:
+            self._ws.open()
+            print(f"[feed] {self.product_id} ws.open OK", flush=True)
+        except Exception as e:
+            print(f"[feed] {self.product_id} ws.open FAILED: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            raise
+        try:
+            self._ws.ticker(product_ids=[self.product_id])
+            print(f"[feed] {self.product_id} ticker subscribe OK", flush=True)
+        except Exception as e:
+            print(f"[feed] {self.product_id} ticker subscribe FAILED: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            raise
         if self._subscribe_l2:
             # SDK method name is `level2` in coinbase-advanced-py
             try:
