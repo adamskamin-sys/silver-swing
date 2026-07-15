@@ -5539,6 +5539,81 @@ const TIMEFRAMES = [
   { label: '30D', days: 30,     granularity: 'ONE_HOUR' },
 ];
 
+// 2026-07-15 chart indicators — closes-only indicators our experts use.
+// User can toggle each on/off. All computation is client-side to avoid
+// backend roundtrips. VWAP/CVD/Anchored VWAP need volume data (currently
+// dropped from candle payload for size); those come in a follow-up.
+const CHART_INDICATORS = [
+  { key: 'kama',      label: 'KAMA',      description: 'Kaufman Adaptive MA — trend-following that adapts to volatility (Kaufman 2013)', color: '#f59e0b' },
+  { key: 'bollinger', label: 'Bollinger', description: 'Bollinger Bands (20, 2σ) — volatility envelope (Bollinger 2001)', color: '#a78bfa' },
+  { key: 'fisher',    label: 'Fisher',    description: 'Ehlers Fisher Transform — cycle inflection detector (Ehlers 2004)', color: '#06b6d4' },
+];
+
+let scannerChartIndicators = { kama: false, bollinger: false, fisher: false };
+
+// ---- Client-side indicator computations ---------------------------------
+// Ported from the Python modules (kama.py, ehlers_fisher.py, and standard
+// Bollinger formula) so the frontend can render overlays without a
+// backend roundtrip per timeframe change. Same math as the Python side.
+
+function computeKAMASeries(closes, erPeriod = 10, fastPeriod = 2, slowPeriod = 30) {
+  // Returns an array parallel to closes, with null for bars before KAMA can be computed.
+  if (!Array.isArray(closes) || closes.length < erPeriod + 1) return null;
+  const fastAlpha = 2 / (fastPeriod + 1);
+  const slowAlpha = 2 / (slowPeriod + 1);
+  const out = new Array(closes.length).fill(null);
+  let kama = closes[erPeriod];
+  out[erPeriod] = kama;
+  for (let i = erPeriod + 1; i < closes.length; i++) {
+    const directional = Math.abs(closes[i] - closes[i - erPeriod]);
+    let volatility = 0;
+    for (let j = i - erPeriod + 1; j <= i; j++) volatility += Math.abs(closes[j] - closes[j - 1]);
+    const er = volatility > 0 ? Math.min(1, Math.max(0, directional / volatility)) : 0;
+    const sc = Math.pow(er * (fastAlpha - slowAlpha) + slowAlpha, 2);
+    kama = kama + sc * (closes[i] - kama);
+    out[i] = kama;
+  }
+  return out;
+}
+
+function computeBollingerSeries(closes, period = 20, numStd = 2) {
+  // Returns { upper, middle, lower } arrays parallel to closes.
+  if (!Array.isArray(closes) || closes.length < period) return null;
+  const upper = new Array(closes.length).fill(null);
+  const middle = new Array(closes.length).fill(null);
+  const lower = new Array(closes.length).fill(null);
+  for (let i = period - 1; i < closes.length; i++) {
+    const window = closes.slice(i - period + 1, i + 1);
+    const mean = window.reduce((a, b) => a + b, 0) / window.length;
+    const variance = window.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / window.length;
+    const std = Math.sqrt(variance);
+    middle[i] = mean;
+    upper[i] = mean + numStd * std;
+    lower[i] = mean - numStd * std;
+  }
+  return { upper, middle, lower };
+}
+
+function computeFisherSeries(closes, period = 10) {
+  // Returns array parallel to closes; Fisher Transform values (unbounded).
+  // Same pipeline as ehlers_fisher.py: normalize→smooth→transform.
+  if (!Array.isArray(closes) || closes.length < period + 2) return null;
+  const out = new Array(closes.length).fill(null);
+  let smooth = null;
+  for (let i = period - 1; i < closes.length; i++) {
+    const window = closes.slice(Math.max(0, i - period + 1), i + 1);
+    if (window.length < 2) continue;
+    const lo = Math.min(...window);
+    const hi = Math.max(...window);
+    const rng = hi - lo;
+    const norm = rng > 0 ? 2 * ((closes[i] - lo) / rng) - 1 : 0;
+    smooth = smooth === null ? norm : 0.33 * norm + 0.67 * smooth;
+    const clipped = Math.max(-0.999, Math.min(0.999, smooth));
+    out[i] = 0.5 * Math.log((1 + clipped) / (1 - clipped));
+  }
+  return out;
+}
+
 function openScannerDetail(row) {
   scannerDetailContext = row;
   scannerChartWindow = { days: 1, granularity: 'FIVE_MINUTE' };
@@ -5838,6 +5913,38 @@ function openScannerDetail(row) {
       loadScannerChart();
     };
     scannerDetailTimeframes.appendChild(b);
+  }
+
+  // 2026-07-15 chart indicators — toggle overlays for KAMA / Bollinger / Fisher.
+  // Uses the same button style as the timeframe row. Rendered as a sibling
+  // container so it visually groups next to the timeframe controls.
+  let indicatorRow = document.getElementById('scanner-detail-indicators');
+  if (!indicatorRow) {
+    indicatorRow = document.createElement('div');
+    indicatorRow.id = 'scanner-detail-indicators';
+    indicatorRow.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;align-items:center;';
+    const label = document.createElement('span');
+    label.textContent = 'indicators:';
+    label.style.cssText = 'color:#8a99ac;font-size:12px;margin-right:4px;';
+    indicatorRow.appendChild(label);
+    scannerDetailTimeframes.parentElement.insertBefore(indicatorRow, scannerDetailTimeframes.nextSibling);
+  }
+  // Clear only the buttons (keep the label span at index 0)
+  while (indicatorRow.children.length > 1) indicatorRow.removeChild(indicatorRow.lastChild);
+  for (const ind of CHART_INDICATORS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    const isOn = !!scannerChartIndicators[ind.key];
+    b.className = 'timeframe-btn' + (isOn ? ' active' : '');
+    b.textContent = ind.label;
+    b.title = ind.description;
+    b.style.borderLeft = `3px solid ${ind.color}`;
+    b.onclick = () => {
+      scannerChartIndicators[ind.key] = !scannerChartIndicators[ind.key];
+      b.classList.toggle('active');
+      loadScannerChart();
+    };
+    indicatorRow.appendChild(b);
   }
 
   // Purchase button behavior depends on whether the active tenant tracks this symbol
