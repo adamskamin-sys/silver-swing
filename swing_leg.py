@@ -3489,6 +3489,44 @@ class SwingTrader:
         # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
         # spins forever emitting sleeve_arm_failed with no order on the book.
         price = self._snap_to_tick(price)
+        # CRITICAL SAFETY (2026-07-15): normal-path over-accumulation guard.
+        # Mirrors the ghost-force-arm check in _maybe_force_arm_ghost_order.
+        # Adam surfaced this session: HYPE sleeve was in WAITING_FOR_BUY state
+        # (stale — missed crediting a fill) and armed a NEW buy at $67.17
+        # while Coinbase already held 1 contract at $66.81. Would have
+        # doubled the position. Refuse the arm when Coinbase's actual
+        # position already >= sum(all sleeves' qty) + core.
+        if side == "BUY":
+            try:
+                current_pos = int(self.b.position_qty() or 0)
+                total_sleeve_qty = 0
+                for other_ss in (self.s.sleeves or {}).values():
+                    other_sc = self._sleeve_cfg_by_id(other_ss.id) if hasattr(
+                        self, "_sleeve_cfg_by_id") else None
+                    if other_sc is None:
+                        total_sleeve_qty += int(getattr(sc, "qty", 1) or 1)
+                    else:
+                        total_sleeve_qty += int(getattr(other_sc, "qty", 1) or 1)
+                intended_position = total_sleeve_qty + int(
+                    getattr(self.cfg, "core_qty", 0) or 0)
+                if current_pos >= intended_position:
+                    self._record(
+                        "sleeve_arm_skipped_position_full",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        side=side, qty=qty, price=price,
+                        current_position=current_pos,
+                        intended_position=intended_position,
+                        total_sleeve_qty=total_sleeve_qty,
+                        core_qty=int(getattr(self.cfg, "core_qty", 0) or 0),
+                        reason="portfolio position >= sum(all sleeve qtys) + core; sleeve state is stale (missed a fill?)",
+                    )
+                    return
+            except Exception as e:
+                # Fail closed for safety — if we can't check the position,
+                # don't arm. A missed opportunity beats a doubled position.
+                self._record("sleeve_arm_position_check_failed",
+                             sleeve_id=sc.id, side=side, error=str(e))
+                return
         # Portfolio circuit breaker (Van Tharp rule: 'stop trading when things
         # go wrong'). If aggregate swing P&L across the tenant drops below the
         # configured drawdown threshold, block all new arms until it recovers.
