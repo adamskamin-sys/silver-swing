@@ -112,13 +112,37 @@ def main() -> None:
     from broker import CoinbaseBroker, BrokerConfig
     fixed = 0
     failed = 0
+
+    def _snap_to_tick(px: float, tick: float) -> float:
+        """Round DOWN to the nearest tick (buy = OK to pay slightly less)."""
+        if tick <= 0:
+            return px
+        return round(round(px / tick) * tick, 8)
+
     for c in candidates:
         symbol = c["symbol"]
         sid = c["sleeve_id"]
         try:
+            # Look up tick_size from the sleeve's stored config (refreshed
+            # against Coinbase periodically). Fall back to fetching from
+            # the broker if not present.
+            cfg = store.get_config(TENANT, symbol) or {}
+            tick_size = float(cfg.get("tick_size") or 0)
             broker = CoinbaseBroker(BrokerConfig(product_id=symbol))
-            print(f"\n  {symbol}/{sid}: placing BUY {c['qty']} @ ${c['buy_px']:.6f}...")
-            result = broker.place_limit(side="BUY", qty=c["qty"], price=c["buy_px"])
+            if tick_size <= 0:
+                # Fetch from Coinbase directly
+                try:
+                    prod = broker.client.get_product(symbol)
+                    ti = getattr(prod, "quote_increment", None) or (
+                        prod.get("quote_increment") if isinstance(prod, dict) else None)
+                    tick_size = float(ti) if ti else 0
+                except Exception:
+                    tick_size = 0
+            snapped_px = _snap_to_tick(c["buy_px"], tick_size) if tick_size > 0 else c["buy_px"]
+            print(f"\n  {symbol}/{sid}: tick_size=${tick_size}, "
+                  f"raw=${c['buy_px']:.6f} → snapped=${snapped_px:.6f}")
+            print(f"    placing BUY {c['qty']} @ ${snapped_px:.6f}...")
+            result = broker.place_limit(side="BUY", qty=c["qty"], price=snapped_px)
             oid = None
             if isinstance(result, dict):
                 oid = result.get("order_id") or result.get("id")
