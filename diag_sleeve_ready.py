@@ -180,18 +180,29 @@ def main() -> None:
                         age = _fmt_age(blocker.get("ts"))
                         reason = f"[{age} ago] {et}: {why}"[:60]
                     else:
-                        # Might have JUST armed — check age
+                        # Adam 2026-07-15: differentiate "no BLOCK events"
+                        # from "no ANY events." The latter means the Track
+                        # is dead (evicted / never spawned) — check any-
+                        # event count for this product in the 24h window.
+                        total_events = len(recent_events_by_symbol.get(sym, []))
                         armed_since = ss.get("armed_buy_since_ts")
                         if armed_since:
                             age_s = int(time.time() - float(armed_since))
                             if age_s < 30:
                                 reason = f"just armed {age_s}s ago — waiting for next tick"
+                            elif total_events == 0:
+                                reason = (f"⚠ TRACK DEAD — 0 events for this product "
+                                          f"in 24h. Track was evicted or never spawned. "
+                                          f"Check live_runner logs.")
                             elif age_s < 300:
-                                reason = f"armed {age_s}s ago, no blocker event visible — check trend gate / crash guard silently blocking"
+                                reason = (f"armed {age_s}s ago, no blocker event visible "
+                                          f"(saw {total_events} other events on this product)")
                             else:
-                                reason = f"armed {_fmt_age(armed_since)} ago, NO recent block events — potential silent bug, investigate"
+                                reason = (f"armed {_fmt_age(armed_since)} ago, "
+                                          f"{total_events} events on this product but 0 "
+                                          f"blockers — silent code path, deep-dive needed")
                         else:
-                            reason = "no armed_buy_since_ts — never fully armed (Option-B seed didn't fire)"
+                            reason = "no armed_buy_since_ts — never fully armed"
                 print(f"{sym:22} {sid:14} {state_val:11} ${buy_px:>9} ${mark:>9.4f} "
                       f"{cb_flag:8} {reason:60}")
 
