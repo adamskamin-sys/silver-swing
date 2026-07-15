@@ -1118,6 +1118,19 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     } else {
       triggerText = `<span class="mono ${trig.side === 'SELL' ? 'pos' : 'neg'}" title="Sleeve fires ${trig.side} at this price">${trig.side === 'SELL' ? '↑' : '↓'} $${fmtPrice(trig.px)}</span>`;
     }
+    // Adam 2026-07-15: EXPERTS SAY sub-line. Pull the latest non-hold reeval
+    // decision for any sleeve on this product from the /api/reeval_shadow
+    // cache and append a compact chip beneath the trigger. Silent when
+    // experts are HOLDing (majority case) so we only surface signal.
+    if (r.kind === 'futures') {
+      const exp = expertRecoForProduct(r.product);
+      if (exp) {
+        const chipCls = exp.action === 'reanchor' ? 'warn' : (exp.action === 'expire' ? 'neg' : 'pos');
+        const newPxTxt = exp.new_buy_px && exp.new_buy_px > 0 ? ` → $${fmtPrice(exp.new_buy_px)}` : '';
+        const ageMin = Math.max(1, Math.round((Date.now() / 1000 - exp.ts) / 60));
+        triggerText += `<div class="ck-chip ${chipCls}" style="font-size:0.65em;margin-top:2px;padding:1px 4px" title="Experts (${exp.mode}) ${ageMin}min ago: ${exp.why || exp.action}">EXP: ${exp.action}${newPxTxt}</div>`;
+      }
+    }
     const liqText = r.liq > 0 ? '$' + fmtPrice(r.liq) : '—';
     const cycles = r.kind === 'futures' ? totalCyclesForProduct(r.product, liveTenant) : 0;
     const cyclesText = cycles > 0
@@ -1652,6 +1665,52 @@ function productTrailActiveInfo(tenant, productId) {
     }
   }
   return out.length ? out : null;
+}
+
+// Adam 2026-07-15: expert-recommendation cache — pulls the latest non-hold
+// reeval decision per sleeve from /api/reeval_shadow every 30s. Portfolio
+// rows show these as sub-line chips beneath the trigger so you can see at
+// a glance which sleeves the experts want to reanchor/breakout/expire vs
+// hold. Silent when experts are HOLDing (majority case).
+let _reevalShadowCache = { latest: {}, ts: 0 };
+let _reevalShadowInFlight = false;
+
+async function refreshReevalShadow() {
+  if (_reevalShadowInFlight) return;
+  if (Date.now() - _reevalShadowCache.ts < 30_000) return;  // 30s cache
+  _reevalShadowInFlight = true;
+  try {
+    const resp = await fetch('/api/reeval_shadow?limit=3000');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data && data.ok && data.latest) {
+      _reevalShadowCache = { latest: data.latest, ts: Date.now() };
+    }
+  } catch (err) {
+    // fail-silent — the trigger cell just won't show the chip
+  } finally {
+    _reevalShadowInFlight = false;
+  }
+}
+
+// Return the latest non-HOLD reeval decision for any sleeve on this product,
+// preferring the most-recent one. Returns {action, new_buy_px, why, mode, ts}
+// or null if no non-hold decision found or cache is empty.
+function expertRecoForProduct(productId) {
+  refreshReevalShadow();  // fire-and-forget refresh in background
+  const latest = _reevalShadowCache.latest || {};
+  let best = null;
+  for (const sid of Object.keys(latest)) {
+    const d = latest[sid];
+    if (!d || d.symbol !== productId) continue;
+    const action = String(d.action || '').toLowerCase();
+    if (action === 'hold' || !action) continue;   // silent on hold
+    if (!best || (d.ts || 0) > (best.ts || 0)) best = d;
+  }
+  // Only surface if the decision is recent (last 30 min) — older decisions
+  // are stale and probably already been acted on / superseded.
+  if (best && (Date.now() / 1000 - (best.ts || 0)) < 1800) return best;
+  return null;
 }
 
 // Next price that would fire a sleeve action on this product — the closest
