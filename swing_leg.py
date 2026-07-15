@@ -338,6 +338,18 @@ class SwingTrader:
                     ss.filled_qty = st.get("filled_qty", 0) or sc.qty
                     self._sleeve_on_fill(sc, ss, st.get("average_filled_price"))
             elif status in ("CANCELLED", "EXPIRED", "UNKNOWN"):
+                # CRITICAL SAFETY (2026-07-15): partial fill / status mismatch
+                # on startup — same class as tick-loop bug above. Credit any
+                # reported fill_qty before clearing so the sleeve doesn't
+                # come up stuck in the pre-fill state.
+                partial_filled = st.get("filled_qty", 0) or 0
+                if partial_filled > 0:
+                    sc = sleeves_cfg_by_id.get(sid)
+                    if sc is not None:
+                        credited_sleeves.append((sid, ss.live_order_id,
+                                                 st.get("average_filled_price")))
+                        ss.filled_qty = partial_filled
+                        self._sleeve_on_fill(sc, ss, st.get("average_filled_price"))
                 cleared_sleeves.append((sid, ss.live_order_id, status))
                 ss.live_order_id = None
                 ss.filled_qty = 0
@@ -3308,6 +3320,20 @@ class SwingTrader:
                 self._sleeve_step(sc, ss, last_price)
             return
         elif status in ("CANCELLED", "EXPIRED", "UNKNOWN"):
+            # CRITICAL SAFETY (2026-07-15 root cause of HYPE stuck-state bug):
+            # if Coinbase reports a non-FILLED status but says some qty was
+            # filled (or reports UNKNOWN when the fill actually happened),
+            # we MUST credit the fill BEFORE clearing live_order_id — else
+            # the sleeve gets stuck in the pre-fill state forever while
+            # Coinbase holds the position. Same class as 2026-07-12 bug.
+            if filled > 0:
+                self._record("sleeve_credited_partial_before_clear",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             order_id=ss.live_order_id, status=status,
+                             filled_qty=filled)
+                ss.filled_qty = filled
+                self._sleeve_on_fill(sc, ss, st.get("average_filled_price"))
+                # Fall through — clear the (now credited) id and re-arm next tick.
             # Zombie order — most commonly a live_order_id persisted through a
             # restart while the broker was re-created (paper) or the exchange
             # cancelled after a timeout (live). Clear it so the state machine
