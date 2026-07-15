@@ -1562,7 +1562,23 @@ class SwingTrader:
                     except Exception:
                         pass
         except Exception as e:
-            self._record("entry_quality_alert_error", sleeve_id=sc.id, error=str(e))
+            # Adam 2026-07-15: silence repeated "float() argument must be a
+            # string or a real number, not 'NoneType'" errors that fire every
+            # 5-10s per ARMED_BUY sleeve when a scanner_signals field is None.
+            # Alert is opt-in + notification-only — swallow the error but
+            # rate-limit the log emission so genuine issues still surface.
+            err_msg = str(e)
+            key = f"eqa_{sc.id}"
+            now_s = int(getattr(self, "_entry_quality_last_err_ts", {}).get(key, 0) or 0)
+            import time as _t_eqa
+            cur = int(_t_eqa.time())
+            if cur - now_s > 300:  # emit at most every 5 min per sleeve
+                self._record("entry_quality_alert_error",
+                             sleeve_id=sc.id, error=err_msg)
+                store = getattr(self, "_entry_quality_last_err_ts", None)
+                if store is None:
+                    self._entry_quality_last_err_ts = {}
+                self._entry_quality_last_err_ts[key] = cur
 
     def _have_margin_for_one(self, sc) -> bool:
         """Best-effort: is there margin headroom to add ONE more contract?
@@ -3107,8 +3123,15 @@ class SwingTrader:
         except Exception:
             pass
         tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
-        # limit_price one tick below stop for reliable fill after trigger.
-        limit_px = max(0.0, target_px - tick)
+        # Adam 2026-07-15: widen the limit-price offset from "1 tick below"
+        # to "max(2 ticks, 0.05% of stop_px)". Fixes the COPR case where
+        # stop=$5.97 and limit=$5.97 (indistinguishable at 4-decimal display)
+        # — one tick was inside the display rounding. 5 bps floor also
+        # provides meaningful slippage buffer for expensive products (BTC)
+        # while staying tight on cheap ones. Guarantees the limit is visibly
+        # below the stop so the order actually fills after trigger.
+        buffer = max(tick * 2.0, target_px * 0.0005)
+        limit_px = max(0.0, target_px - buffer)
         # Sanity: never place a stop at or above current mark (would fire
         # immediately as a limit sell against the book — that's a market sell,
         # not a protective stop). This can happen briefly if the market gaps
@@ -3257,6 +3280,62 @@ class SwingTrader:
             adopted_avg=float(avg),
         )
 
+    def _maybe_arm_stop_on_recovery(self, sc: SleeveConfig, ss: SleeveState,
+                                    last_price: float) -> None:
+        """Adam 2026-07-15 (NGS-generalized): any underwater sleeve with
+        stop_loss_px=0 auto-arms stop_loss_px = own_avg_entry the first
+        time mark climbs back to entry. Then normal three-stage ratchet
+        takes over.
+
+        Fleet-wide rule (not per-sleeve toggle). Formalizes the NGS
+        directive: 'stop stays off while underwater, then arms at entry
+        level and everything goes back to normal.'
+
+        Guards:
+          - Fires ONCE per position (once stop_loss_px is set, no re-fire)
+          - Requires own_avg_entry to be set (sleeve owns the position)
+          - Requires mark to have crossed to or above entry
+          - Persists via config write so next tick sees the new stop
+        """
+        if float(sc.stop_loss_px or 0) > 0:
+            return  # already has a stop
+        own_avg = float(ss.own_avg_entry or 0)
+        if own_avg <= 0:
+            return  # sleeve doesn't own anything
+        try:
+            pos_qty = int(self.b.position_qty() or 0)
+        except Exception:
+            return
+        if pos_qty <= 0:
+            return  # nothing to protect
+        if float(last_price or 0) < own_avg:
+            return  # still underwater, hold the rule
+        # Recovery detected — arm stop_loss_px at entry
+        sc.stop_loss_px = float(own_avg)
+        # Enable stop_loss_enabled flag if it wasn't (so downstream code paths
+        # honor the new stop). Recovery-arm implies the user wants protection
+        # at breakeven from here on.
+        if hasattr(sc, "stop_loss_enabled"):
+            sc.stop_loss_enabled = True
+        # Persist to config store so restart preserves the arm
+        try:
+            cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+            for s in (cfg.get("sleeves") or []):
+                if s.get("id") == sc.id:
+                    s["stop_loss_px"] = float(own_avg)
+                    s["stop_loss_enabled"] = True
+                    break
+            self.store.put_config(self.tenant_id, self.symbol, cfg)
+        except Exception as e:
+            self._record("stop_recovery_arm_persist_failed",
+                         sleeve_id=sc.id, error=str(e))
+        self._record(
+            "stop_loss_armed_at_entry_recovery",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            entry_avg=own_avg, mark=float(last_price),
+            new_stop_loss_px=float(own_avg),
+        )
+
     def _maybe_credit_resting_stop_fill(self, sc: SleeveConfig, ss: SleeveState) -> None:
         """Adam 2026-07-15: post-fill state reconciler for the ratchet-stop.
 
@@ -3367,6 +3446,12 @@ class SwingTrader:
         # Runs before ratchet-stop so ss.state is correct when maintenance
         # decides what to do.
         self._maybe_reconcile_orphan_position(sc, ss)
+
+        # [Adam 2026-07-15] Recovery-arm rule (fleet-wide from NGS directive):
+        # any underwater sleeve with stop_loss_px=0 auto-arms stop at entry
+        # the first time mark recovers to entry. Runs BEFORE ratchet-stop so
+        # the newly-armed stop feeds into Stage 1 immediately.
+        self._maybe_arm_stop_on_recovery(sc, ss, last_price)
 
         # [Adam 2026-07-15] Three-stage Coinbase resting stop-limit ratchet.
         # Runs BEFORE the trigger-check paths so a fresh HWM tick propagates
