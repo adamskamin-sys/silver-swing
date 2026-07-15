@@ -82,6 +82,13 @@ class CoinbaseBroker:
 
     def __init__(self, cfg: BrokerConfig, client: Optional[RESTClient] = None):
         self.cfg = cfg
+        # Adam 2026-07-15 fleet-wide rule: derive price precision from live
+        # tick_size per-product, not the hardcoded cfg.price_decimals fallback.
+        # HYPE ratchet-stop was rejected for HOURS by Coinbase with
+        # INVALID_PRICE_PRECISION because cfg.price_decimals=3 sent "68.200"
+        # while HYP tick=0.01 requires 2 decimals. Cached lazily on first
+        # _price_str call to avoid an extra API round-trip in __init__.
+        self._tick_size_cache: Optional[float] = None
         if client is not None:
             # Injected client (tests, or an already-authenticated instance)
             self.client = client
@@ -93,6 +100,37 @@ class CoinbaseBroker:
                 "no key file: pass BrokerConfig(key_file=...) or set COINBASE_API_KEY_JSON_PATH"
             )
         self.client = RESTClient(key_file=key_path)
+
+    def _tick_size(self) -> float:
+        """Cached tick_size from contract_spec. Falls back to 0 if fetch fails
+        (callers then fall through to cfg.price_decimals)."""
+        if self._tick_size_cache is None:
+            try:
+                spec = self.contract_spec()
+                self._tick_size_cache = float(spec.get("tick_size") or 0)
+            except Exception:
+                self._tick_size_cache = 0.0
+        return self._tick_size_cache
+
+    def _price_str(self, price: float) -> str:
+        """Format a price string at the product's real tick precision.
+
+        Snap-to-tick first (belt-and-suspenders — callers should already snap,
+        but if a stale saved value slipped through we still get a valid string).
+        Decimals derived from tick_size representation (e.g., 0.01 → 2 decimals,
+        0.005 → 3, 0.0001 → 4). Fleet-wide fix — every product's tick_size is
+        the source of truth, no per-instrument overrides needed.
+        """
+        tick = self._tick_size()
+        if tick and tick > 0:
+            snapped = round(price / tick) * tick
+            # Decimals = length of fractional part of tick_size, e.g.:
+            # "0.01"  → 2, "0.005" → 3, "0.0001" → 4, "1.0" → 0
+            s = f"{tick:.10f}".rstrip("0")
+            decimals = len(s.split(".", 1)[1]) if "." in s else 0
+            return f"{snapped:.{decimals}f}"
+        # Fallback: no tick_size available, use the config default
+        return f"{price:.{self.cfg.price_decimals}f}"
 
     # ---- Rate-limit helper -----------------------------------------------
     # Every REST call passes through _rl_call — records the call in the
@@ -160,7 +198,7 @@ class CoinbaseBroker:
             "client_order_id": client_order_id or str(uuid.uuid4()),
             "product_id": self.cfg.product_id,
             "base_size": str(int(qty)),
-            "limit_price": f"{price:.{self.cfg.price_decimals}f}",
+            "limit_price": self._price_str(price),
         }
         if post_only:
             kwargs["post_only"] = True
@@ -226,8 +264,8 @@ class CoinbaseBroker:
         cfg = {
             "stop_limit_stop_limit_gtc": {
                 "base_size": str(int(qty)),
-                "limit_price": f"{limit_price:.{self.cfg.price_decimals}f}",
-                "stop_price": f"{stop_price:.{self.cfg.price_decimals}f}",
+                "limit_price": self._price_str(limit_price),
+                "stop_price": self._price_str(stop_price),
                 "stop_direction": stop_dir,
             }
         }
@@ -482,7 +520,7 @@ class CoinbaseBroker:
         resp = _dump(method(
             product_id=self.cfg.product_id,
             base_size=str(int(qty)),
-            limit_price=f"{price:.{self.cfg.price_decimals}f}",
+            limit_price=self._price_str(price),
         ))
         commission = resp.get("commission_total")
         detail = resp.get("commission_detail_total") or {}

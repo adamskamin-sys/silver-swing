@@ -3161,10 +3161,15 @@ class SwingTrader:
                              limit_px=float(limit_px), qty=sleeve_qty, oid=oid)
             except Exception as e:
                 # Fallback: bot-side trigger stays armed as backstop.
+                # Adam 2026-07-15: severity=critical per the "resting ratchet-
+                # stop must never leave a held position unprotected" rule. A
+                # place failure means Coinbase currently has NO stop for a
+                # held sleeve — dashboard reconciliation chip should turn red
+                # so this is visible without grep-hunting logs.
                 self._record("resting_stop_place_failed",
                              sleeve_id=sc.id, sleeve_name=sc.name,
                              stage=stage, target_px=float(target_px),
-                             error=str(e))
+                             error=str(e), severity="critical")
             return
         # Existing resting order — check if we need to ratchet UP.
         current_px = float(ss.resting_stop_px or 0)
