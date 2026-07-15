@@ -118,7 +118,7 @@ def main() -> None:
         try:
             broker = CoinbaseBroker(BrokerConfig(product_id=symbol))
             print(f"\n  {symbol}/{sid}: placing BUY {c['qty']} @ ${c['buy_px']:.6f}...")
-            result = broker.place_limit(side="BUY", qty=c["qty"], px=c["buy_px"])
+            result = broker.place_limit(side="BUY", qty=c["qty"], price=c["buy_px"])
             oid = None
             if isinstance(result, dict):
                 oid = result.get("order_id") or result.get("id")
