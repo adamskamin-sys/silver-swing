@@ -5254,6 +5254,87 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       showToast(res.error || 'save failed', 'error');
     }
   };
+
+  // 2026-07-15 Phase 1 tile visibility panel — fetches the latest expert
+  // snapshot the bot wrote to Redis and renders a compact "EXPERTS SAY
+  // RIGHT NOW" panel at the top of the modal. Read-only. Populates on
+  // modal open. If the bot hasn't computed a snapshot yet, shows a
+  // dim placeholder note.
+  renderExpertLivePanel(tenant, symbol, m);
+}
+
+async function renderExpertLivePanel(tenant, symbol, modalEl) {
+  const panel = document.createElement('div');
+  panel.id = 'expert-live-panel';
+  panel.style.cssText = 'background:#0a1119;border:1px solid #1e2a3a;border-radius:6px;padding:10px 12px;margin:8px 0;font-size:12px;';
+  panel.innerHTML = `<div style="color:#8a99ac;">📊 Loading expert view for ${escapeHtml(symbol)}…</div>`;
+  const modalPanel = modalEl.querySelector('.modal-panel');
+  if (modalPanel) {
+    // Insert right after the header
+    const header = modalPanel.querySelector('.modal-header');
+    if (header && header.nextSibling) modalPanel.insertBefore(panel, header.nextSibling);
+    else modalPanel.appendChild(panel);
+  }
+  try {
+    const resp = await fetch(`/api/expert-live?tenant=${encodeURIComponent(tenant)}&product_id=${encodeURIComponent(symbol)}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!data.snapshot) {
+      panel.innerHTML = `<div style="color:#8a99ac;">📊 <b>Expert view:</b> ${escapeHtml(data.note || 'no expert data yet')}</div>`;
+      return;
+    }
+    const s = data.snapshot;
+    const votes = s.expert_snapshot || {};
+    const recBuy = Number(s.recommended_buy_px) || 0;
+    const recSell = Number(s.recommended_sell_px) || 0;
+    const mkt = Number(s.current_market) || 0;
+    const armed = s.should_arm !== false;
+    const verdict = armed ? '✅ EXPERTS APPROVE' : '⏸️ EXPERTS SAY WAIT';
+    const verdictColor = armed ? '#22c55e' : '#f59e0b';
+    // Age
+    const ageSec = s.generated_at ? Math.floor(Date.now() / 1000 - s.generated_at) : null;
+    const ageStr = ageSec != null ? `${ageSec}s ago` : 'unknown';
+    // Per-expert one-liners
+    const rows = [];
+    const oneline = (label, obj) => {
+      if (!obj || typeof obj !== 'object') return '';
+      if (obj.error) return `<div><b>${label}:</b> <span style="color:#94a3b8;">module unavailable</span></div>`;
+      // Try to pull a short summary
+      if (obj.regime) return `<div><b>${label}:</b> ${escapeHtml(String(obj.regime))}</div>`;
+      if (obj.cycle_phase != null) return `<div><b>${label}:</b> phase ${Number(obj.cycle_phase).toFixed(2)} — ${obj.in_bounce_zone ? '✓ bounce zone' : '✗ outside zone'}</div>`;
+      if (obj.buy_ok != null) return `<div><b>${label}:</b> ${obj.buy_ok ? '✓ buy_ok' : '✗ ' + (obj.blocked_by || ['blocked']).join('; ')}</div>`;
+      if (obj.suggested_buy_px != null) return `<div><b>${label}:</b> suggests $${Number(obj.suggested_buy_px).toFixed(4)}</div>`;
+      if (obj.band_center != null) return `<div><b>${label}:</b> OU band $${Number(obj.band_center).toFixed(4)} ±$${Number(obj.std || 0).toFixed(4)}</div>`;
+      if (obj.signal) return `<div><b>${label}:</b> ${escapeHtml(obj.signal)} — ${escapeHtml(obj.reason || '')}</div>`;
+      if (obj.crossover) return `<div><b>${label}:</b> ${escapeHtml(obj.crossover)} — ${escapeHtml(obj.reason || '')}</div>`;
+      return `<div><b>${label}:</b> <span style="color:#94a3b8;">${escapeHtml(JSON.stringify(obj).slice(0, 80))}</span></div>`;
+    };
+    if (votes.regime) rows.push(oneline('Kaufman regime', votes.regime));
+    if (votes.ehlers) rows.push(oneline('Ehlers cycle', votes.ehlers));
+    if (votes.elder) rows.push(oneline('Elder Triple Screen', votes.elder));
+    if (votes.chan_ou) rows.push(oneline('Chan OU band', votes.chan_ou));
+    if (votes.connors) rows.push(oneline('Connors', votes.connors));
+    if (votes.vpin != null) rows.push(`<div><b>VPIN:</b> ${typeof votes.vpin === 'number' ? Number(votes.vpin).toFixed(2) : escapeHtml(String(votes.vpin))}</div>`);
+    if (votes.vince) rows.push(oneline('Vince optimal-f', votes.vince));
+    if (votes.kama) rows.push(oneline('KAMA', votes.kama));
+    if (votes.fisher) rows.push(oneline('Fisher Transform', votes.fisher));
+    const reasonsList = Array.isArray(s.reasons) ? s.reasons.join(' · ') : '';
+    panel.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <div style="font-weight:600;color:${verdictColor};">${verdict}</div>
+        <div style="color:#8a99ac;font-size:11px;">expert view · ${escapeHtml(ageStr)}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:8px;">
+        <div><div style="color:#8a99ac;font-size:11px;">CURRENT MARKET</div><div class="mono" style="font-size:14px;font-weight:600;">$${mkt.toFixed(6)}</div></div>
+        <div><div style="color:#8a99ac;font-size:11px;">EXPERTS RECOMMEND BUY</div><div class="mono" style="font-size:14px;font-weight:600;color:#3b82f6;">$${recBuy.toFixed(6)}</div></div>
+        <div><div style="color:#8a99ac;font-size:11px;">EXPERTS RECOMMEND SELL</div><div class="mono" style="font-size:14px;font-weight:600;color:#22c55e;">$${recSell.toFixed(6)}</div></div>
+      </div>
+      <div style="color:#cbd5e1;line-height:1.6;">${rows.join('')}</div>
+      ${reasonsList ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid #1e2a3a;color:#94a3b8;font-size:11px;"><b>Reasoning:</b> ${escapeHtml(reasonsList)}</div>` : ''}
+    `;
+  } catch (err) {
+    panel.innerHTML = `<div style="color:#ef4444;">📊 Expert view failed: ${escapeHtml(String(err.message || err))}</div>`;
+  }
 }
 
 async function deleteSleeve(tenant, symbol, sleeveId) {
