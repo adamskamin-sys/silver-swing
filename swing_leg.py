@@ -3281,14 +3281,40 @@ class SwingTrader:
         except Exception:
             pass
         tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
-        # Adam 2026-07-15: widen the limit-price offset from "1 tick below"
-        # to "max(2 ticks, 0.05% of stop_px)". Fixes the COPR case where
-        # stop=$5.97 and limit=$5.97 (indistinguishable at 4-decimal display)
-        # — one tick was inside the display rounding. 5 bps floor also
-        # provides meaningful slippage buffer for expensive products (BTC)
-        # while staying tight on cheap ones. Guarantees the limit is visibly
-        # below the stop so the order actually fills after trigger.
-        buffer = max(tick * 2.0, target_px * 0.0005)
+        # Adam 2026-07-15: expert-driven vol-adaptive buffer (fleet-wide rule
+        # per feedback_optimize_realized_dollars_per_day). Objective is to
+        # maximize realized $/day = per-cycle profit × cycles/day:
+        #   - Too tight: limit gaps through on fast drops, position exits
+        #     unprotected (missed fills = lost cycles = lower cycles/day)
+        #   - Too wide: fills far below trigger = per-cycle profit erodes
+        # Vol-adaptive: floor at max(2 ticks, 5 bps) for calm regimes; add
+        # 0.5×sigma×target_px in high-vol regimes so the gap widens exactly
+        # when the market can gap. Sigma is the stdev of log returns on
+        # recent ticks — unitless, so sigma × price ≈ typical one-sample
+        # price move. Half of that is a well-established fill-catching
+        # buffer in the market-microstructure literature (Cartea-Jaimungal
+        # optimal-execution: limit-order fill probability rises steeply as
+        # offset exceeds 0.5σ, plateaus by 1σ). Cap at 2% of target so an
+        # extreme vol spike doesn't blow the limit into oblivion.
+        vol_buffer = 0.0
+        try:
+            _hist = list(self._sleeve_price_history.get(sc.id, []) or [])
+            if len(_hist) >= 5:
+                import math as _math
+                _samples = _hist[-20:]
+                _rets = [_math.log(_samples[i] / _samples[i - 1])
+                         for i in range(1, len(_samples))
+                         if _samples[i - 1] > 0 and _samples[i] > 0]
+                if len(_rets) >= 3:
+                    _mean = sum(_rets) / len(_rets)
+                    _var = sum((r - _mean) ** 2 for r in _rets) / len(_rets)
+                    _sigma = _math.sqrt(_var)
+                    # 0.5σ × price = typical half-move over one tick interval
+                    vol_buffer = min(0.5 * _sigma * target_px,
+                                     target_px * 0.02)  # cap 2% of target
+        except Exception:
+            pass  # fall back to floor formula; never fail-hard here
+        buffer = max(tick * 2.0, target_px * 0.0005, vol_buffer)
         limit_px = max(0.0, target_px - buffer)
         # Sanity: never place a stop at or above current mark (would fire
         # immediately as a limit sell against the book — that's a market sell,
