@@ -47,7 +47,7 @@ def main() -> None:
 
     # Find candidates
     print("=" * 70)
-    print(f"SCANNING {TENANT} for ARMED_BUY sleeves without live_order_id...")
+    print(f"SCANNING {TENANT} for GHOST sleeves (armed without live_order_id)...")
     print("=" * 70)
     candidates = []
     for symbol in store.list_symbols(TENANT):
@@ -61,19 +61,28 @@ def main() -> None:
         sleeves_st = state.get("sleeves") or {}
         for sid, ss in sleeves_st.items():
             state_val = str(ss.get("state", "")).upper()
-            if state_val != "ARMED_BUY":
+            if state_val not in ("ARMED_BUY", "ARMED_SELL"):
                 continue
             if ss.get("live_order_id"):
                 continue
             sc = sleeves_cfg.get(sid, {})
-            buy_px = float(sc.get("buy_px") or 0)
-            qty = int(sc.get("qty") or 0)
-            if buy_px <= 0 or qty <= 0:
-                print(f"  SKIP {symbol}/{sid}: invalid buy_px={buy_px} or qty={qty}")
+            # Pick side + price + qty based on state
+            if state_val == "ARMED_BUY":
+                side = "BUY"
+                price = float(sc.get("buy_px") or 0)
+                qty = int(sc.get("qty") or 0)
+                ts_field = "armed_buy_since_ts"
+            else:  # ARMED_SELL
+                side = "SELL"
+                price = float(sc.get("sell_px") or 0)
+                qty = int(sc.get("qty") or 0)
+                ts_field = "armed_sell_since_ts"
+            if price <= 0 or qty <= 0:
+                print(f"  SKIP {symbol}/{sid} ({state_val}): invalid price={price} or qty={qty}")
                 continue
             armed_hours = 0.0
             try:
-                armed_ts = float(ss.get("armed_buy_since_ts") or 0)
+                armed_ts = float(ss.get(ts_field) or 0)
                 if armed_ts > 0:
                     armed_hours = (time.time() - armed_ts) / 3600
             except (TypeError, ValueError):
@@ -81,14 +90,15 @@ def main() -> None:
             candidates.append({
                 "symbol": symbol, "sleeve_id": sid,
                 "sleeve_name": sc.get("name", "?"),
-                "buy_px": buy_px, "qty": qty,
+                "side": side, "price": price, "qty": qty,
                 "armed_hours": armed_hours,
+                "state": state_val,
             })
 
     if not candidates:
         print()
         print("NO GHOST SLEEVES FOUND.")
-        print("All ARMED_BUY sleeves have live_order_ids, or no ARMED_BUY exist.")
+        print("All armed sleeves have live_order_ids.")
         return
 
     print()
@@ -96,7 +106,8 @@ def main() -> None:
     print()
     for c in candidates:
         print(f"  {c['symbol']}/{c['sleeve_id']} ({c['sleeve_name'][:50]})")
-        print(f"    buy_px = ${c['buy_px']:.6f}")
+        print(f"    state  = {c['state']} → will place {c['side']}")
+        print(f"    price  = ${c['price']:.6f}")
         print(f"    qty    = {c['qty']}")
         print(f"    armed  = {c['armed_hours']:.1f} hours ago (without a live order)")
     print()
@@ -138,9 +149,10 @@ def main() -> None:
                     tick_size = float(ti) if ti else 0
                 except Exception:
                     tick_size = 0
-            snapped_px = _snap_to_tick(c["buy_px"], tick_size) if tick_size > 0 else c["buy_px"]
+            raw_px = c.get("price") if "price" in c else c.get("buy_px", 0)
+            snapped_px = _snap_to_tick(raw_px, tick_size) if tick_size > 0 else raw_px
             print(f"\n  {symbol}/{sid}: tick_size=${tick_size}, "
-                  f"raw=${c['buy_px']:.6f} → snapped=${snapped_px:.6f}")
+                  f"raw=${raw_px:.6f} → snapped=${snapped_px:.6f}")
             # Idempotency: re-check the state RIGHT before placing. If another
             # process (or a bot tick) already placed an order, don't duplicate.
             state_now = store.get_state(TENANT, symbol) or {}
@@ -149,8 +161,9 @@ def main() -> None:
                 print(f"    SKIP: sleeve now has live_order_id={ss_now.get('live_order_id')} "
                       "(order was placed since scan — no duplicate)")
                 continue
-            print(f"    placing BUY {c['qty']} @ ${snapped_px:.6f}...")
-            result = broker.place_limit(side="BUY", qty=c["qty"], price=snapped_px)
+            side = c.get("side", "BUY")
+            print(f"    placing {side} {c['qty']} @ ${snapped_px:.6f}...")
+            result = broker.place_limit(side=side, qty=c["qty"], price=snapped_px)
             # CoinbaseBroker.place_limit returns the order_id as a plain string
             # (per broker.py signature: -> str). Handle both string and dict.
             oid = None
