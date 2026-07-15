@@ -1816,6 +1816,16 @@ class SwingTrader:
         except Exception:
             return "legacy"
 
+    def _regime_router_mode(self) -> str:
+        """Read the __regime_router_mode__ scope. Returns 'off' (default),
+        'shadow' (compute + log adjustments without applying), or 'expert'
+        (apply). Same rollout pattern as _expert_spread_mode."""
+        try:
+            m = (self.store.get_state(self.tenant_id, "__regime_router_mode__") or {})
+            return str(m.get("mode") or "off").lower()
+        except Exception:
+            return "off"
+
     def _current_held_symbols_excluding(self, exclude_symbol: str) -> list[str]:
         """List of product_ids on this tenant that currently hold a nonzero
         position, excluding the given symbol. Used by correlation-aware
@@ -4545,6 +4555,55 @@ class SwingTrader:
                     return  # still tracking the low, don't arm this tick
                 self._maybe_emit_ml_shadow(sc)
                 eff_qty = self._kelly_adjusted_qty(sc, ss)
+                # Adam 2026-07-15: regime router (Kaminski-Lo, Chan 2013).
+                # When enabled + expert mode, applies qty multiplier from
+                # regime classification and gates arms during chop.
+                _rr_mode = self._regime_router_mode()
+                if _rr_mode in ("shadow", "expert"):
+                    try:
+                        import regime as _regime
+                        import regime_router as _rrouter
+                        _prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+                        if len(_prices) >= 40:
+                            _reg = _regime.classify_regime(
+                                [{"close": p} for p in _prices])
+                            _adj = _rrouter.regime_adjustments(_reg)
+                            self._record(
+                                "regime_router_shadow" if _rr_mode == "shadow"
+                                else "regime_router_expert",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                regime=_adj["inputs"].get("regime"),
+                                vol_state=_adj["inputs"].get("vol_state"),
+                                gamma_multiplier=_adj["gamma_multiplier"],
+                                qty_multiplier=_adj["qty_multiplier"],
+                                should_arm=_adj["should_arm"],
+                                reason=_adj["reason"],
+                                current_qty=eff_qty,
+                                mode=_rr_mode,
+                            )
+                            if _rr_mode == "expert":
+                                if not _adj["should_arm"]:
+                                    self._record(
+                                        "regime_router_arm_gated",
+                                        sleeve_id=sc.id, sleeve_name=sc.name,
+                                        regime=_adj["inputs"].get("regime"),
+                                        reason=_adj["reason"],
+                                    )
+                                    return
+                                _orig = eff_qty
+                                eff_qty = max(1, int(round(_orig * _adj["qty_multiplier"])))
+                                if eff_qty != _orig:
+                                    self._record(
+                                        "regime_router_qty_adjusted",
+                                        sleeve_id=sc.id, sleeve_name=sc.name,
+                                        original_qty=_orig, adjusted_qty=eff_qty,
+                                        multiplier=_adj["qty_multiplier"],
+                                        regime=_adj["inputs"].get("regime"),
+                                    )
+                    except Exception as _re:
+                        self._record("regime_router_error",
+                                     sleeve_id=sc.id, error=str(_re),
+                                     severity="warn")
                 # Adam 2026-07-15: cross-sleeve correlation-aware sizing
                 # (Rob Carver ch.10). When enabled, downscale qty by
                 # portfolio_correlation_drag — highly-correlated concurrent
