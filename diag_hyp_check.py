@@ -38,8 +38,18 @@ HYP_PRODUCT_IDS = [
 
 
 def _load_raw_state() -> dict:
+    """Load the full state blob via the same code path the bot uses.
+    make_store() returns RedisJsonStore on Render (REDIS_URL set) or a
+    JsonFileStateStore locally. Both expose _load() → full nested dict."""
     data_dir = os.getenv("SWING_DATA_DIR", "data")
-    for name in ("state.json", "swing_state.json", "trader_state.json"):
+    try:
+        import state_store
+        store = state_store.make_store(data_dir)
+        return store._load()
+    except Exception as e:
+        print(f"  WARN: state_store.make_store failed: {e}")
+    # Fallback: try to find a raw JSON file
+    for name in ("store.json", "state.json", "swing_state.json"):
         path = os.path.join(data_dir, name)
         if os.path.exists(path):
             try:
@@ -47,14 +57,6 @@ def _load_raw_state() -> dict:
                     return json.load(f)
             except Exception as e:
                 print(f"  WARN: could not parse {path}: {e}")
-    # Try Redis if state file not found
-    try:
-        import state_store
-        store = state_store.get_store()
-        if store:
-            return store.snapshot() if hasattr(store, "snapshot") else {}
-    except Exception as e:
-        print(f"  WARN: state_store failed: {e}")
     return {}
 
 

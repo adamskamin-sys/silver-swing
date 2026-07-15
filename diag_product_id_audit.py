@@ -26,16 +26,16 @@ import sys
 
 
 def _load_store() -> dict:
-    """Get the raw store — Redis if configured, JSON file otherwise."""
+    """Get the raw store — Redis if REDIS_URL is set, JSON file otherwise.
+    Uses state_store.make_store() (same as the bot) + ._load()."""
+    data_dir = os.getenv("SWING_DATA_DIR", "data")
     try:
         import state_store
-        store = state_store.get_store()
-        if store and hasattr(store, "snapshot"):
-            return store.snapshot()
+        store = state_store.make_store(data_dir)
+        return store._load()
     except Exception as e:
-        print(f"  WARN: state_store failed: {e}")
-    data_dir = os.getenv("SWING_DATA_DIR", "data")
-    for name in ("state.json", "swing_state.json"):
+        print(f"  WARN: state_store.make_store failed: {e}")
+    for name in ("store.json", "state.json", "swing_state.json"):
         p = os.path.join(data_dir, name)
         if os.path.exists(p):
             with open(p) as f:
