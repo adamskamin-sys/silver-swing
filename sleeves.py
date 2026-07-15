@@ -684,6 +684,16 @@ class SleeveState:
     resting_stop_oid: Optional[str] = None
     resting_stop_px: Optional[float] = None
     resting_stop_stage: Optional[str] = None
+    # Adam 2026-07-15: dedup guard against double-credit. Every time
+    # _credit_stop_fill successfully credits a fill, the resting_stop_oid
+    # gets appended here. Both the tick path (_maybe_credit_resting_stop_fill)
+    # and the reconcile sweeper consult this list BEFORE crediting so the
+    # same order_id can't get credited twice (which would inflate realized_pnl
+    # in the OPPOSITE direction from the HYPE 2026-07-15 bug). Bounded to
+    # the last 50 entries — old oids age out; if the same oid somehow
+    # reappears after 50 other cycles that's an exchange-side problem worth
+    # a separate look.
+    credited_oids: list = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict, sleeve_id: str) -> "SleeveState":
