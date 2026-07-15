@@ -797,19 +797,41 @@ def run() -> int:
                     )
                 except Exception:
                     pass
-                # Force-evict. Cooldown gets set by _evict_track, but we
-                # want the IMMEDIATE respawn attempt to fire (not wait 15
-                # min) since we don't know yet whether respawn will fail.
-                # Cooldown protection is for repeated step-failure evictions
-                # (create-fail-evict loops); a zombie eviction is different
-                # — the current Track is proven dead, we want to try again
-                # right now. If respawn ALSO fails, that failure sets its
-                # own cooldown via the spawn error path.
+                # Force-evict. For the FIRST few consecutive zombie
+                # evictions on a product, clear cooldown so respawn fires
+                # immediately. After N consecutive zombie evictions
+                # without a successful step in between, stop clearing —
+                # let the 15-min cooldown throttle the loop (HYF was
+                # respawning every ~20s = burning API). Something is
+                # persistently broken; slow down + let operator diagnose.
                 try:
                     _evict_track(pid, "zombie: no ticks in threshold window")
-                    # Clear the just-set cooldown so the fall-through spawn
-                    # attempt below actually fires this cycle.
-                    _non_primary_last_evict_ts.pop(pid, None)
+                    # Track how many times each product has been zombie-
+                    # evicted in a row (no successful step between).
+                    _zombie_streak = getattr(_maybe_recover_dead_tracks,
+                                              "_zombie_streak", {})
+                    _zombie_streak[pid] = _zombie_streak.get(pid, 0) + 1
+                    setattr(_maybe_recover_dead_tracks, "_zombie_streak",
+                            _zombie_streak)
+                    ZOMBIE_STREAK_COOLDOWN_THRESHOLD = 3
+                    if _zombie_streak[pid] <= ZOMBIE_STREAK_COOLDOWN_THRESHOLD:
+                        # Clear cooldown — try again immediately (transient)
+                        _non_primary_last_evict_ts.pop(pid, None)
+                    else:
+                        # Persistent zombie — respect the 15-min cooldown
+                        try:
+                            log.record(
+                                "track_zombie_persistent_slowdown",
+                                tenant=TENANT, symbol=pid,
+                                streak=_zombie_streak[pid],
+                                threshold=ZOMBIE_STREAK_COOLDOWN_THRESHOLD,
+                                reason=("respawning immediately isn't fixing "
+                                        "this product; letting 15-min cooldown "
+                                        "throttle the retry loop"),
+                                severity="critical",
+                            )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 # Fall through to the spawn-attempt path below.
@@ -986,6 +1008,18 @@ def run() -> int:
                         _track.trader.step(float(_tt["price"]))
                         _track.consecutive_step_failures = 0
                         _track.last_step_ok_ts = now
+                        # Adam 2026-07-15: successful step resets the
+                        # zombie streak counter — a product that eventually
+                        # starts ticking correctly shouldn't be penalized
+                        # for prior zombie evictions.
+                        try:
+                            _zombie_streak = getattr(
+                                _maybe_recover_dead_tracks,
+                                "_zombie_streak", {})
+                            if _pid in _zombie_streak:
+                                del _zombie_streak[_pid]
+                        except Exception:
+                            pass
                     except Exception as e:
                         _track.consecutive_step_failures += 1
                         _log(f"[non-primary] {_pid} step failed "
