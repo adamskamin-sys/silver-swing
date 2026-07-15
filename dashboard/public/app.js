@@ -437,7 +437,26 @@ function renderCockpit(store) {
       snapshotStaleChip = `<span class="ck-chip ck-warn" title="Portfolio snapshot last refreshed ${label} ago. Expected every 2s — check that the bot is running. Sleeve capacity + unrealized may be stale.">snap&nbsp;${label}</span>`;
     }
   }
-  const healthClear = !liqChip && halts === 0 && !paused;
+  // Adam 2026-07-15: silent-Track detection chip. Live_runner emits
+  // track_silent_detected on each 60s health check when a product has
+  // an armed sleeve OR held position but no live Track. Auto-recovery
+  // fires respawn (respects eviction cooldown); the chip surfaces the
+  // count so operator sees fleet health at a glance without running
+  // diag_track_health_fleet.py.
+  let deadTracks = 0;
+  const deadTrackSyms = new Set();
+  const deadCutoff = nowSec - 300;  // last 5 min
+  for (const e of (lastTradeEvents || [])) {
+    if (!e || e.event_type !== 'track_silent_detected') continue;
+    if (e.tenant && e.tenant !== tenant) continue;
+    if ((Number(e.ts) || 0) < deadCutoff) continue;
+    if (e.symbol) deadTrackSyms.add(e.symbol);
+  }
+  deadTracks = deadTrackSyms.size;
+  const deadTracksChip = deadTracks > 0
+    ? `<span class="ck-chip ck-danger" title="${deadTracks} product${deadTracks > 1 ? 's' : ''} with armed sleeves but no live Track in last 5min: ${[...deadTrackSyms].join(', ')}. Live_runner auto-recovery is attempting respawn every 60s (respects 15min eviction cooldown). Run diag_track_health_fleet.py for detail.">💀 ${deadTracks} dead</span>`
+    : '';
+  const healthClear = !liqChip && !deadTracksChip && halts === 0 && !paused;
 
   // [crew] reversal / crash-exit telemetry from the recent event feed
   let revCount = 0, crashExits = 0, revPnl = 0, haveRevPnl = false, shadowRev = 0;
@@ -656,7 +675,7 @@ function renderCockpit(store) {
     <div class="ck-tile" title="Reversals + crash-guard exits (🛡) + shadow reversal signals (👻, paper-only) in the recent event feed, and P&amp;L attributed to reversal legs"><div class="ck-label">reversals (recent)</div><div class="ck-value">${revValue}</div></div>
     <div class="ck-tile" title="Average-down GREEN LIGHT — lights up when the experts' proven conditions for a disciplined scale-in line up (mean-revert range, at the floor, calm flow, margin). Notification only; you pull the trigger."><div class="ck-label">avg-down signal</div><div class="ck-value">${avgDownValue}</div></div>
     <div class="ck-tile" title="Entry-quality GREEN LIGHT — lights up when it's a good time to enter a long (clean trend or calm swing near support, non-toxic flow). Red = chop / toxic flow / crash. Notification only."><div class="ck-label">entry signal</div><div class="ck-value">${entryValue}</div></div>
-    <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${snapshotStaleChip}${healthClear && !snapshotStaleChip ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
+    <div class="ck-tile ck-health"><div class="ck-label">health</div><div class="ck-value">${liqChip}${deadTracksChip}${snapshotStaleChip}${healthClear && !snapshotStaleChip ? '<span class="ck-chip ck-ok">clear</span>' : ''}</div></div>
   </div>`;
 }
 
