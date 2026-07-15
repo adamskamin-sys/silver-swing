@@ -3191,6 +3191,96 @@ class SwingTrader:
             adopted_avg=float(avg),
         )
 
+    def _maybe_credit_resting_stop_fill(self, sc: SleeveConfig, ss: SleeveState) -> None:
+        """Adam 2026-07-15: post-fill state reconciler for the ratchet-stop.
+
+        Fixes Type 3 ghost: sleeve state=ARMED_SELL, own_avg_entry set,
+        Coinbase position=0 → the resting stop-limit fired on Coinbase
+        but we never credited the exit back to sleeve state. Result:
+        cycles never increment, realized_pnl never updates, dashboard
+        shows 'phantom profit' from own_avg_entry that we no longer own.
+
+        Runs each tick. When resting_stop_oid exists, polls its status.
+        If FILLED: credits the fill (cycles++, realized_pnl += profit,
+        own_avg_entry cleared, resting_stop_* cleared, state → ARMED_BUY
+        ready for next cycle). If CANCELLED externally: clears the oid
+        so _maintain_resting_stop places a fresh one next tick.
+        """
+        import time as _time
+        if not ss.resting_stop_oid:
+            return
+        try:
+            status_info = self.b.order_status(ss.resting_stop_oid)
+        except Exception as e:
+            self._record("resting_stop_status_check_failed",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         oid=ss.resting_stop_oid, error=str(e))
+            return
+        status = (status_info or {}).get("status")
+        if status == "OPEN":
+            return  # still resting, nothing to do
+        if status == "FILLED":
+            # Compute fill price + credit as exit.
+            fill_price = status_info.get("average_filled_price")
+            try:
+                fill_price = float(fill_price) if fill_price is not None else 0.0
+            except Exception:
+                fill_price = 0.0
+            filled_qty = int(status_info.get("filled_qty") or sc.qty or 1)
+            own_avg = float(ss.own_avg_entry or 0)
+            profit = 0.0
+            if own_avg > 0 and fill_price > 0:
+                try:
+                    contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
+                except Exception:
+                    contract_size = 1.0
+                profit = (fill_price - own_avg) * filled_qty * contract_size
+            ss.realized_pnl = float(ss.realized_pnl or 0) + profit
+            ss.cycles = int(ss.cycles or 0) + 1
+            ss.last_sell_qty = filled_qty
+            ss.last_sell_fill_price = fill_price
+            # Track for the recent-cycles list (loss-streak detection)
+            try:
+                recent = list(ss.recent_cycle_pnls or [])
+                recent.append(profit)
+                if len(recent) > 20:
+                    recent = recent[-20:]
+                ss.recent_cycle_pnls = recent
+            except Exception:
+                pass
+            # Clear position tracking + resting stop, advance state
+            old_oid = ss.resting_stop_oid
+            old_stage = ss.resting_stop_stage
+            ss.own_avg_entry = None
+            ss.resting_stop_oid = None
+            ss.resting_stop_px = None
+            ss.resting_stop_stage = None
+            ss.state = SleeveStateEnum.ARMED_BUY
+            ss.armed_buy_since_ts = _time.time()
+            self._save_state()
+            self._record(
+                "resting_stop_filled_credited",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                oid=old_oid, stage=old_stage,
+                fill_price=fill_price, own_avg_entry=own_avg,
+                filled_qty=filled_qty, profit=profit,
+                new_realized=ss.realized_pnl, new_cycles=ss.cycles,
+            )
+            return
+        if status in ("CANCELLED", "EXPIRED"):
+            # External cancel — just clear the oid so _maintain_resting_stop
+            # can place a fresh one next tick.
+            old_oid = ss.resting_stop_oid
+            self._record("resting_stop_external_cancel_cleared",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         oid=old_oid, status=status)
+            ss.resting_stop_oid = None
+            ss.resting_stop_px = None
+            ss.resting_stop_stage = None
+            self._save_state()
+            return
+        # UNKNOWN, PENDING, or other — do nothing this tick, retry next.
+
     def _sleeve_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
         """Independent state machine for one additional sleeve. Shares broker,
         position, and floor guard with siblings and with the primary strategy."""
@@ -3199,6 +3289,11 @@ class SwingTrader:
 
         # Track price for volatility signal & update HWM for ratcheting stop.
         self._sleeve_track_price(sc, last_price)
+
+        # [Adam 2026-07-15] Credit any FILLED resting stop-limit BEFORE any
+        # other state check so cycles/realized/own_avg_entry are up-to-date
+        # if Coinbase fired the exit since our last tick.
+        self._maybe_credit_resting_stop_fill(sc, ss)
 
         # [Adam 2026-07-15] Auto-adopt orphan position — if we hold contracts
         # but the sleeve thinks it's waiting to buy, flip state to ARMED_SELL
