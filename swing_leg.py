@@ -1451,10 +1451,59 @@ class SwingTrader:
                 ss.buy_trail_low_water = 0.0
                 return arm_price
             # Between low and low+distance — still waiting for confirmation.
+            # Rate-limited log so this state is visible (same rationale as
+            # the "waiting_for_dip" branch above).
+            import time as _t_bt2
+            key = f"buy_trail_bounce_{sc.id}"
+            store = getattr(self, "_buy_trail_wait_last_ts", None)
+            if store is None:
+                self._buy_trail_wait_last_ts = {}
+                store = self._buy_trail_wait_last_ts
+            last_ts = int(store.get(key, 0) or 0)
+            cur = int(_t_bt2.time())
+            if cur - last_ts > 600:
+                self._record(
+                    "buy_trail_waiting_for_bounce",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    buy_px=sc.buy_px,
+                    low_water=round(ss.buy_trail_low_water, 6),
+                    last_price=round(float(last_price), 6),
+                    bounce_needed=round(ss.buy_trail_low_water + distance - float(last_price), 6),
+                    trail_distance=distance,
+                    reason=("buy_trail armed at prior dip; waiting for mark "
+                            "to bounce trail_distance above the running low"),
+                )
+                store[key] = cur
             return None
 
         # Not yet armed: only arm once mark dips at/through buy_px.
         if last_price > sc.buy_px:
+            # Adam 2026-07-15: rate-limited log so the operator can see WHY a
+            # sleeve stays ARMED_BUY with no CB order — buy_trail is patient
+            # by design (wait for mark to dip to buy_px before even tracking
+            # a bounce). Was silent for HOURS on CU/HYF/ZEC, showed up as
+            # "NO recent block events" in diag_sleeve_ready. Rate-limit to
+            # one event per 10min per sleeve to keep the log signal-to-noise
+            # high while still surfacing the state on any diag.
+            import time as _t_bt
+            key = f"buy_trail_wait_{sc.id}"
+            store = getattr(self, "_buy_trail_wait_last_ts", None)
+            if store is None:
+                self._buy_trail_wait_last_ts = {}
+                store = self._buy_trail_wait_last_ts
+            last_ts = int(store.get(key, 0) or 0)
+            cur = int(_t_bt.time())
+            if cur - last_ts > 600:
+                self._record(
+                    "buy_trail_waiting_for_dip",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    buy_px=sc.buy_px, last_price=round(float(last_price), 6),
+                    dip_required=round(float(last_price) - sc.buy_px, 6),
+                    trail_distance=distance,
+                    reason=("mark above buy_px — buy_trail patient by design; "
+                            "arms only when mark dips at/through buy_px"),
+                )
+                store[key] = cur
             return None
 
         ss.buy_trail_armed = True
