@@ -129,6 +129,60 @@ def _peer_pct_change(store, tenant: str, family: str, exclude_symbol: str,
     return worst_pct, worst_sym
 
 
+def portfolio_correlation_drag(store, tenant: str, new_symbol: str,
+                                held_symbols: list[str],
+                                threshold: float = 0.5,
+                                min_scale: float = 0.3,
+                                window_secs: float = 7 * 24 * 3600.0) -> tuple[float, dict]:
+    """Compute a size-multiplier in [min_scale, 1.0] for a new arm on
+    new_symbol, based on how correlated it is with existing held positions.
+
+    Rationale (Rob Carver, Systematic Trading ch.10): sizing each strategy
+    to individual Kelly-optimum ignores that correlated positions crash
+    together. Adding a fifth crypto perp when four are already held doesn't
+    give you 5× the return — it gives you 5× the tail exposure. Downscale.
+
+    Formula:
+      * Compute rolling_correlation(new_symbol, each held_symbol)
+      * Take max(abs(r)) as the "worst-case" concurrent drawdown proxy
+      * If max_corr <= threshold: return 1.0 (no drag)
+      * Else: linear interp from 1.0 at threshold → min_scale at |r|=1.0
+
+    Returns (multiplier, diagnostics_dict). Diagnostics include
+    per-held correlation values for the trade log.
+
+    Fail-safe: any error → return (1.0, {"error": ...}) so callers get
+    the no-drag default and can log the failure. Never over-restricts.
+    """
+    diag = {"max_corr": 0.0, "correlations": {}, "held_count": len(held_symbols)}
+    if not held_symbols:
+        return 1.0, diag
+    try:
+        max_corr = 0.0
+        for held in held_symbols:
+            if held == new_symbol:
+                continue
+            r = rolling_correlation(store, tenant, new_symbol, held, window_secs=window_secs)
+            if r is None:
+                continue
+            diag["correlations"][held] = round(r, 4)
+            abs_r = abs(r)
+            if abs_r > max_corr:
+                max_corr = abs_r
+        diag["max_corr"] = round(max_corr, 4)
+        if max_corr <= threshold:
+            return 1.0, diag
+        # Linear interp: r=threshold → 1.0; r=1.0 → min_scale
+        slope = (min_scale - 1.0) / (1.0 - threshold)
+        mult = max(min_scale, 1.0 + slope * (max_corr - threshold))
+        diag["multiplier"] = round(mult, 4)
+        diag["threshold"] = threshold
+        diag["min_scale"] = min_scale
+        return mult, diag
+    except Exception as e:
+        return 1.0, {"error": str(e), **diag}
+
+
 def rolling_correlation(store, tenant: str, symbol_a: str, symbol_b: str,
                         window_secs: float = 30 * 24 * 3600.0) -> Optional[float]:
     """Pearson correlation of price_history between two symbols over the

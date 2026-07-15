@@ -1816,6 +1816,30 @@ class SwingTrader:
         except Exception:
             return "legacy"
 
+    def _current_held_symbols_excluding(self, exclude_symbol: str) -> list[str]:
+        """List of product_ids on this tenant that currently hold a nonzero
+        position, excluding the given symbol. Used by correlation-aware
+        sizing to check what we're already exposed to before arming a new
+        buy. Best source: state.__portfolio__ (updated on every fill sync).
+
+        Returns [] on any error — correlation drag falls back to 1.0 (no
+        drag), which is the safe direction (never over-restricts sizing)."""
+        try:
+            pf = self.store.get_state(self.tenant_id, "__portfolio__") or {}
+            out = []
+            for sym, snap in pf.items():
+                if not isinstance(snap, dict):
+                    continue
+                if sym.startswith("__"):
+                    continue
+                if sym == exclude_symbol:
+                    continue
+                if float(snap.get("position_qty") or 0) != 0:
+                    out.append(sym)
+            return out
+        except Exception:
+            return []
+
     def _expert_spread_mode(self) -> str:
         """Read the __expert_spread_mode__ scope. Returns one of:
           'off'    (default) — Avellaneda-Stoikov code path does not run
@@ -4521,6 +4545,35 @@ class SwingTrader:
                     return  # still tracking the low, don't arm this tick
                 self._maybe_emit_ml_shadow(sc)
                 eff_qty = self._kelly_adjusted_qty(sc, ss)
+                # Adam 2026-07-15: cross-sleeve correlation-aware sizing
+                # (Rob Carver ch.10). When enabled, downscale qty by
+                # portfolio_correlation_drag — highly-correlated concurrent
+                # holdings compound tail risk, so a fifth crypto perp is
+                # NOT worth 5× a single one. Off by default; opt-in per
+                # sleeve via sc.correlation_sizing_enabled.
+                if getattr(sc, "correlation_sizing_enabled", False):
+                    try:
+                        import correlation as _corr
+                        held = self._current_held_symbols_excluding(self.symbol)
+                        mult, drag_diag = _corr.portfolio_correlation_drag(
+                            self.store, self.tenant_id, self.symbol, held,
+                            threshold=float(getattr(sc, "correlation_sizing_threshold", 0.5) or 0.5),
+                            min_scale=float(getattr(sc, "correlation_sizing_min_scale", 0.3) or 0.3),
+                        )
+                        if mult < 1.0:
+                            orig = eff_qty
+                            eff_qty = max(1, int(round(orig * mult)))
+                            self._record(
+                                "sleeve_correlation_size_adjusted",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                original_qty=orig, adjusted_qty=eff_qty,
+                                multiplier=round(mult, 4),
+                                diagnostics=drag_diag,
+                            )
+                    except Exception as _e:
+                        self._record("correlation_sizing_error",
+                                     sleeve_id=sc.id, error=str(_e),
+                                     severity="warn")
                 eff_price = self._adaptive_spread_price(sc, "BUY", arm_price)
                 ms_qty, ms_px = self._sleeve_ms_adjust(sc, ss, "BUY", eff_qty, eff_price, last_price)
                 if ms_qty is None:
