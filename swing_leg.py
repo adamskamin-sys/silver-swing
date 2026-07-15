@@ -1526,6 +1526,113 @@ class SwingTrader:
         except Exception:
             return "legacy"
 
+    # [crew 2026-07-15] auto-refresh cadence config
+    _AUTO_REFRESH_MIN_INTERVAL_SECS = 60.0      # don't fire more than once/min per sleeve
+    _AUTO_REFRESH_MIN_DRIFT_PCT = 0.5           # skip if new buy_px within 0.5% of current
+    _AUTO_REFRESH_STALE_AFTER_SECS = 1200.0     # only refresh if armed > 20 min
+    _AUTO_REFRESH_MIN_HISTORY = 30              # need >=30 price history entries
+
+    def _maybe_auto_refresh_stale_sleeve(self, sc, ss, last_price: float) -> None:
+        """Universal Level 2 auto-refresh — for any sleeve in ARMED_BUY
+        WITHOUT a live order (i.e., waiting to arm but no order placed
+        yet), periodically re-derive buy_px/sell_px from the CURRENT
+        expert stack (arm_level.pullback_buy_px, backed by Chan OU +
+        Connors on current price history).
+
+        Anchored on CURRENT market price, NOT ss.last_sell_fill_price —
+        the latter can be ancient (months old) and traps sleeves in
+        "waiting to rebuy below a price that will never come" (ZEC case,
+        confirmed 2026-07-15 diag: ancient sold_ref $517.55 blocking a
+        sleeve when current market is $556).
+
+        Preserves the sleeve's current spread. If refresh would materially
+        move buy_px, calls _reanchor_sleeve which persists to store +
+        logs a sleeve_reanchored event with old/new prices for audit.
+
+        Additional guardrail: only fires if elapsed time since armed_at
+        exceeds SWING_STALE_AFTER_SECS (default 20 min — same window as
+        reentry_reeval's stale_after_bars). Prevents thrashing on
+        freshly-armed sleeves.
+
+        See project_auto_refresh_design_decisions.md for design context
+        (Option A universal ship; Option B anchor-aware follow-up needs
+        SleeveConfig.anchor_type schema field).
+        """
+        # Gate 1: must be ARMED_BUY without a live order (reentry_reeval
+        # handles the WITH-live-order case via cancel-replace).
+        if ss.state != SleeveStateEnum.ARMED_BUY:
+            return
+        if ss.live_order_id:
+            return
+
+        # Gate 2: staleness — don't fire on freshly-armed sleeves.
+        import time as _t
+        now = _t.time()
+        armed_ts = float(ss.armed_buy_since_ts or now)
+        if (now - armed_ts) < self._AUTO_REFRESH_STALE_AFTER_SECS:
+            return
+
+        # Gate 3: cadence — throttle to once per minute per sleeve.
+        last_refresh = float(getattr(ss, "_last_auto_refresh_ts", 0.0) or 0.0)
+        if last_refresh and (now - last_refresh) < self._AUTO_REFRESH_MIN_INTERVAL_SECS:
+            return
+
+        # Gate 4: sufficient price history.
+        history = list(self._sleeve_price_history.get(sc.id, []) or [])
+        if len(history) < self._AUTO_REFRESH_MIN_HISTORY:
+            return
+
+        # Compute fresh buy_px via arm_level (Chan OU + Connors).
+        # CRITICAL: use current market as sold_ref, NOT ancient
+        # last_sell_fill_price. See docstring for the ZEC trap.
+        current_spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
+        try:
+            import arm_level as _al
+            new_buy_px = _al.pullback_buy_px(
+                history,
+                spread=current_spread,
+                sold_price=float(last_price),  # current market as reference
+            )
+        except Exception as e:
+            self._record("sleeve_auto_refresh_error", sleeve_id=sc.id,
+                         sleeve_name=sc.name, error=str(e))
+            ss._last_auto_refresh_ts = now
+            return
+
+        if new_buy_px is None:
+            ss._last_auto_refresh_ts = now
+            return
+
+        try:
+            new_buy_px = self._snap_to_tick(float(new_buy_px))
+        except Exception:
+            pass
+
+        # Gate 5: minimum drift — skip if change is negligible.
+        current_buy = float(sc.buy_px)
+        drift_pct = abs(new_buy_px - current_buy) / max(abs(current_buy), 1e-9) * 100
+        if drift_pct < self._AUTO_REFRESH_MIN_DRIFT_PCT:
+            ss._last_auto_refresh_ts = now
+            return
+
+        # Compute matching new_sell_px preserving current spread.
+        new_sell_px = self._snap_to_tick(new_buy_px + current_spread)
+
+        # Persist via _reanchor_sleeve — writes to store + logs
+        # sleeve_reanchored event. Also fires our own event for audit.
+        self._reanchor_sleeve(sc, ss, new_buy_px, new_sell_px, last_price)
+        ss._last_auto_refresh_ts = now
+        self._record(
+            "sleeve_auto_refresh",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            old_buy_px=current_buy, new_buy_px=new_buy_px,
+            old_sell_px=float(sc.sell_px) if False else current_buy + current_spread,
+            new_sell_px=new_sell_px, drift_pct=round(drift_pct, 3),
+            armed_hours=(now - armed_ts) / 3600,
+            current_market=float(last_price),
+            source="arm_level.pullback_buy_px (Chan OU + Connors)",
+        )
+
     def _maybe_reeval_pending_arm(self, sc, ss, last_price: float) -> None:
         """Wire reentry_reeval.evaluate_pending into the ARMED_BUY tick per
         auditor review gate 2026-07-14. Cancel-replace with confirmation.
@@ -2374,6 +2481,17 @@ class SwingTrader:
         # replace with dedup lock, anti-thrash armed_at reset, expire
         # exits cleanly. See tests/test_reentry_reeval_wiring.py.
         self._maybe_reeval_pending_arm(sc, ss, last_price)
+
+        # [crew 2026-07-15] Auto-refresh sleeve levels from experts for
+        # ARMED_BUY sleeves WITHOUT a live order — closes the gap where a
+        # sleeve waiting forever with stale saved buy_px/sell_px from
+        # days-ago anchors never got its levels updated. Adam asked for
+        # this repeatedly across 2026-07-15 late-night session (ZEC
+        # confirmed 6.6% drift, XLP waiting 54.7h with stale levels).
+        # Uses arm_level.pullback_buy_px — SAME helper as reentry_reeval.
+        # Anchored on CURRENT market price (not ancient last_sell_fill_
+        # price which was locking sleeves out of new price regimes).
+        self._maybe_auto_refresh_stale_sleeve(sc, ss, last_price)
 
         # [crew] Average-down GREEN LIGHT alert (notification only). Opt-in.
         self._maybe_avg_down_alert(sc, ss, last_price)
