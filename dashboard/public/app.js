@@ -1584,14 +1584,11 @@ function productHasReversalArmed(tenant, productId) {
   return sleeves.some(s => s && s.reversal_enabled === true);
 }
 
-// Trail-active detector for the portfolio row badge. Returns:
-//   null          — no sleeve on this product has an active trail
-//   { hwm, dist } — HWM (running high-water mark) + effective trail distance
-//                   from the sleeve state; the caller renders "TRAIL @ $X"
-// A sleeve has "active trail" when trail_armed=true in its state. For
-// ratcheting stops the effective stop rides at HWM - stop_loss_ratchet_distance.
-// For hybrid-trail exits it rides at HWM - trail_distance. We pick whichever
-// yields the tighter (higher) stop for a long — that's what will fire first.
+// Trail-active detector for the portfolio row badge. Only fires when a
+// sleeve is CURRENTLY HOLDING (state=ARMED_SELL + a live sell order on the
+// book) AND the trail state is actively engaged (not leftover HWM from a
+// prior cycle). Prior version fired on any sleeve with a populated HWM,
+// which lit up NGS + BIT even though those trails weren't actually running.
 function productTrailActiveInfo(tenant, productId) {
   const block = currentStore?.[tenant]?.[productId];
   if (!block) return null;
@@ -1600,10 +1597,11 @@ function productTrailActiveInfo(tenant, productId) {
   let best = null;  // pick the tightest (highest) trail stop across sleeves
   for (const s of sleeves) {
     const ss = sleeveStates[s.id] || {};
-    // Two independent trails can fire on a sleeve:
-    //   (a) hybrid exit trail — ss.trail_armed=true, distance from ss.trail_high_water_price
-    //   (b) ratcheting stop-loss — ss.stop_loss_hwm set, effective = hwm - ratchet_distance
-    // Both mean "we're locking in gains as price runs." Show whichever is tighter.
+    // Gate: sleeve must be actively holding contracts + have a live sell
+    // order (i.e., a real armed exit) — otherwise HWM is stale.
+    const holdingWithLiveExit = String(ss.state) === 'ARMED_SELL' && !!ss.live_order_id;
+    if (!holdingWithLiveExit) continue;
+    // (a) Hybrid exit trail — armed AND enabled + hwm running
     const trailArmed = ss.trail_armed === true;
     const hwm = Number(ss.trail_high_water_price) || 0;
     const trailDist = Number(s.trail_distance) || 0;
@@ -1613,9 +1611,13 @@ function productTrailActiveInfo(tenant, productId) {
         best = { stopPx, hwm, dist: trailDist, kind: 'trail', sleeveName: s.name || s.id };
       }
     }
+    // (b) Ratcheting stop-loss — requires sc.stop_loss_enabled AND
+    //     sc.stop_loss_ratchet_enabled AND consecutive_stops == 0 AND
+    //     an armed ratchet HWM. Skipping when stop_loss is disabled by
+    //     user (e.g., NGS — Adam's explicit no-stop directive).
     const slHwm = Number(ss.stop_loss_hwm) || 0;
     const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-    if (s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
+    if (s.stop_loss_enabled && s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
       const stopPx = slHwm - ratchetDist;
       if (best === null || stopPx > best.stopPx) {
         best = { stopPx, hwm: slHwm, dist: ratchetDist, kind: 'ratchet', sleeveName: s.name || s.id };
