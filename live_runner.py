@@ -657,7 +657,7 @@ def run() -> int:
     #
     # This periodic check walks state + portfolio, finds every product with
     # an ARMED sleeve OR a held position that DOESN'T have a live Track,
-    # and force-attempts _make_non_primary_track. Respects the eviction
+    # and force-attempts _get_or_create_non_primary_track. Respects the eviction
     # cooldown (won't hammer a persistently failing spawn). Logs
     # track_silent_detected on find + track_auto_respawn_attempted on
     # each spawn attempt so operator gets proactive visibility.
@@ -831,8 +831,8 @@ def run() -> int:
                 continue  # respect the cooldown; try again next health cycle
             # Attempt recovery via the existing spawn path (handles all guards
             # + failure paths). We don't bypass its checks — if config missing
-            # or spawn fails, _make_non_primary_track returns None + logs it.
-            track = _make_non_primary_track(pid)
+            # or spawn fails, _get_or_create_non_primary_track returns None + logs it.
+            track = _get_or_create_non_primary_track(pid)
             try:
                 log.record(
                     "track_auto_respawn_attempted",
