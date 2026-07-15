@@ -88,6 +88,14 @@ SENTINEL_INTERVAL_SECS = float(os.getenv("SWING_SENTINEL_SECS", "300.0"))
 # 5 min is aggressive enough to catch a duplicate-orders or SLR-ghost
 # class of bug within one tick window, cheap enough not to spam the notifier.
 RECONCILIATION_INTERVAL_SECS = float(os.getenv("SWING_RECONCILIATION_SECS", "300.0"))
+# Kill switch for the 2026-07-14 non-primary tick fix. Live worker used to
+# tick ONLY the primary SYMBOL (SLR); sleeves on other held products (PT,
+# HYP, XLP, etc.) went silent when the paper worker was suspended, missing
+# take-profits and stop-losses. When set to 1 (default), the live worker
+# creates a SwingTrader per held non-primary product and ticks each one
+# with fresh marks from the __portfolio__ refresh (every 2s). Set to 0
+# to revert to primary-only ticking if this new path misbehaves.
+TICK_NON_PRIMARY = os.getenv("SWING_LIVE_TICK_NON_PRIMARY", "1") == "1"
 
 
 def _log(msg: str) -> None:
@@ -146,6 +154,32 @@ class DryRunBroker:
             "status": "OPEN", "filled_qty": 0,
         }
         _log(f"[DRY RUN] would place {side} {qty} @ {price} → fake order {oid}")
+        return oid
+
+    def place_market(self, side, qty):
+        # 2026-07-14 problem-scout #4: pre-existing hole — without this,
+        # SwingTrader._sleeve_market_sell / crash_guard / manual market
+        # intents fell through __getattr__ to the real Coinbase client
+        # and submitted REAL market orders even in dry-run mode. Amplified
+        # by the non-primary tick fix which lets every held product's
+        # sleeves reach market-order paths.
+        self._counter += 1
+        oid = f"dry-run-mkt-{self._counter}"
+        # Try to get a reasonable fake fill price from contract_spec so
+        # downstream _on_fill math (realized_pnl, cycles) uses something
+        # near reality instead of 0.0.
+        mark = 0.0
+        try:
+            spec = self._real.contract_spec()
+            mark = float((spec or {}).get("current_price") or 0.0)
+        except Exception:
+            mark = 0.0
+        self._fake_orders[oid] = {
+            "side": side, "qty": qty, "price": mark,
+            "status": "FILLED", "filled_qty": qty,
+            "average_filled_price": mark,
+        }
+        _log(f"[DRY RUN] would market {side} {qty} @ ~{mark} → fake order {oid}")
         return oid
 
     def order_status(self, order_id):
@@ -247,6 +281,17 @@ def run() -> int:
         _log("For a paper session use main.py. For a first live pass use SWING_LIVE_DRY_RUN=1.")
         return 2
 
+    # 2026-07-14 problem-scout #1: hard tenant guard. Non-primary trader
+    # code below constructs SwingTrader(store, TENANT, pid) — if TENANT
+    # doesn't end with '-live', reads/writes go to the wrong scope while
+    # main.py's __portfolio__ lives under '{TENANT}-live'. Silent state
+    # divergence + potential duplicate orders (same class as 2026-07-14
+    # multi-writer incident). main.py already has this guard; parity.
+    if not TENANT.endswith("-live"):
+        _log(f"REFUSING: SWING_TENANT={TENANT!r} must end with '-live'. "
+             f"Set SWING_TENANT=adam-live (or your equivalent) in Render env.")
+        return 2
+
     from alerting import default_notifier
     from broker import BrokerConfig, CoinbaseBroker
     from feed import LiveTickerFeed
@@ -308,6 +353,65 @@ def run() -> int:
     broker = DryRunBroker(coinbase) if dry_run else coinbase
     trader = SwingTrader(broker, store, TENANT, SYMBOL,
                          trade_log=log, kill_switch=ks, notifier=notifier)
+
+    # 2026-07-14 non-primary tick fix. Live worker previously only ticked
+    # the primary SYMBOL — sleeves on other held products (PT, HYP, XLP,
+    # etc.) went silent when the paper worker was suspended, missing take-
+    # profits and stop-losses (root cause of missed PLAT sell + trail).
+    # Cache one SwingTrader per non-primary product; each shares the tenant
+    # kill switch + trade log but has its own CoinbaseBroker (broker is
+    # tied to a product_id). Traders are created lazily on first tick.
+    _non_primary_traders: dict[str, SwingTrader] = {}
+    def _get_or_create_non_primary_trader(product_id: str):
+        if product_id == SYMBOL or product_id.startswith("__"):
+            return None
+        if product_id in _non_primary_traders:
+            return _non_primary_traders[product_id]
+        # 2026-07-14 problem-scout #2: refuse creation for products with
+        # no config. SwingConfig defaults are SLR-calibrated (core=10,
+        # swing_qty=2, sell_px=65, abort=60/70) — wrong for BTC ($65k),
+        # gas ($2), etc. Would fire CRIT halts + potentially place limit
+        # orders at nonsense prices on the first tick. main.py's
+        # _sync_live_portfolio seeds configs for every held product; if
+        # one arrives here without a config, a HUMAN needs to fix it in
+        # the dashboard before we tick.
+        cfg = store.get_config(TENANT, product_id) or {}
+        if not cfg:
+            _log(f"[non-primary] {product_id}: no config in store, SKIPPING "
+                 f"trader creation (configure via dashboard first)")
+            return None
+        # 2026-07-14 problem-scout #5: kill switch check. The primary
+        # trader gets full preflight (kill-switch, session, roll, position
+        # vs floor) BEFORE construction. Non-primary must at minimum
+        # respect the kill switch, since reconcile() below can trigger
+        # _sleeve_on_fill → _maybe_expert_reanchor_after_sell which can
+        # place orders. The kill switch is Adam's "everything stop NOW."
+        try:
+            if ks.is_active():
+                _log(f"[non-primary] {product_id}: kill switch active, "
+                     f"SKIPPING trader creation")
+                return None
+        except Exception:
+            pass  # be permissive on the check itself — don't block creation
+        try:
+            prod_coinbase = CoinbaseBroker(BrokerConfig(product_id=product_id))
+            prod_broker = DryRunBroker(prod_coinbase) if dry_run else prod_coinbase
+            prod_trader = SwingTrader(prod_broker, store, TENANT, product_id,
+                                      trade_log=log, kill_switch=ks, notifier=notifier)
+            # Reconcile once so the trader credits any fills that happened
+            # while this product had no active trader (paper-suspended window).
+            try:
+                prod_trader.reconcile()
+            except Exception as e:
+                _log(f"[non-primary] {product_id} initial reconcile failed: "
+                     f"{type(e).__name__}: {e}")
+            _non_primary_traders[product_id] = prod_trader
+            _log(f"[non-primary] created trader for {product_id}")
+            return prod_trader
+        except Exception as e:
+            _log(f"[non-primary] {product_id} trader creation failed: "
+                 f"{type(e).__name__}: {e}")
+            return None
 
     # Boot-time state coherence check — prevents the 2026-07-14 SLR class of bug
     # where runtime state.swing_qty drifts above config.swing_qty and gets stuck
@@ -440,6 +544,18 @@ def run() -> int:
                 except Exception as e:
                     _log(f"periodic reconcile failed: {type(e).__name__}: {e}")
                     _health.record_error(store, "reconcile", TENANT, e, trade_log=log)
+                # 2026-07-14 non-primary reconcile — same guarantee the
+                # primary gets: credit fills that happened outside the step
+                # loop (manual trades on Coinbase, orders that filled between
+                # ticks). Each product wrapped so one bad reconcile can never
+                # take down siblings.
+                if TICK_NON_PRIMARY:
+                    for _pid, _npt in list(_non_primary_traders.items()):
+                        try:
+                            _npt.reconcile()
+                        except Exception as e:
+                            _log(f"[non-primary] {_pid} periodic reconcile "
+                                 f"failed: {type(e).__name__}: {e}")
             # [crew] Expert-params drift guard — is the live config still using
             # the expert data (expert_params x tuned multipliers)? Alerts on
             # drift. Read-only; a transient failure never stops the loop.
@@ -650,6 +766,37 @@ def run() -> int:
                     # snapshot flags (see main.py:261). We add the health
                     # record here for the wrapper site itself.
                     _health.record_ok(store, "portfolio_refresh", TENANT)
+                    # 2026-07-14 non-primary tick — piggyback on the fresh
+                    # portfolio snapshot. For each held non-primary product,
+                    # get-or-create its SwingTrader and step() it with the
+                    # just-fetched Coinbase mark. Each product step is wrapped
+                    # so one bad product can never take down siblings or the
+                    # primary loop.
+                    if TICK_NON_PRIMARY:
+                        snap = store.get_config(live_tenant, "__portfolio__") or {}
+                        for deriv in (snap.get("derivatives") or []):
+                            pid = deriv.get("product_id")
+                            mark = (deriv.get("mark_price")
+                                    or deriv.get("mark")
+                                    or deriv.get("last"))
+                            if not pid or mark is None or pid == SYMBOL:
+                                continue
+                            if pid.startswith("__"):
+                                continue
+                            try:
+                                mark_f = float(mark)
+                            except (TypeError, ValueError):
+                                continue
+                            if mark_f <= 0:
+                                continue
+                            np_trader = _get_or_create_non_primary_trader(pid)
+                            if np_trader is None:
+                                continue
+                            try:
+                                np_trader.step(mark_f)
+                            except Exception as e:
+                                _log(f"[non-primary] {pid} step failed: "
+                                     f"{type(e).__name__}: {e}")
                 except Exception as e:
                     _log(f"portfolio refresh failed: {type(e).__name__}: {e}")
                     # NOTE: no trade_log= arg here. refresh_portfolio_snapshot
