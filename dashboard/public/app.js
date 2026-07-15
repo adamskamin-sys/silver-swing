@@ -6252,12 +6252,24 @@ function openScannerDetail(row) {
                        data-tenant="${escapeHtml(row._live_tenant)}"
                        data-symbol="${escapeHtml(row.product_id)}">Resume</button>`
             : '';
+          // Adam 2026-07-15: SELL column display should reflect the ACTIVE
+          // exit, not the stale goal, once the trail supersedes. When
+          // trail is engaged (HWM > 0 + trail_distance > 0), dim + strike
+          // the config sell_px and note "trail active" so the reader
+          // doesn't think the bot will still exit at $sell_px — the trail
+          // (floored at sell_px, per checkpoint-then-ratchet) now owns it.
+          const trailEngaged = (s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid')
+                                && Number(ss.trail_high_water_price) > 0
+                                && Number(s.trail_distance) > 0;
+          const sellPxDisplay = trailEngaged
+            ? `<span class="dim" style="text-decoration:line-through" title="Trail superseded this target — see TRAIL column for the ACTIVE exit price. Floor is $${fmtPrice(s.sell_px || 0)} (checkpoint-then-ratchet: trail can only exit ABOVE the goal).">$${fmtPrice(s.sell_px || 0)}</span> <span class="ck-chip ck-ok" style="font-size:0.65em;padding:1px 4px" title="Trail owns this exit — the SELL target is now a floor, not the active price.">→ trail</span>`
+            : `$${fmtPrice(s.sell_px || 0)}`;
           return `<tr>
             <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
             <td class="mono">${s.qty}</td>
             <td class="mono dim">${posAvgPx > 0 ? `$${fmtPrice(posAvgPx)}` : '—'}</td>
             <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
-            <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
+            <td class="mono">${sellPxDisplay}</td>
             <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
             <td class="mono">${stopCell}</td>
             <td class="mono">${ifStoppedCell}</td>
@@ -6528,12 +6540,20 @@ function refreshScannerDetailLive() {
                    data-tenant="${escapeHtml(tenant)}"
                    data-symbol="${escapeHtml(symbol)}">Resume</button>`
         : '';
+      // Adam 2026-07-15: SELL column strike-through when trail supersedes
+      // (matches the other sleeve-row renderer).
+      const trailEngaged2 = (s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid')
+                             && Number(ss.trail_high_water_price) > 0
+                             && Number(s.trail_distance) > 0;
+      const sellPxDisplay2 = trailEngaged2
+        ? `<span class="dim" style="text-decoration:line-through" title="Trail superseded this target — see TRAIL column for the active exit. Floor is $${fmtPrice(s.sell_px || 0)} (checkpoint-then-ratchet: trail can only exit ABOVE the goal).">$${fmtPrice(s.sell_px || 0)}</span> <span class="ck-chip ck-ok" style="font-size:0.65em;padding:1px 4px" title="Trail owns this exit — the SELL target is now a floor, not the active price.">→ trail</span>`
+        : `$${fmtPrice(s.sell_px || 0)}`;
       return `<tr>
         <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
         <td class="mono">${s.qty}</td>
         <td class="mono dim">${posAvgPx > 0 ? `$${fmtPrice(posAvgPx)}` : '—'}</td>
         <td class="mono">${entryPx > 0 ? `$${fmtPrice(entryPx)}` : '<span class="dim">—</span>'}</td>
-        <td class="mono">$${fmtPrice(s.sell_px || 0)}</td>
+        <td class="mono">${sellPxDisplay2}</td>
         <td class="mono">$${fmtPrice(s.buy_px || 0)}</td>
         <td class="mono">${stopCell}</td>
         <td class="mono">${ifStoppedCell}</td>
