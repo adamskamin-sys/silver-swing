@@ -103,7 +103,37 @@ def _is_lab_tenant(tenant: str) -> bool:
 
 
 def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
-    if store.get_config(tenant, symbol):
+    existing = store.get_config(tenant, symbol)
+    if existing:
+        # Adam 2026-07-15 fleet-wide rule: backfill partial live-tenant configs.
+        # arm-as-sleeve from the scanner writes only the `sleeves` array —
+        # primary fields (core_qty, abort_below, abort_above, swing_qty) fall
+        # through to SwingConfig's dataclass defaults, which are SLR-specific:
+        # core_qty=10 (too high — halts any product where user has 0 position),
+        # abort_below/above=60/70 (SLR-specific bands).
+        # For live tenant: force core_qty=0 (no phantom core to defend) and
+        # widen abort bands. If a halt was already logged for "below core",
+        # clear it too — the halt was based on the now-fixed misconfig.
+        if tenant.endswith("-live") and "core_qty" not in existing:
+            existing["core_qty"] = 0
+            existing.setdefault("swing_qty", 0)
+            existing.setdefault("abort_below", 0.0)
+            existing.setdefault("abort_above", 1e9)
+            store.put_config(tenant, symbol, existing)
+            _log(f"[{tenant}/{symbol}] backfilled partial config with live-safe "
+                 f"defaults (core_qty=0)")
+            # Also clear any pre-existing halt caused by the phantom core.
+            try:
+                st = store.get_state(tenant, symbol) or {}
+                halt_reason = str(st.get("halt_reason") or "")
+                if "below core" in halt_reason:
+                    st["halt_reason"] = None
+                    st["state"] = "ARMED_SELL"  # normal reconcile default
+                    store.put_state(tenant, symbol, st)
+                    _log(f"[{tenant}/{symbol}] cleared phantom-core halt: "
+                         f"{halt_reason}")
+            except Exception as _e:
+                _log(f"[{tenant}/{symbol}] halt-clear failed: {type(_e).__name__}: {_e}")
         _fixup_lab_config(store, tenant, symbol)
         if _is_lab_tenant(tenant):
             _seed_lab_comparison_sleeves(store, tenant, symbol)

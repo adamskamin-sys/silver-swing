@@ -589,6 +589,18 @@ export function makeApp({
       }
 
       cfg.sleeves = sleeves;
+      // Adam 2026-07-15 fleet-wide rule: on live tenant, if this config has
+      // no explicit core_qty, force it to 0. SwingConfig's dataclass default
+      // is 10 — designed for SLR where Adam intentionally holds a protected
+      // core. But for any newly-armed sleeve on a product where the user has
+      // 0 position, core=10 causes an immediate reconcile_halt ("position 0
+      // already below core 10"). Live tenant is a portfolio mirror; the
+      // dashboard capacity check already forces core=0 for live, the bot
+      // needs the same treatment or the halt fires on every arm-as-sleeve.
+      // Never overwrites an explicitly-set core_qty (preserves SLR's core).
+      if (isLive && !('core_qty' in cfg)) {
+        cfg.core_qty = 0;
+      }
       store[tenant][symbol].config = cfg;
 
       // Adam 2026-07-15 (Option B): auto-seed EVERY brand-new sleeve id
