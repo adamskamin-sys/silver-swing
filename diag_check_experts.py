@@ -33,35 +33,55 @@ from state_store import make_store
 TENANT = "adam-live"
 
 
-def _fetch_recent_prices(product_id: str, n: int = 120) -> list[float]:
-    """Fetch last n closes from Coinbase for expert computation.
-    Uses the same broker client the bot uses. 1-minute bars."""
-    try:
-        from broker import CoinbaseBroker, BrokerConfig
-        broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
-        # Coinbase's get_candles API: last n minutes at ONE_MINUTE
-        end = int(time.time())
-        start = end - (n * 60)
-        # Use client.get_candles directly since it's the raw API
-        resp = broker.client.get_candles(
-            product_id=product_id,
-            start=str(start),
-            end=str(end),
-            granularity="ONE_MINUTE",
-        )
-        # Response has candles as list of dicts with 'close' field
-        candles = getattr(resp, "candles", None) or resp.get("candles", [])
-        closes = []
-        for c in candles:
-            close = c.get("close") if isinstance(c, dict) else getattr(c, "close", None)
-            if close is not None:
-                closes.append(float(close))
-        # Reverse — Coinbase returns newest-first, we want oldest→newest
-        closes.reverse()
-        return closes
-    except Exception as e:
-        print(f"WARN: couldn't fetch prices via broker: {type(e).__name__}: {e}")
-        return []
+def _fetch_recent_prices(product_id: str, target_bars: int = 100) -> list[float]:
+    """Fetch enough closes for the expert chain to run (>= 40 bars).
+    Strategy: try progressively larger 5-min windows so low-liquidity
+    futures like XLP-20DEC30-CDE get enough history to bypass the
+    experts_reentry.py min_history_bars=40 fallback.
+
+    Attempts, in order:
+      1. Last 8 hours of 5-min bars    (~96 bars)
+      2. Last 24 hours of 5-min bars   (~288 bars)
+      3. Last 3 days of 1-hour bars    (~72 bars)
+    """
+    from broker import CoinbaseBroker, BrokerConfig
+    broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
+
+    attempts = [
+        ("FIVE_MINUTE",   8 * 3600,   "last 8h @ 5m"),
+        ("FIVE_MINUTE",   24 * 3600,  "last 24h @ 5m"),
+        ("ONE_HOUR",      3 * 86400,  "last 3d @ 1h"),
+    ]
+
+    for granularity, span_secs, label in attempts:
+        try:
+            end = int(time.time())
+            start = end - span_secs
+            resp = broker.client.get_candles(
+                product_id=product_id,
+                start=str(start),
+                end=str(end),
+                granularity=granularity,
+            )
+            candles = getattr(resp, "candles", None) or resp.get("candles", [])
+            closes = []
+            for c in candles:
+                close = c.get("close") if isinstance(c, dict) else getattr(c, "close", None)
+                if close is not None:
+                    try:
+                        closes.append(float(close))
+                    except (TypeError, ValueError):
+                        pass
+            # Coinbase returns newest-first — reverse to oldest→newest
+            closes.reverse()
+            print(f"  Attempt: {label} → {len(closes)} valid closes")
+            if len(closes) >= 40:
+                return closes
+        except Exception as e:
+            print(f"  Attempt: {label} → FAILED: {type(e).__name__}: {e}")
+
+    print("  All fetch attempts insufficient — returning whatever we got last")
+    return closes if 'closes' in locals() else []
 
 
 def main() -> None:
