@@ -1060,8 +1060,25 @@ class SwingTrader:
         # 3. Else: halt as before (fixed stop-loss with no auto-recovery).
         if sc.stop_loss_reanchor_on_trigger:
             spread = max(0.005, sc.sell_px - sc.buy_px)
-            new_buy = self._snap_to_tick(last_price - spread / 2)
-            new_sell = self._snap_to_tick(last_price + spread / 2)
+            # 2026-07-15: use arm_level.pullback_buy_px (Chan OU + Connors)
+            # instead of the naive last_price ± spread/2 formula. Same
+            # helper as reentry_reeval + auto-refresh — unified expert
+            # math everywhere. Fallback to the naive centering if
+            # arm_level returns None (insufficient history).
+            try:
+                import arm_level as _al
+                history = list(self._sleeve_price_history.get(sc.id, []) or [])
+                expert_buy = _al.pullback_buy_px(
+                    history, spread=spread, sold_price=float(last_price))
+                if expert_buy is not None:
+                    new_buy = self._snap_to_tick(float(expert_buy))
+                    new_sell = self._snap_to_tick(new_buy + spread)
+                else:
+                    new_buy = self._snap_to_tick(last_price - spread / 2)
+                    new_sell = self._snap_to_tick(last_price + spread / 2)
+            except Exception:
+                new_buy = self._snap_to_tick(last_price - spread / 2)
+                new_sell = self._snap_to_tick(last_price + spread / 2)
             self._reanchor_sleeve(sc, ss, new_buy, new_sell, last_price)
             ss.state = SleeveStateEnum.ARMED_BUY
             return True

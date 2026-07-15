@@ -89,7 +89,14 @@ class SleeveConfig:
     # Without this, the sleeve halts and requires manual Resume; with it, the
     # sleeve keeps trading at the new price level (silver at $60 → buy $59.90,
     # sell $60.10 instead of leaving the old $61.336 / $61.539 stranded).
-    stop_loss_reanchor_on_trigger: bool = False
+    # 2026-07-15: default flipped False → True. Adam's explicit rule: "I don't
+    # want to see any halts in the future — experts should prevent bad entries
+    # instead of stopping trading." With auto-refresh + arm_level.pullback_buy_px
+    # driving the reanchor (Chan OU + Connors), the reanchor is now expert-
+    # backed rather than the naive last-price ± spread/2 formula that made
+    # the old default risky. Existing sleeves with an explicit False stay
+    # opt-out; only new-sleeve defaults change.
+    stop_loss_reanchor_on_trigger: bool = True
 
     # Safety cap: after N consecutive stop-out cycles without a winning
     # round-trip in between, halt the sleeve for manual review. Protects
