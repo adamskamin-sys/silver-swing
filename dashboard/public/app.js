@@ -6436,6 +6436,7 @@ async function loadScannerChart() {
       targetLines,
       tickSize: Number(cfg.tick_size) || 0,
       contractSize: Number(cfg.contract_size) || 0,
+      indicators: { ...scannerChartIndicators },
     });
   } catch (err) {
     scannerDetailChart.innerHTML = `<div class="chart-status error">chart failed: ${escapeHtml(String(err.message || err))}</div>`;
@@ -6463,6 +6464,13 @@ function renderCandleChart(candles, container, opts = {}) {
   const targetLines = Array.isArray(opts.targetLines) ? opts.targetLines : [];
   const tickSize = Number(opts.tickSize) || 0;
   const csize = Number(opts.contractSize) || 0;
+  // 2026-07-15 indicator overlays. Toggled from scannerChartIndicators.
+  // Compute here (once per chart render) so we can add data to Y-axis range.
+  const indicatorOpts = opts.indicators || {};
+  const closes = candles.map(c => Number(c[4]));
+  const kamaSeries = indicatorOpts.kama ? computeKAMASeries(closes) : null;
+  const bbSeries   = indicatorOpts.bollinger ? computeBollingerSeries(closes) : null;
+  const fisherSeries = indicatorOpts.fisher ? computeFisherSeries(closes) : null;
   const W = container.clientWidth || 900;
   const H = 480;
   const padL = 80, padR = 20, padT = 20, padB = 40;
@@ -6476,6 +6484,16 @@ function renderCandleChart(candles, container, opts = {}) {
   for (const c of candles) {
     if (c[3] < lo) lo = c[3];
     if (c[2] > hi) hi = c[2];
+  }
+  // Include Bollinger bands in Y-axis range so they never clip off-chart.
+  if (bbSeries) {
+    for (const v of bbSeries.upper) if (v != null && v > hi) hi = v;
+    for (const v of bbSeries.lower) if (v != null && v < lo) lo = v;
+  }
+  if (kamaSeries) {
+    for (const v of kamaSeries) {
+      if (v != null) { if (v > hi) hi = v; if (v < lo) lo = v; }
+    }
   }
   const firstTs = Number(candles[0][0]) || 0;
   const lastTs = Number(candles[candles.length - 1][0]) || 0;
@@ -6569,6 +6587,72 @@ function renderCandleChart(candles, container, opts = {}) {
     const bh = Math.max(1, Math.abs(yc - yo));
     parts.push(`<line x1="${xc.toFixed(1)}" y1="${yh.toFixed(1)}" x2="${xc.toFixed(1)}" y2="${yl.toFixed(1)}" stroke="${color}" stroke-width="1"/>`);
     parts.push(`<rect x="${(xc - bodyW/2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill="${color}"/>`);
+  }
+
+  // 2026-07-15 indicator overlays. Render as SVG polylines using x(ts) and
+  // y(price) helpers. Each indicator draws its own colored line (or bands).
+  // Series are aligned to candles by index — length matches candles.length.
+  function _polyline(seriesArr, color, opts = {}) {
+    // Convert an aligned series (parallel to candles) into an SVG polyline
+    // path. Skips null entries at the start (before enough history).
+    const pts = [];
+    for (let i = 0; i < seriesArr.length; i++) {
+      const v = seriesArr[i];
+      if (v == null || !isFinite(v)) continue;
+      pts.push(`${x(Number(candles[i][0])).toFixed(1)},${y(v).toFixed(1)}`);
+    }
+    if (pts.length < 2) return;
+    const dash = opts.dash ? ` stroke-dasharray="${opts.dash}"` : '';
+    parts.push(`<polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="${opts.width || 1.5}"${dash} opacity="${opts.opacity || 0.9}"/>`);
+  }
+
+  if (kamaSeries) {
+    _polyline(kamaSeries, '#f59e0b', { width: 1.75 });
+    // Right-edge label for KAMA
+    for (let i = kamaSeries.length - 1; i >= 0; i--) {
+      if (kamaSeries[i] != null) {
+        const yy = y(kamaSeries[i]);
+        parts.push(`<text x="${(W - padR - 4).toFixed(1)}" y="${(yy + 10).toFixed(1)}" fill="#f59e0b" font-size="10" text-anchor="end" font-family="ui-monospace,monospace" opacity="0.9">KAMA $${kamaSeries[i].toFixed(yDec)}</text>`);
+        break;
+      }
+    }
+  }
+  if (bbSeries) {
+    _polyline(bbSeries.upper,  '#a78bfa', { width: 1, dash: '3 3', opacity: 0.75 });
+    _polyline(bbSeries.middle, '#a78bfa', { width: 1.25, opacity: 0.85 });
+    _polyline(bbSeries.lower,  '#a78bfa', { width: 1, dash: '3 3', opacity: 0.75 });
+    // Right-edge label
+    for (let i = bbSeries.middle.length - 1; i >= 0; i--) {
+      if (bbSeries.middle[i] != null) {
+        const yy = y(bbSeries.middle[i]);
+        parts.push(`<text x="${(W - padR - 4).toFixed(1)}" y="${(yy + 22).toFixed(1)}" fill="#a78bfa" font-size="10" text-anchor="end" font-family="ui-monospace,monospace" opacity="0.9">BB(20,2)</text>`);
+        break;
+      }
+    }
+  }
+  if (fisherSeries) {
+    // Fisher Transform is unbounded but typically ±3. Render as a small
+    // sub-panel at the bottom of the chart so it doesn't collide with price.
+    const panelH = 60;
+    const panelTop = padT + plotH - panelH - 4;
+    // Panel background
+    parts.push(`<rect x="${padL}" y="${panelTop}" width="${plotW}" height="${panelH}" fill="#0a1119" opacity="0.7"/>`);
+    parts.push(`<line x1="${padL}" y1="${panelTop + panelH / 2}" x2="${W - padR}" y2="${panelTop + panelH / 2}" stroke="#334155" stroke-width="0.5" stroke-dasharray="2 3"/>`);
+    parts.push(`<text x="${(padL + 4).toFixed(1)}" y="${(panelTop + 10).toFixed(1)}" fill="#06b6d4" font-size="10" font-family="ui-monospace,monospace">Fisher Transform</text>`);
+    // Map fisher values to panel Y — clamp to ±3 for a stable panel scale
+    const fisherToPanelY = (fv) => {
+      const clamped = Math.max(-3, Math.min(3, fv));
+      return panelTop + panelH * (1 - (clamped + 3) / 6);
+    };
+    const pts = [];
+    for (let i = 0; i < fisherSeries.length; i++) {
+      const v = fisherSeries[i];
+      if (v == null || !isFinite(v)) continue;
+      pts.push(`${x(Number(candles[i][0])).toFixed(1)},${fisherToPanelY(v).toFixed(1)}`);
+    }
+    if (pts.length >= 2) {
+      parts.push(`<polyline points="${pts.join(' ')}" fill="none" stroke="#06b6d4" stroke-width="1.5" opacity="0.9"/>`);
+    }
   }
 
   // Target reference lines (current sell / buy / stop from live sleeves).
