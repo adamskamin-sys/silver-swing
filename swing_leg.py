@@ -407,6 +407,8 @@ class SwingTrader:
                 ss.resting_stop_stage = None
                 ss.state = SleeveStateEnum.ARMED_BUY
                 ss.armed_buy_since_ts = _time_recon.time()
+                # Adam 2026-07-15: same cycle-state reset as the tick path.
+                self._reset_cycle_state_post_sell(ss)
             elif status in ("CANCELLED", "EXPIRED"):
                 # External cancel — clear so _maintain_resting_stop places
                 # a fresh one next tick (if the sleeve gets ticked at all)
@@ -3525,6 +3527,38 @@ class SwingTrader:
             new_stop_loss_px=float(own_avg),
         )
 
+    def _reset_cycle_state_post_sell(self, ss: SleeveState) -> None:
+        """Adam 2026-07-15: reset every cycle-scoped state field so cycle
+        N+1 doesn't inherit cycle N's HWM / trail flags / buy-trail state.
+
+        Mirrors what _sleeve_on_fill's SELL branch does (lines 4930+). The
+        resting-stop credit paths (tick + reconcile + dedup-skip) previously
+        cleared ONLY resting_stop_* + own_avg_entry, missing:
+          * trail_armed / trail_high_water_price → chip on cockpit kept
+            showing the prior cycle's ratcheted trail level, but the actual
+            resting stop on Coinbase was placed at the fresh cycle's
+            hard_bottom (way lower). Display/reality divergence + real
+            under-protection on the next cycle.
+          * stop_loss_hwm → the ratchet lift stayed applied, so effective
+            stop-loss appeared to be at the prior HWM, but new-cycle mark
+            couldn't validate that placement (sanity check refused, kept
+            the wide fallback stop from arm time).
+          * hybrid_sell_triggered_ts → old timeout window carried into the
+            next cycle
+          * buy_trail_armed / buy_trail_low_water → any pending buy-trail
+            from a prior arm-buy leg carried into next arm-sell leg
+
+        Centralised so all four call sites (tick success, reconcile success,
+        dedup-skip, and any future path) reset identically. If _sleeve_on_fill's
+        SELL branch adds/removes fields, this helper needs matching updates.
+        """
+        ss.trail_armed = False
+        ss.trail_high_water_price = 0.0
+        ss.hybrid_sell_triggered_ts = None
+        ss.buy_trail_armed = False
+        ss.buy_trail_low_water = 0.0
+        ss.stop_loss_hwm = None
+
     def _credit_stop_fill(self, sc: SleeveConfig, ss: SleeveState,
                           fill_price: float, filled_qty: int,
                           source: str, oid: Optional[str] = None) -> bool:
@@ -3579,6 +3613,8 @@ class SwingTrader:
                 ss.resting_stop_stage = None
                 ss.state = SleeveStateEnum.ARMED_BUY
                 ss.armed_buy_since_ts = _time_dedup.time()
+                # Reset cycle-scoped state too (mirror the successful-credit path)
+                self._reset_cycle_state_post_sell(ss)
                 return False
         if fill_price is None or fill_price <= 0:
             self._record("resting_stop_credit_fill_price_missing",
@@ -3711,6 +3747,13 @@ class SwingTrader:
             ss.resting_stop_stage = None
             ss.state = SleeveStateEnum.ARMED_BUY
             ss.armed_buy_since_ts = _time.time()
+            # Adam 2026-07-15 CRITICAL: reset cycle-scoped state so cycle N+1
+            # doesn't inherit cycle N's HWM/trail flags. Mirror what
+            # _sleeve_on_fill SELL branch does. Skipping this caused HYP
+            # cycle-3 stop-chip to show cycle-2's ratcheted $68.566 while
+            # the actual Coinbase resting stop was $65.18 (way lower) —
+            # display divergence + real under-protection.
+            self._reset_cycle_state_post_sell(ss)
             self._save_state()
             return
         if status in ("CANCELLED", "EXPIRED"):
