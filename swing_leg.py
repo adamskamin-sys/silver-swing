@@ -2249,6 +2249,14 @@ class SwingTrader:
             self._reeval_expire(sc, ss, dec)
             return
 
+    # Adam 2026-07-15: min drift required before reeval will burn a
+    # cancel-replace cycle. Below this threshold, the ~200ms coverage gap
+    # between cancel-ack and place-ack isn't worth the risk of missing a
+    # fill. Confirmed via diag_missed_fills.py: 2 verified in-gap misses
+    # (HYP $66.91 at 08:32, ZEC $554.20 at 08:44) traced to churn where
+    # the new_buy_px was within 0.1% of the current.
+    _REEVAL_MIN_DRIFT_PCT: float = 0.25
+
     def _reeval_cancel_replace(self, sc, ss, dec, last_price: float) -> None:
         """CANCEL-first-CONFIRM-then-PLACE. Anti-thrash reset. Persist
         both in-memory and Redis. Uses shared arm_level helper so the
@@ -2273,6 +2281,26 @@ class SwingTrader:
                 pass
         except Exception:
             new_buy_px = float(dec.new_buy_px)
+
+        # Adam 2026-07-15: min-drift gate — skip cancel-replace if the new
+        # price is basically the same as the current resting price. The
+        # cancel-then-place cycle takes ~200ms during which we're not on
+        # the book; if the market wicks in that gap we miss the fill.
+        # Verified via diag_missed_fills.py: 2 confirmed in-gap misses
+        # from churn where new_buy_px differed by <0.1%.
+        current_buy_px = float(sc.buy_px or 0)
+        if current_buy_px > 0:
+            drift_pct = abs(float(new_buy_px) - current_buy_px) / current_buy_px * 100
+            if drift_pct < self._REEVAL_MIN_DRIFT_PCT:
+                self._record(
+                    "reentry_reeval_replace_skipped_below_drift",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    current_buy_px=current_buy_px, new_buy_px=float(new_buy_px),
+                    drift_pct=round(drift_pct, 4),
+                    threshold_pct=self._REEVAL_MIN_DRIFT_PCT,
+                    reeval_action=getattr(dec, "action", None),
+                )
+                return
 
         # WS1 dedup lock (Tier 1 #2)
         try:
