@@ -1647,6 +1647,15 @@ class SwingTrader:
         if ss.live_order_id:
             return
 
+        # Gate 1a — Option B anchor-aware skip: defensive sleeves anchored
+        # to Your Contract Avg are intentionally static (protecting cost
+        # basis). Auto-refresh would drift them off the cost anchor over
+        # time, defeating the "protect the core" purpose. Only refresh
+        # sleeves anchored to current_market / custom / strategy_entry.
+        anchor = str(getattr(sc, "anchor_type", "current_market")).lower()
+        if anchor == "your_contract_avg":
+            return
+
         # Gate 2: staleness — don't fire on freshly-armed sleeves.
         import time as _t
         now = _t.time()

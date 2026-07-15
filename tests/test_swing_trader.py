@@ -457,6 +457,9 @@ def _config_with_sleeve_stop_loss(mode, custom=0, trigger=60.0, core=0):
             "stop_loss_px": trigger,
             "stop_loss_qty_mode": mode,
             "stop_loss_qty_custom": custom,
+            # Test asserts HALTED behavior — explicitly opt out of the
+            # 2026-07-15 default reanchor-on-trigger=True.
+            "stop_loss_reanchor_on_trigger": False,
         }],
     }
 

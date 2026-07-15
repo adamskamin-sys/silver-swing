@@ -98,6 +98,16 @@ class SleeveConfig:
     # opt-out; only new-sleeve defaults change.
     stop_loss_reanchor_on_trigger: bool = True
 
+    # 2026-07-15: which anchor the user picked when configuring this sleeve.
+    # Determines whether Phase 2 auto-refresh (arm_level.pullback_buy_px)
+    # applies. Defensive sleeves anchored to "your_contract_avg" are
+    # intentionally static — their sell target is meant to stay above the
+    # user's cost basis, and auto-refreshing would drift them off that anchor.
+    # Values: "current_market" (default — allow auto-refresh), "your_contract_avg"
+    # (defensive — SKIP auto-refresh), "custom" (allow auto-refresh),
+    # "strategy_entry" (allow auto-refresh).
+    anchor_type: str = "current_market"
+
     # Safety cap: after N consecutive stop-out cycles without a winning
     # round-trip in between, halt the sleeve for manual review. Protects
     # against reanchor+stop chains during multi-day bleeds. 0 = unlimited.
@@ -454,7 +464,8 @@ class SleeveConfig:
             stop_loss_ratchet_enabled=bool(d.get("stop_loss_ratchet_enabled") or False),
             stop_loss_ratchet_distance=float(d.get("stop_loss_ratchet_distance") or 1.50),
             stop_loss_ratchet_activation=float(d.get("stop_loss_ratchet_activation") or 0.50),
-            stop_loss_reanchor_on_trigger=bool(d.get("stop_loss_reanchor_on_trigger") or False),
+            stop_loss_reanchor_on_trigger=bool(d.get("stop_loss_reanchor_on_trigger", True)),
+            anchor_type=str(d.get("anchor_type") or "current_market"),
             stop_loss_max_consecutive=int(d.get("stop_loss_max_consecutive") or 0),
             reentry_mode=str(d.get("reentry_mode") or "off"),
             reentry_range_contraction=float(d.get("reentry_range_contraction") or 0.5),
