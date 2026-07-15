@@ -141,13 +141,30 @@ def main() -> None:
             snapped_px = _snap_to_tick(c["buy_px"], tick_size) if tick_size > 0 else c["buy_px"]
             print(f"\n  {symbol}/{sid}: tick_size=${tick_size}, "
                   f"raw=${c['buy_px']:.6f} → snapped=${snapped_px:.6f}")
+            # Idempotency: re-check the state RIGHT before placing. If another
+            # process (or a bot tick) already placed an order, don't duplicate.
+            state_now = store.get_state(TENANT, symbol) or {}
+            ss_now = (state_now.get("sleeves") or {}).get(sid, {})
+            if ss_now.get("live_order_id"):
+                print(f"    SKIP: sleeve now has live_order_id={ss_now.get('live_order_id')} "
+                      "(order was placed since scan — no duplicate)")
+                continue
             print(f"    placing BUY {c['qty']} @ ${snapped_px:.6f}...")
             result = broker.place_limit(side="BUY", qty=c["qty"], price=snapped_px)
+            # CoinbaseBroker.place_limit returns the order_id as a plain string
+            # (per broker.py signature: -> str). Handle both string and dict.
             oid = None
-            if isinstance(result, dict):
+            if isinstance(result, str) and result.strip():
+                oid = result.strip()
+            elif isinstance(result, dict):
                 oid = result.get("order_id") or result.get("id")
             if not oid:
-                print(f"    ERROR: place_limit returned no order_id: {result}")
+                print(f"    ERROR: place_limit returned unexpected type/value: "
+                      f"{type(result).__name__}={result}")
+                print(f"    ⚠️  ORDER MAY HAVE BEEN PLACED AT COINBASE — check the")
+                print(f"       Coinbase dashboard OR the bot's next reconciliation")
+                print(f"       (runs every 60s). If an order exists there, run:")
+                print(f"       python3 diag_sync_order_id.py {symbol} {sid} <order_id>")
                 failed += 1
                 continue
             # Update state
