@@ -3107,6 +3107,90 @@ class SwingTrader:
                 ss.resting_stop_stage = None
         # target_px <= current_px → never lower (ratchet-up-only invariant)
 
+    def _maybe_reconcile_orphan_position(self, sc: SleeveConfig, ss: SleeveState) -> None:
+        """Adam 2026-07-15: if a sleeve is ARMED_BUY but a Coinbase position
+        exists that no sleeve claims, adopt it: set own_avg_entry from broker
+        and flip state to ARMED_SELL so the sleeve manages the exit properly.
+
+        Fixes the confusing state where:
+          - Position: 1 LONG at $553.50 (from a prior sleeve or a manual
+            entry)
+          - Sleeve state: ARMED_BUY at $556.20 (wanting to buy MORE)
+          - Sleeve own_avg_entry: None (doesn't know it owns anything)
+          - Dashboard unrealized: $0.00 (because own_avg_entry is None)
+          - _sleeve_arm safety: refuses the buy (position full)
+          - Result: position sitting unmanaged by any sleeve state machine,
+            unrealized displays wrong, "trigger down while LONG" UX
+
+        Only fires when the position is UNCLAIMED — checks that no other
+        sleeve on this product has own_avg_entry set. Safety-tight: if any
+        other sleeve owns even 1 contract, we don't adopt. Prevents two
+        sleeves from claiming the same position.
+        """
+        # Preconditions
+        if ss.state != SleeveStateEnum.ARMED_BUY:
+            return
+        if ss.own_avg_entry is not None:
+            return  # Already owns something — don't adopt more
+        # Broker position
+        try:
+            pos_qty = int(self.b.position_qty() or 0)
+        except Exception:
+            return
+        if pos_qty <= 0:
+            return  # Nothing to adopt
+        # Sum qty claimed by OTHER sleeves on this product
+        claimed_qty = 0
+        for other_id, other_ss in (self.s.sleeves or {}).items():
+            if other_id == sc.id:
+                continue
+            if other_ss.own_avg_entry is not None:
+                # Use configured qty as the claim size — matches how the
+                # position-full safety accounts for sleeve claims.
+                other_sc = None
+                if hasattr(self, "_sleeve_cfg_by_id"):
+                    try:
+                        other_sc = self._sleeve_cfg_by_id(other_id)
+                    except Exception:
+                        other_sc = None
+                claimed_qty += int(getattr(other_sc, "qty", 1) if other_sc else 1)
+        core_qty = int(getattr(self.cfg, "core_qty", 0) or 0)
+        # Unclaimed portion of the current position available to adopt
+        unclaimed_qty = pos_qty - claimed_qty - core_qty
+        if unclaimed_qty <= 0:
+            return
+        # Read broker position avg entry — the price we adopt at
+        try:
+            avg = float((self.b.position or None).avg_entry or 0)
+        except Exception:
+            avg = 0.0
+        if avg <= 0:
+            return
+        # Cancel any pending buy order — sleeve state changing to ARMED_SELL,
+        # buy is meaningless
+        old_oid = ss.live_order_id
+        if old_oid:
+            try:
+                self.b.cancel(old_oid)
+            except Exception as e:
+                self._record("sleeve_orphan_reconcile_cancel_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             oid=old_oid, error=str(e))
+                # Continue anyway — worst case is a stale buy order that the
+                # position-full safety will refuse on any trigger
+        # Adopt: set own_avg_entry + flip state
+        ss.own_avg_entry = float(avg)
+        ss.state = SleeveStateEnum.ARMED_SELL
+        ss.live_order_id = None  # will re-arm SELL on next tick
+        self._save_state()
+        self._record(
+            "sleeve_orphan_position_adopted",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            position_qty=pos_qty, claimed_by_others=claimed_qty,
+            unclaimed_qty=unclaimed_qty, core_qty=core_qty,
+            adopted_avg=float(avg),
+        )
+
     def _sleeve_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
         """Independent state machine for one additional sleeve. Shares broker,
         position, and floor guard with siblings and with the primary strategy."""
@@ -3115,6 +3199,13 @@ class SwingTrader:
 
         # Track price for volatility signal & update HWM for ratcheting stop.
         self._sleeve_track_price(sc, last_price)
+
+        # [Adam 2026-07-15] Auto-adopt orphan position — if we hold contracts
+        # but the sleeve thinks it's waiting to buy, flip state to ARMED_SELL
+        # so the sleeve manages the exit + unrealized display is accurate.
+        # Runs before ratchet-stop so ss.state is correct when maintenance
+        # decides what to do.
+        self._maybe_reconcile_orphan_position(sc, ss)
 
         # [Adam 2026-07-15] Three-stage Coinbase resting stop-limit ratchet.
         # Runs BEFORE the trigger-check paths so a fresh HWM tick propagates
