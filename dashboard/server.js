@@ -864,6 +864,48 @@ export function makeApp({
     }
   });
 
+  // Adam 2026-07-15: EXPERTS SAY preview. Surfaces the latest reeval
+  // decision per sleeve (either shadow-mode "would_action" or expert-mode
+  // real "action") so the dashboard can show what the experts want to do
+  // WITHOUT flipping to expert mode. Returns { [sleeveId]: {action, new_buy_px,
+  // why, mode, ts, sleeve_name} }.
+  app.get('/api/reeval_shadow', requireAuth, async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit || '5000', 10), 10000);
+    try {
+      const events = await tailJsonl(tradeLogPath, limit);
+      const latest = {};
+      // Walk oldest → newest, overwrite so we end with the latest per sleeve.
+      for (const e of events) {
+        if (!e || !e.event_type) continue;
+        const t = e.event_type;
+        // Both event families carry the sleeve_id and enough to render.
+        // reentry_reeval_shadow_action: shadow mode — has would_action / would_new_buy_px
+        // reentry_reeval_decision: any mode — has action / new_buy_px
+        if (t !== 'reentry_reeval_shadow_action' && t !== 'reentry_reeval_decision') continue;
+        const sid = e.sleeve_id;
+        if (!sid) continue;
+        // For decision events, only keep non-hold to keep the UI signal-noise
+        // ratio low. Shadow_action events are already filtered upstream to
+        // non-hold, so keep them all.
+        const action = e.would_action || e.action;
+        if (!action) continue;
+        latest[sid] = {
+          action: String(action),
+          new_buy_px: Number(e.would_new_buy_px ?? e.new_buy_px) || null,
+          old_buy_px: Number(e.old_buy_px) || null,
+          why: e.why || '',
+          mode: e.mode || (t === 'reentry_reeval_shadow_action' ? 'shadow' : 'expert'),
+          ts: Number(e.ts) || 0,
+          sleeve_name: e.sleeve_name || null,
+          symbol: e.symbol || null,
+        };
+      }
+      res.json({ ok: true, latest });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // Filtered fills for chart annotation. Returns each sleeve_order_filled
   // (or primary order_filled) event for a specific product, mapped to
   // {ts, side, price, qty}. Side derived from the leg field: ARMED_SELL →
