@@ -1161,6 +1161,13 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           const revBadge = revArmed
             ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="Reversal watch armed — a crash flatten would log a shadow short signal (paper-only, no live order)">↺</span>`
             : '';
+          // Trail-active badge — sleeve is actively riding a trailing stop
+          // (hybrid trail armed OR ratcheting stop-loss climbing). Green
+          // because it's a profit-lock state.
+          const trailInfo = r.kind === 'futures' ? productTrailActiveInfo(liveTenant, r.product) : null;
+          const trailBadge = trailInfo
+            ? ` <span class="ck-chip ck-ok" style="font-size:0.7em;padding:1px 4px" title="${escapeHtml(trailInfo.kind === 'trail' ? 'HYBRID TRAIL' : 'RATCHET STOP')} ACTIVE — ${trailInfo.sleeveName} · HWM $${fmtPrice(trailInfo.hwm)} · effective stop $${fmtPrice(trailInfo.stopPx)} (distance $${fmtPrice(trailInfo.dist)}). Sells when mark drops to the effective stop.">🔒 TRAIL $${fmtPrice(trailInfo.stopPx)}</span>`
+            : '';
           // Average-down signal — 🟢 when the expert stack says "this is the
           // one to add to." 🟡 when watching but not all conditions met. See
           // avg_down_signal.py — requires mean-revert regime + at channel
@@ -1171,7 +1178,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
             : adLight === 'amber'
               ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="AVG-DOWN AMBER — watching, but not all conditions met yet (regime, floor, calm, or below-avg missing)">🟡</span>`
               : '';
-          return sideText + revBadge + adBadge;
+          return sideText + revBadge + adBadge + trailBadge;
         })()}</td>
         <td class="mono">${qtyText}</td>
         <td class="mono">${avgText}</td>
@@ -1575,6 +1582,47 @@ function productHasReversalArmed(tenant, productId) {
   if (!block) return false;
   const sleeves = block.config?.sleeves || [];
   return sleeves.some(s => s && s.reversal_enabled === true);
+}
+
+// Trail-active detector for the portfolio row badge. Returns:
+//   null          — no sleeve on this product has an active trail
+//   { hwm, dist } — HWM (running high-water mark) + effective trail distance
+//                   from the sleeve state; the caller renders "TRAIL @ $X"
+// A sleeve has "active trail" when trail_armed=true in its state. For
+// ratcheting stops the effective stop rides at HWM - stop_loss_ratchet_distance.
+// For hybrid-trail exits it rides at HWM - trail_distance. We pick whichever
+// yields the tighter (higher) stop for a long — that's what will fire first.
+function productTrailActiveInfo(tenant, productId) {
+  const block = currentStore?.[tenant]?.[productId];
+  if (!block) return null;
+  const sleeves = Array.isArray(block.config?.sleeves) ? block.config.sleeves : [];
+  const sleeveStates = (block.state || {}).sleeves || {};
+  let best = null;  // pick the tightest (highest) trail stop across sleeves
+  for (const s of sleeves) {
+    const ss = sleeveStates[s.id] || {};
+    // Two independent trails can fire on a sleeve:
+    //   (a) hybrid exit trail — ss.trail_armed=true, distance from ss.trail_high_water_price
+    //   (b) ratcheting stop-loss — ss.stop_loss_hwm set, effective = hwm - ratchet_distance
+    // Both mean "we're locking in gains as price runs." Show whichever is tighter.
+    const trailArmed = ss.trail_armed === true;
+    const hwm = Number(ss.trail_high_water_price) || 0;
+    const trailDist = Number(s.trail_distance) || 0;
+    if (trailArmed && hwm > 0 && trailDist > 0) {
+      const stopPx = hwm - trailDist;
+      if (best === null || stopPx > best.stopPx) {
+        best = { stopPx, hwm, dist: trailDist, kind: 'trail', sleeveName: s.name || s.id };
+      }
+    }
+    const slHwm = Number(ss.stop_loss_hwm) || 0;
+    const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
+    if (s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
+      const stopPx = slHwm - ratchetDist;
+      if (best === null || stopPx > best.stopPx) {
+        best = { stopPx, hwm: slHwm, dist: ratchetDist, kind: 'ratchet', sleeveName: s.name || s.id };
+      }
+    }
+  }
+  return best;
 }
 
 // Next price that would fire a sleeve action on this product — the closest
