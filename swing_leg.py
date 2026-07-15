@@ -1867,20 +1867,26 @@ class SwingTrader:
         if ss.live_order_id:
             return
 
-        # CRITICAL SAFETY (2026-07-15): don't over-accumulate. If sleeve is
-        # ARMED_BUY but Coinbase already shows a position we own, the sleeve
-        # state is stale (should be ARMED_SELL) — reconciliation, not a new
-        # BUY, is the correct fix. Placing another BUY here would double-
-        # count. Adam observed 3 ZEC contracts when sleeve qty=1 because
-        # this guard didn't exist.
+        # CRITICAL SAFETY (2026-07-15): don't over-accumulate. Multi-sleeve
+        # setups are legit — Adam runs multiple sleeves on ZEC (Model B +
+        # Custom × 2 = 3 contracts total is CORRECT, not an accumulation
+        # bug). The check must compare against SUM of all sleeves' intended
+        # qty + tenant core_qty, not just this individual sleeve.
         if side == "BUY":
             try:
                 current_pos = int(self.b.position_qty() or 0)
-                # If we already hold at-or-above the sleeve's intended qty
-                # (plus any core position on this product), don't add more.
-                # Compare against sc.qty + tenant core_qty (the "protect the
-                # core" invariant means position can legitimately be > qty).
-                intended_position = int(getattr(sc, "qty", 1) or 1) + int(
+                # Sum every sleeve on this product's qty
+                total_sleeve_qty = 0
+                for other_ss in (self.s.sleeves or {}).values():
+                    other_sc = self._sleeve_cfg_by_id(other_ss.id) if hasattr(
+                        self, "_sleeve_cfg_by_id") else None
+                    if other_sc is None:
+                        # Fallback: assume every armed sleeve wants its own qty
+                        # (this sleeve's qty as best estimate)
+                        total_sleeve_qty += int(getattr(sc, "qty", 1) or 1)
+                    else:
+                        total_sleeve_qty += int(getattr(other_sc, "qty", 1) or 1)
+                intended_position = total_sleeve_qty + int(
                     getattr(self.cfg, "core_qty", 0) or 0)
                 if current_pos >= intended_position:
                     self._record(
@@ -1888,7 +1894,9 @@ class SwingTrader:
                         sleeve_id=sc.id, sleeve_name=sc.name,
                         current_position=current_pos,
                         intended_position=intended_position,
-                        reason="already at-or-above target position; ghost arm would over-accumulate",
+                        total_sleeve_qty=total_sleeve_qty,
+                        core_qty=int(getattr(self.cfg, "core_qty", 0) or 0),
+                        reason="portfolio position >= sum(all sleeve qtys) + core; ghost arm would over-accumulate",
                     )
                     ss._last_ghost_arm_ts = now
                     return
