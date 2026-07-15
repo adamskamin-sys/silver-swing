@@ -1107,10 +1107,17 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
     const qtyText = r.kind === 'spot' ? fmtNum(r.qty, 6) : r.qty;
     const avgText = r.avg > 0 ? '$' + fmtPrice(r.avg) : '—';
     const markText = r.mark > 0 ? '$' + fmtPrice(r.mark) : '—';
-    const trig = r.kind === 'futures' ? nextTriggerForProduct(liveTenant, r.product, r.mark) : null;
-    const triggerText = trig
-      ? `<span class="mono ${trig.side === 'SELL' ? 'pos' : 'neg'}" title="Sleeve fires ${trig.side} at this price">${trig.side === 'SELL' ? '↑' : '↓'} $${fmtPrice(trig.px)}</span>`
-      : '<span class="dim">—</span>';
+    const trig = r.kind === 'futures' ? nextTriggerForProduct(liveTenant, r.product, r.mark, r.qty) : null;
+    let triggerText;
+    if (!trig) {
+      triggerText = '<span class="dim">—</span>';
+    } else if (trig.blocked) {
+      // Sleeve is ARMED_BUY but position >= sum_sleeve_qtys + core_qty →
+      // _sleeve_arm safety refuses the fill. Show grayed with explanation.
+      triggerText = `<span class="dim mono" title="Sleeve would fire BUY at $${fmtPrice(trig.px)} — but position is FULL. Safety net (sleeve_arm) refuses the buy to prevent over-accumulation. Ratchet-stop protects the existing position.">🚫 ↓ $${fmtPrice(trig.px)}</span>`;
+    } else {
+      triggerText = `<span class="mono ${trig.side === 'SELL' ? 'pos' : 'neg'}" title="Sleeve fires ${trig.side} at this price">${trig.side === 'SELL' ? '↑' : '↓'} $${fmtPrice(trig.px)}</span>`;
+    }
     const liqText = r.liq > 0 ? '$' + fmtPrice(r.liq) : '—';
     const cycles = r.kind === 'futures' ? totalCyclesForProduct(r.product, liveTenant) : 0;
     const cyclesText = cycles > 0
@@ -1650,15 +1657,28 @@ function productTrailActiveInfo(tenant, productId) {
 // Next price that would fire a sleeve action on this product — the closest
 // trigger across all active sleeves, so the row shows "what has to happen for
 // something to change." ARMED_SELL → the sell price (trail floor if armed,
-// else sell_px). ARMED_BUY → buy_px. Returns { px, side } or null if nothing
-// is armed. Multi-sleeve: picks the trigger closest to mark (fires first).
-function nextTriggerForProduct(tenant, productId, mark) {
+// else sell_px). ARMED_BUY → buy_px. Returns { px, side, blocked } or null.
+// Multi-sleeve: picks the trigger closest to mark (fires first).
+//
+// Adam 2026-07-15: added `blocked` flag for ARMED_BUY triggers when the
+// position is already >= sum_sleeve_qtys + core_qty. In that case the
+// _sleeve_arm safety net (commits 8214ebc + 8d29287) refuses the buy —
+// so a "sleeve fires BUY at $X" tooltip is misleading. The UI dims the
+// trigger to reflect the true behavior. Prevents the "why is trigger down
+// while we're LONG?" confusion Adam raised on ZEC.
+function nextTriggerForProduct(tenant, productId, mark, positionQty = 0) {
   const block = currentStore?.[tenant]?.[productId];
   if (!block) return null;
   const sleeves = Array.isArray(block.config?.sleeves) ? block.config.sleeves : [];
   if (!sleeves.length) return null;
   const sleeveStates = (block.state || {}).sleeves || {};
   const m = Number(mark) || 0;
+  // Compute "position full" once — sum of all sleeve qtys + core_qty.
+  // If Coinbase position >= this, a fresh BUY on any sleeve would be
+  // refused by the sleeve_arm safety net.
+  const sumSleeveQtys = sleeves.reduce((sum, x) => sum + (Number(x.qty) || 1), 0);
+  const coreQty = Number(block.config?.core_qty) || 0;
+  const positionFull = Number(positionQty) >= sumSleeveQtys + coreQty;
   let best = null;
   for (const s of sleeves) {
     const ss = sleeveStates[s.id] || {};
@@ -1666,6 +1686,7 @@ function nextTriggerForProduct(tenant, productId, mark) {
     if (st === 'HALTED') continue;
     let px = 0;
     let side = '';
+    let blocked = false;
     if (st === 'ARMED_SELL') {
       const peak = Number(ss.trail_high_water_price) || 0;
       const trailDist = Number(s.trail_distance) || 0;
@@ -1679,12 +1700,13 @@ function nextTriggerForProduct(tenant, productId, mark) {
     } else if (st === 'ARMED_BUY') {
       px = Number(s.buy_px) || 0;
       side = 'BUY';
+      blocked = positionFull;
     }
     if (!(px > 0)) continue;
     const dist = m > 0 ? Math.abs(px - m) : px;
-    if (best === null || dist < best.dist) best = { px, side, dist };
+    if (best === null || dist < best.dist) best = { px, side, dist, blocked };
   }
-  return best ? { px: best.px, side: best.side } : null;
+  return best ? { px: best.px, side: best.side, blocked: !!best.blocked } : null;
 }
 
 function totalRealizedForProduct(productId, tenantFilter) {
