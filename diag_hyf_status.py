@@ -146,6 +146,54 @@ def main() -> None:
     except Exception as e:
         print(f"    ✗ trade log read failed: {e}")
 
+    # Step 7: can we actually reach HYF via Coinbase?
+    print(f"\n[7] COINBASE product spec + ticker for {product_id}:")
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        b = CoinbaseBroker(BrokerConfig(product_id=product_id))
+        try:
+            spec = b.contract_spec()
+            print(f"    ✓ contract_spec OK: {spec}")
+        except Exception as e:
+            print(f"    ✗ contract_spec FAILED: {type(e).__name__}: {e}")
+            print(f"      → product_id may not exist on Coinbase, or spec fetch is broken")
+        try:
+            snap = b.snapshot()
+            bid = snap.get("best_bid")
+            ask = snap.get("best_ask")
+            mark = snap.get("last_mark") or snap.get("mark")
+            print(f"    ✓ snapshot: bid={bid} ask={ask} mark={mark}")
+        except Exception as e:
+            print(f"    ✗ snapshot FAILED: {type(e).__name__}: {e}")
+        try:
+            pos = b.position_qty()
+            print(f"    ✓ position_qty: {pos}")
+        except Exception as e:
+            print(f"    ✗ position_qty FAILED: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"    ✗ broker init FAILED: {type(e).__name__}: {e}")
+        print(f"      → the _Track constructor would fail too, sleeve can never tick")
+
+    # Step 8: WebSocket first-tick test — does the feed even produce data?
+    print(f"\n[8] WEBSOCKET FEED test (5s wait for first tick):")
+    try:
+        from feed import LiveTickerFeed
+        feed = LiveTickerFeed(product_id, subscribe_l2=False, subscribe_trades=False)
+        feed.start()
+        got_tick = feed.wait_for_first_tick(timeout=5.0)
+        if got_tick:
+            t = feed.latest_ticker()
+            print(f"    ✓ first tick received: {t}")
+        else:
+            print(f"    ✗ NO TICK within 5s")
+            print(f"      → this is what kills the track in main.py:978 —")
+            print(f"        track.start() returns False, track is silently discarded,")
+            print(f"        sleeve never runs. Check FEED_READY_TIMEOUT ({os.getenv('SWING_FEED_READY_TIMEOUT', '?')})")
+            print(f"        and Render logs for [{product_id}] no ticks within Xs — skipping")
+        feed.stop()
+    except Exception as e:
+        print(f"    ✗ feed init/start FAILED: {type(e).__name__}: {e}")
+
     print("\n" + "=" * 78)
     print("DIAGNOSIS")
     print("=" * 78)
