@@ -6312,10 +6312,15 @@ async function loadScannerChart() {
     const cfg = liveTenant ? (currentStore[liveTenant]?.[product_id]?.config || {}) : {};
     const sleeves = Array.isArray(cfg.sleeves) ? cfg.sleeves : [];
     const targetLines = [];
+    // 2026-07-15 readability: short Coinbase-style labels. Color codes
+    // the side; the full sleeve name (which used to sprawl across 40%
+    // of the chart width) drops. If Adam ever runs multiple sleeves on
+    // one product we can add a sleeve suffix, but 1 sleeve/product is
+    // the common case.
     for (const s of sleeves) {
-      if (Number(s.sell_px) > 0) targetLines.push({ price: Number(s.sell_px), label: `sell (${s.name || s.id})`, color: '#22c55e' });
-      if (Number(s.buy_px) > 0) targetLines.push({ price: Number(s.buy_px), label: `buy (${s.name || s.id})`, color: '#3b82f6' });
-      if (s.stop_loss_enabled && Number(s.stop_loss_px) > 0) targetLines.push({ price: Number(s.stop_loss_px), label: `stop (${s.name || s.id})`, color: '#ef4444' });
+      if (Number(s.sell_px) > 0) targetLines.push({ price: Number(s.sell_px), label: 'SELL', color: '#22c55e' });
+      if (Number(s.buy_px) > 0) targetLines.push({ price: Number(s.buy_px), label: 'BUY', color: '#3b82f6' });
+      if (s.stop_loss_enabled && Number(s.stop_loss_px) > 0) targetLines.push({ price: Number(s.stop_loss_px), label: 'STOP', color: '#ef4444' });
     }
     renderCandleChart(data.candles || [], scannerDetailChart, {
       fills,
@@ -6400,12 +6405,35 @@ function renderCandleChart(candles, container, opts = {}) {
   const parts = [];
   parts.push(`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">`);
 
-  // Y-axis: 7 gridlines with tick-precision labels.
-  for (let i = 0; i <= 6; i++) {
-    const p = lo + (paddedRange * i / 6);
+  // 2026-07-15 readability B: "nice" Y-axis. Instead of dividing the range
+  // into 6 equal (arbitrary-decimal) slices, snap to human-readable step
+  // sizes (1, 2, 2.5, 5 × 10^n) — same approach Coinbase / most charting
+  // libraries use. Values like $65.00, $65.10, $65.20 instead of
+  // $64.8734, $65.0912, $65.3091.
+  function niceStep(rawStep) {
+    if (!isFinite(rawStep) || rawStep <= 0) return 1;
+    const exp = Math.floor(Math.log10(rawStep));
+    const mag = Math.pow(10, exp);
+    const norm = rawStep / mag;
+    let nice;
+    if (norm < 1.5) nice = 1;
+    else if (norm < 3) nice = 2;
+    else if (norm < 7) nice = 5;
+    else nice = 10;
+    return nice * mag;
+  }
+  const targetTicks = 6;
+  const step = niceStep(paddedRange / targetTicks);
+  const yStart = Math.ceil(lo / step) * step;
+  // Y-axis label precision: derive from the step, not tick_size —
+  // integer step should show integer labels, sub-cent step should show
+  // full decimals. Cap at 6 dp.
+  const stepDec = step >= 1 ? 0 : Math.min(6, Math.max(2, -Math.floor(Math.log10(step))));
+  for (let p = yStart; p <= hi; p += step) {
     const yy = y(p);
+    if (yy < padT || yy > padT + plotH) continue;
     parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="#1e2a3a" stroke-width="1" />`);
-    parts.push(`<text x="${padL - 8}" y="${(yy + 4).toFixed(1)}" fill="#8a99ac" font-size="12" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(yDec)}</text>`);
+    parts.push(`<text x="${padL - 8}" y="${(yy + 4).toFixed(1)}" fill="#8a99ac" font-size="12" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(stepDec)}</text>`);
   }
 
   // X-axis: 5 evenly-spaced time labels across the window.
@@ -6442,6 +6470,32 @@ function renderCandleChart(candles, container, opts = {}) {
     if (yy < padT || yy > padT + plotH) continue;
     parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="${t.color}" stroke-width="1" stroke-dasharray="4 3" opacity="0.75"/>`);
     parts.push(`<text x="${(W - padR - 4).toFixed(1)}" y="${(yy - 3).toFixed(1)}" fill="${t.color}" font-size="10" text-anchor="end" font-family="ui-monospace,monospace" opacity="0.9">${escapeHtml(t.label)} $${t.price.toFixed(yDec)}</text>`);
+  }
+
+  // 2026-07-15 readability C: current-price "you are here" line.
+  // Horizontal dotted line at the last candle's close + right-edge
+  // colored pill showing the live price. Same UX as Coinbase's chart.
+  // Uses last candle's close as the current price — dashboard polls
+  // the chart on each state refresh, so this stays current.
+  {
+    const lastCandle = candles[candles.length - 1];
+    if (lastCandle) {
+      const [, o, , , c] = lastCandle;
+      const nowPx = Number(c);
+      const nowY = y(nowPx);
+      if (nowY >= padT && nowY <= padT + plotH) {
+        const nowColor = c >= o ? '#22c55e' : '#ef4444';
+        // Dotted horizontal line across the plot.
+        parts.push(`<line x1="${padL}" y1="${nowY.toFixed(1)}" x2="${(W - padR).toFixed(1)}" y2="${nowY.toFixed(1)}" stroke="${nowColor}" stroke-width="1" stroke-dasharray="2 4" opacity="0.85"/>`);
+        // Right-edge pill with the live price.
+        const label = `$${nowPx.toFixed(stepDec)}`;
+        const pillW = Math.max(56, label.length * 7 + 12);
+        const pillX = W - padR - pillW;
+        const pillY = nowY - 9;
+        parts.push(`<rect x="${pillX.toFixed(1)}" y="${pillY.toFixed(1)}" width="${pillW}" height="18" rx="3" ry="3" fill="${nowColor}" opacity="0.95"/>`);
+        parts.push(`<text x="${(pillX + pillW / 2).toFixed(1)}" y="${(nowY + 4).toFixed(1)}" fill="#0b1220" font-size="11" text-anchor="middle" font-family="ui-monospace,monospace" font-weight="bold">${label}</text>`);
+      }
+    }
   }
 
   // Fill markers + cycle-connecting dashed lines.
