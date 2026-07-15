@@ -18,6 +18,7 @@ to a caller.
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -89,6 +90,16 @@ class CoinbaseBroker:
         # while HYP tick=0.01 requires 2 decimals. Cached lazily on first
         # _price_str call to avoid an extra API round-trip in __init__.
         self._tick_size_cache: Optional[float] = None
+        # Adam 2026-07-15 CRITICAL: per-broker (= per-product) SELL lock.
+        # Prevents TOCTOU race where two concurrent SELL submissions both
+        # pass _no_short_check because neither has filled yet when the other
+        # reads position_qty. CU 2026-07-15 12:34:34 double-fire race —
+        # resting stop + hybrid timeout both submitted a SELL 1 in the same
+        # second; both accepted; position went +1 LONG → -1 SHORT. This
+        # lock serializes the entire {read position + read open sells +
+        # submit} critical section per product so the second submission
+        # sees the first as already-pending.
+        self._sell_lock = threading.Lock()
         if client is not None:
             # Injected client (tests, or an already-authenticated instance)
             self.client = client
@@ -185,9 +196,6 @@ class CoinbaseBroker:
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
-        # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
-        if s == "SELL":
-            self._no_short_check(qty, kind="place_limit")
         method = self.client.limit_order_gtc_buy if s == "BUY" else self.client.limit_order_gtc_sell
         # [crew:#7] Accept a caller-supplied client_order_id. Coinbase dedupes on
         # this id, so a caller that persists it can safely retry an ambiguous
@@ -202,8 +210,16 @@ class CoinbaseBroker:
         }
         if post_only:
             kwargs["post_only"] = True
-        # CRITICAL — order placement always proceeds even under budget pressure.
-        resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
+        # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
+        # _sell_lock serializes _no_short_check + submit so concurrent SELLs
+        # can't both pass the check before either shows up as pending.
+        if s == "SELL":
+            with self._sell_lock:
+                self._no_short_check(qty, kind="place_limit")
+                # CRITICAL — order placement always proceeds even under budget pressure.
+                resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
+        else:
+            resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
         if resp.get("success"):
             oid = (resp.get("success_response") or {}).get("order_id")
             if oid:
@@ -220,17 +236,21 @@ class CoinbaseBroker:
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
-        # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
-        if s == "SELL":
-            self._no_short_check(qty, kind="place_market")
         method = self.client.market_order_buy if s == "BUY" else self.client.market_order_sell
         kwargs = {
             "client_order_id": client_order_id or str(uuid.uuid4()),  # [crew:#7] caller can supply for idempotent retry
             "product_id": self.cfg.product_id,
             "base_size": str(int(qty)),
         }
-        # CRITICAL — market orders always proceed (worth a 429 to hit the top).
-        resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
+        # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
+        # _sell_lock: {check + submit} atomic per product (see __init__ docstring).
+        if s == "SELL":
+            with self._sell_lock:
+                self._no_short_check(qty, kind="place_market")
+                # CRITICAL — market orders always proceed (worth a 429 to hit the top).
+                resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
+        else:
+            resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
         if resp.get("success"):
             oid = (resp.get("success_response") or {}).get("order_id")
             if oid:
@@ -258,8 +278,6 @@ class CoinbaseBroker:
         s = side.upper()
         if s not in ("BUY", "SELL"):
             raise ValueError(f"side must be BUY or SELL, got {side!r}")
-        if s == "SELL":
-            self._no_short_check(qty, kind="place_stop_limit")
         stop_dir = "STOP_DIRECTION_STOP_DOWN" if s == "SELL" else "STOP_DIRECTION_STOP_UP"
         cfg = {
             "stop_limit_stop_limit_gtc": {
@@ -273,12 +291,26 @@ class CoinbaseBroker:
         # Prefer explicit create_order (available on every SDK version). Some
         # SDKs also expose stop_limit_order_gtc_{buy,sell} convenience methods,
         # but create_order + order_configuration is the reliable path.
-        resp = _dump(self._rl_call(
-            Priority.CRITICAL, EndpointKind.PRIVATE,
-            self.client.create_order,
-            client_order_id=coid, product_id=self.cfg.product_id,
-            side=s, order_configuration=cfg,
-        ))
+        # Adam 2026-07-15: _sell_lock atomic {check + submit}. include_pending=
+        # False for stop-limit — see _no_short_check docstring (avoids ratchet
+        # cancel-then-place false-positives; double-fire prevented at swing_leg).
+        if s == "SELL":
+            with self._sell_lock:
+                self._no_short_check(qty, kind="place_stop_limit",
+                                     include_pending=False)
+                resp = _dump(self._rl_call(
+                    Priority.CRITICAL, EndpointKind.PRIVATE,
+                    self.client.create_order,
+                    client_order_id=coid, product_id=self.cfg.product_id,
+                    side=s, order_configuration=cfg,
+                ))
+        else:
+            resp = _dump(self._rl_call(
+                Priority.CRITICAL, EndpointKind.PRIVATE,
+                self.client.create_order,
+                client_order_id=coid, product_id=self.cfg.product_id,
+                side=s, order_configuration=cfg,
+            ))
         if resp.get("success"):
             oid = (resp.get("success_response") or {}).get("order_id")
             if oid:
@@ -286,12 +318,74 @@ class CoinbaseBroker:
         err = resp.get("error_response") or resp.get("failure_reason") or resp
         raise RuntimeError(f"place_stop_limit failed: {err}")
 
-    def _no_short_check(self, sell_qty: int, kind: str) -> None:
-        """Refuse a SELL whose qty > current LONG position. Prevents any
-        code path (trail exit, stop-loss, sleeve arm, manual sell) from
-        opening a short. Reads position from Coinbase — one HIGH-priority
-        API call per SELL. Fail-CLOSED: if position read fails, we still
-        refuse (fail-safe = don't accidentally short)."""
+    def _pending_sell_qty(self) -> int:
+        """Sum of qty across all OPEN SELL orders on this product, covering
+        every shape (limit_limit_gtc, stop_limit_stop_limit_gtc, market, …).
+        Used by _no_short_check to reject a new SELL that would — together
+        with orders already sitting on the book — exceed LONG position.
+
+        Fail-CLOSED: on exception, return a large sentinel so _no_short_check
+        refuses the sell (better to skip a sell than accidentally short).
+        One MEDIUM-priority API call. Kept broader than list_open_orders (which
+        filters to plain limits only for reconciliation purposes)."""
+        try:
+            resp = _dump(self._rl_call(
+                Priority.MEDIUM, EndpointKind.PRIVATE,
+                self.client.list_orders,
+                order_status=["OPEN"],
+                product_ids=[self.cfg.product_id],
+            ))
+        except Exception as e:
+            raise RuntimeError(
+                f"pending_sell_qty: list_orders failed ({e}); refusing to "
+                f"assume 0 pending (would let a concurrent SELL slip through)"
+            ) from e
+        total = 0
+        for o in (resp.get("orders") or []):
+            if str(o.get("side") or "").upper() != "SELL":
+                continue
+            cfg = o.get("order_configuration") or {}
+            qty = 0
+            # Walk every known shape until we find one with a base_size.
+            for shape in cfg.values():
+                if not isinstance(shape, dict):
+                    continue
+                bs = shape.get("base_size")
+                if bs is not None:
+                    try:
+                        qty = int(float(bs))
+                    except (TypeError, ValueError):
+                        qty = 0
+                    if qty > 0:
+                        break
+            total += max(qty, 0)
+        return total
+
+    def _no_short_check(self, sell_qty: int, kind: str,
+                        include_pending: bool = True) -> None:
+        """Refuse a SELL that would take the net position (LONG minus already-
+        pending SELLs) short. Prevents any code path (trail exit, stop-loss,
+        sleeve arm, manual sell, resting-stop double-fire) from opening a
+        short.
+
+        Reads position + pending-sell qty from Coinbase — two HIGH/MEDIUM
+        API calls per SELL. Fail-CLOSED: if either read fails, we refuse
+        (fail-safe = don't accidentally short).
+
+        Adam 2026-07-15 CRITICAL: caller MUST hold self._sell_lock across
+        this check + the submit call. Otherwise two concurrent SELLs can
+        both read the same pre-submit state and both pass. See CoinbaseBroker
+        __init__ docstring for the CU 2026-07-15 12:34:34 race that
+        motivated the lock.
+
+        include_pending: set False for place_stop_limit. Rationale: stop-
+        limits don't fire on placement (they wait for trigger price), so a
+        transient over-count of pending sells (the ratchet cancel-then-place
+        window where the old stop is still visible as OPEN) would false-
+        positive-refuse a legitimate ratchet replacement. Position check
+        still holds; the double-fire risk (resting-stop + market-sell
+        firing on same trigger) is prevented at the swing_leg layer via
+        the resting_stop_oid mutual-exclusion guards."""
         try:
             pos = int(self.position_qty() or 0)
         except Exception as e:
@@ -299,11 +393,18 @@ class CoinbaseBroker:
                 f"no_short_check: position read failed ({e}); refusing {kind} SELL {sell_qty} "
                 "to avoid accidental short"
             ) from e
-        # LONG position is positive. Short would be negative.
-        if int(sell_qty) > max(pos, 0):
+        if include_pending:
+            pending = self._pending_sell_qty()
+        else:
+            pending = 0
+        # Effective available = LONG minus what's already sitting on the book.
+        # Never negative (a short position is already past the invariant).
+        available = max(pos - pending, 0)
+        if int(sell_qty) > available:
             raise RuntimeError(
-                f"no_short_check: {kind} SELL {sell_qty} exceeds LONG position {pos} "
-                f"on {self.cfg.product_id} — refused (would net short)"
+                f"no_short_check: {kind} SELL {sell_qty} exceeds available {available} "
+                f"(pos={pos}, pending_sells={pending}) on {self.cfg.product_id} "
+                f"— refused (would net short)"
             )
 
     def order_status(self, order_id: str) -> dict:
