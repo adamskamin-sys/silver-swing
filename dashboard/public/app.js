@@ -6744,15 +6744,19 @@ function renderCandleChart(candles, container, opts = {}) {
   const plotH = H - padT - padB - volH;
   const volTop = padT + plotH + 4;
 
-  // Include fills in Y-axis range so markers are always visible even if
-  // they're outside the recent candle range (e.g., an old stop-loss below
-  // today's low).
+  // 2026-07-15 Coinbase-style Y-axis: scale to CANDLES ONLY. Prior version
+  // included target_lines in the range, which stretched the axis from $67
+  // (mark) to $62 (stop) — candles then squashed to tiny dashes. Coinbase +
+  // TradingView + every serious chart auto-scales to the visible price
+  // series; overlay lines render on top and get an "off-chart" edge label
+  // if they fall outside the plot area.
   let lo = Infinity, hi = -Infinity;
   for (const c of candles) {
     if (c[3] < lo) lo = c[3];
     if (c[2] > hi) hi = c[2];
   }
-  // Include Bollinger bands in Y-axis range so they never clip off-chart.
+  // Bollinger + KAMA are technical overlays on the price series — include
+  // them so they don't clip off-chart (they're always within a few % of price).
   if (bbSeries) {
     for (const v of bbSeries.upper) if (v != null && v > hi) hi = v;
     for (const v of bbSeries.lower) if (v != null && v < lo) lo = v;
@@ -6764,15 +6768,18 @@ function renderCandleChart(candles, container, opts = {}) {
   }
   const firstTs = Number(candles[0][0]) || 0;
   const lastTs = Number(candles[candles.length - 1][0]) || 0;
+  // Fills WITHIN the visible time window are included so BUY/SELL markers
+  // stay on-screen. Old fills outside the window are ignored — they'd render
+  // off-plot anyway.
   for (const f of fills) {
     if (!(Number(f.ts) >= firstTs && Number(f.ts) <= lastTs)) continue;
     if (f.price < lo) lo = f.price;
     if (f.price > hi) hi = f.price;
   }
-  for (const t of targetLines) {
-    if (t.price < lo) lo = t.price;
-    if (t.price > hi) hi = t.price;
-  }
+  // Target lines are DELIBERATELY excluded from the Y-axis range. If STOP
+  // is far below the current window, we render it as an edge label showing
+  // "STOP $65.18 ↓ 3.5%" at the bottom of the chart rather than stretching
+  // the axis and losing candle detail.
   if (lo === hi) { lo -= 0.5; hi += 0.5; }
   const range = hi - lo;
   // Pad top/bottom 5% so nothing sits flush against the axis.
