@@ -261,6 +261,53 @@ def main() -> None:
     for pid, rp in sorted(per_product_realized.items(), key=lambda x: -x[1]):
         print(f"     {pid:35s} realized=${rp:>8.2f}  cycles={per_product_cycles[pid]}")
 
+    # 6) EXPIRY + ROLL DETECTION (Adam 2026-07-15) — critical for CDE futures
+    # that roll monthly. If we're within 14 days of expiry, we should be
+    # migrating the sleeve to the next-generation product_id.
+    print(f"\n6) EXPIRY + ROLL DETECTION:")
+    all_details = _query_coinbase_futures_details()
+    if not all_details:
+        print("   (Coinbase futures-details fetch failed — check API creds)")
+    else:
+        # Only look at stored futures IDs (skip spots which don't expire)
+        futures_stored = [pid for pid in stored_ids
+                          if pid in all_details or "-CDE" in pid or "-INTX" in pid]
+        expiring_soon = []
+        needs_roll = []
+        healthy = []
+        for pid in sorted(futures_stored):
+            details = all_details.get(pid)
+            if not details:
+                continue
+            days = details.get("days_to_expiry")
+            candidates = _find_roll_candidates(pid, details, all_details)
+            if days is None:
+                healthy.append((pid, None, candidates))
+            elif days <= 3:
+                expiring_soon.append((pid, days, candidates))
+            elif days <= 14:
+                needs_roll.append((pid, days, candidates))
+            else:
+                healthy.append((pid, days, candidates))
+        if expiring_soon:
+            print(f"\n   🚨 EXPIRING WITHIN 3 DAYS — ROLL NOW ({len(expiring_soon)}):")
+            for pid, days, candidates in expiring_soon:
+                print(f"     {pid:35s} expires in {days}d")
+                for c in candidates[:2]:
+                    print(f"        → roll candidate: {c['product_id']} (expires in {c['days_to_expiry']}d)")
+        if needs_roll:
+            print(f"\n   ⚠  EXPIRING WITHIN 14 DAYS — plan roll ({len(needs_roll)}):")
+            for pid, days, candidates in needs_roll:
+                print(f"     {pid:35s} expires in {days}d")
+                for c in candidates[:2]:
+                    print(f"        → roll candidate: {c['product_id']} (expires in {c['days_to_expiry']}d)")
+        if healthy:
+            print(f"\n   ✓ HEALTHY (>14d to expiry or no expiry) ({len(healthy)}):")
+            for pid, days, candidates in healthy:
+                d_str = f"{days}d to expiry" if days is not None else "no expiry"
+                cand_str = f"  ({len(candidates)} roll candidates on book)" if candidates else ""
+                print(f"     {pid:35s} {d_str}{cand_str}")
+
 
 if __name__ == "__main__":
     main()
