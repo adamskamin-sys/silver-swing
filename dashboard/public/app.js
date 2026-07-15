@@ -6694,8 +6694,8 @@ function renderCandleChart(candles, container, opts = {}) {
   for (let p = yStart; p <= hi; p += step) {
     const yy = y(p);
     if (yy < padT || yy > padT + plotH) continue;
-    parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="#1e2a3a" stroke-width="1" />`);
-    parts.push(`<text x="${padL - 8}" y="${(yy + 4).toFixed(1)}" fill="#8a99ac" font-size="12" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(stepDec)}</text>`);
+    parts.push(`<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(1)}" stroke="#152030" stroke-width="0.5" opacity="0.8"/>`);
+    parts.push(`<text x="${padL - 8}" y="${(yy + 4).toFixed(1)}" fill="#8a99ac" font-size="11" text-anchor="end" font-family="ui-monospace,monospace">$${p.toFixed(stepDec)}</text>`);
   }
 
   // X-axis: 5 evenly-spaced time labels across the window.
@@ -6708,9 +6708,9 @@ function renderCandleChart(candles, container, opts = {}) {
     const anchor = i === 0 ? 'start' : (i === xTickCount - 1 ? 'end' : 'middle');
     const dateStr = d.toLocaleDateString([], { month: 'numeric', day: 'numeric' });
     const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    parts.push(`<line x1="${xx.toFixed(1)}" y1="${padT}" x2="${xx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="#0f1720" stroke-width="1"/>`);
-    parts.push(`<text x="${xx.toFixed(1)}" y="${(H - 20).toFixed(1)}" fill="#8a99ac" font-size="11" text-anchor="${anchor}" font-family="ui-monospace,monospace">${dateStr}</text>`);
-    parts.push(`<text x="${xx.toFixed(1)}" y="${(H - 6).toFixed(1)}" fill="#8a99ac" font-size="11" text-anchor="${anchor}" font-family="ui-monospace,monospace">${timeStr}</text>`);
+    parts.push(`<line x1="${xx.toFixed(1)}" y1="${padT}" x2="${xx.toFixed(1)}" y2="${(padT + plotH).toFixed(1)}" stroke="#0d1522" stroke-width="0.5" opacity="0.7"/>`);
+    parts.push(`<text x="${xx.toFixed(1)}" y="${(H - 20).toFixed(1)}" fill="#64748b" font-size="10" text-anchor="${anchor}" font-family="ui-monospace,monospace">${dateStr}</text>`);
+    parts.push(`<text x="${xx.toFixed(1)}" y="${(H - 6).toFixed(1)}" fill="#64748b" font-size="10" text-anchor="${anchor}" font-family="ui-monospace,monospace">${timeStr}</text>`);
   }
 
   // Candles.
@@ -6735,11 +6735,14 @@ function renderCandleChart(candles, container, opts = {}) {
       if (v > maxVol) maxVol = v;
     }
     if (maxVol > 0) {
-      // Volume panel background
-      parts.push(`<rect x="${padL}" y="${volTop}" width="${plotW}" height="${volH}" fill="#0a1119" opacity="0.5"/>`);
-      // Volume label
-      parts.push(`<text x="${(padL + 4).toFixed(1)}" y="${(volTop + 10).toFixed(1)}" fill="#64748b" font-size="10" font-family="ui-monospace,monospace">Volume</text>`);
-      // Volume bars — one per candle, colored by candle direction
+      // Volume panel background (subtle, Coinbase-style)
+      parts.push(`<rect x="${padL}" y="${volTop}" width="${plotW}" height="${volH}" fill="#080f18" opacity="0.4"/>`);
+      // Volume label — show last-candle volume Coinbase-style
+      const lastVol = Number(candles[candles.length - 1][5]) || 0;
+      parts.push(`<text x="${(padL + 4).toFixed(1)}" y="${(volTop + 12).toFixed(1)}" fill="#64748b" font-size="10" font-family="ui-monospace,monospace">VOLUME ${lastVol.toFixed(0)}</text>`);
+      // Volume bars — one per candle, colored by candle direction.
+      // Coinbase uses very subtle tints (~0.35 opacity) so volume doesn't
+      // compete visually with the price action.
       for (let i = 0; i < n; i++) {
         const [ts, o, , , c, v] = candles[i];
         const vol = Number(v) || 0;
@@ -6749,7 +6752,7 @@ function renderCandleChart(candles, container, opts = {}) {
         const barY = volTop + volH - barH;
         const up = c >= o;
         const color = up ? '#22c55e' : '#ef4444';
-        parts.push(`<rect x="${(xc - bodyW/2).toFixed(1)}" y="${barY.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${barH.toFixed(1)}" fill="${color}" opacity="0.7"/>`);
+        parts.push(`<rect x="${(xc - bodyW/2).toFixed(1)}" y="${barY.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${barH.toFixed(1)}" fill="${color}" opacity="0.35"/>`);
       }
     }
   }
