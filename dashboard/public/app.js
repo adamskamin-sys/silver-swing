@@ -6473,9 +6473,14 @@ function renderCandleChart(candles, container, opts = {}) {
   const fisherSeries = indicatorOpts.fisher ? computeFisherSeries(closes) : null;
   const W = container.clientWidth || 900;
   const H = 480;
+  // 2026-07-15 Coinbase-style layout: dedicated volume panel at the bottom.
+  // If any candle has volume (index 5), reserve 60px for volume bars.
+  const hasVolume = candles.some(c => c.length > 5 && Number(c[5]) > 0);
+  const volH = hasVolume ? 60 : 0;
   const padL = 80, padR = 20, padT = 20, padB = 40;
   const plotW = W - padL - padR;
-  const plotH = H - padT - padB;
+  const plotH = H - padT - padB - volH;
+  const volTop = padT + plotH + 4;
 
   // Include fills in Y-axis range so markers are always visible even if
   // they're outside the recent candle range (e.g., an old stop-loss below
@@ -6587,6 +6592,34 @@ function renderCandleChart(candles, container, opts = {}) {
     const bh = Math.max(1, Math.abs(yc - yo));
     parts.push(`<line x1="${xc.toFixed(1)}" y1="${yh.toFixed(1)}" x2="${xc.toFixed(1)}" y2="${yl.toFixed(1)}" stroke="${color}" stroke-width="1"/>`);
     parts.push(`<rect x="${(xc - bodyW/2).toFixed(1)}" y="${top.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${bh.toFixed(1)}" fill="${color}"/>`);
+  }
+
+  // 2026-07-15 volume panel (Coinbase-style). Renders below the price plot
+  // when volume data is available (backtest_worker now includes it).
+  if (hasVolume) {
+    let maxVol = 0;
+    for (const c of candles) {
+      const v = Number(c[5]) || 0;
+      if (v > maxVol) maxVol = v;
+    }
+    if (maxVol > 0) {
+      // Volume panel background
+      parts.push(`<rect x="${padL}" y="${volTop}" width="${plotW}" height="${volH}" fill="#0a1119" opacity="0.5"/>`);
+      // Volume label
+      parts.push(`<text x="${(padL + 4).toFixed(1)}" y="${(volTop + 10).toFixed(1)}" fill="#64748b" font-size="10" font-family="ui-monospace,monospace">Volume</text>`);
+      // Volume bars — one per candle, colored by candle direction
+      for (let i = 0; i < n; i++) {
+        const [ts, o, , , c, v] = candles[i];
+        const vol = Number(v) || 0;
+        if (vol <= 0) continue;
+        const xc = x(Number(ts));
+        const barH = (vol / maxVol) * (volH - 12);
+        const barY = volTop + volH - barH;
+        const up = c >= o;
+        const color = up ? '#22c55e' : '#ef4444';
+        parts.push(`<rect x="${(xc - bodyW/2).toFixed(1)}" y="${barY.toFixed(1)}" width="${bodyW.toFixed(1)}" height="${barH.toFixed(1)}" fill="${color}" opacity="0.7"/>`);
+      }
+    }
   }
 
   // 2026-07-15 indicator overlays. Render as SVG polylines using x(ts) and
