@@ -1175,12 +1175,27 @@ class SwingTrader:
         # LONG to -1 SHORT. CU 2026-07-15 12:34:34 double-fire race — problem-
         # scout found this bot-side path was NOT guarded, only the arm-new-order
         # path was. Same fix pattern as swing_leg.py:3653.
+        #
+        # Rate-limit the log to 5 min per sleeve — HYP 2026-07-15 log dump
+        # showed this firing ~15×/min for hours while mark stayed below the
+        # ratcheted trigger. Real signal (guard fired) still surfaces every
+        # 5 min without drowning the log.
         if getattr(sc, "resting_stop_enabled", True) and ss.resting_stop_oid:
-            self._record("sleeve_stop_loss_skipped_resting_stop_active",
-                         sleeve_id=sc.id, price=last_price,
-                         trigger=effective_stop,
-                         resting_stop_oid=ss.resting_stop_oid,
-                         resting_stop_px=ss.resting_stop_px)
+            import time as _t_ssk
+            key = f"stop_loss_skip_{sc.id}"
+            store = getattr(self, "_stop_loss_skip_last_ts", None)
+            if store is None:
+                self._stop_loss_skip_last_ts = {}
+                store = self._stop_loss_skip_last_ts
+            last_ts = int(store.get(key, 0) or 0)
+            cur = int(_t_ssk.time())
+            if cur - last_ts > 300:
+                self._record("sleeve_stop_loss_skipped_resting_stop_active",
+                             sleeve_id=sc.id, price=last_price,
+                             trigger=effective_stop,
+                             resting_stop_oid=ss.resting_stop_oid,
+                             resting_stop_px=ss.resting_stop_px)
+                store[key] = cur
             return False
         was_ratcheted = effective_stop > float(sc.stop_loss_px or 0.0)
         sell_ok = False
@@ -2506,20 +2521,109 @@ class SwingTrader:
     def _reeval_cancel_replace(self, sc, ss, dec, last_price: float) -> None:
         """CANCEL-first-CONFIRM-then-PLACE. Anti-thrash reset. Persist
         both in-memory and Redis. Uses shared arm_level helper so the
-        reanchor pullback logic is unified with expert_reentry."""
+        reanchor pullback logic is unified with expert_reentry.
+
+        Adam 2026-07-15: also consults expert_spread (Avellaneda-Stoikov)
+        when __expert_spread_mode__ = 'expert'. AS overrides the legacy
+        buy_px pick + optionally moves sell_px too. See
+        feedback_experts_control_spread_and_price memory rule."""
         import time as _t
+        # Adam 2026-07-15: expert_spread APPLY on intra-cycle walk.
+        # When AS is enabled + returns valid, use its buy/sell/spread
+        # instead of the legacy arm_level.pullback_buy_px. Different from
+        # the post-sell reanchor hook (which fires once per cycle) —
+        # this hook fires on every ARMED_BUY tick that reeval decides
+        # to walk, so AS is now re-evaluating vol/regime constantly.
+        as_decision = None
+        as_new_sell_px = None
+        try:
+            spread_mode = self._expert_spread_mode()
+            if spread_mode in ("shadow", "expert"):
+                import expert_spread as _es
+                # Cycle-completion timestamps (arrival-rate estimate)
+                cycle_ts = []
+                try:
+                    if hasattr(self, "trade_log") and self.trade_log:
+                        for e in self.trade_log.events():
+                            if not isinstance(e, dict):
+                                continue
+                            if e.get("event_type") != "sleeve_cycle_completed":
+                                continue
+                            if e.get("sleeve_id") != sc.id:
+                                continue
+                            ts = float(e.get("ts") or 0)
+                            if ts > 0:
+                                cycle_ts.append(ts)
+                except Exception:
+                    pass
+                inventory = 0
+                try:
+                    inventory = int(self.b.position_qty() or 0)
+                except Exception:
+                    pass
+                fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
+                tick = float(getattr(self.cfg, "tick_size", 0) or 0)
+                as_decision = _es.grid_search_optimal_gamma(
+                    mid_price=float(last_price),
+                    price_history=list(self._sleeve_price_history.get(sc.id, []) or []),
+                    cycle_completion_ts=cycle_ts,
+                    fee_per_roundtrip=fee_rt,
+                    contract_size=float(self.cfg.contract_size),
+                    qty=int(sc.qty),
+                    tick_size=tick if tick > 0 else None,
+                    inventory=inventory,
+                )
+                if as_decision is not None:
+                    self._record(
+                        "expert_spread_intra_cycle_shadow" if spread_mode == "shadow"
+                        else "expert_spread_intra_cycle_decision",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        method=as_decision.method,
+                        legacy_new_buy_px=float(dec.new_buy_px),
+                        current_sell_px=float(sc.sell_px),
+                        as_buy_px=as_decision.buy_px,
+                        as_sell_px=as_decision.sell_px,
+                        as_spread=as_decision.spread,
+                        as_expected_daily_pnl=as_decision.expected_daily_pnl,
+                        as_expected_cycles_per_day=as_decision.expected_cycles_per_day,
+                        as_cost_floor_binding=as_decision.cost_floor_binding,
+                        mode=spread_mode,
+                    )
+                    if spread_mode == "expert":
+                        as_new_sell_px = as_decision.sell_px
+                # Shadow mode: don't apply, fall through to legacy path.
+        except Exception as _e:
+            try:
+                self._record("expert_spread_intra_cycle_error",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
+
         # Use the shared level helper (Tier 2 #3 — unified with expert_reentry)
         try:
-            import arm_level
-            spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
-            sold_ref = float(ss.last_sell_fill_price or sc.buy_px)
-            unified_buy_px = arm_level.pullback_buy_px(
-                list(self._sleeve_price_history.get(sc.id, []) or []),
-                spread=spread, sold_price=sold_ref)
-            # If unified helper produces a price, use it. Else fall back to
-            # reeval's own suggestion — but the invariant (buy < sold_ref)
-            # must still hold.
-            new_buy_px = unified_buy_px if unified_buy_px is not None else float(dec.new_buy_px)
+            if as_decision is not None and self._expert_spread_mode() == "expert":
+                # AS APPLY path — use AS buy_px directly, skip legacy arm_level
+                new_buy_px = float(as_decision.buy_px)
+                self._record(
+                    "expert_spread_intra_cycle_applied",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    replaced_legacy_new_buy_px=float(dec.new_buy_px),
+                    as_buy_px=new_buy_px,
+                    as_sell_px=as_new_sell_px,
+                    method=as_decision.method,
+                )
+            else:
+                import arm_level
+                spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
+                sold_ref = float(ss.last_sell_fill_price or sc.buy_px)
+                unified_buy_px = arm_level.pullback_buy_px(
+                    list(self._sleeve_price_history.get(sc.id, []) or []),
+                    spread=spread, sold_price=sold_ref)
+                # If unified helper produces a price, use it. Else fall back to
+                # reeval's own suggestion — but the invariant (buy < sold_ref)
+                # must still hold.
+                new_buy_px = unified_buy_px if unified_buy_px is not None else float(dec.new_buy_px)
             # Snap to tick
             try:
                 new_buy_px = self._snap_to_tick(float(new_buy_px))
