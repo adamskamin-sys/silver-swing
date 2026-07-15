@@ -697,17 +697,27 @@ def run() -> int:
         # Prior version only detected products NOT in the dict, which
         # missed the case where boot spawned a Track whose feed then never
         # produced a tick (silent zombie).
-        ZOMBIE_THRESHOLD_SECS = 300.0  # 5 min without a tick = zombie
+        ZOMBIE_THRESHOLD_SECS = 300.0  # 5 min without a SUCCESSFUL step = zombie
         for pid in sorted(should_track):
             existing = _non_primary_tracks.get(pid)
             if existing is not None:
-                # Check for zombie: has this Track produced a tick recently?
+                # Adam 2026-07-15: check ONLY last_step_ok_ts — NOT
+                # last_tick_seen_ts. _maybe_resync_stale_feed bumps
+                # last_tick_seen_ts = now every time it restarts a stale
+                # feed, which happens every FEED_STALE_THRESHOLD_SECS
+                # (60s default) regardless of whether the feed actually
+                # produces tickers. Using max() of both = false 'alive'
+                # signal when the feed keeps restarting but step() never
+                # runs (no ticker → tick sweep `continue`s before step).
+                #
+                # last_step_ok_ts only advances when
+                # _track.trader.step(...) returns without raising. That's
+                # the ONLY reliable heartbeat that the Track is actually
+                # doing productive work.
                 last_ok = float(getattr(existing, "last_step_ok_ts", 0) or 0)
-                last_tick = float(getattr(existing, "last_tick_seen_ts", 0) or 0)
-                most_recent = max(last_ok, last_tick)
-                age = now - most_recent if most_recent > 0 else float("inf")
+                age = now - last_ok if last_ok > 0 else float("inf")
                 if age < ZOMBIE_THRESHOLD_SECS:
-                    continue  # actively ticking — not a zombie
+                    continue  # actively stepping — not a zombie
                 # ZOMBIE detected — force evict + respawn
                 try:
                     log.record(
