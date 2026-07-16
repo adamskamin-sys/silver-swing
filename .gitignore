@@ -15,3 +15,8 @@ dashboard/node_modules/
 # defensively so a stray copy of the key JSON can't slip into git.
 /secrets/
 /etc/secrets/
+
+# Local scratch / tooling artifacts — never commit these.
+_sym_tmp.trash
+reentry_tuning_report.json
+.claude/
