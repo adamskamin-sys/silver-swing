@@ -68,9 +68,11 @@ class SwingConfig:
     scale_up_buffer_mult: float = 1.5
     fee_per_contract_roundtrip: float = 4.68    # 2 × $2.34 empirical (was 0.0 placeholder)
 
-    # Risk governor (Jim Paul)
-    abort_below: float = 60.0
-    abort_above: float = 70.0
+    # Risk governor (Jim Paul). Defaults are disabled (0 / 1e9) so new
+    # products don't inherit SLR-specific bands. Live-tenant boot sets
+    # these from mark ± 20×ATR via _ensure_live_abort_bounds().
+    abort_below: float = 0.0
+    abort_above: float = 1e9
 
     # §2A fee-gate sanity ceiling: halt if the queued-order commission comes
     # back at more than this many × the expected per-side fee. 2× is a starting

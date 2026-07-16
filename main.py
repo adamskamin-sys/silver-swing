@@ -102,6 +102,31 @@ def _is_lab_tenant(tenant: str) -> bool:
     return tenant == _derive_lab_tenant(TENANT)
 
 
+def _expert_abort_bounds(store, tenant: str, symbol: str) -> tuple:
+    """Compute abort_below / abort_above from mark ± 20×ATR.
+
+    Uses the same 20×ATR multiplier as expert_tuner so the governor sits
+    far enough outside the swing range to never fire on normal volatility,
+    but still catches a crash or runaway move. Falls back to (0, 1e9)
+    (disabled) when data is unavailable.
+    """
+    try:
+        snap = store.get_snapshot(tenant, symbol) or {}
+        mark = float(snap.get("last_mark") or snap.get("mark") or 0)
+        if not mark:
+            return 0.0, 1e9
+        atr = float(snap.get("atr") or 0)
+        if not atr:
+            # Rough fallback: 0.5% of mark per tick, 20×ATR ≈ 10% band
+            atr = mark * 0.005
+        ab = round(mark - 20 * atr, 8)
+        aa = round(mark + 20 * atr, 8)
+        # Never let abort_below go negative
+        return max(ab, 0.0), aa
+    except Exception:
+        return 0.0, 1e9
+
+
 def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
     existing = store.get_config(tenant, symbol)
     if existing:
@@ -123,11 +148,16 @@ def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
             # Auditor 2026-07-14 must-verify #3.
             existing.setdefault("core_qty", 0)
             existing.setdefault("swing_qty", 0)
-            existing.setdefault("abort_below", 0.0)
-            existing.setdefault("abort_above", 1e9)
+            # Abort bounds: derive from mark ± 20×ATR if available so
+            # sub-$1 products (XLP, CHN, etc.) don't inherit the SLR
+            # $60/$70 dataclass defaults. Fall back to disabled (0/1e9).
+            if "abort_below" not in existing or "abort_above" not in existing:
+                _ab, _aa = _expert_abort_bounds(store, tenant, symbol)
+                existing.setdefault("abort_below", _ab)
+                existing.setdefault("abort_above", _aa)
             store.put_config(tenant, symbol, existing)
             _log(f"[{tenant}/{symbol}] backfilled partial config with live-safe "
-                 f"defaults (core_qty=0)")
+                 f"defaults (core_qty=0, abort_below={existing.get('abort_below'):.4g})")
             # Also clear any pre-existing halt caused by the phantom core.
             try:
                 st = store.get_state(tenant, symbol) or {}
