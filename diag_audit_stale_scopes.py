@@ -145,9 +145,9 @@ def main() -> None:
     except Exception:
         log = None
 
-    def _record(kind, **fields):
+    def _record(event_type, **fields):
         if log:
-            try: log.record(kind, severity="info", **fields)
+            try: log.record(event_type, severity="info", **fields)
             except Exception: pass
 
     def _mutate(fn):
