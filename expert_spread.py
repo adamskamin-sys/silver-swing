@@ -406,6 +406,19 @@ def grid_search_optimal_gamma(
     Adam's tie-breaker preference: MORE cycles wins ties. Implemented
     as a small ε reward for cycles/day.
     """
+    # Sanity gate: when there are no observed cycle completions in the
+    # horizon window, arrival_rate_from_cycles() falls back to the minimum
+    # floor (1 fill/hour). At that floor the AS adverse-selection term
+    # (2/γ)·ln(1+γ/k) blows up (e.g. $113k spread on a $544 ZEC contract,
+    # 208× mid price). Return None immediately so callers can show
+    # "no recommendation" rather than garbage. Once the product completes
+    # its first real cycle, k rises above the floor and this gate opens.
+    if not cycle_completion_ts:
+        return None
+    import time as _t
+    if not [ts for ts in cycle_completion_ts if ts >= _t.time() - horizon_secs]:
+        return None  # no cycles within the look-back window
+
     if gamma_grid is None:
         # AS (2008) explored γ in [0.01, 1.0]. Our max-cycles bias
         # skews toward higher γ (tighter spreads, more turns).

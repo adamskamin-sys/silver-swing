@@ -208,10 +208,18 @@ class TestGridSearchOptimalGamma:
         return [100.0 + 0.01 * math.sin(i / 3.0) + 0.005 * (i % 7 - 3)
                 for i in range(30)]
 
+    def _sample_cycles(self):
+        # Simulate 5 recent cycle completions so k is above the floor
+        # and grid_search_optimal_gamma doesn't hit the no-history gate.
+        import time
+        now = time.time()
+        return [now - 600 * i for i in range(1, 6)]
+
     def test_returns_a_decision(self):
         d = grid_search_optimal_gamma(
             mid_price=100.0,
             price_history=self._sample_prices(),
+            cycle_completion_ts=self._sample_cycles(),
             fee_per_roundtrip=0.02,
             contract_size=10.0,
             qty=1,
@@ -220,16 +228,29 @@ class TestGridSearchOptimalGamma:
         assert d is not None
         assert d.spread > 0
 
+    def test_returns_none_when_no_cycle_history(self):
+        # Without cycle completions the AS model blows up (k at floor →
+        # spread >> mid). guard_search should return None not garbage.
+        result = grid_search_optimal_gamma(
+            mid_price=544.5,
+            price_history=self._sample_prices(),
+            cycle_completion_ts=[],   # no history — ZEC-style new product
+        )
+        assert result is None
+
     def test_grid_picks_max_daily(self):
         prices = self._sample_prices()
+        cycles = self._sample_cycles()
         best = grid_search_optimal_gamma(
             mid_price=100.0,
             price_history=prices,
+            cycle_completion_ts=cycles,
             fee_per_roundtrip=0.02,
             contract_size=10.0,
             qty=1,
             tick_size=0.01,
         )
+        assert best is not None
         # Verify: no candidate in the grid has strictly higher (adjusted) score
         from expert_spread import optimal_spread as _os
         eps = 0.01

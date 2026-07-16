@@ -1349,7 +1349,12 @@ def run() -> int:
                     # position_mismatch=0 for that symbol). 2026-07-16 incident.
                     try:
                         drift_syms = {f.symbol for f in findings if f.kind == "state_config_drift"}
+                        # A symbol absent from exch_positions has no exchange position
+                        # (same as qty=0). Include both here so CHN/AVE/HYF-style
+                        # ghost states are corrected even when the exchange omits them
+                        # from the portfolio snapshot entirely.
                         zero_pos_syms = {sym for sym, qty in exch_positions.items() if qty == 0}
+                        zero_pos_syms |= drift_syms - set(exch_positions.keys())
                         for _dsym in drift_syms & zero_pos_syms:
                             _dst = store.get_state(live_tenant, _dsym) or {}
                             _dcfg = store.get_config(live_tenant, _dsym) or {}
@@ -1378,7 +1383,10 @@ def run() -> int:
                     try:
                         mismatch_syms = {f.symbol for f in findings if f.kind == "position_mismatch"}
                         for _msym in mismatch_syms:
-                            if exch_positions.get(_msym) != 0:
+                            # treat "not in exch_positions" as qty=0 — exchange
+                            # simply omitted the symbol because it has no position
+                            _exch_qty = exch_positions.get(_msym, 0)
+                            if _exch_qty != 0:
                                 continue  # only ghosts (exchange confirmed 0)
                             _mst = store.get_state(live_tenant, _msym) or {}
                             if _mst.get("live_order_id"):
