@@ -1291,6 +1291,71 @@ class SwingTrader:
         #    "waiting for volatility contraction" state (reentry_pending).
         # 3. Else: halt as before (fixed stop-loss with no auto-recovery).
         if sc.stop_loss_reanchor_on_trigger:
+            # Adam 2026-07-16: gate the INSTANT-reanchor path too. Before
+            # this, reanchor_on_trigger=True bypassed all cooldown — it was
+            # the primary bleed vector (rearm into the same trend that just
+            # stopped us). Now consult expert_gate; if experts vote NO,
+            # defer to reentry_pending (same as volatility mode) so the
+            # gate has a chance to re-evaluate on the next tick as data
+            # comes in. Kill switch: expert_gate.MODE = "off" → skip.
+            gate_dec = None
+            try:
+                import expert_gate as _eg
+                if getattr(_eg, "MODE", "expert") == "expert":
+                    prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+                    ofi = None; kyle_lam = None; kyle_base = None
+                    try:
+                        if self.ms is not None and hasattr(self.ms, "snapshot"):
+                            snap = self.ms.snapshot()
+                            if isinstance(snap, dict):
+                                ofi = snap.get("trade_ofi_60s") or snap.get("ofi") or snap.get("obi")
+                                kyle_lam = snap.get("kyle_lambda")
+                                kyle_base = snap.get("kyle_lambda_baseline") or snap.get("kyle_lambda_avg")
+                    except Exception:
+                        pass
+                    gate_dec = _eg.reentry_allowed(
+                        prices=prices,
+                        # elapsed=0.0 → cadence floor guarantees at least
+                        # _HARD_CADENCE_FLOOR_SECS wait even in "instant" mode
+                        elapsed_since_stop_secs=0.0,
+                        reentry_direction="buy",
+                        order_flow_imbalance=(float(ofi) if ofi is not None else None),
+                        kyle_lambda=(float(kyle_lam) if kyle_lam is not None else None),
+                        kyle_baseline=(float(kyle_base) if kyle_base is not None else None),
+                    )
+                    self._record(
+                        "sleeve_reanchor_on_trigger_gate",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        allow=gate_dec.allow,
+                        votes=gate_dec.votes,
+                        vote_count=gate_dec.vote_count,
+                        total_voters=gate_dec.total_voters,
+                        cadence_ok=gate_dec.cadence_ok,
+                        cadence_floor_secs=gate_dec.cadence_floor_secs,
+                        method=gate_dec.method,
+                    )
+            except Exception as _e:
+                try:
+                    self._record("sleeve_reanchor_on_trigger_gate_error",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 error=str(_e), severity="warn")
+                except Exception:
+                    pass
+
+            if gate_dec is not None and not gate_dec.allow:
+                # Experts said no. Defer to the volatility-mode reentry_pending
+                # path so the gate re-evaluates as data comes in.
+                import time as _t
+                ss.reentry_pending = True
+                ss.reentry_stop_ts = _t.time()
+                ss.pre_stop_range = self._sleeve_recent_range(sc)
+                ss.state = SleeveStateEnum.ARMED_BUY
+                self._record("sleeve_reanchor_on_trigger_deferred",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             reason="expert_gate denied instant rearm; "
+                                    "deferred to reentry_pending")
+                return True
+
             spread = max(0.005, sc.sell_px - sc.buy_px)
             # 2026-07-15: use arm_level.pullback_buy_px (Chan OU + Connors)
             # instead of the naive last_price ± spread/2 formula. Same
@@ -3106,11 +3171,17 @@ class SwingTrader:
             })
 
     def _maybe_trigger_sleeve_reentry(self, sc, ss, last_price: float) -> bool:
-        """Volatility-contraction re-entry after a stop. When current range
-        has contracted below pre_stop_range × contraction, place a market
-        buy to re-enter at the (lower) new price level. Also reanchors the
-        sleeve's buy/sell targets around the new market. Returns True if
-        it re-entered."""
+        """Volatility-contraction re-entry after a stop.
+
+        Adam 2026-07-16: reentry decision now runs through expert_gate
+        (majority vote of Kaufman / Wilder-ADX / Cartea-OFI / Kyle-λ /
+        Menkveld-cycle-econ + Hasbrouck-derived cadence floor). Prior
+        hardcoded 30s + 50% contraction was the PT/HYPE bleed enabler —
+        no regime awareness, no toxicity check.
+
+        Kill switch: set expert_gate.MODE = "off" to revert to the
+        legacy path below.
+        """
         if not ss.reentry_pending:
             return False
         if sc.reentry_mode != "volatility":
@@ -3120,20 +3191,107 @@ class SwingTrader:
             return False
         import time as _t
         elapsed = _t.time() - (ss.reentry_stop_ts or 0)
-        if elapsed < float(sc.reentry_min_wait_secs or 30.0):
-            return False
-        current_range = self._sleeve_recent_range(sc)
-        pre_range = float(ss.pre_stop_range or 0.0)
-        # If we have no pre-stop baseline (edge case: reentry_pending set
-        # without proper capture), fall back to time-only trigger after 5×
-        # the min wait so the sleeve doesn't get stuck.
-        if pre_range <= 0:
-            if elapsed < float(sc.reentry_min_wait_secs or 30.0) * 5:
+
+        # ---- Expert-gate consultation (2026-07-16) --------------------
+        try:
+            import expert_gate as _eg
+        except Exception:
+            _eg = None
+
+        expert_gate_ran = False
+        if _eg is not None and getattr(_eg, "MODE", "expert") == "expert":
+            try:
+                prices = list(self._sleeve_price_history.get(sc.id, []) or [])
+                # Recent cycle PnLs (last N sleeve_cycle_completed events)
+                cycle_pnls = []
+                try:
+                    if hasattr(self, "trade_log") and self.trade_log:
+                        for e in self.trade_log.events():
+                            if not isinstance(e, dict):
+                                continue
+                            if e.get("event_type") != "sleeve_cycle_completed":
+                                continue
+                            if e.get("sleeve_id") != sc.id:
+                                continue
+                            pnl = e.get("realized_pnl") or e.get("cycle_pnl") or 0
+                            try:
+                                cycle_pnls.append(float(pnl))
+                            except (TypeError, ValueError):
+                                pass
+                except Exception:
+                    pass
+                # Microstructure inputs (None-safe)
+                ofi = None
+                kyle_lam = None
+                kyle_base = None
+                try:
+                    if self.ms is not None and hasattr(self.ms, "snapshot"):
+                        snap = self.ms.snapshot()
+                        if isinstance(snap, dict):
+                            ofi = snap.get("trade_ofi_60s") or snap.get("ofi") or snap.get("obi")
+                            kyle_lam = snap.get("kyle_lambda")
+                            kyle_base = snap.get("kyle_lambda_baseline") or snap.get("kyle_lambda_avg")
+                except Exception:
+                    pass
+                dec = _eg.reentry_allowed(
+                    prices=prices,
+                    elapsed_since_stop_secs=float(elapsed),
+                    reentry_direction="buy",
+                    order_flow_imbalance=(float(ofi) if ofi is not None else None),
+                    kyle_lambda=(float(kyle_lam) if kyle_lam is not None else None),
+                    kyle_baseline=(float(kyle_base) if kyle_base is not None else None),
+                    recent_cycle_pnls=cycle_pnls if cycle_pnls else None,
+                )
+                expert_gate_ran = True
+                self._record(
+                    "sleeve_reentry_gate_decision",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    allow=dec.allow,
+                    votes=dec.votes,
+                    vote_count=dec.vote_count,
+                    total_voters=dec.total_voters,
+                    cadence_ok=dec.cadence_ok,
+                    cadence_floor_secs=dec.cadence_floor_secs,
+                    elapsed_since_stop_secs=dec.elapsed_since_stop_secs,
+                    method=dec.method,
+                    citation=dec.citation,
+                )
+                if not dec.allow:
+                    return False   # experts said no; wait longer
+                # Experts said YES — fall through to reanchor + fire below.
+            except Exception as _e:
+                try:
+                    self._record("sleeve_reentry_gate_error",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 error=str(_e), severity="warn")
+                except Exception:
+                    pass
+
+        # ---- Legacy fallback (kill-switch / expert error path) ----------
+        # Only runs if expert_gate didn't return True above. Preserves the
+        # historic 30s + 50% contraction behavior as the safety net.
+        if not expert_gate_ran:
+            if elapsed < float(sc.reentry_min_wait_secs or 30.0):
                 return False
+            current_range = self._sleeve_recent_range(sc)
+            pre_range = float(ss.pre_stop_range or 0.0)
+            # If we have no pre-stop baseline (edge case: reentry_pending set
+            # without proper capture), fall back to time-only trigger after 5×
+            # the min wait so the sleeve doesn't get stuck.
+            if pre_range <= 0:
+                if elapsed < float(sc.reentry_min_wait_secs or 30.0) * 5:
+                    return False
+            else:
+                contraction_target = pre_range * float(sc.reentry_range_contraction or 0.5)
+                if current_range > contraction_target:
+                    return False  # volatility hasn't contracted enough yet
+            # Set defaults for the shared telemetry event below
+            current_range = self._sleeve_recent_range(sc)
+            pre_range = float(ss.pre_stop_range or 0.0)
         else:
-            contraction_target = pre_range * float(sc.reentry_range_contraction or 0.5)
-            if current_range > contraction_target:
-                return False  # volatility hasn't contracted enough yet
+            # Expert path took over; compute these for the event payload
+            current_range = self._sleeve_recent_range(sc)
+            pre_range = float(ss.pre_stop_range or 0.0)
 
         # Reanchor to current price so the buy fires at market immediately.
         spread = max(0.005, sc.sell_px - sc.buy_px)
