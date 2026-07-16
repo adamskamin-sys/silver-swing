@@ -975,6 +975,22 @@ class SwingTrader:
             if expert_prices and 0 < expert_prices.get("buy_px", 0) < current_price:
                 directive = BuyDirective(qty=directive.qty,
                                          limit_price=expert_prices["buy_px"])
+            # Adam 2026-07-16: safety-cap qty via expert_size (median of
+            # Van Tharp + half-Kelly + Vince, HARD-capped by user config).
+            # Only shrinks — never grows above directive.qty.
+            expert_qty = self._expert_size_adjust(
+                user_configured_qty=int(directive.qty),
+                mark=float(current_price),
+                stop_distance=(float(current_price) - float(directive.limit_price or 0))
+                                if directive.limit_price else 0.0,
+                contract_size=float(getattr(self.cfg, "contract_size", 1) or 1),
+                fee_per_roundtrip=float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0),
+                expected_profit_per_contract=(float(current_price) - float(directive.limit_price or 0))
+                                                if directive.limit_price else 0.0,
+                log_prefix="primary_buy",
+            )
+            if expert_qty != directive.qty:
+                directive = BuyDirective(qty=expert_qty, limit_price=directive.limit_price)
             qty, px = self._ms_adjust("BUY", directive.qty, directive.limit_price, current_price)
             if qty is None:
                 return
@@ -2072,6 +2088,80 @@ class SwingTrader:
             except Exception:
                 pass
             return None
+
+    def _expert_size_adjust(self, user_configured_qty: int, mark: float,
+                             stop_distance: float, contract_size: float,
+                             fee_per_roundtrip: float,
+                             expected_profit_per_contract: float,
+                             recent_cycle_pnls=None,
+                             log_prefix: str = "primary") -> int:
+        """Consult expert_size to determine a SAFETY-CAPPED position size.
+
+        Adam 2026-07-16: experts can only REDUCE user_configured_qty,
+        never increase it. Preserves the 'swing 1-2, protect the core'
+        rule from project_live_intent.
+
+        Returns the size to ship. Always ≥ 1 (unless user configured 0)
+        and always ≤ user_configured_qty.
+
+        Fail-safe: any exception → return user_configured_qty unchanged.
+        Kill switch: expert_size.MODE = "off" → returns user_configured_qty.
+        """
+        try:
+            if user_configured_qty <= 0:
+                return int(user_configured_qty)
+            import expert_size as _esz
+            if getattr(_esz, "MODE", "expert") != "expert":
+                return int(user_configured_qty)
+            # Best-effort account equity from broker
+            equity = 0.0
+            try:
+                # Try common broker interfaces for cash/equity
+                if hasattr(self.b, "account_equity"):
+                    equity = float(self.b.account_equity() or 0)
+                elif hasattr(self.b, "balance"):
+                    equity = float(getattr(self.b, "balance", 0) or 0)
+            except Exception:
+                pass
+            if equity <= 0:
+                # Portfolio snapshot fallback
+                try:
+                    pf = self.store.get_state(self.tenant_id, "__portfolio__") or {}
+                    equity = float(pf.get("account_equity") or pf.get("cash") or 0)
+                except Exception:
+                    equity = 0.0
+            dec = _esz.optimal_size(
+                user_configured_size=int(user_configured_qty),
+                account_equity=float(equity),
+                stop_distance=float(stop_distance or 0),
+                contract_size=float(contract_size or 1),
+                mid_price=float(mark or 0),
+                fee_per_roundtrip=float(fee_per_roundtrip or 0),
+                expected_profit_per_contract=float(expected_profit_per_contract or 0),
+                recent_cycle_pnls=recent_cycle_pnls,
+            )
+            self._record(
+                f"expert_size_{log_prefix}_applied",
+                method=dec.method,
+                citation=dec.citation,
+                user_configured=dec.user_configured,
+                final_size=dec.size,
+                candidates=dec.candidates,
+                consensus=dec.consensus,
+                menkveld_min_size=dec.menkveld_min_size,
+                econ_floor_binding=dec.econ_floor_binding,
+                user_cap_binding=dec.user_cap_binding,
+                mark=round(float(mark or 0), 6),
+                stop_distance=round(float(stop_distance or 0), 6),
+            )
+            return int(dec.size)
+        except Exception as _e:
+            try:
+                self._record(f"expert_size_{log_prefix}_error",
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
+            return int(user_configured_qty)
 
     # [crew 2026-07-15] auto-refresh cadence config
     _AUTO_REFRESH_MIN_INTERVAL_SECS = 60.0      # don't fire more than once/min per sleeve
@@ -5278,6 +5368,66 @@ class SwingTrader:
         # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
         # spins forever emitting sleeve_arm_failed with no order on the book.
         price = self._snap_to_tick(price)
+
+        # Adam 2026-07-16: safety-cap qty via expert_size on BUY only.
+        # Consensus of Van Tharp + half-Kelly + Vince, HARD-capped by
+        # sc.qty (user config). Never grows above sc.qty.
+        if side == "BUY" and qty > 0:
+            try:
+                # Recent cycle PnLs for this sleeve (for Kelly + Vince)
+                cycle_pnls = []
+                try:
+                    if hasattr(self, "trade_log") and self.trade_log:
+                        for e in self.trade_log.events():
+                            if not isinstance(e, dict):
+                                continue
+                            if e.get("event_type") != "sleeve_cycle_completed":
+                                continue
+                            if e.get("sleeve_id") != sc.id:
+                                continue
+                            p = e.get("realized_pnl") or e.get("cycle_pnl") or 0
+                            try:
+                                cycle_pnls.append(float(p))
+                            except (TypeError, ValueError):
+                                pass
+                except Exception:
+                    pass
+                # Expected profit per contract from sleeve's spread
+                try:
+                    spread = float(sc.sell_px or 0) - float(sc.buy_px or 0)
+                    expected_profit_per_contract = max(0.0, spread * float(getattr(self.cfg, "contract_size", 1) or 1))
+                except (TypeError, ValueError):
+                    expected_profit_per_contract = 0.0
+                stop_dist = 0.0
+                try:
+                    if float(sc.stop_loss_px or 0) > 0 and price > float(sc.stop_loss_px or 0):
+                        stop_dist = price - float(sc.stop_loss_px or 0)
+                except (TypeError, ValueError):
+                    pass
+                qty = self._expert_size_adjust(
+                    user_configured_qty=int(qty),
+                    mark=float(price),
+                    stop_distance=float(stop_dist),
+                    contract_size=float(getattr(self.cfg, "contract_size", 1) or 1),
+                    fee_per_roundtrip=float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0),
+                    expected_profit_per_contract=expected_profit_per_contract,
+                    recent_cycle_pnls=(cycle_pnls if cycle_pnls else None),
+                    log_prefix=f"sleeve_{sc.id}_buy",
+                )
+                if qty <= 0:
+                    # Expert says don't size in — respect but log
+                    self._record("sleeve_arm_skipped_expert_size_zero",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 reason="expert_size returned 0")
+                    return
+            except Exception as _e:
+                try:
+                    self._record("sleeve_expert_size_error",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 error=str(_e), severity="warn")
+                except Exception:
+                    pass
+
         # CRITICAL SAFETY (2026-07-15): normal-path over-accumulation guard.
         # Mirrors the ghost-force-arm check in _maybe_force_arm_ghost_order.
         # Adam surfaced this session: HYPE sleeve was in WAITING_FOR_BUY state
