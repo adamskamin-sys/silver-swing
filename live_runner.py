@@ -512,7 +512,7 @@ def run() -> int:
                         "fee_per_contract_roundtrip": 0.5,   # conservative
                         "swing_qty": 0,                       # sleeves only, no primary
                         "core_qty": 0,                        # no protected core
-                        "abort_above": 0,                     # bands off — sleeve controls
+                        "abort_above": 1e9,                   # bands off — sleeve controls (0 would halt on every tick)
                         "abort_below": 0,
                         "sleeves": [],                        # kept in state, not here
                     }

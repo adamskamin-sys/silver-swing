@@ -29,7 +29,9 @@ import requests
 
 class Priority(str, Enum):
     INFO = "info"        # heartbeat, scale-up, cycle complete
+    NORMAL = "info"      # alias for INFO — legacy call sites
     WARN = "warn"        # reconcile mismatch, fee-gate widened
+    HIGH = "warn"        # alias for WARN — legacy call sites
     CRIT = "crit"        # HALT, margin call, kill switch trip
 
 
