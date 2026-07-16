@@ -123,6 +123,16 @@ _DEFAULT_HORIZON_SECS = 3600.0
 # oscillation.
 _LAMBDA_WIDENING_CAP = 3.0
 
+# Adam 2026-07-16: module-level MODE for consistency with the other
+# expert modules (expert_stop, expert_gate, expert_trail, expert_size,
+# expert_arm_gate). The actual per-tenant gate lives on SwingTrader.
+# _expert_spread_mode() which unconditionally returns "expert" post-
+# 2026-07-16 refactor. This constant exists so diagnostic tools
+# (diag_expert_wiring_health) can report a consistent MODE across
+# modules; changing this DOES NOT affect runtime behavior — flip
+# SwingTrader._expert_spread_mode's return value for that.
+MODE = "expert"
+
 
 @dataclass
 class SpreadDecision:
