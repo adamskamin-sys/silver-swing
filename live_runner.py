@@ -1310,6 +1310,34 @@ def run() -> int:
                                            detail=f.detail)
                         except Exception:
                             pass
+                    # Auto-correct state_config_drift: when state.swing_qty >
+                    # config.swing_qty AND exchange position = 0, the bot would
+                    # keep re-arming to sell contracts it doesn't hold until Redis
+                    # is manually fixed. Safe to zero out here — we only act when
+                    # the exchange confirms no position (double-corroborated by
+                    # position_mismatch=0 for that symbol). 2026-07-16 incident.
+                    try:
+                        drift_syms = {f.symbol for f in findings if f.kind == "state_config_drift"}
+                        zero_pos_syms = {sym for sym, qty in exch_positions.items() if qty == 0}
+                        for _dsym in drift_syms & zero_pos_syms:
+                            _dst = store.get_state(live_tenant, _dsym) or {}
+                            _dcfg = store.get_config(live_tenant, _dsym) or {}
+                            _state_sq = int(_dst.get("swing_qty") or 0)
+                            _cfg_sq = int(_dcfg.get("swing_qty") or 0)
+                            if _state_sq > _cfg_sq:
+                                _dst["swing_qty"] = _cfg_sq
+                                store.put_state(live_tenant, _dsym, _dst)
+                                _log(f"[reconcile-autocorrect] {_dsym}: state.swing_qty "
+                                     f"{_state_sq}→{_cfg_sq} (exchange pos=0, config={_cfg_sq})")
+                                try:
+                                    log.record("state_config_drift_autocorrected",
+                                               tenant=TENANT, symbol=_dsym,
+                                               old_swing_qty=_state_sq, new_swing_qty=_cfg_sq,
+                                               severity="warn")
+                                except Exception:
+                                    pass
+                    except Exception as _dce:
+                        _log(f"[reconcile-autocorrect] failed: {type(_dce).__name__}: {_dce}")
                     _health.record_ok(store, "reconciliation_monitor", TENANT)
                 except Exception as e:
                     _log(f"reconciliation_monitor failed: {type(e).__name__}: {e}")

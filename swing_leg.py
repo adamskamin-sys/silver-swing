@@ -934,6 +934,22 @@ class SwingTrader:
                     core_qty=self.cfg.core_qty,
                 )
                 return
+            # Naked-short guard: even when core_qty=0 (shorts "allowed"),
+            # refuse to sell more contracts than the exchange actually shows.
+            # Covers position_mismatch class (2026-07-16): bot thinks it holds
+            # N contracts but exchange=0 — without this, it places a sell order
+            # for N contracts it doesn't own. The shorting path (core_qty=0,
+            # pos=0, intent=short) sets swing_qty <= 0 initially and arms via
+            # ARMED_BUY, so this guard doesn't block intentional shorts.
+            if pos < self.s.swing_qty:
+                self._record(
+                    "arm_sell_refused_position_mismatch",
+                    reason=f"exchange pos={pos} < swing_qty={self.s.swing_qty}; refusing to sell contracts we don't hold",
+                    position=pos,
+                    swing_qty=self.s.swing_qty,
+                    severity="critical",
+                )
+                return
             directive = strat.sell_action(self.s, self.cfg, current_price)
             if directive is None:
                 return  # trailing waiting for trigger / trail crossover
@@ -3612,11 +3628,14 @@ class SwingTrader:
         if self._maybe_trigger_stop_loss(last_price):
             return
 
-        if self.s.state == State.ARMED_SELL and last_price >= self.cfg.abort_above:
+        # 0 means "band disabled" — skip the check entirely.  A product seeded
+        # from SLR defaults (abort_above=70) for a $3k+ asset would halt every
+        # tick without this guard (2026-07-16 CHN incident).
+        if self.cfg.abort_above > 0 and self.s.state == State.ARMED_SELL and last_price >= self.cfg.abort_above:
             return self._halt(
                 f"price {last_price} ran above abort_above {self.cfg.abort_above} while flat on swing"
             )
-        if self.s.state == State.ARMED_BUY and last_price <= self.cfg.abort_below:
+        if self.cfg.abort_below > 0 and self.s.state == State.ARMED_BUY and last_price <= self.cfg.abort_below:
             return self._halt(
                 f"price {last_price} fell below abort_below {self.cfg.abort_below} while holding swing"
             )
@@ -4449,10 +4468,10 @@ class SwingTrader:
         if self._sleeve_in_blackout(sc, ss):
             return
 
-        # Abort governor uses the symbol-level bands.
-        if ss.state == SleeveStateEnum.ARMED_SELL and last_price >= self.cfg.abort_above:
+        # Abort governor uses the symbol-level bands. 0 = disabled.
+        if self.cfg.abort_above > 0 and ss.state == SleeveStateEnum.ARMED_SELL and last_price >= self.cfg.abort_above:
             return self._sleeve_halt(sc, ss, f"price {last_price} above abort_above {self.cfg.abort_above}")
-        if ss.state == SleeveStateEnum.ARMED_BUY and last_price <= self.cfg.abort_below:
+        if self.cfg.abort_below > 0 and ss.state == SleeveStateEnum.ARMED_BUY and last_price <= self.cfg.abort_below:
             return self._sleeve_halt(sc, ss, f"price {last_price} below abort_below {self.cfg.abort_below}")
 
         # Arm if no live order.
