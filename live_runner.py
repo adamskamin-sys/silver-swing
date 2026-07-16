@@ -1414,14 +1414,29 @@ def run() -> int:
                     # is manually fixed. Safe to zero out here — we only act when
                     # the exchange confirms no position (double-corroborated by
                     # position_mismatch=0 for that symbol). 2026-07-16 incident.
+                    #
+                    # SAFETY GATE: a Coinbase partial-response (HTTP 200 but one
+                    # product missing from the derivatives list) sets _refresh_ok=False
+                    # in main.refresh_portfolio_snapshot. If the snapshot is stale or
+                    # incomplete, treat "absent from snapshot" as UNKNOWN — not zero.
+                    # Skip both autocorrectors entirely to avoid clearing real positions.
+                    _pf_ok = pf.get("_refresh_ok", True)  # True = never refreshed yet (fresh boot, fail-open once)
+                    _pf_ts = float(pf.get("_refresh_ts") or 0)
+                    _pf_age = (now - _pf_ts) if _pf_ts else None
+                    _pf_fresh = _pf_ok and (_pf_age is None or _pf_age < PORTFOLIO_REFRESH_SECS * 10)
+                    if not _pf_fresh:
+                        _log(f"[reconcile-autocorrect] snapshot not fresh "
+                             f"(_refresh_ok={_pf_ok}, age={_pf_age:.0f}s if known) — "
+                             f"skipping autocorrect to avoid false ghost-clear")
                     try:
                         drift_syms = {f.symbol for f in findings if f.kind == "state_config_drift"}
                         # A symbol absent from exch_positions has no exchange position
-                        # (same as qty=0). Include both here so CHN/AVE/HYF-style
-                        # ghost states are corrected even when the exchange omits them
-                        # from the portfolio snapshot entirely.
+                        # (same as qty=0) — BUT only when the snapshot is confirmed
+                        # complete (_pf_fresh). On a partial/stale snapshot, treat
+                        # absent symbols as UNKNOWN to avoid a false ghost-clear.
                         zero_pos_syms = {sym for sym, qty in exch_positions.items() if qty == 0}
-                        zero_pos_syms |= drift_syms - set(exch_positions.keys())
+                        if _pf_fresh:
+                            zero_pos_syms |= drift_syms - set(exch_positions.keys())
                         for _dsym in drift_syms & zero_pos_syms:
                             _dst = store.get_state(live_tenant, _dsym) or {}
                             _dcfg = store.get_config(live_tenant, _dsym) or {}
@@ -1450,8 +1465,15 @@ def run() -> int:
                     try:
                         mismatch_syms = {f.symbol for f in findings if f.kind == "position_mismatch"}
                         for _msym in mismatch_syms:
-                            # treat "not in exch_positions" as qty=0 — exchange
-                            # simply omitted the symbol because it has no position
+                            # treat "not in exch_positions" as qty=0, but ONLY
+                            # when the portfolio snapshot is confirmed fresh and
+                            # complete. A Coinbase partial-200 could silently omit
+                            # a real position — skip the clear in that case.
+                            if not _pf_fresh and _msym not in exch_positions:
+                                _log(f"[reconcile-autocorrect] {_msym}: skipping "
+                                     f"ghost-clear (snapshot not fresh, absence is "
+                                     f"unconfirmed)")
+                                continue
                             _exch_qty = exch_positions.get(_msym, 0)
                             if _exch_qty != 0:
                                 continue  # only ghosts (exchange confirmed 0)

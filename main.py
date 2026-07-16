@@ -71,13 +71,16 @@ def _resolve_symbol(fallback: str) -> str:
 
 
 def _default_paper_config():
-    """Empirical SLR-27AUG26-CDE values (spec §3A). Used when the store has no config."""
+    """Empirical SLR-27AUG26-CDE values (spec §3A). Used when the store has no config.
+    abort_below/above are set to disabled (0/1e9) — SLR-specific price bands (60/70)
+    belong in the live Redis store config, not the code default, so dry-run sessions
+    on any non-SLR product don't halt every tick on a wrong band."""
     return {
         "core_qty": 10, "swing_qty": 2, "max_swing_qty": 5,
         "sell_px": 65.0, "buy_px": 63.0, "contract_size": 50,
         "margin_per_contract": 275.0, "scale_up_buffer_mult": 1.5,
         "fee_per_contract_roundtrip": 4.68,
-        "abort_below": 60.0, "abort_above": 70.0,
+        "abort_below": 0.0, "abort_above": 1e9,
         "fee_sanity_multiplier": 2.0,
     }
 

@@ -130,7 +130,10 @@ def advise(symbol: str, tenant: str, store_path: str = "data") -> dict:
         )
     except Exception:
         pass
-    have_margin = available_margin >= margin_per_ct or available_margin == 0.0  # fail-open on unknown balance
+    # Fail-closed: if portfolio snapshot hasn't landed yet (available_margin=0),
+    # treat margin as UNKNOWN and block the signal. A fresh deploy with no
+    # snapshot should not produce a GREEN that executes against empty margin.
+    have_margin = available_margin > 0 and available_margin >= margin_per_ct
 
     # Build price history from snapshot ticks if available, else synthetic
     prices = []

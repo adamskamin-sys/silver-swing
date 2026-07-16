@@ -379,6 +379,23 @@ export function makeApp({
         });
       }
 
+      // Validate price pair before touching the store — sell_px must exist
+      // and be strictly above buy_px or the sleeve creates an inverted or
+      // zero-sell-price order that loops on exchange rejection.
+      const execBuyPx = Number(fresh.suggested_buy_px);
+      const execSellPx = Number(fresh.new_sell_px || clientAdvice.new_sell_px || 0);
+      if (!Number.isFinite(execBuyPx) || execBuyPx <= 0)
+        return res.status(409).json({ ok: false, error: 'advisor returned invalid buy_px — cannot create sleeve' });
+      if (!Number.isFinite(execSellPx) || execSellPx <= 0)
+        return res.status(409).json({ ok: false, error: 'no sell_px available (parent sleeve has no sell target) — set a sell price on the parent sleeve first' });
+      if (execBuyPx >= execSellPx)
+        return res.status(409).json({ ok: false, error: `buy_px (${execBuyPx}) must be < sell_px (${execSellPx})` });
+      // Margin sanity at execution time
+      const marginAvail = Number(fresh.margin_available || 0);
+      const marginNeeded = Number(fresh.margin_needed || 0);
+      if (marginNeeded > 0 && marginAvail > 0 && marginAvail < marginNeeded)
+        return res.status(409).json({ ok: false, error: `insufficient margin: need $${marginNeeded.toFixed(2)}, have $${marginAvail.toFixed(2)}` });
+
       const store = await readStore(storePath);
       store[tenant] = store[tenant] || {};
       store[tenant][symbol] = store[tenant][symbol] || {};
