@@ -40,6 +40,18 @@ import health as _health  # background-job health tracker; never-raise
 TENANT = os.getenv("SWING_TENANT", "adam")
 SYMBOL = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
 SYMBOL_FAMILY = os.getenv("SWING_SYMBOL_FAMILY", "").strip() or None
+
+# Adam 2026-07-16: SWING_SYMBOL can now be "" or "NONE" to disable the
+# primary-trader path entirely. Every product then runs as a non-primary
+# track — collapses the primary/non-primary asymmetry per the
+# project_silver_not_special memory rule. When PRIMARY_ENABLED=False:
+#   - no primary broker / trader / feed
+#   - no primary preflight, no primary reconcile, no primary step()
+#   - main loop cadence uses time.sleep instead of primary feed poll
+#   - non-primary tracks discover + tick normally
+# Default (any real symbol) preserves current behavior. Kill switch:
+# revert env var to the old SYMBOL value.
+PRIMARY_ENABLED = bool(SYMBOL and SYMBOL.strip().upper() not in ("", "NONE"))
 DATA_DIR = os.getenv("SWING_DATA_DIR", "data")
 LOOP_INTERVAL_SECS = float(os.getenv("SWING_LOOP_INTERVAL", "0.05"))
 FEED_READY_TIMEOUT = float(os.getenv("SWING_FEED_TIMEOUT", "15.0"))
@@ -336,7 +348,7 @@ def run() -> int:
     # Family mode: resolve current front-month contract before anything else.
     # Lets a Coinbase auto-roll survive a redeploy without touching env vars.
     global SYMBOL
-    if SYMBOL_FAMILY:
+    if PRIMARY_ENABLED and SYMBOL_FAMILY:
         try:
             from roll import resolve_front_month
             probe = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
@@ -349,8 +361,12 @@ def run() -> int:
         except Exception as e:
             _log(f"family resolution failed ({type(e).__name__}: {e}) — using fallback {SYMBOL}")
 
-    _log(f"live_runner: mode={mode}, symbol={SYMBOL}, tenant={TENANT}"
-         f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
+    if PRIMARY_ENABLED:
+        _log(f"live_runner: mode={mode}, symbol={SYMBOL}, tenant={TENANT}"
+             f"{' (family=' + SYMBOL_FAMILY + ')' if SYMBOL_FAMILY else ''}")
+    else:
+        _log(f"live_runner: mode={mode}, tenant={TENANT} — NO PRIMARY "
+             f"(SWING_SYMBOL={SYMBOL!r}) — non-primary tracks only")
 
     store = make_store(DATA_DIR)
     log = make_trade_log(DATA_DIR)
@@ -358,33 +374,42 @@ def run() -> int:
     ks = KillSwitch(store, TENANT)
     notifier = default_notifier()
 
-    # In dry-run only, seed a default config if the tenant/symbol has no
-    # config yet — otherwise the preflight validator rejects the run before
-    # the operator can configure via dashboard (chicken-and-egg on first
-    # deploy). Real-money mode still requires the config to be pre-set:
-    # we don't want defaults touching production.
-    if dry_run and not store.get_config(TENANT, SYMBOL):
-        from main import _default_paper_config
-        _log(f"dry-run: seeding default config for {TENANT}/{SYMBOL}")
-        store.put_config(TENANT, SYMBOL, _default_paper_config())
+    # Primary-symbol setup — skipped entirely when PRIMARY_ENABLED=False.
+    # In no-primary mode: coinbase/broker/trader remain None. The main
+    # loop below handles the None case.
+    coinbase = None
+    broker = None
+    trader = None
+    if PRIMARY_ENABLED:
+        # In dry-run only, seed a default config if the tenant/symbol has no
+        # config yet — otherwise the preflight validator rejects the run before
+        # the operator can configure via dashboard (chicken-and-egg on first
+        # deploy). Real-money mode still requires the config to be pre-set:
+        # we don't want defaults touching production.
+        if dry_run and not store.get_config(TENANT, SYMBOL):
+            from main import _default_paper_config
+            _log(f"dry-run: seeding default config for {TENANT}/{SYMBOL}")
+            store.put_config(TENANT, SYMBOL, _default_paper_config())
 
-    coinbase = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
-    ok, issues = _preflight(coinbase, store, TENANT, SYMBOL, notifier)
-    if not ok:
-        for i in issues:
-            _log(f"  ✗ {i}")
-        _log("preflight failed — refusing to start")
-        notifier.send(
-            "live_runner preflight FAILED",
-            f"tenant={TENANT} symbol={SYMBOL}\n" + "\n".join(issues),
-            __import__("alerting").Priority.CRIT,
-        )
-        return 3
-    _log("preflight: all checks passed")
+        coinbase = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
+        ok, issues = _preflight(coinbase, store, TENANT, SYMBOL, notifier)
+        if not ok:
+            for i in issues:
+                _log(f"  ✗ {i}")
+            _log("preflight failed — refusing to start")
+            notifier.send(
+                "live_runner preflight FAILED",
+                f"tenant={TENANT} symbol={SYMBOL}\n" + "\n".join(issues),
+                __import__("alerting").Priority.CRIT,
+            )
+            return 3
+        _log("preflight: all checks passed")
 
-    broker = DryRunBroker(coinbase) if dry_run else coinbase
-    trader = SwingTrader(broker, store, TENANT, SYMBOL,
-                         trade_log=log, kill_switch=ks, notifier=notifier)
+        broker = DryRunBroker(coinbase) if dry_run else coinbase
+        trader = SwingTrader(broker, store, TENANT, SYMBOL,
+                             trade_log=log, kill_switch=ks, notifier=notifier)
+    else:
+        _log("no primary symbol — skipping primary broker/preflight/trader")
 
     # 2026-07-14 non-primary tick fix. Live worker previously only ticked
     # the primary SYMBOL — sleeves on other held products (PT, HYP, XLP,
@@ -890,6 +915,24 @@ def run() -> int:
             except Exception:
                 pass
 
+    def _account_broker():
+        """Return any broker suitable for account-level Coinbase API calls
+        (futures_balance, list_open_orders, snapshot). These don't need a
+        specific product_id but CoinbaseBroker's constructor requires one.
+
+        Prefers the primary broker if enabled. Otherwise reuses the first
+        available non-primary track's broker. Returns None if no broker
+        is available yet (early boot in no-primary mode with no tracks
+        discovered) — caller must handle None.
+        """
+        if coinbase is not None:
+            return coinbase
+        for _tr in _non_primary_tracks.values():
+            b = getattr(getattr(_tr, "trader", None), "b", None)
+            if b is not None:
+                return b
+        return None
+
     def _evict_track(product_id: str, reason: str) -> None:
         track = _non_primary_tracks.pop(product_id, None)
         if track is None:
@@ -911,13 +954,15 @@ def run() -> int:
     # where runtime state.swing_qty drifts above config.swing_qty and gets stuck
     # re-arming an unwanted position after cancellation. Only clamps in provably
     # safe conditions (no live position tracked, not mid-cycle). Notifies CRIT.
-    try:
-        from boot_state_normalizer import normalize_primary_swing_qty
-        _r = normalize_primary_swing_qty(trader, log=log, notifier=notifier)
-        if _r["drifted"]:
-            _log(f"boot state normalize: {_r['reason']}")
-    except Exception as e:
-        _log(f"WARN: boot_state_normalizer failed: {type(e).__name__}: {e}")
+    # Skipped in no-primary mode — no primary trader to normalize.
+    if trader is not None:
+        try:
+            from boot_state_normalizer import normalize_primary_swing_qty
+            _r = normalize_primary_swing_qty(trader, log=log, notifier=notifier)
+            if _r["drifted"]:
+                _log(f"boot state normalize: {_r['reason']}")
+        except Exception as e:
+            _log(f"WARN: boot_state_normalizer failed: {type(e).__name__}: {e}")
 
     # Sync EVERY product's contract_size + fees from Coinbase before the
     # trader takes its first step. Without this, dashboard modals and slider
@@ -944,7 +989,10 @@ def run() -> int:
     # even when bot-paper isn't running (Adam retired it). Reuses the same
     # cadence (30s floor, 15 min auto) and force_include semantics.
     from scanner_worker import ScannerWorker
-    scanner_worker = ScannerWorker(store, os.getenv("REDIS_URL") or None, SYMBOL)
+    # ScannerWorker accepts a symbol as a "seed"; in no-primary mode there
+    # isn't one — pass empty string, ScannerWorker treats it as unset.
+    scanner_worker = ScannerWorker(store, os.getenv("REDIS_URL") or None,
+                                   SYMBOL if PRIMARY_ENABLED else "")
 
     # Candle/backtest job servicer — dashboard queues candle-fetch and backtest
     # requests to Redis; a background thread here services them so the /api/
@@ -960,7 +1008,9 @@ def run() -> int:
         except Exception as e:
             _log(f"WARN: backtest_worker failed to start: {type(e).__name__}: {e}")
 
-    feed = LiveTickerFeed(SYMBOL)
+    # Primary feed — skipped in no-primary mode. Cadence then comes from
+    # a fixed sleep in the main loop instead of feed poll.
+    feed = LiveTickerFeed(SYMBOL) if PRIMARY_ENABLED else None
     stopping = False
 
     def stop(*_):
@@ -972,14 +1022,18 @@ def run() -> int:
     signal.signal(signal.SIGTERM, stop)
 
     try:
-        feed.start()
-        if not feed.wait_for_first_tick(timeout=FEED_READY_TIMEOUT):
-            _log("no ticks — check WS + product_id")
-            return 1
-        _log("feed live — starting main loop")
+        if feed is not None:
+            feed.start()
+            if not feed.wait_for_first_tick(timeout=FEED_READY_TIMEOUT):
+                _log("no ticks — check WS + product_id")
+                return 1
+            _log("feed live — starting main loop")
+        else:
+            _log("no primary feed — starting main loop with sleep cadence")
         log.record("bot_started", mode=("dry_run" if dry_run else "live"),
-                   tenant=TENANT, symbol=SYMBOL)
-        trader.reconcile()
+                   tenant=TENANT, symbol=(SYMBOL if PRIMARY_ENABLED else None))
+        if trader is not None:
+            trader.reconcile()
 
         last_snapshot = 0.0
         last_reconcile = time.time()  # [crew:#4] startup reconcile just ran
@@ -988,23 +1042,29 @@ def run() -> int:
         last_reconciliation = time.time()  # [crew] reconciliation_monitor
         last_family_check = time.time()  # already resolved on startup
         while not stopping:
-            t = feed.latest_ticker()
-            if t is None:
-                time.sleep(0.1)
-                continue
-            # problem-scout #6 (v2): wrap the primary step so a transient
-            # error (e.g. Coinbase 500 during order_status) doesn't crash
-            # the loop and take down every non-primary sibling track with
-            # it via process restart. Mirror the non-primary wrapper.
-            try:
-                trader.step(t["price"])
-            except Exception as e:
-                _log(f"[primary] {SYMBOL} step failed: {type(e).__name__}: {e}")
+            if feed is not None:
+                t = feed.latest_ticker()
+                if t is None:
+                    time.sleep(0.1)
+                    continue
+                # problem-scout #6 (v2): wrap the primary step so a transient
+                # error (e.g. Coinbase 500 during order_status) doesn't crash
+                # the loop and take down every non-primary sibling track with
+                # it via process restart. Mirror the non-primary wrapper.
                 try:
-                    _health.record_error(store, "primary_step", TENANT, e,
-                                         trade_log=log)
-                except Exception:
-                    pass
+                    trader.step(t["price"])
+                except Exception as e:
+                    _log(f"[primary] {SYMBOL} step failed: {type(e).__name__}: {e}")
+                    try:
+                        _health.record_error(store, "primary_step", TENANT, e,
+                                             trade_log=log)
+                    except Exception:
+                        pass
+            else:
+                # No-primary mode: no feed to poll for cadence. Sleep briefly
+                # so we don't burn CPU, then fall through to non-primary
+                # track ticking. LOOP_INTERVAL_SECS default is 0.05s.
+                time.sleep(max(LOOP_INTERVAL_SECS, 0.05))
             now = time.time()
             # 2026-07-14 full parity: tick each non-primary track on the
             # SAME loop cadence as the primary, using each product's own
@@ -1105,12 +1165,13 @@ def run() -> int:
             # the loop down; the next tick retries.
             if now - last_reconcile >= RECONCILE_INTERVAL_SECS:
                 last_reconcile = now
-                try:
-                    trader.reconcile()
-                    _health.record_ok(store, "reconcile", TENANT)
-                except Exception as e:
-                    _log(f"periodic reconcile failed: {type(e).__name__}: {e}")
-                    _health.record_error(store, "reconcile", TENANT, e, trade_log=log)
+                if trader is not None:
+                    try:
+                        trader.reconcile()
+                        _health.record_ok(store, "reconcile", TENANT)
+                    except Exception as e:
+                        _log(f"periodic reconcile failed: {type(e).__name__}: {e}")
+                        _health.record_error(store, "reconcile", TENANT, e, trade_log=log)
                 # 2026-07-14 non-primary reconcile — same guarantee the
                 # primary gets: credit fills that happened outside the step
                 # loop (manual trades on Coinbase, orders that filled between
@@ -1174,7 +1235,12 @@ def run() -> int:
                             "margin_per_contract": float(_cfg_d.get("margin_per_contract") or 0),
                         })
                     if _ms_positions:
-                        _bal = coinbase.futures_balance()
+                        _acc_b = _account_broker()
+                        if _acc_b is None:
+                            _log("[margin-sentinel] skipped — no broker available "
+                                 "for account balance call")
+                            continue
+                        _bal = _acc_b.futures_balance()
                         _cfm = 0.0
                         try:
                             _cfm = float((_bal.get("cfm_usd_balance") or {}).get("value") or 0)
@@ -1293,7 +1359,8 @@ def run() -> int:
                     # pass empty and rely on position_mismatch + stale_entry.
                     open_orders_data: list[dict] = []
                     try:
-                        list_orders_fn = getattr(coinbase, "list_open_orders", None)
+                        _acc_b = _account_broker()
+                        list_orders_fn = getattr(_acc_b, "list_open_orders", None) if _acc_b else None
                         if callable(list_orders_fn):
                             open_orders_data = list_orders_fn() or []
                     except Exception as _e:
@@ -1581,7 +1648,10 @@ def run() -> int:
                         _log(f"tick_recorder pruned {n} old day-directories")
                 except Exception as e:
                     _log(f"tick prune failed: {type(e).__name__}: {e}")
-            if now - last_snapshot >= SNAPSHOT_INTERVAL:
+            # Primary-symbol snapshot — only when primary is enabled. In
+            # no-primary mode, each non-primary track owns its own snapshot
+            # write (put_snapshot called by SwingTrader.step).
+            if trader is not None and feed is not None and now - last_snapshot >= SNAPSHOT_INTERVAL:
                 try:
                     snap = coinbase.snapshot()
                     snap["mode"] = "dry_run" if dry_run else "live"
@@ -1595,7 +1665,9 @@ def run() -> int:
             time.sleep(LOOP_INTERVAL_SECS)
 
     finally:
-        feed.stop()
+        if feed is not None:
+            try: feed.stop()
+            except Exception: pass
         # 2026-07-14 full parity: cleanly close every per-product WS feed
         # on shutdown so we don't leak connections back to Coinbase across
         # deploys/restarts.
