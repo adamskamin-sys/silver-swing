@@ -970,6 +970,14 @@ class SwingTrader:
             )
             if directive is None:
                 return
+            # Adam 2026-07-16: initial-entry regime gate. Blocks buys into
+            # extended/toxic regimes. Kill switch: expert_arm_gate.MODE = "off".
+            if not self._expert_arm_gate_allows(prices_source="primary",
+                                                  arm_direction="buy"):
+                self._record("primary_arm_denied_by_gate",
+                             reason="expert_arm_gate voted deny",
+                             current_price=float(current_price))
+                return
             # Override buy price with expert value if we got one AND it's
             # below current mark (never buy above market via limit).
             if expert_prices and 0 < expert_prices.get("buy_px", 0) < current_price:
@@ -2088,6 +2096,72 @@ class SwingTrader:
             except Exception:
                 pass
             return None
+
+    def _expert_arm_gate_allows(self, prices_source: str,
+                                  arm_direction: str = "buy",
+                                  sleeve_id: Optional[str] = None) -> bool:
+        """Consult expert_arm_gate before firing a fresh BUY.
+
+        Adam 2026-07-16: 6-voter supermajority (Kaufman + Wilder-ADX +
+        Cartea-OFI + Kyle-λ + Connors RSI(2) + Bollinger). Blocks buys
+        into extended/toxic regimes. Silence = deny.
+
+        prices_source: "primary" reads self._primary_price_history;
+                       otherwise treated as a sleeve id key into
+                       self._sleeve_price_history.
+
+        Returns True if gate allows (or MODE=off or fail-safe). Returns
+        False if experts deny.
+        """
+        try:
+            import expert_arm_gate as _eag
+            if getattr(_eag, "MODE", "expert") != "expert":
+                return True  # kill switch
+            if prices_source == "primary":
+                prices = list(self._primary_price_history)
+            else:
+                prices = list(self._sleeve_price_history.get(prices_source, []) or [])
+            # Read microstructure snapshot (None-safe)
+            ofi = None; kyle_lam = None; kyle_base = None
+            try:
+                if self.ms is not None and hasattr(self.ms, "snapshot"):
+                    snap = self.ms.snapshot()
+                    if isinstance(snap, dict):
+                        ofi = snap.get("trade_ofi_60s") or snap.get("ofi") or snap.get("obi")
+                        kyle_lam = snap.get("kyle_lambda")
+                        kyle_base = snap.get("kyle_lambda_baseline") or snap.get("kyle_lambda_avg")
+            except Exception:
+                pass
+            dec = _eag.arm_allowed(
+                prices=prices,
+                arm_direction=arm_direction,
+                order_flow_imbalance=(float(ofi) if ofi is not None else None),
+                kyle_lambda=(float(kyle_lam) if kyle_lam is not None else None),
+                kyle_baseline=(float(kyle_base) if kyle_base is not None else None),
+            )
+            event_name = ("primary_arm_gate_decision" if prices_source == "primary"
+                          else "sleeve_arm_gate_decision")
+            self._record(
+                event_name,
+                sleeve_id=sleeve_id,
+                allow=dec.allow,
+                votes=dec.votes,
+                vote_count=dec.vote_count,
+                total_voters=dec.total_voters,
+                method=dec.method,
+                arm_direction=arm_direction,
+            )
+            return bool(dec.allow)
+        except Exception as _e:
+            # Fail-safe: if the gate itself errors, allow the arm (legacy
+            # behavior) and log the error. We don't want an expert bug to
+            # block all trading — that would be worse than no gate at all.
+            try:
+                self._record("expert_arm_gate_error",
+                             sleeve_id=sleeve_id, error=str(_e), severity="warn")
+            except Exception:
+                pass
+            return True
 
     def _expert_size_adjust(self, user_configured_qty: int, mark: float,
                              stop_distance: float, contract_size: float,
@@ -5368,6 +5442,18 @@ class SwingTrader:
         # off-tick prices with INVALID_PRICE_PRECISION and the sleeve then
         # spins forever emitting sleeve_arm_failed with no order on the book.
         price = self._snap_to_tick(price)
+
+        # Adam 2026-07-16: initial-entry regime gate on sleeve BUY.
+        # 6-voter supermajority. Kill switch: expert_arm_gate.MODE = "off".
+        if side == "BUY" and qty > 0:
+            if not self._expert_arm_gate_allows(prices_source=sc.id,
+                                                  arm_direction="buy",
+                                                  sleeve_id=sc.id):
+                self._record("sleeve_arm_denied_by_gate",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             reason="expert_arm_gate voted deny",
+                             price=float(price))
+                return
 
         # Adam 2026-07-16: safety-cap qty via expert_size on BUY only.
         # Consensus of Van Tharp + half-Kelly + Vince, HARD-capped by
