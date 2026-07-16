@@ -85,32 +85,27 @@ def main() -> None:
           f"(cutoff = {int(cutoff_ts)} epoch)")
     print("=" * 90)
 
-    # Read the trade log
-    log_path = os.getenv("SWING_TRADE_LOG_PATH",
-                          os.path.join(args.data_dir, "trades.jsonl"))
+    # Read the trade log — use safety.make_trade_log so we get Redis
+    # backend on Render (SWING_TRADE_LOG_PATH file may not exist there).
     events: list[dict] = []
-    if os.path.exists(log_path):
-        try:
-            with open(log_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                        ts = float(e.get("ts") or 0)
-                        if ts >= cutoff_ts:
-                            events.append(e)
-                    except (ValueError, TypeError):
-                        pass
-        except Exception as e:
-            print(f"\n✗ Failed to read {log_path}: {e}")
-            sys.exit(1)
-    else:
-        print(f"\n✗ Trade log not found at {log_path}")
+    log_source = "?"
+    try:
+        from safety import make_trade_log
+        log = make_trade_log(args.data_dir)
+        log_source = type(log).__name__
+        for e in log.events():
+            try:
+                ts = float(e.get("ts") or 0)
+                if ts >= cutoff_ts:
+                    events.append(e)
+            except (ValueError, TypeError):
+                pass
+    except Exception as e:
+        print(f"\n✗ Failed to read trade log via safety.make_trade_log: "
+              f"{type(e).__name__}: {e}")
         sys.exit(1)
 
-    print(f"\nRead {len(events)} events from {log_path}")
+    print(f"\nRead {len(events)} events from {log_source}")
     print()
 
     any_flag = False
