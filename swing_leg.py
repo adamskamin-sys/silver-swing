@@ -2159,11 +2159,19 @@ class SwingTrader:
             ss._last_stop_refresh_ts = now
             return
 
-        # Multiplier: derived from asset class if we can determine it,
-        # else fall back to a reasonable default matching the tile logic.
-        # 2.0×ATR is the Turtle canonical; 2.5-3.0× is common for
-        # crypto/volatile assets.
-        stop_x_atr = 2.5  # default; matches tile's crypto class ballpark
+        # Adam 2026-07-16: stop distance is now chosen by expert consensus,
+        # not legacy stop_x_atr multiplier. Per feedback_experts_control_
+        # spread_and_price memory: every trading decision uses experts.
+        # See expert_stop.py for sources (Wilder/Cartea/Kyle/Menkveld/Van Tharp).
+        # Fee floor (Menkveld 2013 3× rt-fees) is HARD — prevents the PT bleed
+        # class where stop distance < fees guaranteed losing cycles.
+        # Kill switch: set expert_stop.MODE = "off" to revert to legacy.
+        try:
+            import expert_stop as _est
+        except Exception:
+            _est = None
+
+        wilder_mult = 2.0  # Wilder canonical baseline for the expert
         try:
             import expert_params
             asset_class = expert_params.asset_class_for(self.symbol) if hasattr(
@@ -2172,11 +2180,76 @@ class SwingTrader:
                 params = expert_params.params_for_class(asset_class) if hasattr(
                     expert_params, "params_for_class") else {}
                 if params and "stop_x_atr" in params:
-                    stop_x_atr = float(params["stop_x_atr"])
+                    wilder_mult = float(params["stop_x_atr"])
         except Exception:
-            pass  # fallback default is fine
+            pass
 
-        new_stop_px = float(last_price) - (atr_est * stop_x_atr)
+        # Gather microstructure inputs — None-safe (experts degrade to
+        # Wilder baseline if these aren't available).
+        ofi = None
+        kyle_lam = None
+        kyle_base = None
+        try:
+            if self.ms is not None:
+                snap = self.ms.snapshot() if hasattr(self.ms, "snapshot") else {}
+                if isinstance(snap, dict):
+                    ofi = snap.get("trade_ofi_60s") or snap.get("ofi") or snap.get("obi")
+                    kyle_lam = snap.get("kyle_lambda")
+                    kyle_base = snap.get("kyle_lambda_baseline") or snap.get("kyle_lambda_avg")
+        except Exception:
+            pass
+
+        fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
+        contract_size = float(getattr(self.cfg, "contract_size", 1) or 1)
+        tick_snap = float(getattr(self.cfg, "tick_size", 0) or 0)
+
+        new_stop_px = None
+        expert_decision = None
+        if _est is not None and getattr(_est, "MODE", "expert") == "expert":
+            try:
+                expert_decision = _est.optimal_stop_distance(
+                    mark=float(last_price),
+                    atr_est=float(atr_est),
+                    fee_per_roundtrip=fee_rt,
+                    contract_size=contract_size,
+                    qty=max(1, int(sc.qty or 1)),
+                    order_flow_imbalance=(float(ofi) if ofi is not None else None),
+                    kyle_lambda=(float(kyle_lam) if kyle_lam is not None else None),
+                    kyle_baseline=(float(kyle_base) if kyle_base is not None else None),
+                    wilder_multiplier=wilder_mult,
+                    tick_size=(tick_snap if tick_snap > 0 else None),
+                )
+                if expert_decision is not None:
+                    new_stop_px = float(expert_decision.stop_px)
+                    self._record(
+                        "expert_stop_applied",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        method=expert_decision.method,
+                        citation=expert_decision.citation,
+                        mark=round(float(last_price), 6),
+                        atr_est=round(float(atr_est), 6),
+                        stop_distance=expert_decision.stop_distance,
+                        stop_px=expert_decision.stop_px,
+                        candidates=expert_decision.candidates,
+                        consensus=expert_decision.consensus,
+                        fee_floor=expert_decision.fee_floor,
+                        fee_floor_binding=expert_decision.fee_floor_binding,
+                        sanity_cap=expert_decision.sanity_cap,
+                        sanity_cap_binding=expert_decision.sanity_cap_binding,
+                    )
+            except Exception as _e:
+                # Never let the expert crash the auto-refresh path.
+                try:
+                    self._record("expert_stop_error",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 error=str(_e), severity="warn")
+                except Exception:
+                    pass
+
+        # Fallback to legacy math if expert unavailable / off / errored.
+        # Preserves prior behavior as the kill-switch state.
+        if new_stop_px is None:
+            new_stop_px = float(last_price) - (atr_est * wilder_mult)
         try:
             new_stop_px = self._snap_to_tick(new_stop_px)
         except Exception:
