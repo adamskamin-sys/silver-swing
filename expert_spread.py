@@ -45,9 +45,11 @@ gives a tight spread that fills often.
 - T-t → configurable rolling horizon (default 3600s = 1h) so the
   math stays bounded even for perpetual contracts.
 - Discrete tick_size → snap final offsets to the product's tick.
-- Cost floor: never place a spread narrower than 2×fee_per_rt —
-  a fill would guarantee a loss. This is the Cartea-Jaimungal
-  "adverse selection cost floor" (2015, ch.8).
+- Cost floor: never place a spread narrower than 3×fee_per_rt.
+  Cartea-Jaimungal (2015, ch.8) provides the framework; Menkveld
+  (2013, J. Financial Markets 16:712) provides the empirical
+  multiplier (2.5× breakeven, 3× safety margin). Below this,
+  a fill guarantees a loss.
 
 ## Cross-checks
 
@@ -77,11 +79,22 @@ from typing import Optional
 # Named constants tuned for retail Coinbase CFM/perp. Every value has
 # a rationale — no arbitrary magic numbers.
 
-# Cartea-Jaimungal (2015) ch.8 §8.3.2: min viable spread must cover
-# round-trip fees × safety factor. Factor 2.0 means even a losing-
-# streak of adverse selection still nets positive on average across
-# the sleeve's cycle distribution. Below this, cycles are pure loss.
-_COST_FLOOR_MULTIPLIER = 2.0
+# Cartea-Jaimungal (2015) ch.8 §8.3.2 sets the minimum viable spread
+# as some multiplier × round-trip fees. The multiplier itself comes from
+# Menkveld (2013) "High Frequency Trading and the New Market Makers"
+# (J. Financial Markets 16, 712-740), which shows empirically that
+# 2.5× round-trip fees is typical HFT market-maker breakeven — below
+# that, even successful cycles net negative once adverse selection
+# and slippage are absorbed. We use 3.0× as margin of safety over
+# Menkveld's empirical breakeven, so a sleeve that fills cleanly still
+# nets positive after fees + typical retail slippage.
+#
+# Bumped 2026-07-16 from 2.0 → 3.0 after PT + HYPE bled ~$150 each
+# in <10min from tight cycles that "worked" mechanically but lost
+# money on every fill because spread < fees. Adam's directive:
+# "make it how the experts intended" — Menkveld says 2.5, safety
+# says 3.0. This is a HARD floor no other expert can vote against.
+_COST_FLOOR_MULTIPLIER = 3.0
 
 # Avellaneda-Stoikov (2008) §4 default γ range in original paper:
 # [0.01, 1.0]. For a "maximize cycles" bias, γ = 0.7 is a strong
@@ -301,9 +314,11 @@ def optimal_spread(
     raw_buy = reservation - half_spread_dollars
     raw_sell = reservation + half_spread_dollars
 
-    # Cartea-Jaimungal (2015) ch.8 §8.3.2 cost floor. Ensure the
-    # spread covers 2× round-trip fees so an average-case fill
-    # still nets positive after slippage.
+    # Cartea-Jaimungal (2015) ch.8 §8.3.2 + Menkveld (2013) fee floor.
+    # Ensure the spread covers 3× round-trip fees so an average-case
+    # fill still nets positive after slippage. Menkveld shows 2.5× is
+    # empirical MM breakeven; 3× is safety margin. This is a HARD
+    # floor no other expert term can override.
     cost_floor = _COST_FLOOR_MULTIPLIER * fee_per_roundtrip / (contract_size * qty) if (contract_size * qty) > 0 else 0.0
     spread_dollars = raw_sell - raw_buy
     cost_floor_binding = False

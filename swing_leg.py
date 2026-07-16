@@ -36,7 +36,7 @@ from typing import Optional, Protocol
 from alerting import Notifier, Priority
 from state_store import StateStore
 from safety import KillSwitch, TradeLog
-from strategies import ExitStrategy, strategy_by_name
+from strategies import ExitStrategy, SellDirective, BuyDirective, strategy_by_name
 from sleeves import SleeveConfig, SleeveState, SleeveStateEnum
 
 
@@ -154,6 +154,14 @@ class SwingTrader:
         # strategies (mean reversion, Bollinger). Empty for now; will be
         # populated the same commit those exit_modes are wired in.
         self._sleeve_price_history: dict = {}
+        # Adam 2026-07-16: primary-swing price history for expert_spread.
+        # Same purpose as _sleeve_price_history but scoped to the primary
+        # state machine (which doesn't have a sc.id). Appended on every
+        # step(). Bounded so long-running processes stay flat in memory.
+        # 120 samples × 5s tick ≈ 10 minutes of history — enough for the
+        # AS realized-vol estimate (needs ≥5 samples per expert_spread.py).
+        from collections import deque as _deque
+        self._primary_price_history: _deque = _deque(maxlen=120)
         # [crew] Per-sleeve cascade-lifecycle observations (price + VPIN/OFI +
         # per-tick vol proxy) for the crash-guard re-entry gate. Only populated
         # when a sleeve has crash_guard_enabled — zero cost otherwise.
@@ -909,6 +917,13 @@ class SwingTrader:
             return
         pos = self.b.position_qty()
         strat = self._exit_strategy()
+        # Adam 2026-07-16: consult expert_spread BEFORE the strategy computes
+        # its directive. When expert_spread returns valid, it overrides the
+        # directive's limit_price. The 3× Menkveld fee floor inside
+        # expert_spread is what prevents HYPE/PT-style bleed cycles where
+        # spread < fees. Fail-safe: on any error the legacy directive stands.
+        expert_prices = self._expert_pick_primary_prices(pos, current_price)
+
         if self.s.state == State.ARMED_SELL:
             if not self._floor_ok(pos, self.s.swing_qty):
                 self._record(
@@ -922,6 +937,11 @@ class SwingTrader:
             directive = strat.sell_action(self.s, self.cfg, current_price)
             if directive is None:
                 return  # trailing waiting for trigger / trail crossover
+            # Override sell price with expert value if we got one AND it's
+            # above current mark (never sell below market via limit).
+            if expert_prices and expert_prices.get("sell_px", 0) > current_price:
+                directive = SellDirective(qty=directive.qty,
+                                          limit_price=expert_prices["sell_px"])
             qty, px = self._ms_adjust("SELL", directive.qty, directive.limit_price, current_price)
             if qty is None:
                 return  # filter said pause
@@ -934,6 +954,11 @@ class SwingTrader:
             )
             if directive is None:
                 return
+            # Override buy price with expert value if we got one AND it's
+            # below current mark (never buy above market via limit).
+            if expert_prices and 0 < expert_prices.get("buy_px", 0) < current_price:
+                directive = BuyDirective(qty=directive.qty,
+                                         limit_price=expert_prices["buy_px"])
             qty, px = self._ms_adjust("BUY", directive.qty, directive.limit_price, current_price)
             if qty is None:
                 return
@@ -1851,21 +1876,121 @@ class SwingTrader:
             return []
 
     def _expert_spread_mode(self) -> str:
-        """Read the __expert_spread_mode__ scope. Returns one of:
-          'off'    (default) — Avellaneda-Stoikov code path does not run
-          'shadow' — compute AS spread + log alongside legacy; NEVER apply
-          'expert' — compute AS spread + APPLY to buy_px / sell_px
+        """Adam 2026-07-16: experts ALWAYS decide the spread. Rule per
+        feedback_experts_control_spread_and_price memory: every trading
+        decision — spread, buy price, stop distance, reentry — is made
+        by expert algorithms grounded in academic HFT literature. No
+        legacy fallback. The gate is deleted; this method now returns
+        "expert" unconditionally. Kept as a method (not inlined) so
+        the two call sites read symmetrically and any future kill-switch
+        can be added here in one place.
 
-        Same rollout pattern as _reentry_mode: enable 'shadow' first,
-        observe 24-48h of expert_spread_shadow_decision events comparing
-        AS vs legacy, THEN flip to 'expert' for one sleeve at a time.
+        Prior behavior (before 2026-07-16): tenant-scoped
+        __expert_spread_mode__ flag with off/shadow/expert. Kept HYPE
+        and PT bleeding on tight spreads because the mode was still
+        'off' or 'shadow' on most sleeves + not wired to primary at all.
 
-        Fail-safe: any store error → 'off'."""
+        Kill switch: if a future incident requires falling back to
+        legacy, change this to return "off" and both call sites will
+        skip the AS block."""
+        return "expert"
+
+    def _expert_pick_primary_prices(self, inventory: int, mark: float) -> Optional[dict]:
+        """Ask expert_spread for primary-swing buy/sell prices at current mark.
+
+        Adam 2026-07-16: fixes the HYPE + PT bleed pattern where the primary
+        state machine armed swings with spread < fees, guaranteeing losing
+        cycles. The 3× Menkveld fee floor inside expert_spread ensures every
+        cycle is at least fee-break-even.
+
+        Returns {'buy_px', 'sell_px', 'spread'} on success. Returns None on
+        failure — the caller falls back to the strategy's legacy directive
+        (which is what shipped before this method existed).
+
+        Reads:
+          - price history from self._primary_price_history (populated per-tick)
+          - cycle_completion_ts from trade log (for arrival-rate estimate)
+          - fee_per_roundtrip, contract_size, tick_size from cfg
+          - inventory passed in (position_qty from broker)
+          - qty from state.swing_qty
+
+        The AS grid search internally picks γ to maximize E[$/day] with
+        tie-breaker to MORE cycles (per feedback_optimize_realized_dollars_per_day).
+        """
         try:
-            m = (self.store.get_state(self.tenant_id, "__expert_spread_mode__") or {})
-            return str(m.get("mode") or "off").lower()
-        except Exception:
-            return "off"
+            if mark <= 0 or self.s.swing_qty <= 0:
+                return None
+            history = list(self._primary_price_history)
+            if len(history) < 5:
+                return None  # expert_spread needs ≥5 samples
+            # Cycle completion timestamps for arrival-rate estimate.
+            cycle_ts = []
+            try:
+                if hasattr(self, "trade_log") and self.trade_log:
+                    for e in self.trade_log.events():
+                        if not isinstance(e, dict):
+                            continue
+                        if e.get("event_type") != "cycle_completed":
+                            continue
+                        if e.get("symbol") != self.symbol:
+                            continue
+                        ts = float(e.get("ts") or 0)
+                        if ts > 0:
+                            cycle_ts.append(ts)
+            except Exception:
+                pass
+            fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
+            tick = float(getattr(self.cfg, "tick_size", 0) or 0)
+            contract_size = float(getattr(self.cfg, "contract_size", 1) or 1)
+            qty = int(self.s.swing_qty)
+            import expert_spread as _es
+            dec = _es.grid_search_optimal_gamma(
+                mid_price=float(mark),
+                price_history=history,
+                cycle_completion_ts=cycle_ts,
+                fee_per_roundtrip=fee_rt,
+                contract_size=contract_size,
+                qty=qty,
+                tick_size=tick if tick > 0 else None,
+                inventory=int(inventory or 0),
+            )
+            if dec is None:
+                return None
+            if dec.buy_px <= 0 or dec.sell_px <= 0 or dec.sell_px <= dec.buy_px:
+                return None
+            # Log so the operator can audit what the expert chose vs mark.
+            try:
+                self._record(
+                    "expert_spread_primary_applied",
+                    method=dec.method,
+                    citation=dec.citation,
+                    mark=round(mark, 6),
+                    inventory=int(inventory or 0),
+                    swing_qty=qty,
+                    fee_per_roundtrip=fee_rt,
+                    contract_size=contract_size,
+                    expert_buy_px=dec.buy_px,
+                    expert_sell_px=dec.sell_px,
+                    expert_spread=dec.spread,
+                    expected_daily_pnl=dec.expected_daily_pnl,
+                    expected_cycles_per_day=dec.expected_cycles_per_day,
+                    cost_floor_binding=dec.cost_floor_binding,
+                    lambda_widening=dec.lambda_widening,
+                )
+            except Exception:
+                pass
+            return {
+                "buy_px": float(dec.buy_px),
+                "sell_px": float(dec.sell_px),
+                "spread": float(dec.spread),
+            }
+        except Exception as e:
+            try:
+                self._record("expert_spread_primary_error",
+                             error=str(e), severity="warn")
+            except Exception:
+                pass
+            return None
 
     # [crew 2026-07-15] auto-refresh cadence config
     _AUTO_REFRESH_MIN_INTERVAL_SECS = 60.0      # don't fire more than once/min per sleeve
@@ -3431,6 +3556,15 @@ class SwingTrader:
     # ---- main loop -------------------------------------------------------
 
     def step(self, last_price: float) -> None:
+        # Adam 2026-07-16: append to primary price history so expert_spread
+        # has a live vol estimate on the next arm. Zero-cost when unused.
+        try:
+            px = float(last_price)
+            if px > 0:
+                self._primary_price_history.append(px)
+        except (TypeError, ValueError):
+            pass
+
         # Adam 2026-07-15: consume any pending state-store patch FIRST.
         # Solves the diag-vs-live race — diag scripts (force-credit backfill,
         # etc.) write a patch that this consumer merges into in-memory state
