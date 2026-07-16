@@ -3962,45 +3962,69 @@ class SwingTrader:
         # Only rewrites when live estimate diverges >20% from static —
         # avoids thrashing the trail on every tick. Logged so audit can
         # see adaptation vs static behavior.
-        if trail_distance > 0 and getattr(sc, "adaptive_trail_enabled", False):
+        # Adam 2026-07-16: trail distance now via expert_trail consensus
+        # (Chande + Wilder-SAR + Turtle) + Menkveld floor + Van Tharp cap +
+        # Ho-Stoll age tightener. Replaces the LeBeau vol-adaptive block.
+        # Applies whenever we have a valid trail_distance base; the expert
+        # OVERRIDES the base. Kill switch: expert_trail.MODE = "off".
+        if trail_distance > 0:
             try:
-                import math as _math_at
-                _hist = list(self._sleeve_price_history.get(sc.id, []) or [])
-                if len(_hist) >= 10:
-                    _samples = _hist[-30:]
-                    _rets = [_math_at.log(_samples[i] / _samples[i - 1])
-                             for i in range(1, len(_samples))
-                             if _samples[i - 1] > 0 and _samples[i] > 0]
-                    if len(_rets) >= 5:
-                        _mean = sum(_rets) / len(_rets)
-                        _var = sum((r - _mean) ** 2 for r in _rets) / len(_rets)
-                        _sigma = _math_at.sqrt(_var)
-                        _k = float(getattr(sc, "adaptive_trail_k", 2.5) or 2.5)
-                        _live_dist = _k * _sigma * last_price
-                        # Cap: no wider than 5% of mark (chandelier max)
-                        _live_dist = min(_live_dist, last_price * 0.05)
-                        # Floor: at least 2 ticks
-                        _tick = float(getattr(self.cfg, "tick_size", 0) or 0)
-                        if _tick > 0:
-                            _live_dist = max(_live_dist, _tick * 2.0)
-                        # Only rewrite if divergence > 20% from static
-                        _delta_pct = abs(_live_dist - trail_distance) / trail_distance
-                        if _delta_pct > 0.20:
+                import expert_trail as _et
+                if getattr(_et, "MODE", "expert") == "expert":
+                    _hist = list(self._sleeve_price_history.get(sc.id, []) or [])
+                    if len(_hist) >= 5:
+                        # ATR proxy from recent |Δclose|
+                        _deltas = [abs(_hist[i] - _hist[i - 1])
+                                    for i in range(1, len(_hist))]
+                        _atr = sum(_deltas[-14:]) / max(1, len(_deltas[-14:])) if _deltas else 0.0
+                        _hh = float(ss.trail_high_water_price or last_price)
+                        _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
+                        _contract_size = float(getattr(self.cfg, "contract_size", 1) or 1)
+                        # Position age from sleeve's own_avg_entry_ts if we have it,
+                        # else 0.0 (no age adjustment).
+                        import time as _t_at
+                        _age = 0.0
+                        _entry_ts = getattr(ss, "own_avg_entry_ts", None) or getattr(ss, "armed_since_ts", None)
+                        if _entry_ts:
+                            try:
+                                _age = max(0.0, _t_at.time() - float(_entry_ts))
+                            except (TypeError, ValueError):
+                                pass
+                        _dec = _et.optimal_trail_distance(
+                            mid_price=float(last_price),
+                            highest_high=_hh,
+                            atr_est=float(_atr),
+                            prices=_hist,
+                            fee_per_roundtrip=_fee_rt,
+                            contract_size=_contract_size,
+                            qty=max(1, int(sc.qty or 1)),
+                            position_age_secs=_age,
+                        )
+                        if _dec is not None and _dec.trail_distance > 0:
                             self._record(
-                                "trail_distance_adapted",
+                                "expert_trail_applied",
                                 sleeve_id=sc.id, sleeve_name=sc.name,
-                                static_trail_distance=round(trail_distance, 6),
-                                live_trail_distance=round(_live_dist, 6),
-                                sigma=round(_sigma, 8),
-                                k=_k, last_price=last_price,
-                                delta_pct=round(_delta_pct * 100, 2),
-                                reason=("LeBeau chandelier vol-adaptive: "
-                                        "k×σ×price, capped at 5% of mark, "
-                                        "floor at 2 ticks"),
+                                method=_dec.method,
+                                citation=_dec.citation,
+                                legacy_trail_distance=round(trail_distance, 6),
+                                expert_trail_distance=_dec.trail_distance,
+                                candidates=_dec.candidates,
+                                consensus=_dec.consensus,
+                                fee_floor=_dec.fee_floor,
+                                fee_floor_binding=_dec.fee_floor_binding,
+                                sanity_cap=_dec.sanity_cap,
+                                sanity_cap_binding=_dec.sanity_cap_binding,
+                                age_tightener_factor=_dec.age_tightener_factor,
+                                position_age_secs=round(_age, 1),
                             )
-                            trail_distance = _live_dist
-            except Exception:
-                pass  # fall back to static — never fail-hard on the stop path
+                            trail_distance = _dec.trail_distance
+            except Exception as _e:
+                try:
+                    self._record("expert_trail_error",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 error=str(_e), severity="warn")
+                except Exception:
+                    pass  # fall back to static — never fail-hard on the stop path
         target_px = None
         stage = None
         # Adam 2026-07-15: checkpoint-then-ratchet model.
