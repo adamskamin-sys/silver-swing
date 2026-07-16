@@ -47,9 +47,14 @@ KNOWN_KINDS = [
 
 
 def _classify(kind: str, symbol: str, detail: dict,
-              retired_syms: set, live_holds: dict) -> tuple[str, str]:
+              retired_syms: set, live_holds: dict,
+              known_syms: set) -> tuple[str, str]:
     """Return (icon, one-line reasoning) for a finding."""
-    # Retired products: any finding on a symbol we retired is stale
+    # Already-purged symbols (no state block at all): historical finding
+    # from before the purge — trade log will age it out.
+    if symbol not in known_syms:
+        return "🟢", f"{symbol} state was purged — historical finding, will age out"
+    # Retired products still present in state: any finding is stale
     if symbol in retired_syms:
         return "🟢", f"{symbol} was retired — finding is ghost data"
 
@@ -127,6 +132,7 @@ def main() -> None:
     # and current holdings (position_qty from __portfolio__)
     retired_syms = set()
     live_holds: dict = {}
+    known_syms: set = set()
     try:
         from state_store import make_store
         store = make_store(args.data_dir)
@@ -142,6 +148,7 @@ def main() -> None:
         for sym in store.list_symbols(tenant):
             if sym.startswith("__"):
                 continue
+            known_syms.add(sym)
             st = store.get_state(tenant, sym) or {}
             cfg = store.get_config(tenant, sym) or {}
             sleeves = st.get("sleeves") or {}
@@ -178,7 +185,7 @@ def main() -> None:
             age = time.time() - float(most_recent.get("ts") or 0)
             severity = most_recent.get("severity", "?")
             detail = most_recent.get("detail") or {}
-            icon, reasoning = _classify(kind, sym, detail, retired_syms, live_holds)
+            icon, reasoning = _classify(kind, sym, detail, retired_syms, live_holds, known_syms)
             if icon == "🟢": ghost += 1
             elif icon == "🟠": review += 1
             elif icon == "🔴": real += 1
