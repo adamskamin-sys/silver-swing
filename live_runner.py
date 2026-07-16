@@ -1338,6 +1338,44 @@ def run() -> int:
                                     pass
                     except Exception as _dce:
                         _log(f"[reconcile-autocorrect] failed: {type(_dce).__name__}: {_dce}")
+                    # Auto-correct position_mismatch (ghost positions): exchange=0
+                    # but state=ARMED_SELL with swing_qty>0 and no live order.
+                    # Without this the primary loop spins on RuntimeError from
+                    # no_short_check every tick (2026-07-16 SLVR/AVE/HYF incident).
+                    # Only acts when exchange confirms 0 AND no live_order_id — a
+                    # live order in flight means the fill might land any second.
+                    try:
+                        mismatch_syms = {f.symbol for f in findings if f.kind == "position_mismatch"}
+                        for _msym in mismatch_syms:
+                            if exch_positions.get(_msym) != 0:
+                                continue  # only ghosts (exchange confirmed 0)
+                            _mst = store.get_state(live_tenant, _msym) or {}
+                            if _mst.get("live_order_id"):
+                                continue  # order in flight — don't touch
+                            _mstate = str(_mst.get("state") or "").upper()
+                            _msq = int(_mst.get("swing_qty") or 0)
+                            if _mstate == "ARMED_SELL" and _msq > 0:
+                                _mst["swing_qty"] = 0
+                                _mst["state"] = "HALTED"
+                                _mst["live_order_id"] = None
+                                _mst["halt_reason"] = (
+                                    f"ghost position auto-cleared: exchange=0 "
+                                    f"but state=ARMED_SELL qty={_msq} (2026-07-16)"
+                                )
+                                store.put_state(live_tenant, _msym, _mst)
+                                _log(f"[reconcile-autocorrect] {_msym}: ghost cleared "
+                                     f"(exchange=0, ARMED_SELL qty={_msq}→0, now HALTED)")
+                                try:
+                                    log.record("position_mismatch_autocorrected",
+                                               tenant=TENANT, symbol=_msym,
+                                               old_swing_qty=_msq, new_swing_qty=0,
+                                               old_state="ARMED_SELL", new_state="HALTED",
+                                               severity="warn")
+                                except Exception:
+                                    pass
+                    except Exception as _mce:
+                        _log(f"[reconcile-autocorrect] mismatch pass failed: "
+                             f"{type(_mce).__name__}: {_mce}")
                     _health.record_ok(store, "reconciliation_monitor", TENANT)
                 except Exception as e:
                     _log(f"reconciliation_monitor failed: {type(e).__name__}: {e}")
