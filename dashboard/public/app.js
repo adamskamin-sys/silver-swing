@@ -67,6 +67,11 @@ const backtestModal = document.getElementById('backtest-modal');
 const backtestForm = document.getElementById('backtest-form');
 const backtestResult = document.getElementById('backtest-result');
 
+const avgDownModal = document.getElementById('avg-down-modal');
+const avgDownModalTitle = document.getElementById('avg-down-modal-title');
+const avgDownModalBody = document.getElementById('avg-down-modal-body');
+const avgDownConfirmBtn = document.getElementById('avg-down-confirm-btn');
+
 const tradeModal = document.getElementById('trade-modal');
 const tradeModalTitle = document.getElementById('trade-modal-title');
 const tradeModalBody = document.getElementById('trade-modal-body');
@@ -1337,7 +1342,7 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           // floor + calm flow + volatility settled + below your avg + margin.
           const adLight = r.kind === 'futures' ? productAvgDownLight(liveTenant, r.product) : null;
           const adBadge = adLight === 'green'
-            ? ` <span class="ck-chip ck-ok" style="font-size:0.7em;padding:1px 4px" title="AVG-DOWN GREEN — expert stack says a disciplined scale-in near support is on the table right now. Notification only; you still pull the trigger.">🟢</span>`
+            ? ` <span class="ck-chip ck-ok avg-down-btn" style="font-size:0.7em;padding:1px 4px;cursor:pointer" title="AVG-DOWN GREEN — click for expert scale-in recommendation" data-symbol="${escapeHtml(r.product)}" data-tenant="${escapeHtml(liveTenant)}">🟢 avg↓</span>`
             : adLight === 'amber'
               ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="AVG-DOWN AMBER — watching, but not all conditions met yet (regime, floor, calm, or below-avg missing)">🟡</span>`
               : '';
@@ -5687,6 +5692,108 @@ async function deleteSleeve(tenant, symbol, sleeveId) {
   }
 }
 
+// ---- avg-down advice modal ----------------------------------------------
+
+let _avgDownAdvice = null;
+
+function openAvgDownModal(symbol, tenant) {
+  _avgDownAdvice = null;
+  avgDownConfirmBtn.disabled = true;
+  avgDownModalTitle.textContent = `Expert avg-down — ${symbol}`;
+  avgDownModalBody.innerHTML = '<p class="dim">Loading expert recommendation…</p>';
+  avgDownModal.hidden = false;
+
+  fetch(`/api/avg-down-advice?symbol=${encodeURIComponent(symbol)}&tenant=${encodeURIComponent(tenant)}`, {
+    credentials: 'same-origin',
+  })
+    .then(r => r.json())
+    .then(advice => {
+      if (advice._unauthorized) { showLogin(); return; }
+      _avgDownAdvice = advice;
+      avgDownModalBody.innerHTML = renderAvgDownAdvice(advice);
+      avgDownConfirmBtn.disabled = !(advice.ok && advice.light === 'green');
+      // Wire confirm
+      avgDownConfirmBtn.onclick = () => executeAvgDown(symbol, tenant, advice);
+    })
+    .catch(err => {
+      avgDownModalBody.innerHTML = `<p class="neg">Failed to load advice: ${escapeHtml(String(err))}</p>`;
+    });
+}
+
+function renderAvgDownAdvice(a) {
+  const light = a.light || 'red';
+  const lightEmoji = light === 'green' ? '🟢' : light === 'amber' ? '🟡' : '🔴';
+  const reasons = (a.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+  if (!a.ok) {
+    return `
+      <div style="margin-bottom:1rem">${lightEmoji} <b>${light.toUpperCase()}</b> — signal not actionable</div>
+      ${reasons ? `<ul style="margin:0 0 1rem 1.2rem;color:var(--dim-color)">${reasons}</ul>` : ''}
+      <p class="dim" style="font-size:0.85em">Signal requires: mean-revert regime · at channel floor · calm flow · volatility settled · price below your avg · margin headroom</p>`;
+  }
+  const fmt = v => v != null ? `$${Number(v).toFixed(4)}` : '—';
+  const fmtQty = v => v != null ? String(Math.round(v)) : '—';
+  const pnlPct = a.current_avg_entry && a.current_mark
+    ? (((a.current_mark - a.current_avg_entry) / a.current_avg_entry) * 100).toFixed(2)
+    : null;
+  const checks = a.signal_checks || {};
+  const checkRows = Object.entries(checks).map(([k, v]) => {
+    const ok = v === true || v === 'green' || v === 'pass';
+    return `<tr><td class="dim">${escapeHtml(k)}</td><td>${ok ? '✅' : '⚠️'} ${escapeHtml(String(v))}</td></tr>`;
+  }).join('');
+
+  return `
+    <div style="margin-bottom:0.75rem">${lightEmoji} <b>GREEN — scale-in opportunity confirmed</b></div>
+    ${reasons ? `<ul style="margin:0 0 1rem 1.2rem;color:var(--dim-color);font-size:0.85em">${reasons}</ul>` : ''}
+
+    <table style="width:100%;border-collapse:collapse;margin-bottom:1rem">
+      <colgroup><col style="width:55%"><col style="width:45%"></colgroup>
+      <tr><th colspan="2" style="text-align:left;padding:4px 0;border-bottom:1px solid var(--border-color)">Current position — ${escapeHtml(a.sleeve_name || a.sleeve_id || '')}</th></tr>
+      <tr><td class="dim">Current qty</td><td class="mono">${fmtQty(a.current_qty)} contracts</td></tr>
+      <tr><td class="dim">Avg entry</td><td class="mono">${fmt(a.current_avg_entry)}${pnlPct !== null ? ` <span class="${Number(pnlPct) >= 0 ? 'pos' : 'neg'}">(${pnlPct}%)</span>` : ''}</td></tr>
+      <tr><td class="dim">Current mark</td><td class="mono">${fmt(a.current_mark)}</td></tr>
+      <tr><td class="dim">ATR (14)</td><td class="mono">${a.atr ? `$${Number(a.atr).toFixed(4)}` : '—'}</td></tr>
+
+      <tr><th colspan="2" style="text-align:left;padding:4px 0 4px;border-bottom:1px solid var(--border-color);border-top:1px solid var(--border-color);margin-top:0.5rem">Expert scale-in parameters</th></tr>
+      <tr><td class="dim">Add qty</td><td class="mono"><b>${fmtQty(a.recommended_add_qty)} contract${a.recommended_add_qty === 1 ? '' : 's'}</b></td></tr>
+      <tr><td class="dim">Suggested buy px</td><td class="mono"><b>${fmt(a.suggested_buy_px)}</b></td></tr>
+      <tr><td class="dim">Blended entry (after fill)</td><td class="mono">${fmt(a.blended_entry_px)}</td></tr>
+      <tr><td class="dim">New stop</td><td class="mono neg">${fmt(a.new_stop_px)}</td></tr>
+      <tr><td class="dim">Trail trigger</td><td class="mono pos">${fmt(a.new_trail_trigger)}</td></tr>
+      <tr><td class="dim">Trail distance</td><td class="mono">${fmt(a.new_trail_distance)}</td></tr>
+      <tr><td class="dim">Sell target</td><td class="mono pos">${fmt(a.new_sell_px)}</td></tr>
+
+      <tr><th colspan="2" style="text-align:left;padding:4px 0;border-bottom:1px solid var(--border-color);border-top:1px solid var(--border-color)">Margin</th></tr>
+      <tr><td class="dim">Available</td><td class="mono">${a.margin_available ? `$${Number(a.margin_available).toFixed(2)}` : '—'}</td></tr>
+      <tr><td class="dim">Needed for add</td><td class="mono">${a.margin_needed ? `$${Number(a.margin_needed).toFixed(2)}` : '—'}</td></tr>
+    </table>
+
+    ${checkRows ? `<details style="margin-top:0.5rem"><summary class="dim" style="cursor:pointer;font-size:0.8em">Signal checks</summary><table style="width:100%;font-size:0.8em;margin-top:0.4rem">${checkRows}</table></details>` : ''}
+
+    <p class="dim" style="font-size:0.8em;margin-top:0.75rem">Clicking "Scale in" creates a new ARMED_BUY sleeve at ${fmt(a.suggested_buy_px)} with the parameters above. The bot places the limit buy on Coinbase on the next tick. No order is placed until you confirm.</p>`;
+}
+
+async function executeAvgDown(symbol, tenant, advice) {
+  avgDownConfirmBtn.disabled = true;
+  avgDownConfirmBtn.textContent = 'Creating sleeve…';
+  try {
+    const res = await postJson('/api/avg-down-execute', { tenant, symbol, advice });
+    if (res._unauthorized) { showLogin(); return; }
+    if (res.ok) {
+      avgDownModal.hidden = true;
+      showToast(`Scale-in sleeve created (${res.sleeve_id}) — buy queued for next tick`, 'info');
+      refreshOnce();
+    } else {
+      avgDownModalBody.innerHTML += `<p class="neg" style="margin-top:0.5rem">⚠ ${escapeHtml(res.error || 'execute failed')}</p>`;
+      avgDownConfirmBtn.textContent = 'Scale in — create sleeve';
+      avgDownConfirmBtn.disabled = false;
+    }
+  } catch (err) {
+    avgDownModalBody.innerHTML += `<p class="neg" style="margin-top:0.5rem">⚠ ${escapeHtml(String(err))}</p>`;
+    avgDownConfirmBtn.textContent = 'Scale in — create sleeve';
+    avgDownConfirmBtn.disabled = false;
+  }
+}
+
 // ---- manual trade -------------------------------------------------------
 
 function openTradeModal(tenant, symbol, side) {
@@ -7527,6 +7634,13 @@ document.addEventListener('click', (e) => {
       return;
     }
   }
+  // Avg-down badge (span, not button) — open the advice modal
+  const adSpan = e.target.closest('.avg-down-btn');
+  if (adSpan) {
+    openAvgDownModal(adSpan.dataset.symbol, adSpan.dataset.tenant);
+    return;
+  }
+
   const btn = e.target.closest('button');
   if (!btn) return;
   if (btn.dataset.close !== undefined) {

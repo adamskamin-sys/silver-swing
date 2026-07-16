@@ -339,6 +339,93 @@ export function makeApp({
     }
   });
 
+  // --- avg-down advice (read-only computation, no orders placed) -----------
+  // Spawns avg_down_advisor.py as a subprocess; returns expert-computed
+  // scale-in parameters. GREEN = signal is live and actionable; any other
+  // light = not now. The Python script never places orders.
+  app.get('/api/avg-down-advice', requireAuth, async (req, res) => {
+    const { symbol, tenant } = req.query;
+    if (!symbol || !tenant) return res.status(400).json({ ok: false, error: 'symbol and tenant required' });
+    try {
+      const result = await runAvgDownAdvisor({ symbol, tenant });
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
+  // --- avg-down execute: create a scale-in sleeve --------------------------
+  // Validates signal is still GREEN, then appends one new ARMED_BUY sleeve
+  // to config.sleeves with the expert-derived parameters. The tick loop
+  // places the entry buy on Coinbase at suggested_buy_px.
+  //
+  // Payload: { tenant, symbol, advice }  where advice is the full object
+  // returned by /api/avg-down-advice. We re-run the signal in the advisor
+  // to guard against stale advice (e.g., user left modal open for 10 min).
+  app.post('/api/avg-down-execute', requireAuth, async (req, res) => {
+    const { tenant, symbol, advice: clientAdvice } = req.body || {};
+    if (!tenant || !symbol) return res.status(400).json({ ok: false, error: 'tenant and symbol required' });
+    if (!clientAdvice || typeof clientAdvice !== 'object')
+      return res.status(400).json({ ok: false, error: 'advice payload required' });
+
+    try {
+      // Re-run advisor to confirm signal is still GREEN
+      const fresh = await runAvgDownAdvisor({ symbol, tenant });
+      if (!fresh.ok || fresh.light !== 'green') {
+        return res.status(409).json({
+          ok: false,
+          error: `signal is no longer green (now: ${fresh.light}) — ${(fresh.reasons || []).join('; ')}`,
+          advice: fresh,
+        });
+      }
+
+      const store = await readStore(storePath);
+      store[tenant] = store[tenant] || {};
+      store[tenant][symbol] = store[tenant][symbol] || {};
+      const cfg = store[tenant][symbol].config || {};
+
+      const src = fresh.source_sleeve || {};
+      const nowSec = Math.floor(Date.now() / 1000);
+      // New sleeve id: parent id + scale-in timestamp
+      const newId = `${fresh.sleeve_id || 'sleeve'}-avd-${nowSec}`;
+
+      const newSleeve = {
+        id: newId,
+        name: `Avg-down of ${fresh.sleeve_name || fresh.sleeve_id} @ ${fresh.suggested_buy_px}`,
+        qty: fresh.recommended_add_qty,
+        buy_px: fresh.suggested_buy_px,
+        sell_px: fresh.new_sell_px || clientAdvice.new_sell_px,
+        exit_mode: src.exit_mode || 'fixed_limit',
+        stop_loss_enabled: !!(src.stop_loss_enabled || fresh.new_stop_px),
+        stop_loss_px: fresh.new_stop_px,
+        stop_loss_qty_mode: 'all',
+        buy_trail_enabled: !!(src.buy_trail_enabled),
+        // Trail fields — set when we have a valid trigger above buy price
+        ...(fresh.new_trail_trigger && fresh.new_trail_trigger > fresh.suggested_buy_px ? {
+          trail_activation_px: fresh.new_trail_trigger,
+          trail_distance: fresh.new_trail_distance,
+        } : {}),
+      };
+
+      cfg.sleeves = Array.isArray(cfg.sleeves) ? cfg.sleeves : [];
+      cfg.sleeves.push(newSleeve);
+      store[tenant][symbol].config = cfg;
+
+      // Seed ARMED_BUY state for the new sleeve
+      const stateBlock = store[tenant][symbol].state || {};
+      const sleeveStates = stateBlock.sleeves || {};
+      sleeveStates[newId] = { id: newId, state: 'ARMED_BUY', armed_buy_since_ts: nowSec };
+      if (!stateBlock.state) stateBlock.state = 'ARMED_SELL';
+      stateBlock.sleeves = sleeveStates;
+      store[tenant][symbol].state = stateBlock;
+
+      await writeStoreAtomic(storePath, store);
+      res.json({ ok: true, sleeve_id: newId, advice: fresh });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  });
+
   // --- backtest ---
   // In prod (Redis wired): push job onto a Redis queue, poll for the paper
   // worker's response. Keeps Coinbase creds on the one service that needs
@@ -1073,6 +1160,35 @@ async function writeStoreAtomic(storePath, data) {
 const PYTHON_BIN = process.env.SWING_PYTHON_BIN ||
   path.resolve(__dirname, '..', '.venv', 'bin', 'python');
 const BACKTEST_SCRIPT = path.resolve(__dirname, '..', 'scripts', 'run_backtest.py');
+const AVG_DOWN_ADVISOR_SCRIPT = path.resolve(__dirname, '..', 'avg_down_advisor.py');
+
+function runAvgDownAdvisor({ symbol, tenant }) {
+  return new Promise((resolve, reject) => {
+    const projectRoot = path.resolve(__dirname, '..');
+    const storePath = process.env.SWING_DATA_DIR || path.resolve(projectRoot, 'data');
+    const proc = spawn(PYTHON_BIN, [
+      AVG_DOWN_ADVISOR_SCRIPT,
+      '--symbol', symbol,
+      '--tenant', tenant,
+      '--store-path', storePath,
+    ], {
+      cwd: projectRoot,
+      env: { ...process.env, PYTHONPATH: projectRoot },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => { stdout += d; });
+    proc.stderr.on('data', d => { stderr += d; });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error(`avg_down_advisor failed (code=${code}): ${stderr || stdout}`));
+      }
+    });
+  });
+}
 
 function runPythonBacktest(payload) {
   return new Promise((resolve, reject) => {
