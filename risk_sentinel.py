@@ -28,7 +28,7 @@ DEFAULTS = {
     "window_secs": 3600.0,          # look-back for cluster detection
     "halt_cluster_n": 3,            # >= N halts in window -> alert
     "fee_fail_cluster_n": 5,        # >= N fee-gate preview failures -> alert
-    "stale_snapshot_secs": 120.0,   # snapshot older than this -> flying blind
+    "stale_snapshot_secs": 30.0,    # snapshot older than this -> flying blind
     "drawdown_accel_ratio": 2.0,    # recent loss-rate vs prior -> alert
 }
 

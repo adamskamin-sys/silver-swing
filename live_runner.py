@@ -1,4 +1,4 @@
-"""
+""" 
 live_runner.py — the real-money entry point.
 
 Deliberately separate from main.py so it can't run by accident. Two safety
@@ -415,7 +415,7 @@ def run() -> int:
     # a tick in this many seconds (and it's been alive that long),
     # tear down and restart the feed. Adam's 2026-07-14 rule: "catch up
     # + sync, never halt."
-    FEED_STALE_THRESHOLD_SECS = float(os.getenv("SWING_FEED_STALE_SECS", "60.0"))
+    FEED_STALE_THRESHOLD_SECS = float(os.getenv("SWING_FEED_STALE_SECS", "30.0"))
     # After N consecutive step failures on a track, evict + log a WARN so
     # a silently-broken trader doesn't sit forever pretending to work.
     STEP_FAILURE_EVICT_THRESHOLD = int(os.getenv("SWING_STEP_FAIL_EVICT", "10"))
@@ -1118,6 +1118,64 @@ def run() -> int:
                 except Exception as e:
                     _log(f"risk_sentinel failed: {type(e).__name__}: {e}")
                     _health.record_error(store, "risk_sentinel", TENANT, e, trade_log=log)
+                # C-2 fix: margin sentinel wired into the live loop.
+                # margin_sentinel.py had correct logic but was never called
+                # here; live margin utilization and cluster liquidation
+                # headroom were completely unmonitored. Runs every
+                # SENTINEL_INTERVAL_SECS alongside risk_sentinel.
+                try:
+                    import margin_sentinel
+                    _lt = TENANT  # TENANT is guardrailed to end with -live (line 304)
+                    _pf = store.get_config(_lt, "__portfolio__") or {}
+                    _ms_positions = []
+                    for _d in (_pf.get("derivatives") or []):
+                        _dpid = _d.get("product_id")
+                        if not _dpid or not _d.get("mark"):
+                            continue
+                        _cfg_d = store.get_config(_lt, _dpid) or {}
+                        _ms_positions.append({
+                            "symbol": _dpid,
+                            "side": _d.get("side", "BUY"),
+                            "qty": float(_d.get("qty") or 0),
+                            "avg_entry": float(_d.get("avg_entry") or 0),
+                            "mark": float(_d.get("mark") or 0),
+                            "contract_size": float(_cfg_d.get("contract_size") or 1),
+                            "margin_per_contract": float(_cfg_d.get("margin_per_contract") or 0),
+                        })
+                    if _ms_positions:
+                        _bal = coinbase.futures_balance()
+                        _cfm = 0.0
+                        try:
+                            _cfm = float((_bal.get("cfm_usd_balance") or {}).get("value") or 0)
+                        except (TypeError, ValueError):
+                            pass
+                        _ms = margin_sentinel.margin_report(
+                            _ms_positions, _cfm, warn_distance_pct=20.0)
+                        for _a in (_ms.get("alerts") or []):
+                            _log(f"[margin-sentinel] {_a['severity'].upper()}: {_a['detail']}")
+                            try:
+                                from alerting import Priority
+                                _prio = Priority.CRIT if _a["severity"] == "critical" else Priority.HIGH
+                                notifier.send("margin sentinel", _a["detail"], _prio)
+                            except Exception:
+                                pass
+                        if _ms.get("alerts"):
+                            try:
+                                log.record(
+                                    "margin_sentinel_alert", tenant=TENANT,
+                                    utilization_pct=_ms.get("utilization_pct"),
+                                    nearest_distance_to_liq_pct=_ms.get("nearest_distance_to_liq_pct"),
+                                    verdict=_ms.get("verdict"),
+                                    alerts=_ms.get("alerts"),
+                                    severity=("critical"
+                                              if any(_a["severity"] == "critical"
+                                                     for _a in _ms["alerts"])
+                                              else "high"),
+                                )
+                            except Exception:
+                                pass
+                except Exception as _mse:
+                    _log(f"margin_sentinel failed: {type(_mse).__name__}: {_mse}")
             # Periodic sweep so no product's contract_size/fees can silently
             # drift for more than SPEC_REFRESH_SECS (6h default).
             if now - last_spec_refresh >= SPEC_REFRESH_SECS:
@@ -1302,6 +1360,67 @@ def run() -> int:
                     # snapshot flags (see main.py:261). We add the health
                     # record here for the wrapper site itself.
                     _health.record_ok(store, "portfolio_refresh", TENANT)
+                    # C-1 fix: WS-vs-REST mark drift detection per CLAUDE.md
+                    # top-priority invariant. A WebSocket feed that is alive
+                    # but delivering stale/wrong prices passes the stale-feed
+                    # gate while silently misfiring stops + TPs. Compare each
+                    # product's fresh REST mark (just written above) against
+                    # its live WS price. Drift > 1% → force WS restart.
+                    # Never halt trading (per invariant: re-sync, not halt).
+                    try:
+                        _pf_drift = store.get_config(live_tenant, "__portfolio__") or {}
+                        for _dd in (_pf_drift.get("derivatives") or []):
+                            _dpid = _dd.get("product_id")
+                            _rest_mark = float(_dd.get("mark") or 0)
+                            if not _dpid or _rest_mark <= 0:
+                                continue
+                            _ws_price = None
+                            if _dpid == SYMBOL:
+                                _wt = feed.latest_ticker()
+                                if _wt:
+                                    _ws_price = float(_wt.get("price") or 0)
+                            elif _dpid in _non_primary_tracks:
+                                _wt = _non_primary_tracks[_dpid].feed.latest_ticker()
+                                if _wt:
+                                    _ws_price = float(_wt.get("price") or 0)
+                            if not _ws_price or _ws_price <= 0:
+                                continue
+                            _drift = abs(_ws_price - _rest_mark) / _rest_mark
+                            if _drift > 0.01:
+                                _log(f"[mark-drift] {_dpid}: WS={_ws_price:.4f} "
+                                     f"REST={_rest_mark:.4f} drift={_drift*100:.2f}% "
+                                     f"— force re-sync")
+                                try:
+                                    log.record(
+                                        "mark_drift_detected", tenant=TENANT,
+                                        symbol=_dpid, ws_price=_ws_price,
+                                        rest_mark=_rest_mark,
+                                        drift_pct=round(_drift * 100, 3),
+                                        severity="critical")
+                                except Exception:
+                                    pass
+                                try:
+                                    from alerting import Priority
+                                    notifier.send(
+                                        f"mark drift {_dpid}",
+                                        f"{_dpid}: WS {_ws_price:.4f} vs REST "
+                                        f"{_rest_mark:.4f} ({_drift*100:.1f}% apart) "
+                                        f"— restarting WS feed",
+                                        Priority.CRIT,
+                                    )
+                                except Exception:
+                                    pass
+                                if _dpid == SYMBOL:
+                                    try:
+                                        feed.stop()
+                                        feed.start()
+                                        _log(f"[mark-drift] primary feed {_dpid} restarted")
+                                    except Exception as _fe:
+                                        _log(f"[mark-drift] primary feed restart failed: {_fe}")
+                                elif _dpid in _non_primary_tracks:
+                                    _maybe_resync_stale_feed(_non_primary_tracks[_dpid])
+                    except Exception as _dme:
+                        _log(f"[mark-drift] check failed: {type(_dme).__name__}: {_dme}")
                     # 2026-07-14 full parity — discovery only here. Each
                     # non-primary product's actual tick happens on the outer
                     # loop cadence (below) using its own WS feed, not the
