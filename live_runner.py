@@ -806,15 +806,12 @@ def run() -> int:
                 # persistently broken; slow down + let operator diagnose.
                 try:
                     _evict_track(pid, "zombie: no ticks in threshold window")
-                    # Adam 2026-07-15: settle delay before respawn. When
-                    # a WSClient is closed via .close(), Coinbase's server-
-                    # side subscription may take a few seconds to fully
-                    # clear. Opening a new WSClient + resubscribing the
-                    # SAME product within that window can result in the
-                    # new subscription being silently dropped (dedup by
-                    # product_id + API key). Sleeping 3s gives Coinbase
-                    # time to release the old subscription.
-                    time.sleep(3.0)
+                    # Adam 2026-07-15 REVERTED: had time.sleep(3.0) here but
+                    # it BLOCKED the main tick loop — if 5 products got
+                    # zombied in one cycle, we slept 15s total, during which
+                    # OTHER Tracks went stale and became zombies. Cascading
+                    # zombification. Now zero-delay respawn; the rate limit
+                    # (3 quick then 15-min cooldown) is sufficient throttle.
                     # Track how many times each product has been zombie-
                     # evicted in a row (no successful step between).
                     _zombie_streak = getattr(_maybe_recover_dead_tracks,
