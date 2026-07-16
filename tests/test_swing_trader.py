@@ -569,10 +569,18 @@ def _config_with_reanchor_sleeve(threshold=0.75, buy=63.0, sell=63.20, qty=2, co
 def test_sleeve_reanchors_when_price_runs_above_buy(tmp_path):
     """Silver rallies past buy_px + reanchor_threshold while the sleeve is
     ARMED_BUY. Sleeve should walk buy_px + sell_px UP to bracket the current
-    market instead of sitting on stale targets waiting for a dip."""
+    market instead of sitting on stale targets waiting for a dip.
+
+    Adam 2026-07-16: zero out broker position so the recently-added
+    _maybe_reconcile_orphan_position doesn't adopt the make_trader
+    fixture's preloaded 12 contracts and flip the sleeve to ARMED_SELL
+    before the reanchor path can fire.
+    """
     from sleeves import SleeveStateEnum
     cfg = _config_with_reanchor_sleeve(threshold=0.50, buy=63.0, sell=63.20)
     trader, broker, _, _, store = make_trader(tmp_path, config=cfg)
+    # Clear the fixture's preloaded position so orphan-adopt doesn't fire
+    broker.position.qty = 0
     trader.reconcile()
     ss = trader.s.sleeves["s1"]
     ss.state = SleeveStateEnum.ARMED_BUY  # sleeve just sold, waiting to rebuy

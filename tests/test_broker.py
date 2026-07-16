@@ -43,12 +43,32 @@ def _mock_long_pos(client, qty: int, product_id: str = "SLR-27AUG26-CDE"):
     })
 
 
+def _mock_product_spec(client, product_id: str = "SLR-27AUG26-CDE",
+                        tick_size: float = 0.005):
+    """Set get_product to return a proper spec so _price_str's tick-size
+    based decimal formatting works. Without this, MagicMock's default
+    coerces tick_size to 1.0 and every price snaps to an integer —
+    which caused the 2026-07-16 3-broker-test failure class."""
+    client.get_product.return_value = FakeResponse({
+        "product_id": product_id,
+        "price_increment": str(tick_size),
+        "price": "65.0",
+        "best_bid_price": "64.99",
+        "best_ask_price": "65.01",
+        "future_product_details": {
+            "contract_size": "50",
+            "contract_expiry": None,
+        },
+    })
+
+
 # ---- place_limit ------------------------------------------------------------
 
 
 def test_place_limit_sell_returns_order_id():
     c = MagicMock()
     _mock_long_pos(c, 2)
+    _mock_product_spec(c, tick_size=0.005)   # SLR tick — gives 3 decimals
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": True,
         "success_response": {"order_id": "abc-123", "product_id": "SLR-27AUG26-CDE"},
@@ -113,6 +133,7 @@ def test_place_limit_generates_distinct_client_order_ids():
 def test_place_limit_price_decimals_configurable():
     c = MagicMock()
     _mock_long_pos(c, 1, product_id="X")
+    _mock_product_spec(c, product_id="X", tick_size=0.00001)   # 5 decimals
     c.limit_order_gtc_sell.return_value = FakeResponse({
         "success": True, "success_response": {"order_id": "x"},
     })
@@ -156,6 +177,7 @@ def test_place_stop_limit_sell_uses_stop_down_direction():
     """SELL stop-limit → STOP_DIRECTION_STOP_DOWN (trigger on price falling)."""
     c = MagicMock()
     _mock_long_pos(c, 1)
+    _mock_product_spec(c, tick_size=0.005)   # SLR tick — 3 decimals
     c.create_order.return_value = FakeResponse({
         "success": True, "success_response": {"order_id": "stop-1"},
     })

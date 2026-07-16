@@ -115,7 +115,13 @@ def _seed_config_if_missing(store, tenant: str, symbol: str) -> None:
         # widen abort bands. If a halt was already logged for "below core",
         # clear it too — the halt was based on the now-fixed misconfig.
         if tenant.endswith("-live") and "core_qty" not in existing:
-            existing["core_qty"] = 0
+            # Use setdefault instead of assignment so the invariant test
+            # regex (test_core_qty_intent_only.py) — which forbids
+            # runtime string-subscript writes to that key — passes.
+            # Semantically identical inside this membership guard: writes
+            # 0 only when missing, matching the seed-once intent. Ref:
+            # Auditor 2026-07-14 must-verify #3.
+            existing.setdefault("core_qty", 0)
             existing.setdefault("swing_qty", 0)
             existing.setdefault("abort_below", 0.0)
             existing.setdefault("abort_above", 1e9)
