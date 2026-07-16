@@ -228,7 +228,7 @@ class DryRunBroker:
 
 def _preflight(coinbase, store, tenant, symbol, notifier) -> tuple[bool, list[str]]:
     """Return (ok, issues). Every check must pass to proceed to live."""
-    from config_validator import validate_config
+    from config_validator import validate_config, validate_market_bounds
     from roll import check_roll
     from safety import KillSwitch
 
@@ -257,6 +257,24 @@ def _preflight(coinbase, store, tenant, symbol, notifier) -> tuple[bool, list[st
     v = validate_config(cfg)
     if not v.ok:
         issues.extend(f"preflight config: {i.field}: {i.message}" for i in v.issues)
+    # Advisory: check abort bands vs current market price (non-blocking — does
+    # NOT add to issues; won't prevent startup). Catches CHN-class bug where
+    # abort_above=70 on a $3133 asset halts every tick. Logged prominently so
+    # the operator sees it; a phone alert fires via notifier if available.
+    try:
+        _mark = coinbase.get_best_bid_ask() or {}
+        _mid = (_mark.get("best_bid", 0) + _mark.get("best_ask", 0)) / 2
+        if not _mid:
+            _mid = float((coinbase.contract_spec() or {}).get("price") or 0)
+        for _w in validate_market_bounds(cfg, _mid):
+            _log(f"WARN preflight abort-band: {_w}")
+            try:
+                from alerting import Priority
+                notifier.send("preflight: abort band misconfiguration", _w, Priority.WARN)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # 4. Kill switch off
     ks = KillSwitch(store, tenant)
@@ -1013,7 +1031,20 @@ def run() -> int:
                     try:
                         _track.trader.step(float(_tt["price"]))
                         _track.consecutive_step_failures = 0
-                        _track.last_step_ok_ts = now
+                        # Don't advance the zombie heartbeat for a HALTED trader.
+                        # A halted step() returns immediately without doing work,
+                        # so updating last_step_ok_ts would mask it from zombie
+                        # detection forever. Without this guard, a halted track
+                        # holds a WS connection indefinitely (2026-07-16 MEDIUM-9).
+                        try:
+                            _step_halted = (
+                                getattr(getattr(_track.trader, "s", None),
+                                        "state", None) == "HALTED"
+                            )
+                        except Exception:
+                            _step_halted = False
+                        if not _step_halted:
+                            _track.last_step_ok_ts = now
                         # Adam 2026-07-15: successful step resets the
                         # zombie streak counter — a product that eventually
                         # starts ticking correctly shouldn't be penalized

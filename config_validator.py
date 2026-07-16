@@ -199,6 +199,38 @@ def validate_config(cfg: dict) -> ValidationResult:
     return ValidationResult(ok=len(issues) == 0, issues=issues)
 
 
+def validate_market_bounds(cfg: dict, current_mark: float) -> list[str]:
+    """Advisory-only check: abort bands vs current market price.
+    Returns human-readable warning strings (non-blocking — caller decides
+    whether to log or reject). Catches the CHN class of bug: abort_above=70
+    on a $3133 asset is internally consistent but wrong for the instrument.
+    Call this at preflight when the current mark is available."""
+    warnings = []
+    if not current_mark or current_mark <= 0:
+        return warnings
+    abort_above = cfg.get("abort_above")
+    abort_below = cfg.get("abort_below")
+    try:
+        aa = float(abort_above)
+        if 0 < aa < current_mark:
+            warnings.append(
+                f"abort_above ({aa}) is below current mark ({current_mark:.4f}) — "
+                f"ARMED_SELL state will halt on every tick (CHN-class misconfiguration)"
+            )
+    except (TypeError, ValueError):
+        pass
+    try:
+        ab = float(abort_below)
+        if ab > 0 and ab > current_mark:
+            warnings.append(
+                f"abort_below ({ab}) is above current mark ({current_mark:.4f}) — "
+                f"ARMED_BUY state will halt on every tick"
+            )
+    except (TypeError, ValueError):
+        pass
+    return warnings
+
+
 def clamp_to_bounds(cfg: dict) -> dict:
     """Best-effort correction of edge values without changing intent — useful
     for tests and defaults. Does NOT bypass validate_config; the returned dict

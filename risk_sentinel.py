@@ -24,6 +24,12 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 
+# Per-kind notification dedup — prevents 12 CRIT phone alerts/hour when a
+# single product (e.g. CHN misconfigured abort_above) generates a persistent
+# halt cluster. Resets on process restart; first alert always fires immediately.
+_notify_last_sent: dict = {}
+_NOTIFY_DEDUP_SECS = 1800.0  # 30 minutes between repeated notifications per kind
+
 DEFAULTS = {
     "window_secs": 3600.0,          # look-back for cluster detection
     "halt_cluster_n": 3,            # >= N halts in window -> alert
@@ -150,10 +156,14 @@ def run_sentinel(store, tenant: str, trade_log, now: float,
     if notifier is not None:
         for a in alerts:
             if a.get("severity") in ("high", "critical"):
+                kind = a.get("kind", "unknown")
+                if now - _notify_last_sent.get(kind, 0.0) < _NOTIFY_DEDUP_SECS:
+                    continue  # already notified this kind recently — suppress repeat
                 try:
                     from alerting import Priority
                     prio = Priority.CRIT if a["severity"] == "critical" else Priority.HIGH
                     notifier.send(f"risk sentinel: {a['kind']}", a["detail"], prio)
+                    _notify_last_sent[kind] = now
                 except Exception:
                     pass
     return alerts
