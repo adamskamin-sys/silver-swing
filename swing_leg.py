@@ -3857,9 +3857,30 @@ class SwingTrader:
         so no cross-tenant leak.
         """
         old_buy, old_sell = sc.buy_px, sc.sell_px
+        old_stop = float(sc.stop_loss_px or 0.0)
         sc.buy_px = float(new_buy_px)
         sc.sell_px = float(new_sell_px)
         sc.trail_trigger = float(new_sell_px)
+        # Reanchor stop_loss_px to maintain the same dollar distance below the
+        # new buy. Without this, stop_loss_px stays at the pre-reanchor level.
+        # If price reanchored DOWN, the stale stop is above the new buy price,
+        # causing _maintain_resting_stop to place a stop that fires immediately
+        # on the first tick after the buy fills. Root cause of the NEAR/PLAT
+        # immediate-sell-after-buy pattern observed 2026-07-17.
+        # Only shift when old_buy > 0 to avoid division by zero on fresh config.
+        new_stop = 0.0
+        if old_buy > 0 and old_stop > 0:
+            stop_offset = old_buy - old_stop          # $ below old buy
+            new_stop = float(new_buy_px) - stop_offset
+            new_stop = self._snap_to_tick(new_stop) if new_stop > 0 else 0.0
+            # Hard safety: stop must always be strictly below the new buy.
+            # If the offset math produces a stop >= new_buy (edge case: offset
+            # was negative, i.e. stop was already above buy in old config),
+            # leave stop_loss_px at zero so _maintain_resting_stop skips it.
+            if new_stop >= float(new_buy_px):
+                new_stop = 0.0
+        if new_stop > 0:
+            sc.stop_loss_px = new_stop
         # Reset the ARMED_BUY timer — we just moved targets to bracket the
         # current market, so the "priced out" clock restarts from here.
         import time as _time
@@ -3871,6 +3892,8 @@ class SwingTrader:
                 s["buy_px"] = float(new_buy_px)
                 s["sell_px"] = float(new_sell_px)
                 s["trail_trigger"] = float(new_sell_px)
+                if new_stop > 0:
+                    s["stop_loss_px"] = new_stop
                 break
         cfg["sleeves"] = sleeves
         self.store.put_config(self.tenant_id, self.symbol, cfg)
@@ -3880,6 +3903,7 @@ class SwingTrader:
             current_price=current_price,
             old_buy=old_buy, old_sell=old_sell,
             new_buy=new_buy_px, new_sell=new_sell_px,
+            old_stop_loss_px=old_stop, new_stop_loss_px=new_stop,
             reason=f"price {current_price} moved > {sc.reanchor_threshold} above buy {old_buy}",
         )
 
