@@ -49,12 +49,38 @@ def main() -> None:
     args = ap.parse_args()
 
     sym = args.symbol
+    from state_store import make_store
+    store = make_store(args.data_dir)
+
+    # Fuzzy match: if the exact symbol has no state, look for symbols
+    # containing the substring on the tenant.
+    all_syms = [s for s in store.list_symbols(TENANT) if not s.startswith("__")]
+    if sym not in all_syms:
+        needle = sym.upper().replace("-", "").replace("_", "")
+        candidates = [s for s in all_syms
+                       if needle in s.upper().replace("-", "").replace("_", "")]
+        if not candidates:
+            # Try just the first token (e.g. "XLM" from "XLM-PERP-CDE")
+            token = sym.split("-")[0].upper()
+            candidates = [s for s in all_syms if token in s.upper()]
+        if not candidates:
+            print(f"✗ No symbol matching {sym!r} on tenant {TENANT}.")
+            print(f"\nAll symbols on {TENANT}:")
+            for s in sorted(all_syms):
+                print(f"  · {s}")
+            sys.exit(2)
+        if len(candidates) == 1:
+            print(f"Note: exact {sym!r} not found; using {candidates[0]!r}\n")
+            sym = candidates[0]
+        else:
+            print(f"✗ {sym!r} matched {len(candidates)} symbols — be more specific:")
+            for c in candidates:
+                print(f"  · {c}")
+            sys.exit(2)
+
     print("=" * 90)
     print(f"SYMBOL PRICE TRACE — {sym} — last {args.hours}h")
     print("=" * 90)
-
-    from state_store import make_store
-    store = make_store(args.data_dir)
 
     # ---- current state ----------------------------------------------------
     st = store.get_state(TENANT, sym) or {}
