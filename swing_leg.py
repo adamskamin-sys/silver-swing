@@ -3111,7 +3111,22 @@ class SwingTrader:
             else:
                 import arm_level
                 spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
-                sold_ref = float(ss.last_sell_fill_price or sc.buy_px)
+                # Adam 2026-07-17 XLP runaway fix: fallback chain must NOT end
+                # at sc.buy_px alone. For a fresh sleeve (no last_sell_fill_price
+                # yet), passing current buy_px as sold_ref caused arm_level's
+                # `buy_px < sold_ref` clamp to compute buy_px = sc.buy_px - epsilon
+                # every iteration → walk-down. XLP hit 65+ replaces in 3 min,
+                # buy_px marched from $0.148 → $0.117 chasing itself away from
+                # the $0.187 mark. Fallback order: last sell fill > current mark
+                # > sell target > current buy. Each falls back only when the
+                # previous is 0/None. This preserves the "buy below sold" invariant
+                # in every meaningful case without letting sc.buy_px self-anchor.
+                sold_ref = float(
+                    ss.last_sell_fill_price
+                    or last_price
+                    or sc.sell_px
+                    or sc.buy_px
+                )
                 unified_buy_px = arm_level.pullback_buy_px(
                     list(self._sleeve_price_history.get(sc.id, []) or []),
                     spread=spread, sold_price=sold_ref)
