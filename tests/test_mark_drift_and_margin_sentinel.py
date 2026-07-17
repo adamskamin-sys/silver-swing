@@ -6,6 +6,8 @@ the underlying modules invoked by the new loop code.
 
 from __future__ import annotations
 
+import pytest
+
 import margin_sentinel
 import risk_sentinel
 
@@ -63,10 +65,31 @@ def test_margin_sentinel_empty_positions_no_alerts():
 
 
 def test_margin_sentinel_position_headroom_returns_none_on_underspecified():
-    """Underspecified position (zero margin_per_contract) returns None."""
+    """Zero margin_per_contract AND no liquidation_price → None (truly underspecified)."""
     pos = _pos(margin_per_contract=0.0)
     result = margin_sentinel.position_headroom(pos)
     assert result is None
+
+
+def test_margin_sentinel_uses_coinbase_liq_price_when_mpc_zero():
+    """Auto-seeded product (mpc=0) with a Coinbase liquidation_price is included."""
+    pos = _pos(margin_per_contract=0.0, avg_entry=30.0, mark=30.0)
+    pos["liquidation_price"] = 25.0  # 16.7% away
+    result = margin_sentinel.position_headroom(pos)
+    assert result is not None
+    assert result["liq_price"] == 25.0
+    assert result["distance_to_liq_pct"] == pytest.approx((30.0 - 25.0) / 30.0 * 100, abs=0.01)
+
+
+def test_margin_sentinel_prefers_coinbase_liq_price_over_computed():
+    """When mpc > 0 and Coinbase liq_price is also present, Coinbase wins."""
+    # Computed liq for qty=1, entry=30, cs=50, mpc=275 → leverage≈5.45×, liq≈24.5
+    pos = _pos(qty=1, avg_entry=30.0, mark=30.0,
+               contract_size=50.0, margin_per_contract=275.0)
+    pos["liquidation_price"] = 22.0  # Coinbase says lower than computed
+    result = margin_sentinel.position_headroom(pos)
+    assert result is not None
+    assert result["liq_price"] == 22.0
 
 
 # ---- risk_sentinel stale threshold -------------------------------------------

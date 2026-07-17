@@ -33,22 +33,38 @@ def liquidation_move_pct(side: str, leverage: float, maint_margin_frac: float = 
 
 
 def position_headroom(pos: dict, maint_margin_frac: float = 0.005) -> Optional[dict]:
-    """pos = {symbol, side, qty, avg_entry, mark, contract_size, margin_per_contract}.
-    Returns headroom to liquidation for this position (None if underspecified)."""
+    """pos = {symbol, side, qty, avg_entry, mark, contract_size, margin_per_contract[, liquidation_price]}.
+    Returns headroom to liquidation for this position (None if underspecified).
+
+    When margin_per_contract is zero (auto-seeded config), falls back to the
+    Coinbase-provided liquidation_price field if present. When both are available,
+    Coinbase's value is preferred as it accounts for actual FCM margin tiers."""
     try:
         qty = float(pos["qty"]); entry = float(pos["avg_entry"]); mark = float(pos.get("mark") or entry)
-        cs = float(pos["contract_size"]); mpc = float(pos["margin_per_contract"])
+        cs = float(pos["contract_size"]); mpc = float(pos.get("margin_per_contract") or 0)
     except (KeyError, TypeError, ValueError):
         return None
-    if qty <= 0 or entry <= 0 or cs <= 0 or mpc <= 0:
+    if qty <= 0 or entry <= 0 or cs <= 0:
         return None
-    notional = qty * cs * entry
-    margin = qty * mpc
-    leverage = notional / margin if margin > 0 else 0.0
-    move = liquidation_move_pct(pos.get("side", "BUY"), leverage, maint_margin_frac)
     side = str(pos.get("side", "BUY")).upper()
-    liq_price = entry * (1 - move) if side == "BUY" else entry * (1 + move)
-    # current distance to liq from the live mark
+    liq_given = float(pos.get("liquidation_price") or 0)
+    if mpc <= 0:
+        # No margin_per_contract in config (auto-seeded product). Fall back to
+        # the Coinbase-reported liquidation_price; return None if unavailable.
+        if liq_given <= 0:
+            return None
+        liq_price = liq_given
+        leverage = 0.0
+        move = 0.0
+        margin = 0.0
+    else:
+        notional = qty * cs * entry
+        margin = qty * mpc
+        leverage = notional / margin if margin > 0 else 0.0
+        move = liquidation_move_pct(side, leverage, maint_margin_frac)
+        liq_price = entry * (1 - move) if side == "BUY" else entry * (1 + move)
+        if liq_given > 0:
+            liq_price = liq_given
     dist_pct = (mark - liq_price) / mark if side == "BUY" else (liq_price - mark) / mark
     return {
         "symbol": pos.get("symbol"),
@@ -58,7 +74,7 @@ def position_headroom(pos: dict, maint_margin_frac: float = 0.005) -> Optional[d
         "liq_price": round(liq_price, 6),
         "distance_to_liq_pct": round(dist_pct * 100, 2),
         "margin_used": round(margin, 2),
-        "notional": round(notional, 2),
+        "notional": round(qty * cs * entry, 2),
     }
 
 

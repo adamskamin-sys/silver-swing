@@ -1219,6 +1219,20 @@ def run() -> int:
                     import margin_sentinel
                     _lt = TENANT  # TENANT is guardrailed to end with -live (line 304)
                     _pf = store.get_config(_lt, "__portfolio__") or {}
+                    # Portfolio mark staleness check: _refresh_ts is written by
+                    # refresh_portfolio_snapshot every PORTFOLIO_REFRESH_SECS (2s).
+                    # A gap > 30s means the REST mark is stale — price-triggered
+                    # actions (TP, trail, stop) may fire on a frozen price.
+                    _pf_refresh_ts = float(_pf.get("_refresh_ts") or 0)
+                    _pf_mark_age = (now - _pf_refresh_ts) if _pf_refresh_ts else None
+                    if _pf_mark_age is not None and _pf_mark_age > 30:
+                        _stale_msg = f"__portfolio__ mark is {_pf_mark_age:.0f}s stale (> 30s)"
+                        _log(f"[margin-sentinel] CRIT: {_stale_msg}")
+                        try:
+                            from alerting import Priority
+                            notifier.send("portfolio mark stale", _stale_msg, Priority.CRIT)
+                        except Exception:
+                            pass
                     _ms_positions = []
                     for _d in (_pf.get("derivatives") or []):
                         _dpid = _d.get("product_id")
@@ -1233,6 +1247,10 @@ def run() -> int:
                             "mark": float(_d.get("mark") or 0),
                             "contract_size": float(_cfg_d.get("contract_size") or 1),
                             "margin_per_contract": float(_cfg_d.get("margin_per_contract") or 0),
+                            # Pass Coinbase's liquidation_price so margin_sentinel can
+                            # compute headroom even for auto-seeded products that have
+                            # margin_per_contract=0 in their config.
+                            "liquidation_price": float(_d.get("liquidation_price") or 0),
                         })
                     if _ms_positions:
                         _acc_b = _account_broker()
