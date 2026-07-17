@@ -393,7 +393,23 @@ class SwingTrader:
                 continue  # transient, retry next reconcile
             status = (st or {}).get("status")
             if status == "OPEN":
-                continue  # still resting
+                # If the sleeve already transitioned to ARMED_BUY the TP fill
+                # fired first — cancel the dangling stop so it doesn't create
+                # a spurious short if price recovers above stop_px.
+                if str(ss.state) == "ARMED_BUY":
+                    try:
+                        self.b.cancel(ss.resting_stop_oid)
+                        self._record("resting_stop_cancelled_tp_beat_stop",
+                                     sleeve_id=sid, oid=ss.resting_stop_oid,
+                                     source="reconcile")
+                    except Exception as _ce:
+                        self._record("resting_stop_cancel_tp_beat_stop_failed",
+                                     sleeve_id=sid, oid=ss.resting_stop_oid,
+                                     error=str(_ce))
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
+                continue  # still resting (or just cancelled above)
             if status == "FILLED":
                 try:
                     fill_price = float(st.get("average_filled_price") or 0)
@@ -6164,6 +6180,23 @@ class SwingTrader:
             # ratcheting HWM — next cycle starts fresh at the new basis.
             ss.consecutive_stops = 0
             ss.stop_loss_hwm = None
+            # Cancel any resting stop-limit on Coinbase. The position was
+            # just exited via take-profit; the stop order is dangling and
+            # must be cancelled before price can recover above stop_px and
+            # fill it (which would create an accidental short).
+            if ss.resting_stop_oid:
+                try:
+                    self.b.cancel(ss.resting_stop_oid)
+                    self._record("resting_stop_cancelled_on_tp_fill",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 oid=ss.resting_stop_oid)
+                except Exception as _ce:
+                    self._record("resting_stop_cancel_on_tp_fill_failed",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 oid=ss.resting_stop_oid, error=str(_ce))
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
             # Timestamp for time-based reanchor — starts counting from the
             # moment this cycle finished the sell leg.
             import time as _time
