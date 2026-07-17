@@ -4898,6 +4898,13 @@ class SwingTrader:
         # Volatility-contraction re-entry: after a stop set reentry_pending,
         # this fires the reanchor when the market has calmed enough.
         self._maybe_trigger_sleeve_reentry(sc, ss, last_price)
+        # Gate enforcement: if the expert gate blocked re-entry, reentry_pending
+        # is still True. The normal arm path below must not run — it doesn't
+        # check reentry_pending and would place a buy immediately, bypassing the
+        # cadence floor entirely. This was the NEAR/HYPE churn-loop root cause:
+        # gate denied at 0s elapsed, arm path fired anyway 1 tick later.
+        if ss.reentry_pending:
+            return
 
         # News blackout: pause new arms during scheduled high-uncertainty
         # windows (FOMC, CPI, NFP). Existing positions ride through unless

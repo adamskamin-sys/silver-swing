@@ -187,3 +187,25 @@ def test_wire_up_records_gate_decision():
     from swing_leg import SwingTrader
     src = inspect.getsource(SwingTrader._maybe_trigger_sleeve_reentry)
     assert "sleeve_reentry_gate_decision" in src
+
+
+def test_arm_path_blocked_while_reentry_pending():
+    """Regression: the normal arm path in _sleeve_step must NOT run while
+    reentry_pending=True. Root cause of NEAR/HYPE churn loop: gate denied
+    reentry but _maybe_trigger_sleeve_reentry() return value was discarded,
+    so execution fell straight into 'Arm if no live order' and placed a buy
+    immediately — cadence floor bypassed entirely.
+
+    Fix: after calling _maybe_trigger_sleeve_reentry(), check ss.reentry_pending
+    and return early. This verifies that guard exists in the source."""
+    import inspect
+    from swing_leg import SwingTrader
+    src = inspect.getsource(SwingTrader._sleeve_step)
+    # The guard must appear AFTER the _maybe_trigger_sleeve_reentry call
+    reentry_call_pos = src.find("_maybe_trigger_sleeve_reentry")
+    assert reentry_call_pos != -1, "_maybe_trigger_sleeve_reentry not found in _sleeve_step"
+    guard_pos = src.find("reentry_pending", reentry_call_pos)
+    assert guard_pos != -1, (
+        "No reentry_pending guard found after _maybe_trigger_sleeve_reentry call. "
+        "This means the arm path can bypass the expert gate — the NEAR/HYPE churn loop."
+    )
