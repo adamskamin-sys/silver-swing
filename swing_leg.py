@@ -292,7 +292,10 @@ class SwingTrader:
     # ---- reconcile on startup --------------------------------------------
 
     def reconcile(self) -> None:
-        """Trust the book, not memory. Called ONCE on startup.
+        """Trust the book, not memory. Called on startup AND periodically
+        from live_runner (it's the only hook that runs for a product whose
+        trader has stopped ticking, so the resting-stop sweeper below relies
+        on the periodic invocation).
 
         - If actual position is already below core, HALT.
         - If we thought an order was live but it's actually done/gone, clear it.
@@ -396,19 +399,28 @@ class SwingTrader:
                 # If the sleeve already transitioned to ARMED_BUY the TP fill
                 # fired first — cancel the dangling stop so it doesn't create
                 # a spurious short if price recovers above stop_px.
-                if str(ss.state) == "ARMED_BUY":
+                # NOTE: compare the enum directly. `str(ss.state)` yields
+                # 'SleeveStateEnum.ARMED_BUY' (SleeveStateEnum is a (str, Enum),
+                # not a StrEnum), so `str(ss.state) == "ARMED_BUY"` is ALWAYS
+                # False and this whole branch was dead code.
+                if ss.state == SleeveStateEnum.ARMED_BUY:
                     try:
                         self.b.cancel(ss.resting_stop_oid)
                         self._record("resting_stop_cancelled_tp_beat_stop",
                                      sleeve_id=sid, oid=ss.resting_stop_oid,
                                      source="reconcile")
+                        # Only clear the handle on a CONFIRMED cancel. On a
+                        # transient failure (CoinbaseBroker.cancel raises) keep
+                        # the oid so the next reconcile retries — else the stop
+                        # dangles OPEN on Coinbase with no handle to cancel it.
+                        ss.resting_stop_oid = None
+                        ss.resting_stop_px = None
+                        ss.resting_stop_stage = None
                     except Exception as _ce:
                         self._record("resting_stop_cancel_tp_beat_stop_failed",
                                      sleeve_id=sid, oid=ss.resting_stop_oid,
                                      error=str(_ce))
-                    ss.resting_stop_oid = None
-                    ss.resting_stop_px = None
-                    ss.resting_stop_stage = None
+                        # State left intact — retry on the next reconcile.
                 continue  # still resting (or just cancelled above)
             if status == "FILLED":
                 try:
@@ -6190,13 +6202,21 @@ class SwingTrader:
                     self._record("resting_stop_cancelled_on_tp_fill",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  oid=ss.resting_stop_oid)
+                    # Only clear the handle on a CONFIRMED cancel. If cancel
+                    # raises (CoinbaseBroker.cancel raises RuntimeError on any
+                    # transient/timeout/non-success), keep resting_stop_oid set
+                    # so the periodic reconcile sweeper retries — nulling it
+                    # here would strand the stop OPEN on Coinbase with no handle
+                    # to cancel it, which is the accidental-short this block
+                    # exists to prevent.
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
                 except Exception as _ce:
                     self._record("resting_stop_cancel_on_tp_fill_failed",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  oid=ss.resting_stop_oid, error=str(_ce))
-                ss.resting_stop_oid = None
-                ss.resting_stop_px = None
-                ss.resting_stop_stage = None
+                    # State left intact — reconcile retries next cycle.
             # Timestamp for time-based reanchor — starts counting from the
             # moment this cycle finished the sell leg.
             import time as _time
