@@ -4118,12 +4118,37 @@ class SwingTrader:
                     try: self.b.cancel(st_obj.live_order_id)
                     except Exception: pass
                 del self.s.sleeves[sid]
+        # Retirement ledger: if the product is in cooldown from a prior
+        # retire, refuse to instantiate NEW sleeve state. Existing sleeves
+        # keep ticking (safety), but no fresh SleeveState is created for a
+        # sleeve id that isn't already in memory. Closes the PT/HYP/SLR
+        # ghost class where diag_retire_sleeves removed state but next tick
+        # re-inflated from config.
+        try:
+            import retirement_ledger as _rl
+            _in_cd, _cd_reason, _cd_secs = _rl.is_in_cooldown(
+                self.store, self.tenant_id, self.symbol
+            )
+        except Exception:
+            _in_cd, _cd_reason, _cd_secs = False, "", 0.0
+
         for sc in sleeves_cfg:
-            if sc.id not in self.s.sleeves:
-                self.s.sleeves[sc.id] = SleeveState(id=sc.id)
+            if sc.id in self.s.sleeves:
+                continue
+            if _in_cd:
+                self._record(
+                    "sleeve_retirement_cooldown_blocked_arm",
+                    sleeve_id=sc.id, symbol=self.symbol,
+                    reason=_cd_reason, cooldown_secs_remaining=int(_cd_secs),
+                    severity="warn",
+                )
+                continue
+            self.s.sleeves[sc.id] = SleeveState(id=sc.id)
 
         # Run each additional sleeve's state machine independently.
         for sc in sleeves_cfg:
+            if sc.id not in self.s.sleeves:
+                continue  # blocked by retirement cooldown; skip ticking
             self._sleeve_step(sc, self.s.sleeves[sc.id], last_price)
 
         self._save_state()
