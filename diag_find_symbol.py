@@ -42,29 +42,56 @@ def main() -> None:
     print(f"HUNT FOR {n!r} — where does this symbol actually live?")
     print("=" * 90)
 
-    # ---- 1. Coinbase get_products (server-side truth) --------------------
-    print(f"\n[1] Coinbase server-side products matching {n!r}")
+    # ---- 1. Coinbase get_products across EVERY surface -------------------
+    # Per feedback_check_coinbase_product_surfaces: default get_products
+    # filters by product_type and can miss perps entirely (2026-07-17 XLM
+    # incident). Query each surface explicitly + one unfiltered call, then
+    # dedupe. Also try /brokerage/products/list_products with product_type
+    # kwargs the SDK exposes.
+    print(f"\n[1] Coinbase server-side products matching {n!r}"
+          f" — querying every surface")
     try:
         from broker import BrokerConfig, CoinbaseBroker, _dump
-        # Use any product_id to bootstrap the broker's client
         b = CoinbaseBroker(BrokerConfig(product_id="SLR-27AUG26-CDE"))
-        resp = _dump(b.client.get_products()) or {}
-        products = resp.get("products") or []
+        all_products: dict[str, dict] = {}
+        # Try each product_type filter individually; SDK differences mean
+        # some kwargs work, others don't. Fail-open on each attempt.
+        surfaces = [
+            ("default", {}),
+            ("SPOT", {"product_type": "SPOT"}),
+            ("FUTURE", {"product_type": "FUTURE"}),
+            ("PERPETUAL", {"product_type": "PERPETUAL"}),
+            ("INTX_PERP", {"product_type": "INTX_PERPETUAL"}),
+        ]
+        for label, kwargs in surfaces:
+            try:
+                resp = _dump(b.client.get_products(**kwargs)) or {}
+                products = resp.get("products") or []
+                new_count = 0
+                for p in products:
+                    pid = str(p.get("product_id") or "")
+                    if pid and pid not in all_products:
+                        all_products[pid] = p
+                        new_count += 1
+                print(f"  · surface={label:<12} returned {len(products)} products "
+                      f"({new_count} new)")
+            except Exception as _e:
+                print(f"  · surface={label:<12} failed: {type(_e).__name__}: {_e}")
+        # Now filter across the union
         matches = []
-        for p in products:
-            pid = str(p.get("product_id") or "")
+        for pid, p in all_products.items():
             display = str(p.get("display_name") or p.get("base_display_symbol") or "")
             fields = f"{pid} {display}".upper().replace("-", "").replace("_", "")
             if n_up in fields:
                 matches.append((pid, display, p.get("status"), p.get("product_type")))
-        if not matches:
-            print(f"  (no products matched)")
-        for pid, display, status, ptype in matches[:20]:
-            print(f"  · {pid:<32}  display={display!r:<30}  status={status}  type={ptype}")
-        if len(matches) > 20:
-            print(f"  ... {len(matches) - 20} more")
+        print(f"\n  Union: {len(all_products)} unique products across surfaces")
+        print(f"  Matching {n!r}: {len(matches)}")
+        for pid, display, status, ptype in matches[:30]:
+            print(f"    · {pid:<32}  display={display!r:<30}  status={status}  type={ptype}")
+        if len(matches) > 30:
+            print(f"    ... {len(matches) - 30} more")
     except Exception as e:
-        print(f"  ✗ get_products failed: {type(e).__name__}: {e}")
+        print(f"  ✗ Coinbase query failed: {type(e).__name__}: {e}")
 
     # ---- 2. Coinbase list_futures_positions (currently held) -------------
     print(f"\n[2] Coinbase list_futures_positions filtered to {n!r}")
