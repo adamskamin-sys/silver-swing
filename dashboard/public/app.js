@@ -6413,15 +6413,18 @@ function openScannerDetail(row) {
           // you always see the closer trigger.
           let stopCell = '<span class="dim">off</span>';
           if (s.stop_loss_enabled) {
+            // 2026-07-19 XLM incident: display MUST show the ACTUAL
+            // resting stop price on Coinbase (ss.resting_stop_px) rather
+            // than the projected/ratcheted floor. Prior code showed the
+            // projected profit-lock value even when the real resting stop
+            // on the exchange was still at hard_bottom — user thought
+            // downside was $7.70 protected when the real exposure was
+            // ~$116 to the actual $0.165 stop.
+            const restingPx = Number(ss.resting_stop_px) || 0;
+            const restingStage = String(ss.resting_stop_stage || '').toLowerCase();
             const baseStop = Number(s.stop_loss_px) || 0;
             const hwm = Number(ss.stop_loss_hwm) || 0;
             const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-            // Ratchet only actually applies once unrealized/contract crosses
-            // stop_loss_ratchet_activation — see swing_leg._sleeve_effective_stop.
-            // Without this activation check, the dashboard shows a "ratcheted"
-            // stop even when the sleeve is underwater and the ratchet doesn't
-            // apply — misleading users into thinking the effective stop is
-            // higher than it actually is.
             const activation = Number(s.stop_loss_ratchet_activation) || 0;
             const ownAvgEntry = Number(ss.own_avg_entry) || 0;
             const unrealizedPerContract = ownAvgEntry > 0 ? hwm - ownAvgEntry : 0;
@@ -6429,12 +6432,26 @@ function openScannerDetail(row) {
             const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0 && ratchetArmed)
               ? hwm - ratchetDist
               : 0;
-            const effective = Math.max(baseStop, ratchetedFloor);
-            if (effective > 0) {
+            const projected = Math.max(baseStop, ratchetedFloor);
+            if (restingPx > 0) {
+              // Real resting stop from Coinbase — show this. Stage label
+              // + arrow direction reflects reality, not projection.
+              const isProfitLocked = ownAvgEntry > 0 && restingPx > ownAvgEntry;
+              const badge = isProfitLocked
+                ? `<span class="sl-ratchet-badge">↑</span>`
+                : '';
+              const gapVsProjected = projected > 0 && Math.abs(restingPx - projected) > 1e-6
+                ? ` · projected would be $${fmtPrice(projected)}`
+                : '';
+              stopCell = `<span class="mono" title="ACTUAL resting stop on Coinbase (${restingStage || 'stage unknown'})${gapVsProjected}">$${fmtPrice(restingPx)} ${badge}</span>`;
+            } else if (projected > 0) {
+              // No resting order — show projected value with a clear
+              // "not yet placed" marker so the user isn't misled into
+              // thinking downside is capped.
               const ratcheted = ratchetedFloor > baseStop;
               stopCell = ratcheted
-                ? `<span class="mono" title="Ratchet armed — floor lifted from base $${fmtPrice(baseStop)} to $${fmtPrice(effective)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">$${fmtPrice(effective)} <span class="sl-ratchet-badge">↑</span></span>`
-                : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
+                ? `<span class="mono dim" title="PROJECTED (no resting stop placed yet). Ratchet-armed at $${fmtPrice(projected)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">~$${fmtPrice(projected)} <span class="sl-ratchet-badge">↑</span></span>`
+                : `<span class="mono dim" title="PROJECTED (no resting stop placed yet). Base stop-loss (ratchet not yet armed)">~$${fmtPrice(projected)}</span>`;
             }
           }
           // If-stopped projection: realized (already banked this cycle) plus
@@ -6454,16 +6471,25 @@ function openScannerDetail(row) {
           const cfg2 = currentStore[row._live_tenant]?.[row.product_id]?.config || {};
           const sellFee = Number(cfg2.fee_per_fill_sell) || ((Number(cfg2.fee_per_contract_roundtrip) || 0) / 2);
           // Compute both candidate exits — winner is the higher price for a long.
+          // 2026-07-19 XLM incident: prefer ACTUAL resting_stop_px over
+          // projected. Prior code used projected, so IF STOPPED showed
+          // +$7.71 when the real Coinbase stop at $0.165 would have
+          // realized -$116. Hard-honest number now.
           let slEff = 0;
           if (s.stop_loss_enabled && ownAvg2 > 0) {
-            const baseStop2 = Number(s.stop_loss_px) || 0;
-            const hwm2 = Number(ss.stop_loss_hwm) || 0;
-            const ratchetDist2 = Number(s.stop_loss_ratchet_distance) || 0;
-            const activation2 = Number(s.stop_loss_ratchet_activation) || 0;
-            const unrl2 = hwm2 - ownAvg2;
-            const armed2 = unrl2 >= activation2;
-            const floor2 = (s.stop_loss_ratchet_enabled && hwm2 > 0 && ratchetDist2 > 0 && armed2) ? hwm2 - ratchetDist2 : 0;
-            slEff = Math.max(baseStop2, floor2);
+            const restingPx2 = Number(ss.resting_stop_px) || 0;
+            if (restingPx2 > 0) {
+              slEff = restingPx2;
+            } else {
+              const baseStop2 = Number(s.stop_loss_px) || 0;
+              const hwm2 = Number(ss.stop_loss_hwm) || 0;
+              const ratchetDist2 = Number(s.stop_loss_ratchet_distance) || 0;
+              const activation2 = Number(s.stop_loss_ratchet_activation) || 0;
+              const unrl2 = hwm2 - ownAvg2;
+              const armed2 = unrl2 >= activation2;
+              const floor2 = (s.stop_loss_ratchet_enabled && hwm2 > 0 && ratchetDist2 > 0 && armed2) ? hwm2 - ratchetDist2 : 0;
+              slEff = Math.max(baseStop2, floor2);
+            }
           }
           let trailEff = 0;
           const trailModes2 = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
