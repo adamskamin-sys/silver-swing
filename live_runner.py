@@ -1447,31 +1447,38 @@ def run() -> int:
                              f"(_refresh_ok={_pf_ok}, age={_pf_age:.0f}s if known) — "
                              f"skipping autocorrect to avoid false ghost-clear")
                     try:
+                        import state_autocorrect
                         drift_syms = {f.symbol for f in findings if f.kind == "state_config_drift"}
-                        # A symbol absent from exch_positions has no exchange position
-                        # (same as qty=0) — BUT only when the snapshot is confirmed
-                        # complete (_pf_fresh). On a partial/stale snapshot, treat
-                        # absent symbols as UNKNOWN to avoid a false ghost-clear.
-                        zero_pos_syms = {sym for sym, qty in exch_positions.items() if qty == 0}
-                        if _pf_fresh:
-                            zero_pos_syms |= drift_syms - set(exch_positions.keys())
-                        for _dsym in drift_syms & zero_pos_syms:
+                        for _dsym in drift_syms:
                             _dst = store.get_state(live_tenant, _dsym) or {}
                             _dcfg = store.get_config(live_tenant, _dsym) or {}
-                            _state_sq = int(_dst.get("swing_qty") or 0)
-                            _cfg_sq = int(_dcfg.get("swing_qty") or 0)
-                            if _state_sq > _cfg_sq:
-                                _dst["swing_qty"] = _cfg_sq
-                                store.put_state(live_tenant, _dsym, _dst)
-                                _log(f"[reconcile-autocorrect] {_dsym}: state.swing_qty "
-                                     f"{_state_sq}→{_cfg_sq} (exchange pos=0, config={_cfg_sq})")
-                                try:
-                                    log.record("state_config_drift_autocorrected",
-                                               tenant=TENANT, symbol=_dsym,
-                                               old_swing_qty=_state_sq, new_swing_qty=_cfg_sq,
-                                               severity="warn")
-                                except Exception:
-                                    pass
+                            _exch_qty = int(exch_positions.get(_dsym, 0) or 0)
+                            _sym_present = _dsym in exch_positions
+                            _ok, _new_sq, _why = state_autocorrect.should_autocorrect(
+                                _dst, _dcfg, _exch_qty,
+                                snapshot_fresh=_pf_fresh,
+                                symbol_present_in_snapshot=_sym_present,
+                            )
+                            if not _ok:
+                                if _why == "snapshot_stale_and_symbol_absent":
+                                    _log(f"[reconcile-autocorrect] {_dsym}: skipping — "
+                                         f"snapshot not fresh + symbol absent from exch")
+                                continue
+                            _old_sq = int(_dst.get("swing_qty") or 0)
+                            _dst["swing_qty"] = _new_sq
+                            store.put_state(live_tenant, _dsym, _dst)
+                            _log(f"[reconcile-autocorrect] {_dsym}: state.swing_qty "
+                                 f"{_old_sq}→{_new_sq} (exchange={_exch_qty}, "
+                                 f"config={_dcfg.get('swing_qty')})")
+                            try:
+                                log.record("state_config_drift_autocorrected",
+                                           tenant=TENANT, symbol=_dsym,
+                                           old_swing_qty=_old_sq, new_swing_qty=_new_sq,
+                                           exchange_qty=_exch_qty,
+                                           config_swing_qty=_dcfg.get("swing_qty"),
+                                           severity="warn")
+                            except Exception:
+                                pass
                     except Exception as _dce:
                         _log(f"[reconcile-autocorrect] failed: {type(_dce).__name__}: {_dce}")
                     # Auto-correct position_mismatch (ghost positions): exchange=0
