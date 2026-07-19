@@ -1735,18 +1735,33 @@ function productAvgDownLight(tenant, productId) {
   // depending on where the sleeve runs. For the LIVE portfolio row, if any
   // sleeve on that symbol has a green signal, show it — the user cares about
   // the SIGNAL for THIS contract, not which tenant reported it.
+  //
+  // Adam 2026-07-19: 5-min staleness cutoff. Bot emits `avg_down_light`
+  // continuously while a sleeve is in ARMED_SELL underwater. If the bot
+  // has restarted since a previous amber (or hasn't ticked this sleeve
+  // recently), the last event is stale — its in-memory `_avg_down_light`
+  // dict was reset, so no `off` event was emitted to clear. Cutoff at
+  // 5 min: if we haven't seen a FRESH light for this sleeve within that
+  // window, treat it as no signal.
+  const STALE_SECS = 5 * 60;
+  const nowSecs = Date.now() / 1000;
   const latestBySleeve = {};
+  const tsBySleeve = {};
   for (const e of events) {
     if (!e || e.event_type !== 'avg_down_light') continue;
     if (String(e.symbol) !== String(productId)) continue;
     if (!e.sleeve_id) continue;
     latestBySleeve[e.sleeve_id] = e.light;
+    tsBySleeve[e.sleeve_id] = Number(e.ts) || 0;
   }
-  // Adam 2026-07-19: bot now emits light='off' when a sleeve transitions
-  // out of ARMED_SELL (position sold/stopped/halted). Treat 'off' as
-  // no-signal so the dashboard drops the yellow dot instead of showing
-  // a stale amber from a previous cycle.
-  const lights = Object.values(latestBySleeve).filter(l => l && l !== 'off');
+  const lights = [];
+  for (const sid of Object.keys(latestBySleeve)) {
+    const l = latestBySleeve[sid];
+    if (!l || l === 'off') continue;
+    // Drop stale events — no fresh signal within STALE_SECS = no dot
+    if (tsBySleeve[sid] > 0 && (nowSecs - tsBySleeve[sid]) > STALE_SECS) continue;
+    lights.push(l);
+  }
   if (!lights.length) return null;
   if (lights.includes('green')) return 'green';
   if (lights.includes('amber')) return 'amber';
