@@ -60,11 +60,15 @@ services:
           name: silver-swing-state
           property: connectionString
 
-  # ---- LIVE bot worker (REAL ORDERS — starts in dry-run) --------------------
-  # First deploy uses SWING_LIVE_DRY_RUN=1: full wiring, real feed, orders are
-  # LOGGED not submitted. Confirm the pipeline is clean, then flip to
-  # SWING_LIVE_CONFIRM=I_UNDERSTAND (and remove SWING_LIVE_DRY_RUN) in the
-  # Render UI to go actually live.
+  # ---- LIVE bot worker (REAL ORDERS) ----------------------------------------
+  # 2026-07-19: SWING_LIVE_DRY_RUN key REMOVED from blueprint. Adam had it
+  # unset in the Render UI (running live for real); leaving `value: "1"` here
+  # caused a silent re-sync flip back INTO dry-run on the last blueprint push.
+  # If you want a first pass in dry-run, set SWING_LIVE_DRY_RUN=1 IN THE UI
+  # ONLY — never in this file.
+  #
+  # SWING_LIVE_CONFIRM=I_UNDERSTAND stays UI-only for the same reason: don't
+  # let a stale blueprint accidentally flip real trading on/off.
   - type: worker
     name: silver-swing-bot-live
     runtime: python
@@ -80,8 +84,6 @@ services:
         value: adam-live
       - key: SWING_SYMBOL
         value: SLR-27AUG26-CDE
-      - key: SWING_LIVE_DRY_RUN
-        value: "1"
       # 2026-07-19: three expert-source-refactor flags flipped ON per
       # Adam's "go live" directive. All three ship canonical peer-
       # reviewed mechanisms; see the respective flag_enabled() docstrings
