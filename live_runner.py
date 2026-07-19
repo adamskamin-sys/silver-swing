@@ -1223,16 +1223,9 @@ def run() -> int:
                     # refresh_portfolio_snapshot every PORTFOLIO_REFRESH_SECS (2s).
                     # A gap > 30s means the REST mark is stale — price-triggered
                     # actions (TP, trail, stop) may fire on a frozen price.
-                    _pf_refresh_ts = float(_pf.get("_refresh_ts") or 0)
-                    _pf_mark_age = (now - _pf_refresh_ts) if _pf_refresh_ts else None
-                    if _pf_mark_age is not None and _pf_mark_age > 30:
-                        _stale_msg = f"__portfolio__ mark is {_pf_mark_age:.0f}s stale (> 30s)"
-                        _log(f"[margin-sentinel] CRIT: {_stale_msg}")
-                        try:
-                            from alerting import Priority
-                            notifier.send("portfolio mark stale", _stale_msg, Priority.CRIT)
-                        except Exception:
-                            pass
+                    # Stale-mark alert moved to the 2s portfolio-refresh block
+                    # (runs after its try/except) so it fires within seconds of
+                    # a feed failure rather than waiting up to 300s here.
                     _ms_positions = []
                     for _d in (_pf.get("derivatives") or []):
                         _dpid = _d.get("product_id")
@@ -1561,16 +1554,11 @@ def run() -> int:
             # circuit-breaker math, and Carver risk-contribution reads.
             if now - last_portfolio_refresh >= PORTFOLIO_REFRESH_SECS:
                 last_portfolio_refresh = now
+                # Hoist live_tenant before try so it is in scope for the
+                # drift and stale-mark checks that run after the except.
+                live_tenant = f"{TENANT}-live" if not TENANT.endswith("-live") else TENANT
                 try:
                     from main import refresh_portfolio_snapshot
-                    # Match the reconcile guard on line 495: if TENANT already
-                    # ends with '-live' (Adam's live worker has SWING_TENANT=
-                    # adam-live), do NOT append another '-live' — else every
-                    # refresh writes to the ghost 'adam-live-live' scope while
-                    # the dashboard reads 'adam-live' and stays frozen at the
-                    # startup snapshot. Root cause of 2026-07-14 stale-mark
-                    # incident that missed PLAT sell + trail.
-                    live_tenant = f"{TENANT}-live" if not TENANT.endswith("-live") else TENANT
                     n_refreshed = refresh_portfolio_snapshot(store, live_tenant)
                     if n_refreshed > 0:
                         pass  # silent success — logging every 30s is noisy
@@ -1579,67 +1567,6 @@ def run() -> int:
                     # snapshot flags (see main.py:261). We add the health
                     # record here for the wrapper site itself.
                     _health.record_ok(store, "portfolio_refresh", TENANT)
-                    # C-1 fix: WS-vs-REST mark drift detection per CLAUDE.md
-                    # top-priority invariant. A WebSocket feed that is alive
-                    # but delivering stale/wrong prices passes the stale-feed
-                    # gate while silently misfiring stops + TPs. Compare each
-                    # product's fresh REST mark (just written above) against
-                    # its live WS price. Drift > 1% → force WS restart.
-                    # Never halt trading (per invariant: re-sync, not halt).
-                    try:
-                        _pf_drift = store.get_config(live_tenant, "__portfolio__") or {}
-                        for _dd in (_pf_drift.get("derivatives") or []):
-                            _dpid = _dd.get("product_id")
-                            _rest_mark = float(_dd.get("mark") or 0)
-                            if not _dpid or _rest_mark <= 0:
-                                continue
-                            _ws_price = None
-                            if _dpid == SYMBOL:
-                                _wt = feed.latest_ticker()
-                                if _wt:
-                                    _ws_price = float(_wt.get("price") or 0)
-                            elif _dpid in _non_primary_tracks:
-                                _wt = _non_primary_tracks[_dpid].feed.latest_ticker()
-                                if _wt:
-                                    _ws_price = float(_wt.get("price") or 0)
-                            if not _ws_price or _ws_price <= 0:
-                                continue
-                            _drift = abs(_ws_price - _rest_mark) / _rest_mark
-                            if _drift > 0.01:
-                                _log(f"[mark-drift] {_dpid}: WS={_ws_price:.4f} "
-                                     f"REST={_rest_mark:.4f} drift={_drift*100:.2f}% "
-                                     f"— force re-sync")
-                                try:
-                                    log.record(
-                                        "mark_drift_detected", tenant=TENANT,
-                                        symbol=_dpid, ws_price=_ws_price,
-                                        rest_mark=_rest_mark,
-                                        drift_pct=round(_drift * 100, 3),
-                                        severity="critical")
-                                except Exception:
-                                    pass
-                                try:
-                                    from alerting import Priority
-                                    notifier.send(
-                                        f"mark drift {_dpid}",
-                                        f"{_dpid}: WS {_ws_price:.4f} vs REST "
-                                        f"{_rest_mark:.4f} ({_drift*100:.1f}% apart) "
-                                        f"— restarting WS feed",
-                                        Priority.CRIT,
-                                    )
-                                except Exception:
-                                    pass
-                                if _dpid == SYMBOL:
-                                    try:
-                                        feed.stop()
-                                        feed.start()
-                                        _log(f"[mark-drift] primary feed {_dpid} restarted")
-                                    except Exception as _fe:
-                                        _log(f"[mark-drift] primary feed restart failed: {_fe}")
-                                elif _dpid in _non_primary_tracks:
-                                    _maybe_resync_stale_feed(_non_primary_tracks[_dpid])
-                    except Exception as _dme:
-                        _log(f"[mark-drift] check failed: {type(_dme).__name__}: {_dme}")
                     # 2026-07-14 full parity — discovery only here. Each
                     # non-primary product's actual tick happens on the outer
                     # loop cadence (below) using its own WS feed, not the
@@ -1663,6 +1590,88 @@ def run() -> int:
                     # write so cockpit chip + daily audit still see the
                     # failure. (Auditor fix-on-top 2026-07-14 15:35.)
                     _health.record_error(store, "portfolio_refresh", TENANT, e)
+                # C-1 fix: WS-vs-REST mark drift detection moved outside the
+                # refresh try/except so it runs every 2s regardless of whether
+                # refresh_portfolio_snapshot succeeded. Reads whatever mark is
+                # currently in the store — the stale-mark check below will flag
+                # if that data is too old. Never halts trading (re-sync only).
+                try:
+                    _pf_drift = store.get_config(live_tenant, "__portfolio__") or {}
+                    for _dd in (_pf_drift.get("derivatives") or []):
+                        _dpid = _dd.get("product_id")
+                        _rest_mark = float(_dd.get("mark") or 0)
+                        if not _dpid or _rest_mark <= 0:
+                            continue
+                        _ws_price = None
+                        if _dpid == SYMBOL:
+                            _wt = feed.latest_ticker()
+                            if _wt:
+                                _ws_price = float(_wt.get("price") or 0)
+                        elif _dpid in _non_primary_tracks:
+                            _wt = _non_primary_tracks[_dpid].feed.latest_ticker()
+                            if _wt:
+                                _ws_price = float(_wt.get("price") or 0)
+                        if not _ws_price or _ws_price <= 0:
+                            continue
+                        _drift = abs(_ws_price - _rest_mark) / _rest_mark
+                        if _drift > 0.01:
+                            _log(f"[mark-drift] {_dpid}: WS={_ws_price:.4f} "
+                                 f"REST={_rest_mark:.4f} drift={_drift*100:.2f}% "
+                                 f"— force re-sync")
+                            try:
+                                log.record(
+                                    "mark_drift_detected", tenant=TENANT,
+                                    symbol=_dpid, ws_price=_ws_price,
+                                    rest_mark=_rest_mark,
+                                    drift_pct=round(_drift * 100, 3),
+                                    severity="critical")
+                            except Exception:
+                                pass
+                            try:
+                                from alerting import Priority
+                                notifier.send(
+                                    f"mark drift {_dpid}",
+                                    f"{_dpid}: WS {_ws_price:.4f} vs REST "
+                                    f"{_rest_mark:.4f} ({_drift*100:.1f}% apart) "
+                                    f"— restarting WS feed",
+                                    Priority.CRIT,
+                                )
+                            except Exception:
+                                pass
+                            if _dpid == SYMBOL:
+                                try:
+                                    feed.stop()
+                                    feed.start()
+                                    _log(f"[mark-drift] primary feed {_dpid} restarted")
+                                except Exception as _fe:
+                                    _log(f"[mark-drift] primary feed restart failed: {_fe}")
+                            elif _dpid in _non_primary_tracks:
+                                _maybe_resync_stale_feed(_non_primary_tracks[_dpid])
+                except Exception as _dme:
+                    _log(f"[mark-drift] check failed: {type(_dme).__name__}: {_dme}")
+                # C-1 + C-2 fix: stale-mark check runs every 2s here, not every
+                # 300s in the sentinel. Also fixes the C-2 boot bug: _refresh_ts=0
+                # (never refreshed) is now treated as infinite age instead of
+                # silently skipped via the old `if _pf_refresh_ts else None` guard.
+                try:
+                    _pf_stale = store.get_config(live_tenant, "__portfolio__") or {}
+                    _pf_ts = float(_pf_stale.get("_refresh_ts") or 0)
+                    _pf_mark_age = now - _pf_ts if _pf_ts > 0 else float("inf")
+                    if _pf_mark_age > 30:
+                        _stale_msg = (
+                            "__portfolio__ mark has never been refreshed"
+                            if _pf_ts == 0
+                            else f"__portfolio__ mark is {_pf_mark_age:.0f}s stale (> 30s)"
+                        )
+                        _log(f"[mark-stale] CRIT: {_stale_msg}")
+                        try:
+                            from alerting import Priority
+                            notifier.send("portfolio mark stale", _stale_msg, Priority.CRIT)
+                        except Exception:
+                            pass
+                        last_portfolio_refresh = 0  # force re-fetch next tick
+                except Exception as _mse:
+                    _log(f"[mark-stale] check failed: {type(_mse).__name__}: {_mse}")
             if now - last_twitter_poll >= TWITTER_POLL_SECS:
                 last_twitter_poll = now
                 try:
