@@ -77,6 +77,43 @@ def _current_atr(store, tenant: str, symbol: str, tuned: Optional[dict]):
     return None, None
 
 
+def _current_er(store, tenant: str, symbol: str, tuned: Optional[dict]) -> float:
+    """Best-available Kaufman Efficiency Ratio (2026-07-19 Option B).
+    Mirrors _current_atr's precedence. Returns 1.0 (neutral — no ER
+    modulation) when unavailable. Prevents expert_guard from flagging
+    a false drift when live cfg was er-modulated but guard fell back
+    to unmodulated canonical."""
+    if tuned and tuned.get("efficiency_ratio") is not None:
+        try:
+            return float(tuned["efficiency_ratio"])
+        except (TypeError, ValueError):
+            pass
+    try:
+        snap = (store.get_snapshot(tenant, symbol) or {}) if hasattr(store, "get_snapshot") else {}
+    except Exception:
+        snap = {}
+    if snap.get("efficiency_ratio") is not None:
+        try:
+            return float(snap["efficiency_ratio"])
+        except (TypeError, ValueError):
+            pass
+    # Portfolio snapshot stores per-product ER under __portfolio__.derivatives
+    try:
+        pf = store.get_config(tenant, "__portfolio__") or {}
+        for d in (pf.get("derivatives") or []):
+            if d.get("product_id") == symbol and d.get("efficiency_ratio") is not None:
+                return float(d["efficiency_ratio"])
+    except Exception:
+        pass
+    cfg = store.get_config(tenant, symbol) or {}
+    if cfg.get("efficiency_ratio") is not None:
+        try:
+            return float(cfg["efficiency_ratio"])
+        except (TypeError, ValueError):
+            pass
+    return 1.0  # neutral fallback
+
+
 def check(store, tenant: str, symbol: str, tolerance_pct: float = 10.0) -> dict:
     """Drift report for one symbol. Skips (ok=True) when data is missing."""
     cfg = store.get_config(tenant, symbol) or {}
@@ -87,7 +124,11 @@ def check(store, tenant: str, symbol: str, tolerance_pct: float = 10.0) -> dict:
     if not atr or atr <= 0:
         return {"symbol": symbol, "ok": True, "skipped": "no ATR available", "drifts": []}
 
-    expected = dict(expert_params.expert_params(symbol, atr))
+    # Pass ER so expert_guard's expected matches what _attach_expert_params
+    # actually wrote to the live cfg. Without this, ER-modulated live cfg
+    # vs unmodulated expected = phantom drifts fire every tick.
+    er = _current_er(store, tenant, symbol, tuned)
+    expected = dict(expert_params.expert_params(symbol, atr, er=er))
     using_tuned = bool(tuned and tuned.get("trail_x_atr"))
     if using_tuned:
         # Layer-2 overrides the trail multiplier with the per-product tuned one.

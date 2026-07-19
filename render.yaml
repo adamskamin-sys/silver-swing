@@ -82,6 +82,19 @@ services:
         value: SLR-27AUG26-CDE
       - key: SWING_LIVE_DRY_RUN
         value: "1"
+      # 2026-07-19: three expert-source-refactor flags flipped ON per
+      # Adam's "go live" directive. All three ship canonical peer-
+      # reviewed mechanisms; see the respective flag_enabled() docstrings
+      # for source citations + enable path notes.
+      #   B  — Kaufman ER modulation (Perry Kaufman TSaM 2013)
+      #   D-1 — Faber SMA + MOP TSM trend filter (Faber 2007, MOP 2012)
+      #   D-2 — Harvey vol-target sizing (Harvey 2018 JPM)
+      - key: SWING_ER_MODULATION_ENABLED
+        value: "1"
+      - key: SWING_TREND_FILTER_ENABLED
+        value: "1"
+      - key: SWING_VOL_TARGET_ENABLED
+        value: "1"
       - key: COINBASE_API_KEY_JSON_PATH
         value: /etc/secrets/coinbase.json
       - key: REDIS_URL
