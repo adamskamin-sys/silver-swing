@@ -563,16 +563,34 @@ def run() -> int:
                 "contract_size": 1.0,
                 "core_qty": 0,
             }
+            # A previous deploy of this seed path (before 6248f67) may
+            # have written buy_px=sell_px=0.0 to Redis. Those pass the
+            # "field present" check but fail the cross-field validator.
+            # Overwrite invalid zeros too, not just missing fields.
+            _invalid_zero_keys = {
+                "buy_px", "sell_px",
+                "margin_per_contract", "scale_up_buffer_mult",
+                "contract_size", "abort_above",
+            }
             _dirty = False
             for k, v in _hard_defaults.items():
-                if k not in _cfg2:
+                cur = _cfg2.get(k)
+                missing = k not in _cfg2
+                zero_invalid = (k in _invalid_zero_keys and cur == 0)
+                if missing or zero_invalid:
                     _cfg2[k] = v
                     _dirty = True
+            # Cross-field: if abort_below >= buy_px, snap it below.
+            try:
+                if float(_cfg2.get("abort_below", 0)) >= float(_cfg2.get("buy_px", 0)):
+                    _cfg2["abort_below"] = float(_cfg2["buy_px"]) * 0.5
+                    _dirty = True
+            except (TypeError, ValueError):
+                pass
             if _dirty:
                 store.put_config(TENANT, SYMBOL, _cfg2)
                 _log(f"[{TENANT}/{SYMBOL}] real-money: seeded hard defaults "
-                     f"for missing primary fields (primary disabled, sleeves "
-                     f"unaffected)")
+                     f"for primary fields (primary disabled, sleeves unaffected)")
 
         coinbase = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
         ok, issues = _preflight(coinbase, store, TENANT, SYMBOL, notifier)
