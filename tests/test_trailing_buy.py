@@ -155,9 +155,17 @@ def test_between_low_and_low_plus_distance_keeps_waiting():
 
 def test_expert_default_distance_from_atr():
     """expert_params.expert_params() emits buy_trail_distance = 0.5×ATR
-    for metals/energy — the Le Beau entry-filter canonical."""
+    for every asset class — Le Beau entry-filter canonical. Crypto no
+    longer has a fixed 0.75×ATR bump; dynamic widening is delegated to
+    Kaufman Efficiency Ratio (2026-07-19). Called without ER → er=1.0
+    → no modulation → canonical 0.5×ATR."""
     from expert_params import expert_params
     p = expert_params("SLR-27AUG26-CDE", atr=0.10)
     assert p["buy_trail_distance"] == pytest.approx(0.05)  # 0.10 × 0.5
     p_crypto = expert_params("BTC-PERP-INTX", atr=100.0)
-    assert p_crypto["buy_trail_distance"] == pytest.approx(75.0)  # 100 × 0.75
+    assert p_crypto["buy_trail_distance"] == pytest.approx(50.0)  # 100 × 0.5 (canonical)
+    # Low-ER widening is feature-flagged OFF by default (2026-07-19
+    # backtest-referee NO-GO on unmodulated constant). When flag off,
+    # ER is reported but does NOT scale distances — matches canonical.
+    p_crypto_noisy = expert_params("BTC-PERP-INTX", atr=100.0, er=0.5)
+    assert p_crypto_noisy["buy_trail_distance"] == pytest.approx(50.0)  # canonical still

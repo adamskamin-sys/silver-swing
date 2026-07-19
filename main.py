@@ -251,7 +251,7 @@ def _attach_expert_params(broker, portfolio_snap: dict) -> None:
     Best-effort — failures per product don't stall the caller."""
     from datetime import datetime, timedelta, timezone
     from backtest import fetch_candles
-    from expert_params import compute_atr, expert_params
+    from expert_params import compute_atr, compute_efficiency_ratio, expert_params
 
     derivs = portfolio_snap.get("derivatives") or []
     end = datetime.now(timezone.utc)
@@ -264,8 +264,14 @@ def _attach_expert_params(broker, portfolio_snap: dict) -> None:
             candles = fetch_candles(broker.client, pid, start, end, granularity="FIVE_MINUTE")
             atr = compute_atr(candles, period=14)
             if atr > 0:
+                # Kaufman Efficiency Ratio over 20 bars (Perry Kaufman,
+                # Trading Systems and Methods 5th ed. 2013). Modulates
+                # stop/trail multipliers — noisy regimes widen, trending
+                # regimes tighten. Replaces retired crypto 25% bump.
+                er = compute_efficiency_ratio(candles, period=20)
                 d["atr"] = round(atr, 5)
-                d["expert_params"] = expert_params(pid, atr)
+                d["efficiency_ratio"] = round(er, 4)
+                d["expert_params"] = expert_params(pid, atr, er=er)
         except Exception:
             pass
 

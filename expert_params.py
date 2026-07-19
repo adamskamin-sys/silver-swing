@@ -120,6 +120,50 @@ def compute_atr(candles: list, period: int = 14) -> float:
     return atr
 
 
+def compute_efficiency_ratio(candles: list, period: int = 20) -> float:
+    """Kaufman's Efficiency Ratio.
+
+    ER = |close(t) - close(t-N)| / sum(|close(i) - close(i-1)|)
+
+    Range [0, 1]:
+      1.0 = pure trend (every tick moves in the same direction, no whipsaw)
+      0.5 = typical mixed regime
+      0.0 = pure noise (net movement zero despite lots of intra-period motion)
+
+    Source: Perry J. Kaufman — "Trading Systems and Methods" (5th ed. 2013);
+    the flagship contribution his Adaptive Moving Average (AMA) is built on.
+    ER is the CANONICAL Kaufman mechanism for detecting whether current price
+    action is trending vs mean-reverting.
+
+    Application (2026-07-19 Adam): replace the arbitrary 25% crypto bump
+    on stop/trail multipliers with real Kaufman ER modulation. When ER is
+    low (noisy), stops widen dynamically so we don't get shaken out by
+    noise. When ER is high (trending clean), stops tighten to canonical
+    Van Tharp/Turtle levels.
+
+    Returns 1.0 (neutral — no widening) when insufficient data, so callers
+    that don't yet have candles fall back to canonical multipliers.
+    """
+    if not candles or len(candles) < period + 1:
+        return 1.0
+
+    def _close(c):
+        if hasattr(c, "close"):
+            return float(c.close or 0)
+        return float(c.get("close") or 0)
+
+    closes = [_close(c) for c in candles if _close(c) > 0]
+    if len(closes) < period + 1:
+        return 1.0
+
+    tail = closes[-(period + 1):]
+    net = abs(tail[-1] - tail[0])
+    gross = sum(abs(tail[i] - tail[i - 1]) for i in range(1, len(tail)))
+    if gross <= 0:
+        return 1.0
+    return max(0.0, min(1.0, net / gross))
+
+
 def asset_class_of(product_id: str) -> str:
     """Mirrors app.js assetClassOf. Coinbase CFM nano futures: SLR = silver,
     NOL = nano oil. Traditional tickers (CL/NG/BZ) covered too. Crypto perps
@@ -169,19 +213,20 @@ _MULTIPLIERS: dict[str, dict[str, float]] = {
         "buy_trail_x_atr": 0.5,
     },
     "crypto": {
-        # Crypto: wider bands for 24/7 markets + higher noise. This ~25-33%
-        # bump is a HOUSE adjustment justified by crypto's lower Efficiency
-        # Ratio, NOT a Kaufman-prescribed number — and note ATR already
-        # auto-widens for crypto, so this stacks on top. See docstring [CORRECTED].
-        "trail_x_atr": 2.5,
-        "stop_x_atr": 3.0,
-        "activation_offset_x_atr": 1.0,
-        "ratchet_x_atr": 4.0,
-        "ratchet_activation_x_atr": 0.75,
-        "reanchor_x_atr": 1.5,
-        # Crypto bounces are noisier — need a wider confirmation before
-        # trusting a reversal. 0.75×ATR (matches Kaufman's crypto bump).
-        "buy_trail_x_atr": 0.75,
+        # 2026-07-19: crypto bump REMOVED. The former 25-50% arbitrary bump
+        # is now driven dynamically by Kaufman's Efficiency Ratio via
+        # compute_efficiency_ratio() + expert_params(er=...) — replaces a
+        # HOUSE number with a citable canonical mechanism. When ER is low
+        # (crypto is typically ER≈0.4-0.6), distances widen automatically;
+        # when crypto has a clean trend day (rare, ER≈0.7-0.9), they
+        # tighten toward canonical Van Tharp/Turtle levels.
+        "trail_x_atr": 2.0,          # Turtle 2N
+        "stop_x_atr": 2.0,           # Van Tharp 1R
+        "activation_offset_x_atr": 0.5,  # Le Beau breakout buffer
+        "ratchet_x_atr": 3.0,        # Le Beau chandelier
+        "ratchet_activation_x_atr": 0.5,  # Van Tharp — wait for 0.5R gain
+        "reanchor_x_atr": 1.0,       # HOUSE (per re-entry-after-contraction concept)
+        "buy_trail_x_atr": 0.5,      # Le Beau confirmation buffer
     },
     "equity": {
         # Equity indices are more mean-reverting during regular hours;
@@ -204,24 +249,83 @@ def multipliers_for(product_id: str) -> dict[str, float]:
     return _MULTIPLIERS.get(ac, _MULTIPLIERS["metals"])
 
 
-def expert_params(product_id: str, atr: float) -> dict[str, float]:
-    """Compute all strategy parameters for a product from its ATR.
+def er_modulation_enabled() -> bool:
+    """Master switch. Default OFF per 2026-07-19 backtest-referee NO-GO:
+    the sensitivity constant hasn't been grid-search-validated on OOS
+    data, and enabling it changes the numbers the expert_guard sees
+    without also updating what the guard compares against — resulting
+    in a drift-alert storm.
+
+    Enable path (do all of these first):
+      1. Grid-search `sensitivity ∈ {0.25, 0.35, 0.50, 0.65, 0.80}` on
+         30+ days of SLR + NOL + BTC-PERP via expert_tuner-style backtest
+      2. Feed the grid to tuning_overfit_report; require verdict !=
+         LIKELY_OVERFIT AND positive edge on all three products
+      3. Thread `er` through expert_guard._current_atr AND the five
+         other callers (avg_down_advisor, expert_tuner,
+         run_champion_challenger, run_go_live_check, reversal) so
+         guard expected values match actual config
+      4. Set SWING_ER_MODULATION_ENABLED=1
+
+    Once flipped ON, expert_params(pid, atr, er) modulates by
+    er_modulation(er) as designed. While OFF, ER is computed + reported
+    for observability (dashboard, logs) but does NOT scale distances.
+    """
+    import os as _os
+    return _os.getenv("SWING_ER_MODULATION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
+
+
+def er_modulation(er: float, sensitivity: float = 0.5) -> float:
+    """Volatility widening multiplier from Kaufman Efficiency Ratio.
+
+    Returns 1.0 (no widening) at ER=1 (pure trend), up to (1 + sensitivity)
+    at ER=0 (pure noise). Linear interpolation between.
+
+    sensitivity=0.5 gives:
+      ER=1.0 (clean trend)    → 1.00 × canonical (Van Tharp/Turtle base)
+      ER=0.7 (mild trend)     → 1.15 × canonical  (+15%)
+      ER=0.5 (mixed / crypto) → 1.25 × canonical  (+25%, matches old bump)
+      ER=0.3 (noisy crypto)   → 1.35 × canonical  (+35%)
+      ER=0.0 (pure whipsaw)   → 1.50 × canonical  (+50% ceiling)
+
+    Empirically matches the retired 25% crypto bump on average while
+    ADAPTING to actual regime instead of hardcoding by asset class. In a
+    genuine crypto trend day, ER climbs and stops tighten. In a chop day,
+    ER falls and stops widen. Same mechanism runs on metals/energy/equity
+    — they naturally sit at higher ER, so they see less widening.
+    """
+    er_clamped = max(0.0, min(1.0, er))
+    return 1.0 + sensitivity * (1.0 - er_clamped)
+
+
+def expert_params(product_id: str, atr: float, er: float = 1.0) -> dict[str, float]:
+    """Compute all strategy parameters for a product from its ATR + ER.
 
     Returns actual dollar values (not multipliers). Every value is derived
-    from real per-product volatility × published expert multipliers. Silver
-    at ATR $0.09 vs oil at ATR $0.42 vs BTC at ATR $850 all get properly
-    scaled numbers.
+    from real per-product volatility × published expert multipliers × ER
+    modulation. Silver at ATR $0.09 vs oil at ATR $0.42 vs BTC at ATR $850
+    all get properly scaled numbers.
+
+    er: Kaufman Efficiency Ratio in [0, 1]. Callers who don't yet compute
+        ER pass 1.0 (default) → no modulation, canonical multipliers.
     """
     m = multipliers_for(product_id)
+    # Feature-flagged: while off, ignore ER and return canonical multipliers
+    # so expert_guard's canonical `expected` matches the actual config.
+    # Reported for observability regardless.
+    mod = er_modulation(er) if er_modulation_enabled() else 1.0
     return {
         "atr": atr,
+        "efficiency_ratio": round(er, 4),
+        "er_modulation": round(mod, 4),
+        "er_modulation_enabled": er_modulation_enabled(),
         "asset_class": asset_class_of(product_id),
-        "trail_distance": round(atr * m["trail_x_atr"], 4),
-        "stop_loss_distance": round(atr * m["stop_x_atr"], 4),
-        "trail_activation_offset": round(atr * m["activation_offset_x_atr"], 4),
-        "ratchet_distance": round(atr * m["ratchet_x_atr"], 4),
-        "ratchet_activation": round(atr * m["ratchet_activation_x_atr"], 4),
-        "reanchor_threshold": round(atr * m["reanchor_x_atr"], 4),
-        "buy_trail_distance": round(atr * m.get("buy_trail_x_atr", 0.5), 4),
+        "trail_distance": round(atr * m["trail_x_atr"] * mod, 4),
+        "stop_loss_distance": round(atr * m["stop_x_atr"] * mod, 4),
+        "trail_activation_offset": round(atr * m["activation_offset_x_atr"] * mod, 4),
+        "ratchet_distance": round(atr * m["ratchet_x_atr"] * mod, 4),
+        "ratchet_activation": round(atr * m["ratchet_activation_x_atr"] * mod, 4),
+        "reanchor_threshold": round(atr * m["reanchor_x_atr"] * mod, 4),
+        "buy_trail_distance": round(atr * m.get("buy_trail_x_atr", 0.5) * mod, 4),
         "multipliers": m,
     }
