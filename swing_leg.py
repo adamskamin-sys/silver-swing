@@ -1350,25 +1350,12 @@ class SwingTrader:
             # to rebuy) or otherwise flat. Stop-loss doesn't apply; skip
             # silently rather than halting so the cycle continues.
             return False
-        to_sell = self._compute_sleeve_stop_loss_qty(sc, pos)
-        if to_sell <= 0:
-            self._sleeve_halt(sc, ss,
-                              f"stop-loss at {last_price} (≤ {effective_stop}) but core floor "
-                              f"{self.cfg.core_qty} blocks the sell (pos={pos})")
-            return True
-        # Adam 2026-07-15 CRITICAL: mutual exclusion with exchange resting stop.
-        # If resting_stop_enabled=True, Coinbase already has a stop-limit sitting
-        # at effective_stop. When mark crosses, IT fires — and if we ALSO
-        # place_market SELL here, both flatten one contract each, taking a +1
-        # LONG to -1 SHORT. CU 2026-07-15 12:34:34 double-fire race — problem-
-        # scout found this bot-side path was NOT guarded, only the arm-new-order
-        # path was. Same fix pattern as swing_leg.py:3653.
-        #
-        # Rate-limit the log to 5 min per sleeve — HYP 2026-07-15 log dump
-        # showed this firing ~15×/min for hours while mark stayed below the
-        # ratcheted trigger. Real signal (guard fired) still surfaces every
-        # 5 min without drowning the log.
-        if getattr(sc, "resting_stop_enabled", True) and ss.resting_stop_oid:
+        # 2026-07-19: mutual-exclusion guard moved ABOVE _compute_sleeve_stop_
+        # loss_qty. When resting_stop_enabled, we defer to the exchange stop
+        # regardless of whether the oid is placed yet — no need to compute
+        # qty (which requires self.cfg.core_qty and would raise on lightweight
+        # test setups anyway).
+        if getattr(sc, "resting_stop_enabled", True):
             import time as _t_ssk
             key = f"stop_loss_skip_{sc.id}"
             store = getattr(self, "_stop_loss_skip_last_ts", None)
@@ -1378,13 +1365,22 @@ class SwingTrader:
             last_ts = int(store.get(key, 0) or 0)
             cur = int(_t_ssk.time())
             if cur - last_ts > 300:
-                self._record("sleeve_stop_loss_skipped_resting_stop_active",
-                             sleeve_id=sc.id, price=last_price,
-                             trigger=effective_stop,
-                             resting_stop_oid=ss.resting_stop_oid,
-                             resting_stop_px=ss.resting_stop_px)
+                try:
+                    self._record("sleeve_stop_loss_skipped_resting_stop_active",
+                                 sleeve_id=sc.id, price=last_price,
+                                 trigger=effective_stop,
+                                 resting_stop_oid=ss.resting_stop_oid,
+                                 resting_stop_px=ss.resting_stop_px)
+                except Exception:
+                    pass
                 store[key] = cur
             return False
+        to_sell = self._compute_sleeve_stop_loss_qty(sc, pos)
+        if to_sell <= 0:
+            self._sleeve_halt(sc, ss,
+                              f"stop-loss at {last_price} (≤ {effective_stop}) but core floor "
+                              f"{self.cfg.core_qty} blocks the sell (pos={pos})")
+            return True
         was_ratcheted = effective_stop > float(sc.stop_loss_px or 0.0)
         sell_ok = False
         try:
@@ -4118,13 +4114,29 @@ class SwingTrader:
         # sells sitting on the book. Firing a primary market SELL here on top
         # of that = the double-fire race (CU 2026-07-15 12:34:34) at the
         # product level. Skip the bot-side sell; the exchange stops carry it.
-        active_resting = [ss.resting_stop_oid
-                          for ss in (self.s.sleeves or {}).values()
+        #
+        # 2026-07-19 EXTENDED (SLR $56.03 incident): also defer when a sleeve
+        # has resting_stop_enabled but hasn't PLACED yet — the ~1s window
+        # between a fresh BUY fill and _maintain_resting_stop() writing the
+        # oid was a hole. Primary would see mark<stop on the fresh position
+        # and market-sell what the sleeve just bought. Now: if ANY sleeve
+        # HAS or WILL HAVE a resting stop, primary defers. If the resting
+        # stop actually never places (Coinbase failure), the ratchet-stop
+        # gap watchdog raises a critical alert — not this path double-selling.
+        sleeves = (self.s.sleeves or {}).values()
+        sleeves_cfg = {sc.id: sc for sc in self._load_sleeves_cfg()}
+        active_resting = [ss.resting_stop_oid for ss in sleeves
                           if getattr(ss, "resting_stop_oid", None)]
-        if active_resting:
+        will_have_resting = [
+            ss.id for ss in sleeves
+            if getattr(sleeves_cfg.get(ss.id), "resting_stop_enabled", False)
+            and not getattr(ss, "resting_stop_oid", None)
+        ]
+        if active_resting or will_have_resting:
             self._record("stop_loss_skipped_resting_stop_active",
                          price=last_price, trigger=trigger,
-                         resting_stop_oids=list(active_resting))
+                         resting_stop_oids=list(active_resting),
+                         will_have_resting=list(will_have_resting))
             return False
         try:
             source = getattr(self.b, "set_pending_source", None)
