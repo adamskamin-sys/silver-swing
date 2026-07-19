@@ -72,9 +72,9 @@ SPEC_REFRESH_SECS = float(os.getenv("SWING_SPEC_REFRESH_SECS", "21600.0"))
 # daily candles change once/day; 6h refresh gives us a fresh verdict well
 # ahead of the 12h cache TTL. Env override for tests + tuning.
 TREND_REFRESH_SECS = float(os.getenv("SWING_TREND_REFRESH_SECS", "21600.0"))
-# Twitter shadow scanner poll interval. 5 min balances freshness against
-# Nitter instance rate limits and RSS parse cost. Env override for tests.
-TWITTER_POLL_SECS = float(os.getenv("SWING_TWITTER_POLL_SECS", "300.0"))
+# Funding-rate sign-flip watcher poll cadence. 5 min balances freshness
+# against funding change rate (perpetuals fund every 1h or 8h).
+FUNDING_POLL_SECS = float(os.getenv("SWING_FUNDING_POLL_SECS", "300.0"))
 # Tick recorder pruning cadence + retention. Runs once per hour on the
 # main loop. keep_days=7 caps total disk at roughly ~1GB across ~15
 # symbols — bump SWING_TICK_KEEP_DAYS if a Render persistent disk is
@@ -1293,9 +1293,8 @@ def run() -> int:
     except Exception as e:
         _log(f"WARN: startup trend refresh failed: {type(e).__name__}: {e}")
     last_trend_refresh = time.time()
-    # Offset the first twitter poll by 60s so bot startup isn't dominated by
-    # a slow RSS fetch across ~15 handles.
-    last_twitter_poll = time.time() - TWITTER_POLL_SECS + 60.0
+    # Offset the funding watcher by 60s so bot startup isn't dominated by it.
+    last_funding_poll = time.time() - FUNDING_POLL_SECS + 60.0
     # Set to now so the FIRST refresh fires PORTFOLIO_REFRESH_SECS after
     # startup (the initial refresh already happened in _sync_live_portfolio).
     last_portfolio_refresh = time.time()
@@ -2002,49 +2001,11 @@ def run() -> int:
                         last_portfolio_refresh = 0  # force re-fetch next tick
                 except Exception as _mse:
                     _log(f"[mark-stale] check failed: {type(_mse).__name__}: {_mse}")
-            # 2026-07-19: twitter_scanner.tick moved to a BACKGROUND THREAD.
-            # Root cause of the 4-5 min zombie-eviction cascade: Nitter
-            # instances routinely time out; polling 14 handles serially can
-            # block for 3-6 min, during which no Track's step() runs and
-            # every non-primary Track hits ZOMBIE_THRESHOLD_SECS=300s.
-            # Problem-scout 2026-07-19 confirmed the block via live logs.
-            #
-            # Design: single-flight daemon thread. A run_lock prevents
-            # concurrent ticks if a prior tick is still in flight (would
-            # queue up otherwise). Main loop keeps ticking regardless.
-            if now - last_twitter_poll >= TWITTER_POLL_SECS:
-                last_twitter_poll = now
-                _tw_lock = getattr(run, "_twitter_run_lock", None)
-                if _tw_lock is None:
-                    import threading as _th
-                    _tw_lock = _th.Lock()
-                    setattr(run, "_twitter_run_lock", _tw_lock)
-
-                def _twitter_bg_tick():
-                    if not _tw_lock.acquire(blocking=False):
-                        _log("twitter_scanner tick skipped — previous tick still running")
-                        return
-                    try:
-                        import twitter_scanner as _tw
-                        telem = _tw.tick(store, TENANT)
-                        if telem.get("signals_new", 0) or telem.get("outcomes_updated", 0):
-                            _log(f"twitter_scanner: {telem}")
-                    except Exception as _e:
-                        _log(f"twitter_scanner tick failed: {type(_e).__name__}: {_e}")
-                    finally:
-                        _tw_lock.release()
-
-                try:
-                    import threading as _th2
-                    _th2.Thread(target=_twitter_bg_tick,
-                                 name="twitter_scanner_bg",
-                                 daemon=True).start()
-                except Exception as _te:
-                    _log(f"twitter_scanner bg spawn failed: {type(_te).__name__}: {_te}")
-                # Funding sign-flip watcher rides the same cadence — every
-                # 5 min. Cheap (reads snapshot cache, no external API), so
-                # no additional throttle needed. Emits shadow signals into
-                # the Signals tab when a perp's funding rate crosses zero.
+            # Funding sign-flip watcher — every 5 min. Cheap (reads snapshot
+            # cache, no external API). Emits shadow signals into the Signals
+            # tab when a perp's funding rate crosses zero.
+            if now - last_funding_poll >= FUNDING_POLL_SECS:
+                last_funding_poll = now
                 try:
                     import funding_watcher
                     ftelem = funding_watcher.tick(store, TENANT)

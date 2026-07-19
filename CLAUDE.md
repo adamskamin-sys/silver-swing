@@ -10,7 +10,7 @@ money — correctness and safety outrank cleverness.**
 - main.py (~1k lines) — entrypoint / orchestration.
 - swing_leg.py (~2.5k lines) — core strategy logic. **Biggest file; highest
   risk; primary refactor + audit target.**
-- scanner.py, scanner_worker.py, twitter_scanner.py — opportunity scanning.
+- scanner.py, scanner_worker.py — opportunity scanning.
 - broker.py, paper_broker.py — live vs simulated order execution.
 - backtest.py, backtest_worker.py — historical simulation. **Watch for
   look-ahead bias / data leakage.**

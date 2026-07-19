@@ -819,12 +819,11 @@ export function makeApp({
     }
   });
 
-  // Twitter shadow signal log — read-only. The scanner runs in the bot loop
-  // (live_runner calls twitter_scanner.tick every TWITTER_POLL_SECS) and
-  // writes entries to REDIS_TWITTER_LOG_KEY as JSON strings. Frontmost entry
-  // is the newest. Shadow-mode invariant: `shadow_mode` and
-  // `trades_executed: false` are set by the Python side; the dashboard
-  // surfaces them so the user always sees "not executing" front-and-center.
+  // 2026-07-19: twitter_scanner retired (Nitter fleet blocked the main
+  // tick loop for 4-5 min, causing zombie evictions + real-money stop
+  // cancellations). The Redis log key stays because ml_predictor and
+  // tape_shadow write to it under the same shadow-signal harness.
+  // Endpoint kept as read-only for those signal types.
   app.get('/api/twitter-signals', requireAuth, async (req, res) => {
     const r = await getRedis();
     if (!r) return res.json({ entries: [], summary: { total_signals: 0, shadow_mode: true } });
@@ -834,7 +833,6 @@ export function makeApp({
       for (const raw of raws) {
         try { entries.push(JSON.parse(raw)); } catch { /* skip malformed */ }
       }
-      // Aggregate hit rate for the header. Cheap: N ≤ 200.
       const tally = { '1h': { correct: 0, wrong: 0, flat: 0, unknown: 0 },
                       '6h': { correct: 0, wrong: 0, flat: 0, unknown: 0 },
                       '24h': { correct: 0, wrong: 0, flat: 0, unknown: 0 } };
