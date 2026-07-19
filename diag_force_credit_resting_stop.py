@@ -15,6 +15,10 @@ This script:
 Read-only by default. Usage:
     python3 diag_force_credit_resting_stop.py ZEC-20DEC30-CDE               # dry-run
     python3 diag_force_credit_resting_stop.py ZEC-20DEC30-CDE --apply       # execute
+
+    # When own_avg_entry was never recorded (HALTED with "own_avg unknown"),
+    # look up the actual buy fill on Coinbase Orders and pass it:
+    python3 diag_force_credit_resting_stop.py XLP-20DEC30-CDE --buy-avg 0.18689 --apply
 """
 from __future__ import annotations
 import os
@@ -24,10 +28,21 @@ import time
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("USAGE: python3 diag_force_credit_resting_stop.py <PRODUCT_ID> [--apply]")
+        print("USAGE: python3 diag_force_credit_resting_stop.py <PRODUCT_ID> "
+              "[--apply] [--buy-avg PRICE]")
         return
     product_id = sys.argv[1]
     apply = "--apply" in sys.argv
+    manual_buy_avg = None
+    if "--buy-avg" in sys.argv:
+        try:
+            manual_buy_avg = float(sys.argv[sys.argv.index("--buy-avg") + 1])
+        except (IndexError, ValueError):
+            print("✗ --buy-avg needs a numeric price")
+            return
+        if manual_buy_avg <= 0:
+            print(f"✗ --buy-avg must be > 0, got {manual_buy_avg}")
+            return
 
     print("=" * 78)
     print(f"FORCE CREDIT RESTING STOP{'  (APPLYING)' if apply else '  (dry-run)'} — {product_id}")
@@ -95,8 +110,14 @@ def main() -> None:
     fill_price = float(status_info.get("average_filled_price") or 0)
     filled_qty = int(status_info.get("filled_qty") or target_cfg.get("qty") or 1)
     own_avg = float(target_state.get("own_avg_entry") or 0)
+    if own_avg <= 0 and manual_buy_avg is not None:
+        own_avg = manual_buy_avg
+        print(f"\n  ⚠ own_avg_entry was None — using --buy-avg override ${own_avg}")
     if fill_price <= 0 or own_avg <= 0:
         print(f"\n✗ fill_price={fill_price}, own_avg={own_avg} — can't compute profit.")
+        if own_avg <= 0:
+            print(f"  Look up the actual buy fill for {product_id} on Coinbase Orders,")
+            print(f"  then re-run with: --buy-avg <price>")
         return
 
     # Get contract_size
@@ -144,11 +165,18 @@ def main() -> None:
     entry = raw[target_tenant][product_id]
     state = entry.get("state") or {}
     sleeves_state = state.get("sleeves") or {}
+    # Clear any HALT reason set by the reconciliation gap so the sleeve can
+    # re-arm normally on next tick. Preserved under _prev_halt_reason for audit.
+    if target_state.get("state") == "HALTED" or target_state.get("halt_reason"):
+        target_state["_prev_halt_reason"] = target_state.get("halt_reason")
+        target_state["halt_reason"] = None
     sleeves_state[target_sid] = target_state
     state["sleeves"] = sleeves_state
     store.put_state(target_tenant, product_id, state)
     print(f"\n✓ APPLIED. Sleeve {target_sid} credited with ${profit:.2f} profit.")
     print("  Refresh dashboard — realized should reflect the new number.")
+    if manual_buy_avg is not None:
+        print(f"  Note: used manual buy_avg ${manual_buy_avg} — verify against Coinbase.")
 
 
 if __name__ == "__main__":
