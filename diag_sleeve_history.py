@@ -85,38 +85,29 @@ def main() -> None:
     except Exception as e:
         print(f"  (retirement_ledger read failed: {e})")
 
-    # 3. Trade log grep — sleeve events tagged with sleeve_id or product_id
-    print(f"\n--- Trade log events (last 200 mentioning this sleeve/product) ---")
-    trade_log_path = os.path.join(os.getenv("SWING_DATA_DIR", "data"),
-                                    "trades.jsonl")
-    if not os.path.exists(trade_log_path):
-        print(f"  (no trade log at {trade_log_path})")
-        return
-
+    # 3. Trade log grep — Redis-backed on Render (not the local jsonl).
+    print(f"\n--- Trade log events (mentions of {sleeve_id} or {product_id}) ---")
     events: list[dict] = []
     try:
-        with open(trade_log_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                if sleeve_id not in line and product_id not in line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
+        from safety import make_trade_log
+        log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
+        # tail() reads recent events; adjust if the sleeve is older
+        recent = log.tail(5000) if hasattr(log, "tail") else []
+        for ev in recent:
+            blob = json.dumps(ev)
+            if sleeve_id in blob or product_id in blob:
                 events.append(ev)
     except Exception as e:
-        print(f"  (trade log read failed: {e})")
+        print(f"  (trade log read failed: {type(e).__name__}: {e})")
         return
 
     if not events:
-        print(f"  ✗ No events reference {sleeve_id} or {product_id}.")
+        print(f"  ✗ No events reference {sleeve_id} or {product_id}"
+              f" in last 5000 log entries.")
         return
 
-    # Show most recent 30
-    events = events[-30:]
-    for ev in events:
+    # Show all matches, most recent last
+    for ev in events[-50:]:
         ts = ev.get("ts") or ev.get("timestamp")
         typ = ev.get("event_type") or ev.get("event") or "?"
         sid_field = ev.get("sleeve_id") or ""

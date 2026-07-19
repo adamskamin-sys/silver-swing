@@ -115,6 +115,89 @@ def _log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
 
 
+def _sweep_orphan_orders(store, live_tenant: str) -> int:
+    """Cancel any Coinbase open order not referenced by any sleeve on the
+    live tenant. Runs on boot + after every position-flat event.
+
+    Motivation (2026-07-19): CHN + NER had orphan SELLs sitting on the
+    exchange from a prior bot session that had lost oid tracking. When
+    the primary sell would have fired, the orphan would then flip the
+    account SHORT — violating the no-shorting rule
+    (feedback_no_shorting.md).
+
+    Only sweeps orders whose product_id has an entry in the live tenant
+    cfg (safety: never touches products we don't know about — could be
+    hedges or manual positions the user placed via Coinbase UI).
+
+    Also refuses to cancel BUY orders — those can't take you short.
+    Only SELL orders are the short-flip risk.
+
+    Returns count of orders canceled.
+    """
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+    except Exception as e:
+        _log(f"[orphan-sweep] broker import failed: {e}")
+        return 0
+
+    # Build known-oid set from live tenant sleeves
+    known_oids: set[str] = set()
+    try:
+        for symbol in store.list_symbols(live_tenant):
+            if symbol.startswith("__"):
+                continue
+            state = store.get_state(live_tenant, symbol) or {}
+            for sid, ss in (state.get("sleeves") or {}).items():
+                if not isinstance(ss, dict):
+                    continue
+                for k in ("live_order_id", "resting_stop_oid"):
+                    v = ss.get(k)
+                    if v: known_oids.add(str(v))
+            if state.get("live_order_id"):
+                known_oids.add(str(state.get("live_order_id")))
+    except Exception as e:
+        _log(f"[orphan-sweep] oid collection failed: {e}")
+        return 0
+
+    # Seed BrokerConfig with any known product_id
+    seed = os.getenv("SWING_SYMBOL", "SLR-27AUG26-CDE")
+    try:
+        b = CoinbaseBroker(BrokerConfig(product_id=seed))
+        resp = b.client.list_orders(order_status=["OPEN"])
+        raw = resp.to_dict() if hasattr(resp, "to_dict") else resp
+    except Exception as e:
+        _log(f"[orphan-sweep] list_orders failed: {e}")
+        return 0
+
+    orders = raw.get("orders") or []
+    canceled = 0
+    for o in orders:
+        oid = o.get("order_id") or o.get("id")
+        side = str(o.get("side") or "").upper()
+        pid = o.get("product_id")
+        if not oid or oid in known_oids:
+            continue
+        if side != "SELL":
+            continue  # BUYs can't take us short — leave for now
+        # Guard: only touch products we know about (in cfg)
+        try:
+            cfg = store.get_config(live_tenant, pid) or {}
+        except Exception:
+            cfg = {}
+        if not cfg.get("contract_size"):
+            _log(f"[orphan-sweep] skip {pid}/{oid}: product not in cfg")
+            continue
+        try:
+            b2 = CoinbaseBroker(BrokerConfig(product_id=pid))
+            b2.cancel(oid)
+            canceled += 1
+            _log(f"[orphan-sweep] CANCELED orphan SELL {pid}/{oid} "
+                 f"(would have flipped account short)")
+        except Exception as e:
+            _log(f"[orphan-sweep] cancel {pid}/{oid} failed: {e}")
+    return canceled
+
+
 def _refresh_all_specs(store) -> int:
     """Pull fresh contract_size/tick_size/fees from Coinbase for EVERY product
     in EVERY tenant's config, and merge into the stored config. Runs once on
@@ -1001,6 +1084,19 @@ def run() -> int:
     except Exception as e:
         _log(f"WARN: startup spec refresh failed: {type(e).__name__}: {e}")
     last_spec_refresh = time.time()
+
+    # 2026-07-19: orphan-order sweep at boot. Prevents the CHN/NER class
+    # where a prior bot session left resting SELL orders untracked; when
+    # the primary sell fires and closes position, the orphans flip us
+    # SHORT. Only touches SELL orders on products in cfg; never BUYs.
+    try:
+        from main import _derive_live_tenant
+        live_tenant = _derive_live_tenant(TENANT)
+        n_orphan = _sweep_orphan_orders(store, live_tenant)
+        if n_orphan:
+            _log(f"startup orphan sweep: canceled {n_orphan} orphan SELL order(s)")
+    except Exception as e:
+        _log(f"WARN: startup orphan sweep failed: {type(e).__name__}: {e}")
     # Offset the first twitter poll by 60s so bot startup isn't dominated by
     # a slow RSS fetch across ~15 handles.
     last_twitter_poll = time.time() - TWITTER_POLL_SECS + 60.0
