@@ -4,12 +4,11 @@ Adam 2026-07-19: XLP scan-mrqn4az1 holds own_avg_entry=0.18775 with no
 resting stop protecting it. Rule feedback_ratchet_stop_never_gap says a
 held position must ALWAYS have a stop; a gap is a blocker.
 
-But: right after arming the position, there's a legitimate window between
-'sleeve holds' and 'stop placed on Coinbase'. This diag measures that
-window against the bot's heartbeat so we can tell:
-  - stop is being placed now (normal, wait a tick)
-  - stop failed to place N minutes ago (needs intervention)
-  - stop-loss is disabled in cfg (by design)
+Reports for each sleeve:
+  - sleeve state, own_avg, stop_oid, armed_ts
+  - cfg stop_loss_enabled (flat key, defaults False in SleeveConfig)
+  - Coinbase-side: actual position size + any open orders on the product
+  - Verdict: OK / WATCHING / BLOCKER / STALE (own_avg but no position)
 
 Usage:  python3 diag_check_stop_gap.py XLP-20DEC30-CDE
 """
@@ -41,9 +40,39 @@ def main() -> None:
     raw = store._load()
 
     now = time.time()
-    hits = 0
     findings: list[str] = []
 
+    # Coinbase ground truth
+    cb_position_size = None
+    cb_open_orders: list[dict] = []
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+        b = CoinbaseBroker(BrokerConfig(product_id=product_id))
+        try:
+            pos = b.position()
+            cb_position_size = int(pos.get("number_of_contracts") or pos.get("qty") or 0)
+        except Exception as e:
+            print(f"(position lookup failed: {e})")
+        try:
+            open_orders = b.list_open_orders(product_id) or []
+            cb_open_orders = list(open_orders)
+        except Exception as e:
+            print(f"(list_open_orders failed: {e})")
+    except Exception as e:
+        print(f"(broker init failed: {e})")
+
+    print(f"\nCoinbase ground truth for {product_id}:")
+    print(f"  position size: {cb_position_size}")
+    print(f"  open orders  : {len(cb_open_orders)}")
+    for o in cb_open_orders:
+        oid = o.get("order_id") or o.get("id")
+        side = o.get("side")
+        typ = o.get("order_type") or o.get("type")
+        px = o.get("limit_price") or o.get("stop_price") or o.get("price")
+        qty = o.get("size") or o.get("qty")
+        print(f"    - oid={oid}  side={side}  type={typ}  px={px}  qty={qty}")
+
+    hits = 0
     for tenant, tenant_data in raw.items():
         if not isinstance(tenant_data, dict):
             continue
@@ -66,40 +95,64 @@ def main() -> None:
             st = ss.get("state")
             own_avg = ss.get("own_avg_entry")
             stop_oid = ss.get("resting_stop_oid")
-            armed_ts = ss.get("armed_sell_since_ts") or ss.get("own_avg_entry_ts")
+            armed_ts = (ss.get("armed_sell_since_ts") or
+                        ss.get("own_avg_entry_ts") or
+                        ss.get("armed_since_ts"))
             armed_age = (now - float(armed_ts)) if armed_ts else None
-
-            stop_cfg = sc.get("stopLoss") or sc.get("stop_loss") or {}
-            stop_enabled = stop_cfg.get("enabled") if isinstance(stop_cfg, dict) else None
+            stop_enabled = sc.get("stop_loss_enabled", False)
 
             print(f"\n  sid={sid}")
             print(f"    state={st}  own_avg={own_avg}  stop_oid={stop_oid}")
-            print(f"    armed_sell_since={_fmt_age(armed_age) if armed_age is not None else 'unknown'}")
-            print(f"    cfg stop_loss.enabled={stop_enabled}")
+            print(f"    armed_ts={_fmt_age(armed_age) if armed_age is not None else 'unknown'} ago")
+            print(f"    cfg stop_loss_enabled={stop_enabled}")
 
-            # Verdict
             holds_position = (st == "ARMED_SELL") and own_avg is not None
             if not holds_position:
-                print(f"    → OK (no position held)")
-                continue
-            if stop_oid:
-                print(f"    → OK (stop_oid present)")
-                continue
-            if stop_enabled is False:
-                print(f"    → OK (stop_loss disabled in cfg — by design)")
+                print(f"    → OK (no position held per bot state)")
                 continue
 
-            # Held position, no stop, stop enabled (or unspecified).
+            # Bot thinks it holds — cross-check Coinbase.
+            if cb_position_size is not None and cb_position_size == 0:
+                findings.append(
+                    f"{tenant}/{sid}: STALE own_avg — bot thinks HELD but Coinbase position=0"
+                )
+                print(f"    ✗ STALE: bot has own_avg={own_avg} but Coinbase position=0")
+                print(f"      → own_avg is a ghost from a prior cycle; needs clearing")
+                continue
+
+            # Position is real.
+            if stop_oid:
+                # Check if the oid appears in open orders
+                matched = any((o.get("order_id") or o.get("id")) == stop_oid
+                              for o in cb_open_orders)
+                if matched:
+                    print(f"    → OK (stop_oid {stop_oid} matches open order)")
+                else:
+                    findings.append(
+                        f"{tenant}/{sid}: stop_oid {stop_oid} NOT in Coinbase open orders — orphan"
+                    )
+                    print(f"    ✗ ORPHAN stop_oid: {stop_oid} not in Coinbase open orders")
+                continue
+
+            if not stop_enabled:
+                print(f"    → BY DESIGN (stop_loss_enabled=False in cfg — no stop expected)")
+                continue
+
+            # Held real position, stop enabled, no oid.
             if armed_age is None:
-                findings.append(f"{tenant}/{sid}: HELD w/o stop, armed_ts unknown")
-                print(f"    ⚠ GAP: holds position, no resting stop, unknown arm time")
+                findings.append(
+                    f"{tenant}/{sid}: HELD w/o stop, arm time unknown — likely stale"
+                )
+                print(f"    ⚠ GAP: real position, stop enabled, no oid, unknown arm time")
             elif armed_age < 30:
-                print(f"    → PROBABLY OK (just armed {_fmt_age(armed_age)} ago — stop should place next tick)")
+                print(f"    → PROBABLY OK (just armed — stop should place next tick)")
             elif armed_age < 120:
-                print(f"    ⚠ WATCHING: armed {_fmt_age(armed_age)} ago, stop not placed — one more tick then escalate")
+                print(f"    ⚠ WATCHING: armed {_fmt_age(armed_age)} ago, no stop yet")
             else:
-                findings.append(f"{tenant}/{sid}: HELD w/o stop for {_fmt_age(armed_age)} — blocker")
-                print(f"    ✗ BLOCKER: held {_fmt_age(armed_age)} without resting stop (ratchet_stop_never_gap rule)")
+                findings.append(
+                    f"{tenant}/{sid}: HELD w/o stop for {_fmt_age(armed_age)} — blocker"
+                )
+                print(f"    ✗ BLOCKER: held {_fmt_age(armed_age)} without stop (ratchet_stop_never_gap)")
 
     if hits == 0:
         print(f"\nNo {product_id} sleeves found.")
@@ -107,11 +160,11 @@ def main() -> None:
 
     print("\n" + "=" * 78)
     if findings:
-        print(f"⚠ {len(findings)} STOP-GAP FINDING(S):")
+        print(f"⚠ {len(findings)} FINDING(S):")
         for f in findings:
             print(f"  - {f}")
     else:
-        print("✓ No stop-gap findings.")
+        print("✓ No findings.")
 
 
 if __name__ == "__main__":
