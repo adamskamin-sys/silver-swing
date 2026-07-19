@@ -44,15 +44,20 @@ def main() -> None:
 
     # Coinbase ground truth
     cb_position_size = None
+    cb_position_avg = None
     cb_open_orders: list[dict] = []
     try:
         from broker import BrokerConfig, CoinbaseBroker
         b = CoinbaseBroker(BrokerConfig(product_id=product_id))
         try:
-            pos = b.position()
-            cb_position_size = int(pos.get("number_of_contracts") or pos.get("qty") or 0)
+            cb_position_size = int(b.position_qty())  # signed int
         except Exception as e:
-            print(f"(position lookup failed: {e})")
+            print(f"(position_qty failed: {e})")
+        try:
+            p = b.position  # property → _Pos with .qty / .avg_entry
+            cb_position_avg = float(getattr(p, "avg_entry", 0.0) or 0.0)
+        except Exception as e:
+            print(f"(position property failed: {e})")
         try:
             open_orders = b.list_open_orders(product_id) or []
             cb_open_orders = list(open_orders)
@@ -62,7 +67,7 @@ def main() -> None:
         print(f"(broker init failed: {e})")
 
     print(f"\nCoinbase ground truth for {product_id}:")
-    print(f"  position size: {cb_position_size}")
+    print(f"  position size: {cb_position_size} (avg={cb_position_avg})")
     print(f"  open orders  : {len(cb_open_orders)}")
     for o in cb_open_orders:
         oid = o.get("order_id") or o.get("id")
@@ -88,6 +93,13 @@ def main() -> None:
 
         print(f"\n--- tenant={tenant} ---")
         print(f"bot heartbeat age: {_fmt_age(hb_age) if hb_age is not None else 'unknown'}")
+        print(f"configured sleeves ({len(sleeves_cfg)}): {list(sleeves_cfg.keys())}")
+        print(f"state sleeves     ({len(sleeves_state)}): {list(sleeves_state.keys())}")
+        missing = set(sleeves_cfg) - set(sleeves_state)
+        if missing:
+            for m in missing:
+                findings.append(f"{tenant}/{m}: configured but NO STATE (dropped)")
+                print(f"  ✗ CONFIGURED BUT NO STATE: {m}")
 
         for sid, ss in sleeves_state.items():
             hits += 1
