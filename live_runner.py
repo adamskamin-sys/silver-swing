@@ -1074,7 +1074,11 @@ def run() -> int:
         # Prior version only detected products NOT in the dict, which
         # missed the case where boot spawned a Track whose feed then never
         # produced a tick (silent zombie).
-        ZOMBIE_THRESHOLD_SECS = 300.0  # 5 min without a SUCCESSFUL step = zombie
+        # 2026-07-19: bumped 300→600s after twitter_scanner-blocking incident.
+        # Any pre-existing OR future main-loop stall of ~5 min would nuke
+        # every non-primary Track simultaneously; 10 min gives more room.
+        # Env override: SWING_ZOMBIE_THRESHOLD_SECS.
+        ZOMBIE_THRESHOLD_SECS = float(os.getenv("SWING_ZOMBIE_THRESHOLD_SECS", "600.0"))
         for pid in sorted(should_track):
             existing = _non_primary_tracks.get(pid)
             if existing is not None:
@@ -1998,15 +2002,45 @@ def run() -> int:
                         last_portfolio_refresh = 0  # force re-fetch next tick
                 except Exception as _mse:
                     _log(f"[mark-stale] check failed: {type(_mse).__name__}: {_mse}")
+            # 2026-07-19: twitter_scanner.tick moved to a BACKGROUND THREAD.
+            # Root cause of the 4-5 min zombie-eviction cascade: Nitter
+            # instances routinely time out; polling 14 handles serially can
+            # block for 3-6 min, during which no Track's step() runs and
+            # every non-primary Track hits ZOMBIE_THRESHOLD_SECS=300s.
+            # Problem-scout 2026-07-19 confirmed the block via live logs.
+            #
+            # Design: single-flight daemon thread. A run_lock prevents
+            # concurrent ticks if a prior tick is still in flight (would
+            # queue up otherwise). Main loop keeps ticking regardless.
             if now - last_twitter_poll >= TWITTER_POLL_SECS:
                 last_twitter_poll = now
+                _tw_lock = getattr(run, "_twitter_run_lock", None)
+                if _tw_lock is None:
+                    import threading as _th
+                    _tw_lock = _th.Lock()
+                    setattr(run, "_twitter_run_lock", _tw_lock)
+
+                def _twitter_bg_tick():
+                    if not _tw_lock.acquire(blocking=False):
+                        _log("twitter_scanner tick skipped — previous tick still running")
+                        return
+                    try:
+                        import twitter_scanner as _tw
+                        telem = _tw.tick(store, TENANT)
+                        if telem.get("signals_new", 0) or telem.get("outcomes_updated", 0):
+                            _log(f"twitter_scanner: {telem}")
+                    except Exception as _e:
+                        _log(f"twitter_scanner tick failed: {type(_e).__name__}: {_e}")
+                    finally:
+                        _tw_lock.release()
+
                 try:
-                    import twitter_scanner
-                    telem = twitter_scanner.tick(store, TENANT)
-                    if telem.get("signals_new", 0) or telem.get("outcomes_updated", 0):
-                        _log(f"twitter_scanner: {telem}")
-                except Exception as e:
-                    _log(f"twitter_scanner tick failed: {type(e).__name__}: {e}")
+                    import threading as _th2
+                    _th2.Thread(target=_twitter_bg_tick,
+                                 name="twitter_scanner_bg",
+                                 daemon=True).start()
+                except Exception as _te:
+                    _log(f"twitter_scanner bg spawn failed: {type(_te).__name__}: {_te}")
                 # Funding sign-flip watcher rides the same cadence — every
                 # 5 min. Cheap (reads snapshot cache, no external API), so
                 # no additional throttle needed. Emits shadow signals into
