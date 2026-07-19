@@ -94,17 +94,45 @@ def test_orphan_sell_gets_canceled(monkeypatch):
     assert ("CHN-19DEC30-CDE", "known-sell-oid") not in _FakeBroker.canceled
 
 
-def test_buy_orders_never_canceled(monkeypatch):
-    """BUYs can't flip us short — leave them alone even if unknown."""
+def test_lone_orphan_buy_left_alone(monkeypatch):
+    """A lone orphan BUY (no bot-owned counterpart) is left alone —
+    could be a manual user order. Only DUPLICATES get canceled."""
     from live_runner import _sweep_orphan_orders
     store = _FakeStore()
     store.put_config("adam-live", "HYP-20DEC30-CDE", {"contract_size": 1.0})
     _install(monkeypatch, [
-        {"order_id": "unknown-buy", "side": "BUY", "product_id": "HYP-20DEC30-CDE"},
+        {"order_id": "lone-unknown-buy", "side": "BUY",
+         "product_id": "HYP-20DEC30-CDE"},
     ])
     n = _sweep_orphan_orders(store, "adam-live")
     assert n == 0
     assert _FakeBroker.canceled == []
+
+
+def test_duplicate_orphan_buy_canceled(monkeypatch):
+    """HYP 2026-07-19 incident: orphan BUY 28bf7de3 sat alongside the
+    bot's fresh BUY 552fbcab, both at $60.17. Both filling = oversize.
+    Sweep must cancel the orphan when a bot-owned BUY on the same
+    product is present."""
+    from live_runner import _sweep_orphan_orders
+    store = _FakeStore()
+    store.put_config("adam-live", "HYP-20DEC30-CDE", {"contract_size": 1.0})
+    # Sleeve owns the bot-placed BUY
+    store.put_state("adam-live", "HYP-20DEC30-CDE", {
+        "sleeves": {"s1": {"live_order_id": "bot-buy-fresh",
+                            "state": "ARMED_BUY"}},
+    })
+    _install(monkeypatch, [
+        {"order_id": "bot-buy-fresh", "side": "BUY",
+         "product_id": "HYP-20DEC30-CDE"},
+        {"order_id": "orphan-buy-old", "side": "BUY",
+         "product_id": "HYP-20DEC30-CDE"},
+    ])
+    n = _sweep_orphan_orders(store, "adam-live")
+    assert n == 1
+    assert ("HYP-20DEC30-CDE", "orphan-buy-old") in _FakeBroker.canceled
+    # Bot-owned BUY must NOT be canceled
+    assert ("HYP-20DEC30-CDE", "bot-buy-fresh") not in _FakeBroker.canceled
 
 
 def test_sells_on_unknown_products_left_alone(monkeypatch):

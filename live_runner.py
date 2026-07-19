@@ -171,18 +171,23 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
     """Cancel any Coinbase open order not referenced by any sleeve on the
     live tenant. Runs on boot + after every position-flat event.
 
-    Motivation (2026-07-19): CHN + NER had orphan SELLs sitting on the
-    exchange from a prior bot session that had lost oid tracking. When
-    the primary sell would have fired, the orphan would then flip the
-    account SHORT — violating the no-shorting rule
-    (feedback_no_shorting.md).
+    Two distinct classes covered:
+
+      1. Orphan SELL (any product in cfg) — CHN + NER incident 2026-07-19.
+         SELL orders left by a prior bot session flip the account SHORT
+         after the primary sell closes position. HARD invariant per
+         feedback_no_shorting.md.
+
+      2. Orphan BUY that DUPLICATES a sleeve-owned BUY on the same product
+         at similar price — HYP incident 2026-07-19 22:51 reconcile log
+         showed 2 BUYs @ $60.17 on HYP-20DEC30-CDE (28bf7de3 orphan +
+         552fbcab bot-owned). Both filling = oversize. A lone orphan BUY
+         is left alone — could be a manual order the user just placed,
+         not our business to cancel.
 
     Only sweeps orders whose product_id has an entry in the live tenant
     cfg (safety: never touches products we don't know about — could be
     hedges or manual positions the user placed via Coinbase UI).
-
-    Also refuses to cancel BUY orders — those can't take you short.
-    Only SELL orders are the short-flip risk.
 
     Returns count of orders canceled.
     """
@@ -192,8 +197,11 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
         _log(f"[orphan-sweep] broker import failed: {e}")
         return 0
 
-    # Build known-oid set from live tenant sleeves
+    # Build known-oid set from live tenant sleeves. Also keep a
+    # product+side+price index of KNOWN orders so we can detect
+    # orphan duplicates.
     known_oids: set[str] = set()
+    known_by_pid_side: dict[tuple[str, str], list[str]] = {}
     try:
         for symbol in store.list_symbols(live_tenant):
             if symbol.startswith("__"):
@@ -204,9 +212,23 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
                     continue
                 for k in ("live_order_id", "resting_stop_oid"):
                     v = ss.get(k)
-                    if v: known_oids.add(str(v))
+                    if v:
+                        known_oids.add(str(v))
+                        # Track side/product for duplicate detection.
+                        # resting_stop_oid → SELL. live_order_id side
+                        # inferred from state.state (ARMED_SELL → SELL,
+                        # ARMED_BUY → BUY).
+                        if k == "resting_stop_oid":
+                            side_of = "SELL"
+                        else:
+                            st = str(ss.get("state") or "").upper()
+                            side_of = "SELL" if "SELL" in st else "BUY"
+                        known_by_pid_side.setdefault((symbol, side_of), []).append(str(v))
             if state.get("live_order_id"):
                 known_oids.add(str(state.get("live_order_id")))
+                st = str(state.get("state") or "").upper()
+                side_of = "SELL" if "SELL" in st else "BUY"
+                known_by_pid_side.setdefault((symbol, side_of), []).append(str(state.get("live_order_id")))
     except Exception as e:
         _log(f"[orphan-sweep] oid collection failed: {e}")
         return 0
@@ -222,6 +244,28 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
         return 0
 
     orders = raw.get("orders") or []
+
+    def _order_price(o: dict) -> float:
+        cfg_o = o.get("order_configuration") or {}
+        for shape in cfg_o.values():
+            if isinstance(shape, dict):
+                for k in ("limit_price", "stop_price", "price"):
+                    v = shape.get(k)
+                    if v:
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            pass
+        return 0.0
+
+    # Index open orders by (product, side) so we can detect duplicates.
+    open_by_pid_side: dict[tuple[str, str], list[dict]] = {}
+    for o in orders:
+        pid = o.get("product_id")
+        side = str(o.get("side") or "").upper()
+        if pid and side:
+            open_by_pid_side.setdefault((pid, side), []).append(o)
+
     canceled = 0
     for o in orders:
         oid = o.get("order_id") or o.get("id")
@@ -229,8 +273,6 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
         pid = o.get("product_id")
         if not oid or oid in known_oids:
             continue
-        if side != "SELL":
-            continue  # BUYs can't take us short — leave for now
         # Guard: only touch products we know about (in cfg)
         try:
             cfg = store.get_config(live_tenant, pid) or {}
@@ -239,12 +281,31 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
         if not cfg.get("contract_size"):
             _log(f"[orphan-sweep] skip {pid}/{oid}: product not in cfg")
             continue
+
+        cancel_reason = None
+        if side == "SELL":
+            # Any orphan SELL is a short-flip risk — cancel.
+            cancel_reason = "would have flipped account short"
+        elif side == "BUY":
+            # Orphan BUY is only cancelable when it DUPLICATES a known
+            # bot-owned BUY on the same product (fill-double = oversize).
+            # A lone orphan BUY could be a manual user order; leave it.
+            known_buys = known_by_pid_side.get((pid, "BUY"), [])
+            all_open_buys = open_by_pid_side.get((pid, "BUY"), [])
+            has_bot_owned_buy = any(str(x.get("order_id") or x.get("id")) in known_buys
+                                     for x in all_open_buys)
+            if has_bot_owned_buy:
+                px = _order_price(o)
+                cancel_reason = f"duplicate BUY vs bot-owned on {pid} (px={px})"
+        if not cancel_reason:
+            continue
+
         try:
             b2 = CoinbaseBroker(BrokerConfig(product_id=pid))
             b2.cancel(oid)
             canceled += 1
-            _log(f"[orphan-sweep] CANCELED orphan SELL {pid}/{oid} "
-                 f"(would have flipped account short)")
+            _log(f"[orphan-sweep] CANCELED orphan {side} {pid}/{oid} "
+                 f"({cancel_reason})")
         except Exception as e:
             _log(f"[orphan-sweep] cancel {pid}/{oid} failed: {e}")
     return canceled
