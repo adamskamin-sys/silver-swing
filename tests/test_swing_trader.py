@@ -460,6 +460,12 @@ def _config_with_sleeve_stop_loss(mode, custom=0, trigger=60.0, core=0):
             # Test asserts HALTED behavior — explicitly opt out of the
             # 2026-07-15 default reanchor-on-trigger=True.
             "stop_loss_reanchor_on_trigger": False,
+            # 2026-07-19: bot-side backstop now defers whenever
+            # resting_stop_enabled=True (fresh-buy race fix). This test
+            # exercises the backstop path itself — disable resting_stop
+            # so the backstop is the only protection and fires as
+            # expected.
+            "resting_stop_enabled": False,
         }],
     }
 

@@ -1782,12 +1782,40 @@ class SwingTrader:
         return None
 
     def _sleeve_trend_ok_for_buy(self, sc, last_price: float) -> bool:
-        """Trend gate on the BUY arm. Returns False (block the buy) when the
-        filter is enabled AND last_price < the M-bar SMA of the sleeve's
-        rolling price history. Turtle / Livermore rule: don't buy into a
-        confirmed downtrend. If we don't have enough history yet, allow the
-        buy — the filter should be permissive at cold start rather than
-        stall the sleeve indefinitely."""
+        """Trend gate on the BUY arm. Two independent layers:
+
+        1. SHORT-horizon SMA (existing, ~20-bar per-sleeve rolling price
+           history at 5s cadence ≈ 100s lookback). Turtle/Livermore intra-
+           day filter — don't buy into a confirmed intraday downtrend.
+
+        2. LONG-horizon canonical filter (Option D-1, 2026-07-19). Faber
+           200-day SMA + MOP 12-month TSM on DAILY candles, cached per
+           product. Enabled by SWING_TREND_FILTER_ENABLED env flag.
+           Blocks BUY when the multi-month trend is DOWN — the canonical
+           evidence-backed gate the docstring in expert_params.py flags
+           as the biggest missing edge. Kaminski-Lo (2014): stops help
+           ONLY under momentum. Without this gate we run stops in
+           mean-reverting regimes where they hurt.
+
+        Both layers permissive-fail-open — cold start, missing data, or
+        flag off → allow. Only an ACTIVE negative signal blocks.
+        """
+        # Layer 2: long-horizon canonical filter (feature-flagged)
+        try:
+            import trend_filter as _tf
+            allowed, reason = _tf.long_trend_ok_for_buy(
+                self.store, self.tenant_id, self.symbol)
+            if not allowed:
+                self._record(
+                    "sleeve_long_trend_gate_blocked",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    reason=reason, last_price=round(float(last_price), 4),
+                )
+                return False
+        except Exception:
+            pass  # fail-open on any error in the filter path
+
+        # Layer 1: existing short-horizon SMA
         if not getattr(sc, "entry_trend_filter_enabled", False):
             return True
         window = int(getattr(sc, "entry_trend_sma_window", 20) or 0)

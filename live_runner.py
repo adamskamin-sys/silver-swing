@@ -67,6 +67,11 @@ FAMILY_RECHECK_SECS = float(os.getenv("SWING_FAMILY_RECHECK_SECS", "3600.0"))
 # until we overwrite it. 6h is a fine tradeoff: 4 refreshes/day, negligible
 # Coinbase API budget, and no product can drift for more than 6h.
 SPEC_REFRESH_SECS = float(os.getenv("SWING_SPEC_REFRESH_SECS", "21600.0"))
+# Long-horizon trend verdict refresh — daily candles for each held product,
+# fed to trend_filter.long_trend_verdict. 6h cadence matches spec refresh:
+# daily candles change once/day; 6h refresh gives us a fresh verdict well
+# ahead of the 12h cache TTL. Env override for tests + tuning.
+TREND_REFRESH_SECS = float(os.getenv("SWING_TREND_REFRESH_SECS", "21600.0"))
 # Twitter shadow scanner poll interval. 5 min balances freshness against
 # Nitter instance rate limits and RSS parse cost. Env override for tests.
 TWITTER_POLL_SECS = float(os.getenv("SWING_TWITTER_POLL_SECS", "300.0"))
@@ -113,6 +118,53 @@ TICK_NON_PRIMARY = os.getenv("SWING_LIVE_TICK_NON_PRIMARY", "1") == "1"
 
 def _log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", flush=True)
+
+
+def _refresh_all_trend_verdicts(store, live_tenant: str) -> int:
+    """Fetch daily candles for every held product on the live tenant
+    and cache a fresh long-horizon trend verdict (Faber 200-day SMA +
+    MOP 12-month TSM per trend_filter.py).
+
+    2026-07-19 Option D-1: only refreshes when SWING_TREND_FILTER_ENABLED
+    is on. When off, this is a no-op — no wasted Coinbase API calls.
+
+    Runs on startup + every TREND_REFRESH_SECS. Bounded API cost: 1
+    daily-candle call per held product per refresh (default 6h).
+
+    Returns count of products whose verdict was refreshed.
+    """
+    try:
+        import trend_filter as _tf
+    except Exception:
+        return 0
+    if not _tf.long_trend_flag_enabled():
+        return 0
+    try:
+        from broker import BrokerConfig, CoinbaseBroker
+    except Exception:
+        return 0
+    # Pull the current portfolio snapshot to find held products
+    pf = store.get_config(live_tenant, "__portfolio__") or {}
+    derivs = pf.get("derivatives") or []
+    refreshed = 0
+    for d in derivs:
+        pid = d.get("product_id")
+        try:
+            qty = float(d.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if not pid or qty == 0:
+            continue
+        try:
+            b = CoinbaseBroker(BrokerConfig(product_id=pid))
+            v = _tf.refresh_long_trend_verdict(b, store, live_tenant, pid)
+            if v is not None:
+                refreshed += 1
+                _log(f"[trend] {pid} verdict: buy_ok={v.get('buy_ok')} "
+                     f"tsm={v.get('tsm_sign')} gap={v.get('faber_gap')}")
+        except Exception as e:
+            _log(f"[trend] {pid} refresh failed: {type(e).__name__}: {e}")
+    return refreshed
 
 
 def _sweep_orphan_orders(store, live_tenant: str) -> int:
@@ -1097,6 +1149,20 @@ def run() -> int:
             _log(f"startup orphan sweep: canceled {n_orphan} orphan SELL order(s)")
     except Exception as e:
         _log(f"WARN: startup orphan sweep failed: {type(e).__name__}: {e}")
+
+    # 2026-07-19 Option D-1: long-horizon trend verdict boot refresh.
+    # No-op when SWING_TREND_FILTER_ENABLED is off (default). When on,
+    # fetches daily candles for each held product + caches a verdict
+    # so the sleeve trend gate has fresh data on first tick.
+    try:
+        from main import _derive_live_tenant
+        live_tenant = _derive_live_tenant(TENANT)
+        n_trend = _refresh_all_trend_verdicts(store, live_tenant)
+        if n_trend:
+            _log(f"startup trend refresh: {n_trend} product(s) verdicts cached")
+    except Exception as e:
+        _log(f"WARN: startup trend refresh failed: {type(e).__name__}: {e}")
+    last_trend_refresh = time.time()
     # Offset the first twitter poll by 60s so bot startup isn't dominated by
     # a slow RSS fetch across ~15 handles.
     last_twitter_poll = time.time() - TWITTER_POLL_SECS + 60.0
@@ -1417,6 +1483,18 @@ def run() -> int:
                 except Exception as e:
                     _log(f"periodic spec refresh failed: {type(e).__name__}: {e}")
                     _health.record_error(store, "spec_refresh", TENANT, e, trade_log=log)
+            # 2026-07-19 Option D-1: long-horizon trend verdict periodic
+            # refresh. No-op when SWING_TREND_FILTER_ENABLED is off.
+            if now - last_trend_refresh >= TREND_REFRESH_SECS:
+                last_trend_refresh = now
+                try:
+                    from main import _derive_live_tenant
+                    _lt = _derive_live_tenant(TENANT)
+                    n_tr = _refresh_all_trend_verdicts(store, _lt)
+                    if n_tr:
+                        _log(f"periodic trend refresh: {n_tr} product(s) refreshed")
+                except Exception as e:
+                    _log(f"periodic trend refresh failed: {type(e).__name__}: {e}")
             # Portfolio circuit breaker — Van Tharp 'stop trading when things
             # go wrong'. Runs on the same cadence as snapshot so it can see
             # fresh mark prices when computing unrealized. Cheap: single
