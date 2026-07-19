@@ -59,8 +59,12 @@ def main() -> None:
         except Exception as e:
             print(f"(position property failed: {e})")
         try:
-            open_orders = b.list_open_orders(product_id) or []
-            cb_open_orders = list(open_orders)
+            open_orders = b.list_open_orders([product_id]) or []
+            # Defensive post-filter: some SDK versions ignore product_ids.
+            cb_open_orders = [o for o in open_orders
+                               if (o.get("product_id") or o.get("symbol")) in (product_id, None)]
+            if len(cb_open_orders) != len(open_orders):
+                print(f"(post-filtered {len(open_orders) - len(cb_open_orders)} unrelated orders)")
         except Exception as e:
             print(f"(list_open_orders failed: {e})")
     except Exception as e:
