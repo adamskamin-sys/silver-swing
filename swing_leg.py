@@ -2023,14 +2023,41 @@ class SwingTrader:
         """[crew] Average-down GREEN LIGHT — notification only, never executes.
         Fires only while HOLDING an underwater long, when the sleeve opts in.
         Computes avg_down_signal and, edge-triggered, records the light + pings
-        on green. Opt-in (avg_down_alert_enabled); OFF by default; fail-safe."""
+        on green. Opt-in (avg_down_alert_enabled); OFF by default; fail-safe.
+
+        Adam 2026-07-19: emits explicit 'off' light on transitions off
+        ARMED_SELL (position sold / stopped / halted) so the dashboard
+        clears the yellow dot. Previously the dashboard aggregated ALL
+        recent events without a time filter, so a stale amber from a
+        previous cycle kept showing on a WAITING sleeve with no position.
+        """
+        # Edge-triggered clear: if we previously flagged a light but the
+        # sleeve is no longer eligible (opt-out, not ARMED_SELL, above avg),
+        # emit off so the dashboard drops the indicator.
+        def _clear_if_lit(reason: str) -> None:
+            prev = self._avg_down_light.get(sc.id)
+            if prev and prev != "off":
+                self._avg_down_light[sc.id] = "off"
+                try:
+                    self._record("avg_down_light", sleeve_id=sc.id,
+                                 sleeve_name=sc.name, light="off",
+                                 reason=reason)
+                except Exception:
+                    pass
+
         if not getattr(sc, "avg_down_alert_enabled", False):
+            _clear_if_lit("alert disabled on this sleeve")
             return
         if ss.state != SleeveStateEnum.ARMED_SELL:   # only while holding a long
+            _clear_if_lit("no held long (state != ARMED_SELL)")
             return
         try:
             avg = ss.own_avg_entry
-            if avg is None or float(last_price) >= float(avg):   # only underwater
+            if avg is None:
+                _clear_if_lit("no own_avg_entry — sleeve doesn't hold contracts")
+                return
+            if float(last_price) >= float(avg):   # only underwater
+                _clear_if_lit("mark above avg — position not underwater")
                 return
             import avg_down_signal
             prices = list(self._sleeve_price_history.get(sc.id, []) or [])

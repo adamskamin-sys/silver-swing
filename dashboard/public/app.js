@@ -1742,7 +1742,11 @@ function productAvgDownLight(tenant, productId) {
     if (!e.sleeve_id) continue;
     latestBySleeve[e.sleeve_id] = e.light;
   }
-  const lights = Object.values(latestBySleeve);
+  // Adam 2026-07-19: bot now emits light='off' when a sleeve transitions
+  // out of ARMED_SELL (position sold/stopped/halted). Treat 'off' as
+  // no-signal so the dashboard drops the yellow dot instead of showing
+  // a stale amber from a previous cycle.
+  const lights = Object.values(latestBySleeve).filter(l => l && l !== 'off');
   if (!lights.length) return null;
   if (lights.includes('green')) return 'green';
   if (lights.includes('amber')) return 'amber';
