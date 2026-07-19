@@ -741,13 +741,18 @@ def run() -> int:
         # Split into (a) held-position (critical) and (b) armed-sleeve (regular).
         should_track_critical: set[str] = set()
         should_track_regular: set[str] = set()
-        # Held positions first — always considered critical
+        # Held positions first — always considered critical.
+        # __portfolio__ is written to the CONFIG scope (store.put_config in
+        # main.py) and structured as {"derivatives": [{product_id, qty, ...}]}.
+        # Previously used get_STATE + wrong key iteration — always returned {}
+        # so should_track_critical was always empty (2026-07-19 fix).
         try:
-            pf = store.get_state(TENANT, "__portfolio__") or {}
-            for sym, snap in pf.items():
-                if sym.startswith("__") or sym == SYMBOL:
+            pf = store.get_config(TENANT, "__portfolio__") or {}
+            for deriv in (pf.get("derivatives") or []):
+                sym = deriv.get("product_id")
+                if not sym or sym.startswith("__") or sym == SYMBOL:
                     continue
-                if isinstance(snap, dict) and float(snap.get("position_qty") or 0) != 0:
+                if float(deriv.get("qty") or 0) != 0:
                     should_track_critical.add(sym)
         except Exception:
             pass
