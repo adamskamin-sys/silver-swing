@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 import health as _health  # background-job health tracker; never-raise
+import log_config as _log_config; _log_config.install()  # quiet Cloudflare 502 HTML dumps + WS reconnect spam
 
 
 TENANT = os.getenv("SWING_TENANT", "adam")
