@@ -923,7 +923,17 @@ function renderAssetTabs(store) {
 // ---- position lane -------------------------------------------------------
 
 function renderPositionLane(state, config, snapshot) {
-  const posQty = snapshot?.position_qty ?? state?.swing_qty ?? 0;
+  // Stale snapshot guard: per-symbol snapshots can survive across position
+  // cycles (product sold → 0, snapshot's position_qty from prior cycle
+  // persists). 2026-07-18 HYP phantom: snapshot showed 1 LONG @ $59.95
+  // when exchange had 0. Discard snapshot's position fields when it's
+  // older than 5 min OR when generated_at is missing entirely.
+  const STALE_SECS = 5 * 60;
+  const genAt = Number(snapshot?.generated_at) || 0;
+  const ageS = genAt > 0 ? (Date.now() / 1000 - genAt) : Infinity;
+  const snapFresh = ageS <= STALE_SECS;
+  const posQty = (snapFresh ? snapshot?.position_qty : null) ?? state?.swing_qty ?? 0;
+  const posAvg = snapFresh ? snapshot?.position_avg_entry : null;
   const core = config?.core_qty ?? 0;
   const swingHeld = Math.max(0, posQty - core);
   const swingArmed = state?.swing_qty ?? 0;
@@ -935,7 +945,7 @@ function renderPositionLane(state, config, snapshot) {
       </div>
       <div class="position-lane-row" style="margin-top:4px;color:var(--muted);font-size:11px;">
         <span>total held: ${posQty}</span>
-        <span>avg entry: ${fmtPrice(snapshot?.position_avg_entry)}</span>
+        <span>avg entry: ${fmtPrice(posAvg)}</span>
       </div>
     </div>
   `;
@@ -6673,10 +6683,21 @@ function refreshScannerDetailLive() {
   let high = Number(ctx.high_24h) || 0, low = Number(ctx.low_24h) || 0;
   const pfSnap = currentStore?.[tenant]?.['__portfolio__']?.config;
   const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+  // Phantom guard: broker.portfolio_snapshot() skips derivatives with 0
+  // contracts. If __portfolio__ is fresh + refresh_ok but posRow is absent,
+  // the product genuinely holds 0 — trust that over any stale ctx value
+  // (which could be from an old snapshot showing a phantom position).
+  const pfRefreshOk = pfSnap?._refresh_ok !== false;
+  const pfRefreshTs = Number(pfSnap?._refresh_ts) || 0;
+  const pfFresh = pfRefreshOk && pfRefreshTs > 0
+    && (Date.now() / 1000 - pfRefreshTs) < 60;
   if (posRow) {
     mark = Number(posRow.mark) || 0;
     avg = Number(posRow.avg_entry) || avg;
     qty = Number(posRow.qty) || qty;
+  } else if (pfFresh) {
+    qty = 0;
+    avg = 0;
   }
   if (!mark) {
     for (const t of Object.keys(currentStore || {})) {
