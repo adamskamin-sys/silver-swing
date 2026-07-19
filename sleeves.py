@@ -736,6 +736,13 @@ class SleeveState:
             resting_stop_oid=d.get("resting_stop_oid"),
             resting_stop_px=d.get("resting_stop_px"),
             resting_stop_stage=d.get("resting_stop_stage"),
+            # 2026-07-19: sell-side cost basis (nullable). Missing here
+            # would corrupt realized-P/L on the next reload-on-tick cycle.
+            sell_entry_avg=d.get("sell_entry_avg"),
+            # 2026-07-19: double-credit dedup list. Missing here would wipe
+            # the guard on every reload-on-tick — reconcile could then credit
+            # the same resting_stop_oid twice, inflating realized_pnl.
+            credited_oids=list(d.get("credited_oids") or []),
         )
 
     def to_dict(self) -> dict:

@@ -136,6 +136,52 @@ def test_qty_zero_skipped(patched_deps, monkeypatch):
     assert not patched_deps
 
 
+def test_bootstrap_backoff_after_recent_attempt(patched_deps, monkeypatch):
+    """After a bootstrap attempt (even a failed one), further attempts on
+    the same product are skipped for 5 min. Prevents 2s Coinbase spam."""
+    import time
+    store = _FakeStore()
+    # Pre-seed cfg as if a prior attempt just happened, no specs written yet
+    store.put_config("adam-live", "PENDING-CDE", {
+        "_bootstrap_last_attempt_ts": time.time() - 10,  # 10s ago
+    })
+    _install_broker(monkeypatch, {
+        "derivatives": [{"product_id": "PENDING-CDE", "qty": 1}],
+    })
+    from main import refresh_portfolio_snapshot
+    refresh_portfolio_snapshot(store, "adam-live")
+    # Bootstrap MUST NOT fire again — still inside backoff window
+    assert ("adam-live", "PENDING-CDE") not in patched_deps
+
+
+def test_bootstrap_retries_after_backoff_expires(patched_deps, monkeypatch):
+    """After 5+ min, bootstrap retries. Simulates Coinbase recovering
+    after a transient issue."""
+    import time
+    store = _FakeStore()
+    store.put_config("adam-live", "STALE-CDE", {
+        "_bootstrap_last_attempt_ts": time.time() - 400,  # 400s ago > 300s backoff
+    })
+    _install_broker(monkeypatch, {
+        "derivatives": [{"product_id": "STALE-CDE", "qty": 1}],
+    })
+    from main import refresh_portfolio_snapshot
+    refresh_portfolio_snapshot(store, "adam-live")
+    assert ("adam-live", "STALE-CDE") in patched_deps
+
+
+def test_fractional_qty_still_triggers_bootstrap(patched_deps, monkeypatch):
+    """Coinbase may report fractional qty on certain products. Old
+    int(qty) cast would have made 0.5 → 0 and skipped bootstrap."""
+    store = _FakeStore()
+    _install_broker(monkeypatch, {
+        "derivatives": [{"product_id": "FRAC-CDE", "qty": 0.5}],
+    })
+    from main import refresh_portfolio_snapshot
+    refresh_portfolio_snapshot(store, "adam-live")
+    assert ("adam-live", "FRAC-CDE") in patched_deps
+
+
 def test_bootstrap_failure_does_not_abort_snapshot(monkeypatch):
     """Bootstrap raising for one product must not break the snapshot write
     or bootstrap of other products."""
@@ -169,6 +215,13 @@ def test_bootstrap_failure_does_not_abort_snapshot(monkeypatch):
     pf = store.get_config("adam-live", "__portfolio__")
     assert pf is not None
     assert pf["_refresh_ok"] is True
-    # Good product got its cfg; bad product did not
-    assert store.get_config("adam-live", "GOOD-CDE") is not None
-    assert store.get_config("adam-live", "BAD-CDE") is None
+    # Good product got its cfg with specs
+    good = store.get_config("adam-live", "GOOD-CDE")
+    assert good is not None
+    assert good["contract_size"] == 50.0
+    # Bad product got a backoff marker but no specs — ensures the
+    # 5-min backoff kicks in so we don't hammer Coinbase on failures.
+    bad = store.get_config("adam-live", "BAD-CDE")
+    assert bad is not None
+    assert bad.get("contract_size") is None
+    assert bad.get("_bootstrap_last_attempt_ts") is not None

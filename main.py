@@ -396,17 +396,36 @@ def refresh_portfolio_snapshot(store, live_tenant: str) -> int:
         # Seeding here means every held product gets contract_size + fees
         # within one 2s refresh cycle, and the preset-application path
         # unblocks itself without any manual diag.
+        # 5-min backoff between bootstrap attempts per product. Prevents
+        # 2s spam of preview_order calls if Coinbase rejects our ±50%
+        # snapped prices (near-limit-price bands, deprecated products) —
+        # left unchecked, 20 such products = 30 REST calls/sec permanent
+        # overhead + likely 429s that break tick-loop broker traffic.
+        _BOOTSTRAP_RETRY_SECS = 300.0
+        _now = _time.time()
         for d in (snap.get("derivatives") or []):
             pid = d.get("product_id")
-            if not pid or int(d.get("qty") or 0) == 0:
+            try:
+                qty_ok = float(d.get("qty") or 0) != 0
+            except (TypeError, ValueError):
+                qty_ok = False
+            if not pid or not qty_ok:
                 continue
             cfg = store.get_config(live_tenant, pid) or {}
-            if not (cfg.get("contract_size") and cfg.get("fee_per_contract_roundtrip")):
-                try:
-                    _refresh_contract_spec_into_config(store, live_tenant, pid)
-                except Exception as _boot_err:
-                    _log(f"[{live_tenant}/{pid}] auto-bootstrap failed: "
-                         f"{type(_boot_err).__name__}: {_boot_err}")
+            if cfg.get("contract_size") and cfg.get("fee_per_contract_roundtrip"):
+                continue  # complete, nothing to do
+            last_attempt = float(cfg.get("_bootstrap_last_attempt_ts") or 0)
+            if _now - last_attempt < _BOOTSTRAP_RETRY_SECS:
+                continue  # backoff in effect
+            # Stamp attempt BEFORE the call so a mid-call exception
+            # still triggers the backoff.
+            cfg["_bootstrap_last_attempt_ts"] = _now
+            store.put_config(live_tenant, pid, cfg)
+            try:
+                _refresh_contract_spec_into_config(store, live_tenant, pid)
+            except Exception as _boot_err:
+                _log(f"[{live_tenant}/{pid}] auto-bootstrap failed: "
+                     f"{type(_boot_err).__name__}: {_boot_err}")
         return len(snap.get("derivatives") or [])
     except Exception as e:
         _log(f"[{live_tenant}] portfolio refresh failed: {type(e).__name__}: {e}")
