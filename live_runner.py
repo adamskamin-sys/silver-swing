@@ -905,7 +905,27 @@ def run() -> int:
             except Exception:
                 pass
             if cooldown_remaining > 0:
-                continue  # respect the cooldown; try again next health cycle
+                # Armed-sleeve-only products: respect the full 900s cooldown
+                # to prevent rate-limit bans from rapid create/fail/evict loops.
+                # Held-position products (critical): 15 min of zero stop-loss
+                # coverage is the worse outcome — use a 60s floor so we retry
+                # every minute rather than waiting the full eviction cooldown.
+                if pid not in should_track_critical:
+                    continue
+                CRITICAL_EVICT_COOLDOWN_SECS = 60.0
+                if (now - last_evict) < CRITICAL_EVICT_COOLDOWN_SECS:
+                    continue
+                try:
+                    log.record(
+                        "track_critical_cooldown_override",
+                        tenant=TENANT, symbol=pid,
+                        full_cooldown_remaining_secs=round(cooldown_remaining, 1),
+                        reason=("held position — bypassing full evict cooldown; "
+                                "stop-loss coverage outweighs rate-limit risk"),
+                        severity="warn",
+                    )
+                except Exception:
+                    pass
             # Attempt recovery via the existing spawn path (handles all guards
             # + failure paths). We don't bypass its checks — if config missing
             # or spawn fails, _get_or_create_non_primary_track returns None + logs it.

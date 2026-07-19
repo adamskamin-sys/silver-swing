@@ -3,12 +3,14 @@
 The full run() loop opens a WebSocket and hits live Coinbase; that path is
 exercised manually, not in CI."""
 
+import inspect
 import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from live_runner import DryRunBroker, _preflight
+import live_runner
 from state_store import JsonFileStateStore
 
 
@@ -172,3 +174,29 @@ def test_preflight_flags_missing_futures_balance(tmp_path):
     ok, issues = _preflight(_mock_broker(balance_ok=False), store, "adam", "SLR-27AUG26-CDE", MagicMock())
     assert not ok
     assert any("futures balance" in i for i in issues)
+
+
+# ---- _maybe_recover_dead_tracks cooldown override --------------------------
+
+
+def test_critical_track_bypasses_full_evict_cooldown():
+    """Held positions must not wait the full 900s eviction cooldown before
+    a respawn attempt — stop-loss coverage outweighs rate-limit risk.
+    The fix gates the full cooldown on armed-sleeve-only products and uses
+    a 60s floor for products in should_track_critical."""
+    src = inspect.getsource(live_runner.run)
+    # The override block must check should_track_critical before skipping
+    assert "pid not in should_track_critical" in src, (
+        "_maybe_recover_dead_tracks must check should_track_critical "
+        "before applying the full evict cooldown"
+    )
+    # A short floor (60s) must still be enforced to prevent tight burn loops
+    assert "CRITICAL_EVICT_COOLDOWN_SECS" in src, (
+        "A short per-critical-product cooldown floor must exist to prevent "
+        "rapid create/fail/evict loops on persistently-broken held positions"
+    )
+    # The armed-sleeve path must still respect the full cooldown
+    assert "track_critical_cooldown_override" in src, (
+        "Override events must be logged so the operator sees when the "
+        "full cooldown is being bypassed for a held position"
+    )
