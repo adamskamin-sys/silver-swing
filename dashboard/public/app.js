@@ -1343,7 +1343,14 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
             for (const t of trailList) {
               const label = t.kind === 'trail' ? '🔒 TRAIL' : '⬆ STOP';
               const kindName = t.kind === 'trail' ? 'HYBRID TRAIL (aggressive — sells on any pullback)' : 'RATCHETING STOP (protective — only fires on real drawdown)';
-              trailBadge += ` <span class="ck-chip ck-ok" style="font-size:0.7em;padding:1px 4px" title="${kindName} · ${escapeHtml(t.sleeveName)} · HWM $${fmtPrice(t.hwm)} · effective stop $${fmtPrice(t.stopPx)} (distance $${fmtPrice(t.dist)}).">${label} $${fmtPrice(t.stopPx)}</span>`;
+              // 2026-07-19: mark projected values with ~ prefix so user
+              // knows this is what the ratchet WOULD advance to, not what
+              // the actual Coinbase order is at.
+              const pxDisplay = t.projected ? `~$${fmtPrice(t.stopPx)}` : `$${fmtPrice(t.stopPx)}`;
+              const stageNote = t.stage ? ` · stage=${t.stage}` : '';
+              const projectedNote = t.projected ? ' · PROJECTED (no resting order placed yet)' : ' · ACTUAL resting order';
+              const chipClass = t.projected ? 'ck-chip' : 'ck-chip ck-ok';
+              trailBadge += ` <span class="${chipClass}" style="font-size:0.7em;padding:1px 4px" title="${kindName} · ${escapeHtml(t.sleeveName)}${stageNote}${projectedNote} · HWM $${fmtPrice(t.hwm)} · stop $${fmtPrice(t.stopPx)}">${label} ${pxDisplay}</span>`;
             }
           }
           // Average-down signal — 🟢 when the expert stack says "this is the
@@ -1823,14 +1830,32 @@ function productTrailActiveInfo(tenant, productId) {
     //     Only shown if stop_loss_enabled is true (respects NGS no-stop
     //     directive). The ratchet raises the stop as mark rises but ONLY
     //     fires on real drawdown, not on minor pullback.
+    //
+    // 2026-07-19 XLM incident: prefer ACTUAL resting_stop_px from the
+    // exchange over the projected hwm-based value. Prior code showed
+    // "STOP $0.18995" on XLM when the real resting stop on Coinbase
+    // was at $0.165 — user thought profit was locked when downside
+    // was actually $116.
+    const restingPx = Number(ss.resting_stop_px) || 0;
     const slHwm = Number(ss.stop_loss_hwm) || 0;
     const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-    if (s.stop_loss_enabled && s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
+    if (restingPx > 0) {
+      // Real resting stop from Coinbase — this is the truth
+      out.push({
+        kind: 'ratchet',
+        stopPx: restingPx,
+        hwm: slHwm || restingPx, dist: ratchetDist,
+        sleeveName: s.name || s.id,
+        stage: ss.resting_stop_stage || null,
+      });
+    } else if (s.stop_loss_enabled && s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
+      // No resting order yet — show projected value with a marker
       out.push({
         kind: 'ratchet',
         stopPx: slHwm - ratchetDist,
         hwm: slHwm, dist: ratchetDist,
         sleeveName: s.name || s.id,
+        projected: true,
       });
     }
   }
