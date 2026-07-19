@@ -67,6 +67,40 @@ def main() -> None:
                 print(f"(post-filtered {len(open_orders) - len(cb_open_orders)} unrelated orders)")
         except Exception as e:
             print(f"(list_open_orders failed: {e})")
+
+        # 2026-07-19: XLM incident — list_open_orders with status=OPEN
+        # filter can MISS stop-limit orders that Coinbase categorizes
+        # under a different bucket. Cross-check any sleeve's known
+        # stop_oid via order_status directly and add it to cb_open_orders
+        # if it's OPEN. Prevents false-orphan findings.
+        try:
+            import state_store as _ss
+            _store = _ss.make_store(os.getenv("SWING_DATA_DIR", "data"))
+            _raw = _store._load()
+            _known_stop_oids: set[str] = set()
+            for _t, _td in (_raw or {}).items():
+                if not isinstance(_td, dict): continue
+                _entry = _td.get(product_id)
+                if not isinstance(_entry, dict): continue
+                for _sid, _ss2 in ((_entry.get("state") or {}).get("sleeves") or {}).items():
+                    if isinstance(_ss2, dict) and _ss2.get("resting_stop_oid"):
+                        _known_stop_oids.add(str(_ss2["resting_stop_oid"]))
+            _seen = {o.get("order_id") or o.get("id") for o in cb_open_orders}
+            for _oid in _known_stop_oids:
+                if _oid in _seen: continue
+                try:
+                    _st = b.order_status(_oid)
+                except Exception:
+                    _st = None
+                if _st and (_st.get("status") or "").upper() == "OPEN":
+                    print(f"(cross-check: {_oid} confirmed OPEN via order_status — "
+                          f"list_open_orders missed it)")
+                    cb_open_orders.append({
+                        "order_id": _oid, "product_id": product_id,
+                        "status": "OPEN",
+                    })
+        except Exception as _e:
+            print(f"(stop_oid cross-check failed: {_e})")
     except Exception as e:
         print(f"(broker init failed: {e})")
 
