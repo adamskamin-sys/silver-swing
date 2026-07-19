@@ -547,13 +547,19 @@ def run() -> int:
             # so preflight can pass. All conservative: swing disabled, wide
             # abort bands, minimal risk.
             _cfg2 = store.get_config(TENANT, SYMBOL) or {}
+            # Hard defaults satisfy the validator's cross-field checks:
+            #   buy_px < sell_px, abort_below < buy_px < abort_above,
+            #   margin_per_contract > 0. Values are dummies — swing_qty=0
+            #   means the primary strategy is disabled; these numbers never
+            #   drive trades. But the validator doesn't know that so we
+            #   have to pass its shape check.
             _hard_defaults = {
                 "swing_qty": 0, "max_swing_qty": 1,
-                "sell_px": 0.0, "buy_px": 0.0,
-                "abort_below": 0.0, "abort_above": 1e9,
-                "margin_per_contract": 0.0,
+                "buy_px": 1.0, "sell_px": 2.0,
+                "abort_below": 0.5, "abort_above": 1e9,
+                "margin_per_contract": 1.0,
                 "scale_up_buffer_mult": 1.5,
-                "fee_per_contract_roundtrip": 0.0,
+                "fee_per_contract_roundtrip": 0.01,
                 "contract_size": 1.0,
                 "core_qty": 0,
             }
