@@ -389,6 +389,24 @@ def refresh_portfolio_snapshot(store, live_tenant: str) -> int:
         snap["_refresh_ts"] = _time.time()
         snap["_refresh_ok"] = True
         store.put_config(live_tenant, "__portfolio__", snap)
+        # Auto-bootstrap specs for any Coinbase-held product not yet in the
+        # live tenant's cfg. Adam 2026-07-19: buying a product manually
+        # outside the bot (e.g. SLR-27AUG26-CDE) never triggered
+        # _Track init → no cfg → dashboard modal reported specMissing.
+        # Seeding here means every held product gets contract_size + fees
+        # within one 2s refresh cycle, and the preset-application path
+        # unblocks itself without any manual diag.
+        for d in (snap.get("derivatives") or []):
+            pid = d.get("product_id")
+            if not pid or int(d.get("qty") or 0) == 0:
+                continue
+            cfg = store.get_config(live_tenant, pid) or {}
+            if not (cfg.get("contract_size") and cfg.get("fee_per_contract_roundtrip")):
+                try:
+                    _refresh_contract_spec_into_config(store, live_tenant, pid)
+                except Exception as _boot_err:
+                    _log(f"[{live_tenant}/{pid}] auto-bootstrap failed: "
+                         f"{type(_boot_err).__name__}: {_boot_err}")
         return len(snap.get("derivatives") or [])
     except Exception as e:
         _log(f"[{live_tenant}] portfolio refresh failed: {type(e).__name__}: {e}")
