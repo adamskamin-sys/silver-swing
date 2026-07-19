@@ -517,15 +517,56 @@ def run() -> int:
     broker = None
     trader = None
     if PRIMARY_ENABLED:
-        # In dry-run only, seed a default config if the tenant/symbol has no
-        # config yet — otherwise the preflight validator rejects the run before
-        # the operator can configure via dashboard (chicken-and-egg on first
-        # deploy). Real-money mode still requires the config to be pre-set:
-        # we don't want defaults touching production.
-        if dry_run and not store.get_config(TENANT, SYMBOL):
+        # Config auto-seed. Two variants:
+        # - Dry-run: seed the full paper defaults (was already here).
+        # - Real-money: seed a SLEEVES-ONLY config (swing_qty=0, primary
+        #   disabled) so preflight passes without the operator having to
+        #   pre-configure a primary strategy. Adam's fleet is sleeves-
+        #   only (project_silver_not_special); the primary is legacy.
+        #   Live-safe defaults are pulled from _seed_config_if_missing's
+        #   fleet-wide rule (2026-07-15): core_qty=0, abort bands
+        #   ATR-derived, swing_qty=0 disables primary trading.
+        # 2026-07-19: real-money seed added to unbreak the crash loop
+        # observed when a live tenant's primary config was stripped
+        # to specs-only by auto-bootstrap.
+        _existing_cfg = store.get_config(TENANT, SYMBOL) or {}
+        if dry_run and not _existing_cfg:
             from main import _default_paper_config
             _log(f"dry-run: seeding default config for {TENANT}/{SYMBOL}")
             store.put_config(TENANT, SYMBOL, _default_paper_config())
+        elif not dry_run:
+            # Backfill any required primary fields the validator needs, with
+            # live-safe values (swing_qty=0 means primary is disabled → no
+            # bot-side primary trading, sleeves still work). Idempotent: won't
+            # touch fields already set.
+            from main import _seed_config_if_missing
+            _seed_config_if_missing(store, TENANT, SYMBOL)
+            # If STILL missing critical fields after seed (edge case where
+            # the tenant has no ATR + no cfg at all — impossible on adam-
+            # live after auto-bootstrap, but defensive), fill hard defaults
+            # so preflight can pass. All conservative: swing disabled, wide
+            # abort bands, minimal risk.
+            _cfg2 = store.get_config(TENANT, SYMBOL) or {}
+            _hard_defaults = {
+                "swing_qty": 0, "max_swing_qty": 1,
+                "sell_px": 0.0, "buy_px": 0.0,
+                "abort_below": 0.0, "abort_above": 1e9,
+                "margin_per_contract": 0.0,
+                "scale_up_buffer_mult": 1.5,
+                "fee_per_contract_roundtrip": 0.0,
+                "contract_size": 1.0,
+                "core_qty": 0,
+            }
+            _dirty = False
+            for k, v in _hard_defaults.items():
+                if k not in _cfg2:
+                    _cfg2[k] = v
+                    _dirty = True
+            if _dirty:
+                store.put_config(TENANT, SYMBOL, _cfg2)
+                _log(f"[{TENANT}/{SYMBOL}] real-money: seeded hard defaults "
+                     f"for missing primary fields (primary disabled, sleeves "
+                     f"unaffected)")
 
         coinbase = CoinbaseBroker(BrokerConfig(product_id=SYMBOL))
         ok, issues = _preflight(coinbase, store, TENANT, SYMBOL, notifier)
