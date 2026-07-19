@@ -264,11 +264,52 @@ class SwingTrader:
         return [SleeveConfig.from_dict(s) for s in (raw.get("sleeves") or [])]
 
     def _save_state(self) -> None:
+        """Persist tick state, but preserve any external writes that landed
+        between reload and save.
+
+        Adam 2026-07-19 (problem-scout): reload-on-tick closed the "next
+        tick clobbers external write" class, but a diag/dashboard write
+        that lands DURING the tick (between reload at t=0 and save at
+        t=+50-500ms) still gets clobbered. Fix: re-read Redis right
+        before save; for each sleeve, if the Redis blob differs from the
+        _reload_snapshot we took at tick start (i.e., an external writer
+        touched it during this tick), keep the Redis version instead of
+        overwriting with our tick-computed one. Same-tick fills we
+        credited via _sleeve_on_fill still stick because they went into
+        self.s.sleeves, which we're about to persist.
+        """
         import time as _time
         self.s.last_heartbeat_ts = _time.time()
         d = asdict(self.s)
         d["state"] = self.s.state.value
         d["sleeves"] = {sid: s.to_dict() for sid, s in self.s.sleeves.items()}
+
+        # Save-time merge: if a sleeve blob in Redis changed since our
+        # reload-time snapshot, the external write wins for that sleeve.
+        try:
+            snap = getattr(self, "_reload_snapshot", None)
+            if snap is not None:
+                current = self.store.get_state(self.tenant_id, self.symbol) or {}
+                current_sleeves = current.get("sleeves") or {}
+                if isinstance(current_sleeves, dict):
+                    for sid, redis_blob in current_sleeves.items():
+                        baseline = snap.get(sid)
+                        if baseline is not None and redis_blob != baseline:
+                            # External writer touched this sleeve during our
+                            # tick. Preserve their write.
+                            d["sleeves"][sid] = redis_blob
+                            try:
+                                self._record(
+                                    "sleeve_external_write_preserved",
+                                    sleeve_id=sid, symbol=self.symbol,
+                                    severity="info",
+                                )
+                            except Exception:
+                                pass
+        except Exception:
+            # Merge failure must not block the save.
+            pass
+
         self.store.put_state(self.tenant_id, self.symbol, d)
 
     def _reload_sleeves_from_redis(self) -> None:
@@ -286,7 +327,27 @@ class SwingTrader:
 
         Fails open: any Redis read exception leaves in-memory untouched
         (will retry next tick). Malformed entries are skipped, not raised.
+
+        Retirement-cooldown guard (2026-07-19): if the product is in
+        retirement cooldown, we skip the reload entirely. Otherwise a
+        stale sleeve blob left in Redis (retire path may not have cleared
+        the sleeves sub-dict) gets re-hydrated into memory, kept by the
+        sweep (if the id is still in cfg), and ticks THROUGH the cooldown
+        — exactly the ghost re-inflation the retirement ledger exists to
+        prevent.
+
+        Also stamps _reload_snapshot per sleeve so _save_state can detect
+        + preserve external writes that landed between reload and save.
         """
+        try:
+            _in_cd, _cd_reason, _cd_secs = self._is_product_in_retirement_cooldown()
+        except Exception:
+            _in_cd = False
+        if _in_cd:
+            # Product is under cooldown. Do not re-hydrate any sleeve blob
+            # for this product — the cleanup sweep will drop retired sleeves
+            # naturally as configured_ids diverges.
+            return
         try:
             d = self.store.get_state(self.tenant_id, self.symbol) or {}
         except Exception:
@@ -294,13 +355,26 @@ class SwingTrader:
         persisted = d.get("sleeves") or {}
         if not isinstance(persisted, dict):
             return
+        # Fresh baseline for save-time merge (see _save_state).
+        self._reload_snapshot = {}
         for sid, raw in persisted.items():
             if not isinstance(raw, dict):
                 continue
             try:
                 self.s.sleeves[sid] = SleeveState.from_dict(raw, sid)
+                # Store a deep-enough copy so save-time compare works.
+                self._reload_snapshot[sid] = dict(raw)
             except Exception:
                 pass
+
+    def _is_product_in_retirement_cooldown(self) -> tuple[bool, str, float]:
+        """Wrapper around retirement_ledger.is_in_cooldown that fails open.
+        Returns (in_cooldown, reason, secs_remaining)."""
+        try:
+            import retirement_ledger as _rl
+            return _rl.is_in_cooldown(self.store, self.tenant_id, self.symbol)
+        except Exception:
+            return False, "", 0.0
 
     def _notify(self, subject: str, body: str, priority: Priority) -> None:
         if self.notifier is None:

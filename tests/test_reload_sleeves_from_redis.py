@@ -160,3 +160,80 @@ def test_sleeves_scope_missing_from_state_is_noop():
     trader._reload_sleeves_from_redis()
     # In-memory sleeve unchanged
     assert trader.s.sleeves["scan-abc"].state == State.HALTED
+
+
+def test_retirement_cooldown_blocks_reload():
+    """If product is in retirement cooldown, reload does NOT re-hydrate
+    from Redis. Prevents ghost re-inflation from stale sleeve blobs."""
+    import retirement_ledger as _rl
+    store = _MinimalStore()
+    trader = _make_trader(store)
+    from swing_leg import State
+    # Retire the product for 1h
+    _rl.record_retirement(
+        store, "adam-live", "TEST-CDE",
+        "scan-old", "manual retire test",
+        cooldown_hours=1.0,
+    )
+    # Stale sleeve blob left in Redis (as if retire didn't clear sleeves sub-dict)
+    store.put_state("adam-live", "TEST-CDE", {
+        "sleeves": {
+            "scan-ghost": {
+                "state": "ARMED_BUY", "cycles": 1,
+                "realized_pnl": 0.0, "own_avg_entry": 0.5,
+            }
+        }
+    })
+    trader._reload_sleeves_from_redis()
+    # Ghost must NOT be rehydrated during cooldown
+    assert "scan-ghost" not in trader.s.sleeves
+
+
+def test_save_preserves_external_write_during_tick():
+    """External write that lands between reload and save must win.
+    The tick's in-memory state does NOT overwrite it."""
+    store = _MinimalStore()
+    trader = _make_trader(store)
+    from swing_leg import State
+    # Seed Redis with a sleeve, then reload to snapshot it
+    store.put_state("adam-live", "TEST-CDE", {
+        "sleeves": {
+            "scan-abc": {
+                "state": "ARMED_BUY", "cycles": 0,
+                "realized_pnl": 0.0, "own_avg_entry": None,
+            }
+        }
+    })
+    trader._reload_sleeves_from_redis()
+    # Simulate: external writer credits a stop fill DURING our tick
+    store.put_state("adam-live", "TEST-CDE", {
+        "sleeves": {
+            "scan-abc": {
+                "state": "ARMED_BUY", "cycles": 1,
+                "realized_pnl": 5.25, "own_avg_entry": None,
+            }
+        }
+    })
+    # Our tick's in-memory state was set from the OLD snapshot (cycles=0)
+    # and we then save it. The save-time merge must preserve the external
+    # write (cycles=1, realized=5.25).
+    trader._save_state()
+    saved = store.get_state("adam-live", "TEST-CDE")
+    assert saved["sleeves"]["scan-abc"]["cycles"] == 1
+    assert saved["sleeves"]["scan-abc"]["realized_pnl"] == 5.25
+
+
+def test_save_no_external_write_writes_ticks_state():
+    """Baseline: if nothing external happened, save writes tick state normally."""
+    store = _MinimalStore()
+    trader = _make_trader(store)
+    from swing_leg import State
+    store.put_state("adam-live", "TEST-CDE", {
+        "sleeves": {"scan-abc": {"state": "ARMED_BUY", "cycles": 0}}
+    })
+    trader._reload_sleeves_from_redis()
+    # Tick logic advances cycles to 2 in memory
+    trader.s.sleeves["scan-abc"].cycles = 2
+    trader._save_state()
+    saved = store.get_state("adam-live", "TEST-CDE")
+    assert saved["sleeves"]["scan-abc"]["cycles"] == 2
