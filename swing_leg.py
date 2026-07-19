@@ -271,6 +271,37 @@ class SwingTrader:
         d["sleeves"] = {sid: s.to_dict() for sid, s in self.s.sleeves.items()}
         self.store.put_state(self.tenant_id, self.symbol, d)
 
+    def _reload_sleeves_from_redis(self) -> None:
+        """Re-sync in-memory sleeve state with Redis at tick start.
+
+        Closes the SLR/HYP/PT/XLP in-memory-clobber class:
+          diag force-credit XLP-20DEC30-CDE scan-mrr27ttp --apply → Redis
+          gets the fix (state=ARMED_BUY, cycles=1) → next bot tick writes
+          in-memory dict (state=HALTED, cycles=0) BACK to Redis → fix lost.
+
+        Fix: re-read the sleeves dict from Redis at the start of every
+        multi_sleeve_step. External writes get honored within ~1s. Any
+        sleeve in memory but absent from Redis is treated as new (kept);
+        sleeves in Redis update the in-memory copy in place.
+
+        Fails open: any Redis read exception leaves in-memory untouched
+        (will retry next tick). Malformed entries are skipped, not raised.
+        """
+        try:
+            d = self.store.get_state(self.tenant_id, self.symbol) or {}
+        except Exception:
+            return
+        persisted = d.get("sleeves") or {}
+        if not isinstance(persisted, dict):
+            return
+        for sid, raw in persisted.items():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                self.s.sleeves[sid] = SleeveState.from_dict(raw, sid)
+            except Exception:
+                pass
+
     def _notify(self, subject: str, body: str, priority: Priority) -> None:
         if self.notifier is None:
             return
@@ -4104,6 +4135,13 @@ class SwingTrader:
                 # the next target during the ~1s gap.
                 if self.s.state != State.HALTED and not self.s.live_order_id:
                     self._ensure_armed(last_price)
+
+        # Re-sync sleeve state from Redis first — external writes (diag
+        # force-credit, dashboard resume, reconcile autocorrector) get
+        # honored within 1s instead of being clobbered by our in-memory
+        # copy on the next _save_state(). See _reload_sleeves_from_redis
+        # docstring for the SLR/HYP/PT/XLP incident class this closes.
+        self._reload_sleeves_from_redis()
 
         # Reload sleeve configs each tick — user may have added/removed sleeves
         # from the dashboard. Ensure state dict has entries for all configured.
