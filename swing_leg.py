@@ -6140,21 +6140,56 @@ class SwingTrader:
         return True
 
     def _kelly_adjusted_qty(self, sc, ss) -> int:
-        """Apply Kelly-fraction sizing if enabled. Never sizes UP (only ≤ cfg.qty)."""
-        if not getattr(sc, "kelly_enabled", False):
-            return int(sc.qty)
+        """Apply Kelly-fraction sizing if enabled, then Harvey vol-target
+        scaling on top. Never sizes UP past cfg.qty × vol_target.MAX_SCALE.
+
+        Order of operations:
+          1. cfg.qty (user's declared base)
+          2. Kelly quarter-fraction shrink (Van Tharp / Vince) — never
+             sizes UP; only shrinks base after losing streaks
+          3. Harvey (2018 JPM) vol-target scaling — can shrink or grow
+             within [MIN_SCALE, MAX_SCALE]. Reduces drawdowns by
+             sizing DOWN in high-vol regimes.
+
+        Both layers feature-flagged. When both off, returns cfg.qty
+        unchanged. When both on, Kelly shrinks first, then Harvey
+        adjusts the shrunk quantity — conservative composition.
+        """
+        base = int(sc.qty)
+        # Layer 1: Kelly
+        if getattr(sc, "kelly_enabled", False):
+            try:
+                import kelly
+                recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
+                mult = kelly.compute_kelly_multiplier(
+                    recent,
+                    kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
+                    min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
+                )
+                base = kelly.size_from_qty(int(sc.qty), mult)
+            except Exception as e:
+                self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
+                base = int(sc.qty)
+        # Layer 2: Harvey vol-target (Option D-2, 2026-07-19). Feature-
+        # flagged; when off, returns base unchanged.
         try:
-            import kelly
-            recent = list(getattr(ss, "recent_cycle_pnls", []) or [])
-            mult = kelly.compute_kelly_multiplier(
-                recent,
-                kelly_fraction=float(getattr(sc, "kelly_fraction", 0.25) or 0.25),
-                min_cycles=int(getattr(sc, "kelly_min_cycles", 8) or 8),
-            )
-            return kelly.size_from_qty(int(sc.qty), mult)
+            import vol_target
+            # Build a daily return series from the sleeve's rolling
+            # price history. Prefer daily bars if available; fall back
+            # to the tick-level history (which vol_target will scale
+            # via its annualization factor).
+            history = list(self._sleeve_price_history.get(sc.id, []) or [])
+            returns: list[float] = []
+            if len(history) >= 6:
+                import math as _math
+                for i in range(1, len(history)):
+                    a, b = history[i - 1], history[i]
+                    if a > 0 and b > 0:
+                        returns.append(_math.log(b / a))
+            return int(vol_target.adjusted_qty(base, returns))
         except Exception as e:
-            self._record("kelly_compute_failed", sleeve_id=sc.id, error=str(e))
-            return int(sc.qty)
+            self._record("vol_target_failed", sleeve_id=sc.id, error=str(e))
+            return int(base)
 
     def _adaptive_spread_price(self, sc, side: str, arm_price: float) -> float:
         """When adaptive spread is enabled, widen the arm price to account
