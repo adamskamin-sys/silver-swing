@@ -2186,10 +2186,22 @@ header { padding: 20px 32px; }
   #sleeve-modal .modal-panel {
     min-width: 0;
     max-width: 100vw;
-    width: 96vw;
-    max-height: 96vh;
+    width: 100vw;
+    max-height: 100vh;
+    height: 100vh;
     padding: 12px;
-    border-radius: var(--r-md);
+    border-radius: 0;             /* full-bleed, no rounded corners */
+    margin: 0;
+  }
+  /* Modal outer container: no padding around the panel on mobile — use every pixel. */
+  .modal { padding: 0; align-items: flex-start; }
+  /* Close (×) button — bigger tap target, always visible top-right. */
+  .modal-panel .modal-close,
+  .modal-panel [data-close] {
+    min-height: 44px; min-width: 44px;
+    font-size: 24px;
+    position: sticky; top: 0; z-index: 20;
+    background: var(--panel-2, #0d1621);
   }
   /* Every table wrapper gets horizontal scroll so wide tables don't
    * push page width beyond the viewport (causing whole-page horizontal
@@ -2209,6 +2221,13 @@ header { padding: 20px 32px; }
   /* Small buttons in table rows are exempt (they'd blow up row height);
    * they get their own bump so they're still tap-comfortable. */
   button.small, .btn.small { min-height: 36px; }
+  /* Number-input spinners: hide the up/down steppers on mobile — they're
+   * pixel-sized and useless on touch. User taps and types. */
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none; margin: 0;
+  }
+  input[type="number"] { -moz-appearance: textfield; }
   /* Cockpit tiles: full width, one per row on very small screens. */
   .ck-tile { min-width: 100%; flex: 1 1 100%; }
   /* Portfolio + scanner tables: no minimum row height forcing dense text
@@ -2218,4 +2237,89 @@ header { padding: 20px 32px; }
   .tab-bar, .nav-tabs, .subtab-row { flex-wrap: wrap; gap: 4px; }
   /* Toast width — was 480px min. */
   .toast, #toast { max-width: 94vw; }
+
+  /* ---- Sleeve editor mobile layout ---------------------------------- */
+  /* Anchor toggle: stack full-width buttons instead of horizontal row. */
+  .sleeve-anchor-toggle { flex-direction: column; gap: 6px; }
+  .sleeve-anchor-toggle .anchor-choice,
+  .sleeve-anchor-toggle .anchor-choice-custom {
+    width: 100%; min-height: 52px;
+    padding: 10px 14px;
+  }
+  .anchor-choice-value { font-size: 16px; }
+  /* Sleeve editor 2-column rows: stack vertically. */
+  #sleeve-modal .target-inputs,
+  #sleeve-modal .form-row,
+  #sleeve-modal .row-2col,
+  #sleeve-modal .hybrid-fields,
+  #sleeve-modal .stop-loss-fields {
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #sleeve-modal .target-inputs > label,
+  #sleeve-modal .form-row > label { flex: 1 1 100%; }
+  /* Preset dropdown: full width + bigger. */
+  #sleeve-modal select { width: 100%; }
+  /* Preview panel: bigger text, less padding. */
+  .sleeve-preview .preview-row { flex-direction: column; gap: 4px; }
+  .sleeve-preview .preview-row > div { flex: 1 1 100%; }
+  .sleeve-preview .preview-econ { flex-direction: column; gap: 4px; align-items: flex-start; }
+  /* Profit slider block: bigger for touch scrubbing. */
+  .profit-slider { height: 40px; }
+  .profit-slider::-webkit-slider-thumb { width: 32px; height: 32px; }
+  .profit-slider::-moz-range-thumb { width: 32px; height: 32px; }
+  .profit-slider-header { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .slider-value-input-wrap { width: 100%; }
+  .slider-value-input { width: 100%; }
+  /* Save/Cancel action row: sticky footer so the user can always save
+   * without scrolling to the bottom of a tall modal. */
+  #sleeve-modal .actions,
+  #sleeve-modal .modal-actions,
+  #sleeve-modal .save-cancel-row {
+    position: sticky; bottom: 0;
+    background: var(--panel-2, #0d1621);
+    padding: 8px 0;
+    margin: 0 -12px -12px -12px;
+    padding: 8px 12px 12px 12px;
+    z-index: 10;
+    display: flex; gap: 8px;
+    box-shadow: 0 -2px 8px rgba(0,0,0,0.4);
+  }
+  #sleeve-modal .actions button,
+  #sleeve-modal .modal-actions button { flex: 1 1 50%; min-height: 52px; }
+
+  /* ---- Scanner detail (product) modal ------------------------------- */
+  /* Live-strategies header: stack Position + Attach button vertically. */
+  .scanner-detail-live { flex-direction: column; align-items: stretch; }
+  .scanner-detail-live button { margin: 8px 0 0 0; width: 100%; }
+  /* Chart height: reduce on mobile so the sleeve table stays visible
+   * above the fold. Chart is still readable but doesn't hog the screen. */
+  .scanner-detail-chart, #scanner-detail-chart { height: 280px; min-height: 280px; }
+  /* Timeframe / indicator buttons: wrap + bigger tap targets. */
+  .scanner-detail-timeframes, .scanner-detail-indicators {
+    flex-wrap: wrap; gap: 6px;
+  }
+  .scanner-detail-timeframes button, .scanner-detail-indicators button {
+    min-height: 40px; padding: 4px 12px;
+  }
+
+  /* ---- Portfolio table --------------------------------------------- */
+  /* Cash summary line: wrap comfortably on narrow screens. */
+  .pf-cash, .cash-summary { display: block; line-height: 1.6; }
+  /* Portfolio row: reduce column widths, tighten cell padding. */
+  .pf-row td { padding: 8px 6px; }
+  /* Total row: bold + separated. */
+  tr.total-row td, tr.pf-total td { border-top: 2px solid var(--panel-3); font-weight: 700; }
+
+  /* ---- Sleeve/portfolio badges + chips ----------------------------- */
+  /* Stop-loss chip / trigger chip: make sure they don't wrap awkwardly. */
+  .stop-chip, .trigger-chip { white-space: nowrap; font-size: 12px; }
+}
+
+/* Very narrow phones (≤380px, e.g. iPhone SE portrait) — extra squeeze. */
+@media (max-width: 380px) {
+  th, td { padding: 4px 6px; font-size: 12px; }
+  h1 { font-size: 16px; }
+  .anchor-choice-label { font-size: 12px; }
+  .anchor-choice-value { font-size: 14px; }
+  .scanner-detail-chart, #scanner-detail-chart { height: 220px; min-height: 220px; }
 }
