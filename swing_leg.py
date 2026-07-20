@@ -4967,6 +4967,54 @@ class SwingTrader:
         # fallback must track it or _credit_stop_fill will credit the
         # stale sell_entry_avg on a stop fill and mis-report P&L.
         ss.sell_entry_avg = new_avg
+        # Fee-floor re-clamp on avg-UP (Adam 2026-07-20
+        # feedback_no_net_loss_cycles): if the manual add pushed own_avg
+        # UP (bought more at higher price), the existing sc.sell_px may
+        # now be below break-even relative to the new blended basis.
+        # A resting stop at the old target would fire green but net red.
+        # Only clamp UP — never lower sc.sell_px on an avg-down.
+        try:
+            _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            _cs = float(getattr(self.cfg, "contract_size", 0) or 0)
+            _q = max(1, int(getattr(sc, "qty", 1) or 1))
+            _tick = float(getattr(self.cfg, "tick_size", 0) or 0.0)
+            if _fee_rt > 0 and _cs > 0 and new_avg > prev_avg:
+                _fee_per_unit = _fee_rt / _cs / _q
+                _safety = max(_tick if _tick > 0 else 0.0, new_avg * 0.0005)
+                _floor = new_avg + _fee_per_unit + _safety
+                if float(sc.sell_px or 0) < _floor:
+                    _clamped = self._snap_to_tick(_floor) if _tick > 0 else _floor
+                    if _clamped < _floor:
+                        _clamped = _clamped + (_tick or 0.0)
+                    _prev_sell_px = float(sc.sell_px or 0)
+                    sc.sell_px = _clamped
+                    # Persist the sell_px lift to config so restart preserves
+                    try:
+                        _cfg = self.store.get_config(self.tenant_id, self.symbol) or {}
+                        for _s in (_cfg.get("sleeves") or []):
+                            if _s.get("id") == sc.id:
+                                _s["sell_px"] = _clamped
+                                break
+                        self.store.put_config(self.tenant_id, self.symbol, _cfg)
+                    except Exception:
+                        pass
+                    self._record(
+                        "sleeve_reblend_sell_px_fee_floor_clamp",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        prev_sell_px=_prev_sell_px, new_sell_px=_clamped,
+                        prev_own_avg=prev_avg, new_own_avg=new_avg,
+                        severity="info",
+                        reason=("manual avg-up made existing sell_px "
+                                "below break-even + fees — clamped UP "
+                                "per feedback_no_net_loss_cycles"),
+                    )
+        except Exception as _e:
+            try:
+                self._record("sleeve_reblend_fee_floor_error",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
         self._record(
             "sleeve_own_avg_reblended_on_manual_add",
             sleeve_id=sc.id, sleeve_name=sc.name,
