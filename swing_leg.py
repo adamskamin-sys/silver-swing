@@ -4546,8 +4546,20 @@ class SwingTrader:
         if _hold and not ss.trail_armed:
             ss.trail_armed = True
             _dirty = True
-        if (_hold or bool(ss.trail_armed)) and last_price and float(last_price) > float(ss.trail_high_water_price or 0.0):
-            ss.trail_high_water_price = float(last_price)
+        # Adam 2026-07-19 (§3.4 enforcement): HWM floor at own_avg. Prior
+        # code only ratcheted UP from whatever hwm happened to be — if
+        # last_price dropped below own_avg between arm and this call, hwm
+        # could end up below own_avg. That produced the "trail below
+        # entry" numbers on NER, XLP, ZEC (hwm was 0.03-3% under own_avg).
+        # Per §3.4: on buy fill, hwm=own_avg; then ratchet UP only.
+        own_avg_for_hwm = float(ss.own_avg_entry or 0.0)
+        _target_hwm = float(ss.trail_high_water_price or 0.0)
+        if own_avg_for_hwm > 0 and _target_hwm < own_avg_for_hwm and (_hold or bool(ss.trail_armed)):
+            _target_hwm = own_avg_for_hwm
+        if (_hold or bool(ss.trail_armed)) and last_price and float(last_price) > _target_hwm:
+            _target_hwm = float(last_price)
+        if _target_hwm != float(ss.trail_high_water_price or 0.0):
+            ss.trail_high_water_price = _target_hwm
             _dirty = True
         if _dirty:
             try:

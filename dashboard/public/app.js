@@ -6540,48 +6540,48 @@ function openScannerDetail(row) {
             const cached2 = Number((window.__slDisplayCache || {})[cacheKey2]) || 0;
             slEff = Math.max(restingPx2, cached2);
           }
-          let trailEff = 0;
-          const trailModes2 = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
-          if (trailModes2 && ownAvg2 > 0) {
-            const peak2 = Number(ss.trail_high_water_price) || 0;
-            const trailDist2 = Number(s.trail_distance) || 0;
-            if (peak2 > 0 && trailDist2 > 0) trailEff = peak2 - trailDist2;
-          }
-          // Winner = higher exit for a long. If trail is engaged and above
-          // the stop-loss, trail fires first (locks profit). Otherwise
-          // stop-loss is the active exit.
-          if (trailEff > 0 && trailEff >= slEff && ownAvg2 > 0 && qty2 > 0) {
+          // Adam 2026-07-19 TRUTH FIX: the "trail engaged" state is
+          // whatever the BOT actually placed as a resting stop. If the
+          // sleeve is at hard_bottom stage, the trail hasn't earned the
+          // right to place yet — showing a "TRAIL EXIT" chip based on
+          // peak-distance client math would lie about what's on Coinbase.
+          // The only truth is ss.resting_stop_stage.
+          const TRAIL_STAGES = new Set(['trail','trail_pre_goal',
+                'trail_floored_at_sell','trail_floored_at_break_even',
+                'break_even_lock','profit_lock']);
+          const restingStage2 = String(ss.resting_stop_stage || '');
+          const isTrailStage2 = TRAIL_STAGES.has(restingStage2);
+          const trailEff = isTrailStage2 ? (Number(ss.resting_stop_px) || 0) : 0;
+          // Winner = actual placed order. If stage is a trail stage,
+          // trailEff wins (the amber "profit-locked" chip). Otherwise
+          // stop-loss is the active exit — even if a hypothetical trail
+          // would compute higher, it isn't placed anywhere.
+          if (trailEff > 0 && ownAvg2 > 0 && qty2 > 0) {
             const trailPnl = (trailEff - ownAvg2) * liveContractSize * qty2;
             const projected = realized + trailPnl - sellFee * qty2;
-            // Distinct color: trail-locked profit = amber-gold (locked-in gain)
-            // vs stop-loss = red/green. Amber signals "this is the trail exit,
-            // it's a good thing — a locked-in profit, not a forced loss."
-            ifStoppedCell = `<span class="mono" style="color:#f59e0b;font-weight:600" title="TRAIL EXIT projection — sells at $${fmtPrice(trailEff)} if pullback triggers. Locks in this profit. Realized ${fmtMoney(realized)} + (${fmtPrice(trailEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}. Amber = trail (locks profit); green/red = base stop-loss.">🔒 ${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+            ifStoppedCell = `<span class="mono" style="color:#f59e0b;font-weight:600" title="TRAIL EXIT (stage: ${restingStage2}) — sells at $${fmtPrice(trailEff)} if pullback triggers. Realized ${fmtMoney(realized)} + (${fmtPrice(trailEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}. Amber = trail (locks profit); green/red = base stop-loss.">🔒 ${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
           } else if (slEff > 0 && ownAvg2 > 0 && qty2 > 0) {
             const stopPnl = (slEff - ownAvg2) * liveContractSize * qty2;
             const projected = realized + stopPnl - sellFee * qty2;
-            ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+            ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection (stage: ${restingStage2 || 'unknown'}) — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
           }
-          // Trail cell — grey pill with arm price when trail isn't engaged;
-          // green pill with peak + effective stop when it is. Same source as
-          // the sleeve-editor trail-status block: state.trail_high_water_price
-          // > 0 means the trail is armed (state.trail_armed on the primary,
-          // but sleeves persist this on trail_high_water_price only).
+          // Trail cell — show what the BOT actually placed. Only claim
+          // "TRAIL ENGAGED" when the resting order on Coinbase is at a
+          // trail stage; otherwise show the arm price we're waiting for
+          // or a warning that trail is dormant.
           let trailCell = '<span class="dim">—</span>';
           const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
           if (trailModes) {
             const peak = Number(ss.trail_high_water_price) || 0;
             const trailDist = Number(s.trail_distance) || 0;
             const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
-            if (peak > 0 && trailDist > 0) {
-              const effectiveStop = peak - trailDist;
-              // 2026-07-15 Adam UX: prior render showed two same-size numbers
-              // ($67.75  $68.01) that were easy to misread. Now clearly labels
-              // the FIRST as EXIT (where the market SELL fires) and the SECOND
-              // as PEAK/HWM (running high). Same info, unmistakable meaning.
-              trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED — peak $${fmtPrice(peak)}. Sells at $${fmtPrice(effectiveStop)} (peak − $${fmtPrice(trailDist)} pullback). Every new high lifts the exit.">EXIT <b>$${fmtPrice(effectiveStop)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
+            if (isTrailStage2 && trailEff > 0) {
+              trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED (stage: ${restingStage2}) — actual Coinbase stop at $${fmtPrice(trailEff)}. Peak $${fmtPrice(peak)}. Every new high lifts the exit.">EXIT <b>$${fmtPrice(trailEff)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
             } else if (armPx > 0) {
-              trailCell = `<span class="mono trail-pill-off" title="Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).">arms at $${fmtPrice(armPx)}</span>`;
+              const dormantNote = peak > 0 && trailDist > 0
+                ? `Trail dormant — bot has stop-loss at hard_bottom stage. Trail arms once mark crosses $${fmtPrice(armPx)}; then EXIT ratchets from peak − $${fmtPrice(trailDist)}.`
+                : `Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).`;
+              trailCell = `<span class="mono trail-pill-off" title="${dormantNote}">arms at $${fmtPrice(armPx)}</span>`;
             }
           }
           // Halt reason lives on the product-level state (not per-sleeve) when
@@ -6605,11 +6605,14 @@ function openScannerDetail(row) {
           // the config sell_px and note "trail active" so the reader
           // doesn't think the bot will still exit at $sell_px — the trail
           // (floored at sell_px, per checkpoint-then-ratchet) now owns it.
-          const trailEngaged = (s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid')
-                                && Number(ss.trail_high_water_price) > 0
-                                && Number(s.trail_distance) > 0;
-          const sellPxDisplay = trailEngaged
-            ? `<span class="dim" style="text-decoration:line-through" title="Trail superseded this target — see TRAIL column for the ACTIVE exit price. Floor is $${fmtPrice(s.sell_px || 0)} (checkpoint-then-ratchet: trail can only exit ABOVE the goal).">$${fmtPrice(s.sell_px || 0)}</span> <span class="ck-chip ck-ok" style="font-size:0.65em;padding:1px 4px" title="Trail owns this exit — the SELL target is now a floor, not the active price.">→ trail</span>`
+          // Adam 2026-07-19 TRUTH FIX: only strike through sell_px when
+          // trail ACTUALLY owns the exit on Coinbase (resting order at a
+          // trail stage AND above sell_px). Prior logic keyed off HWM +
+          // trail_distance client math, so it lied whenever sleeve was
+          // still at hard_bottom (which is most fresh buys).
+          const trailOwnsExit = isTrailStage2 && trailEff > (Number(s.sell_px) || 0);
+          const sellPxDisplay = trailOwnsExit
+            ? `<span class="dim" style="text-decoration:line-through" title="Trail superseded this target — see TRAIL column for the ACTIVE exit at $${fmtPrice(trailEff)}. Floor is $${fmtPrice(s.sell_px || 0)} (checkpoint-then-ratchet: trail can only exit ABOVE the goal).">$${fmtPrice(s.sell_px || 0)}</span> <span class="ck-chip ck-ok" style="font-size:0.65em;padding:1px 4px" title="Trail owns this exit — the SELL target is now a floor, not the active price.">TRL</span>`
             : `$${fmtPrice(s.sell_px || 0)}`;
           return `<tr>
             <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
@@ -6893,21 +6896,22 @@ function refreshScannerDetailLive() {
         const cached2 = Number((window.__slDisplayCache || {})[cacheKey2]) || 0;
         slEff = Math.max(restingPx2, cached2);
       }
-      let trailEff = 0;
-      const trailModes2 = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
-      if (trailModes2 && ownAvg2 > 0) {
-        const peak2 = Number(ss.trail_high_water_price) || 0;
-        const trailDist2 = Number(s.trail_distance) || 0;
-        if (peak2 > 0 && trailDist2 > 0) trailEff = peak2 - trailDist2;
-      }
-      if (trailEff > 0 && trailEff >= slEff && ownAvg2 > 0 && qty2 > 0) {
+      // Adam 2026-07-19 TRUTH FIX (mirror of initial renderer): actual
+      // resting_stop_stage is the only truth. No client math.
+      const TRAIL_STAGES_T = new Set(['trail','trail_pre_goal',
+            'trail_floored_at_sell','trail_floored_at_break_even',
+            'break_even_lock','profit_lock']);
+      const restingStageT = String(ss.resting_stop_stage || '');
+      const isTrailStageT = TRAIL_STAGES_T.has(restingStageT);
+      const trailEff = isTrailStageT ? (Number(ss.resting_stop_px) || 0) : 0;
+      if (trailEff > 0 && ownAvg2 > 0 && qty2 > 0) {
         const trailPnl = (trailEff - ownAvg2) * contractSize * qty2;
         const projected = realized + trailPnl - sellFee * qty2;
-        ifStoppedCell = `<span class="mono" style="color:#f59e0b;font-weight:600" title="TRAIL EXIT projection — sells at $${fmtPrice(trailEff)} if pullback triggers. Locks in this profit.">🔒 ${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+        ifStoppedCell = `<span class="mono" style="color:#f59e0b;font-weight:600" title="TRAIL EXIT (stage: ${restingStageT}) — sells at $${fmtPrice(trailEff)} if pullback triggers. Locks in this profit.">🔒 ${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
       } else if (slEff > 0 && ownAvg2 > 0 && qty2 > 0) {
         const stopPnl = (slEff - ownAvg2) * contractSize * qty2;
         const projected = realized + stopPnl - sellFee * qty2;
-        ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${contractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+        ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection (stage: ${restingStageT || 'unknown'}) — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${contractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
       }
       let trailCell = '<span class="dim">—</span>';
       const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
@@ -6915,11 +6919,13 @@ function refreshScannerDetailLive() {
         const peak = Number(ss.trail_high_water_price) || 0;
         const trailDist = Number(s.trail_distance) || 0;
         const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
-        if (peak > 0 && trailDist > 0) {
-          const effectiveStop = peak - trailDist;
-          trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED — peak $${fmtPrice(peak)}. Sells at $${fmtPrice(effectiveStop)} (peak − $${fmtPrice(trailDist)} pullback). Every new high lifts the exit.">EXIT <b>$${fmtPrice(effectiveStop)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
+        if (isTrailStageT && trailEff > 0) {
+          trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED (stage: ${restingStageT}) — actual Coinbase stop at $${fmtPrice(trailEff)}. Peak $${fmtPrice(peak)}. Every new high lifts the exit.">EXIT <b>$${fmtPrice(trailEff)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
         } else if (armPx > 0) {
-          trailCell = `<span class="mono trail-pill-off" title="Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).">arms at $${fmtPrice(armPx)}</span>`;
+          const dormantNote = peak > 0 && trailDist > 0
+            ? `Trail dormant — bot has stop-loss at hard_bottom stage. Trail arms once mark crosses $${fmtPrice(armPx)}; then EXIT ratchets from peak − $${fmtPrice(trailDist)}.`
+            : `Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).`;
+          trailCell = `<span class="mono trail-pill-off" title="${dormantNote}">arms at $${fmtPrice(armPx)}</span>`;
         }
       }
       const productHaltReason = state === 'HALTED'
@@ -6936,11 +6942,11 @@ function refreshScannerDetailLive() {
         : '';
       // Adam 2026-07-15: SELL column strike-through when trail supersedes
       // (matches the other sleeve-row renderer).
-      const trailEngaged2 = (s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid')
-                             && Number(ss.trail_high_water_price) > 0
-                             && Number(s.trail_distance) > 0;
-      const sellPxDisplay2 = trailEngaged2
-        ? `<span class="dim" style="text-decoration:line-through" title="Trail superseded this target — see TRAIL column for the active exit. Floor is $${fmtPrice(s.sell_px || 0)} (checkpoint-then-ratchet: trail can only exit ABOVE the goal).">$${fmtPrice(s.sell_px || 0)}</span> <span class="ck-chip ck-ok" style="font-size:0.65em;padding:1px 4px" title="Trail owns this exit — the SELL target is now a floor, not the active price.">→ trail</span>`
+      // Adam 2026-07-19 TRUTH FIX (mirror): only strike sell_px when
+      // actual placed order is at a trail stage AND above sell_px.
+      const trailOwnsExit2 = isTrailStageT && trailEff > (Number(s.sell_px) || 0);
+      const sellPxDisplay2 = trailOwnsExit2
+        ? `<span class="dim" style="text-decoration:line-through" title="Trail superseded this target — see TRAIL column for the active exit at $${fmtPrice(trailEff)}. Floor is $${fmtPrice(s.sell_px || 0)} (checkpoint-then-ratchet: trail can only exit ABOVE the goal).">$${fmtPrice(s.sell_px || 0)}</span> <span class="ck-chip ck-ok" style="font-size:0.65em;padding:1px 4px" title="Trail owns this exit — the SELL target is now a floor, not the active price.">TRL</span>`
         : `$${fmtPrice(s.sell_px || 0)}`;
       return `<tr>
         <td><b>${escapeHtml(s.name || s.id || '')}</b></td>
