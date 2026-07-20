@@ -4471,11 +4471,41 @@ class SwingTrader:
             # oid + advanced state; no further work here.
             return
         # Resolve stage + target price.
+        # Adam 2026-07-20 fix: HWM was never updated on the resting-stop
+        # path (only _sleeve_step / _sleeve_hybrid_step updated it, and
+        # those return early when resting_stop_enabled + exit_mode in
+        # hybrid/trailing_stop). Result: for the modern config HWM stayed
+        # at own_avg forever, so the trail never ratcheted. Track HWM
+        # here every tick whenever the sleeve is armed to sell.
+        if bool(ss.trail_armed) and last_price and float(last_price) > float(ss.trail_high_water_price or 0.0):
+            ss.trail_high_water_price = float(last_price)
         hwm = float(ss.trail_high_water_price or 0.0)
         trail_engaged = bool(ss.trail_armed)
         stop_loss_px = float(getattr(sc, "stop_loss_px", 0) or 0)
         sell_px = float(getattr(sc, "sell_px", 0) or 0)
         trail_distance = float(getattr(sc, "trail_distance", 0) or 0)
+        # Adam 2026-07-20 (feedback_trail_arm_at_buy_fill +
+        # feedback_biggest_rule_dont_lose_take_best): compute the break-
+        # even floor. Any trail exit must clear own_avg + fee_safety so
+        # the take-profit path never closes in the red. Protective
+        # stop_loss (hard_bottom) is separate — it may fire below.
+        own_avg = float(ss.own_avg_entry or 0.0)
+        try:
+            _cs = float((self.contract_spec_cache or {}).get("contract_size") or getattr(self.cfg, "contract_size", 1) or 1)
+        except Exception:
+            _cs = 1.0
+        try:
+            _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            _fee_price = _fee_rt / max(1.0, _cs) / max(1, int(sc.qty or 1))
+        except Exception:
+            _fee_price = 0.0
+        try:
+            _tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
+        except Exception:
+            _tick = 0.01
+        break_even_floor = 0.0
+        if own_avg > 0:
+            break_even_floor = own_avg + _fee_price + max(_tick, own_avg * 0.0005)
         # Adam 2026-07-15: live-adaptive trail_distance. When enabled per
         # sleeve (sc.adaptive_trail_enabled), recompute trail_distance from
         # recent realized vol × mid so the trail widens in chaotic markets
@@ -4566,22 +4596,46 @@ class SwingTrader:
         # trail stop reaches the desired sell gap" — the checkpoint is the
         # goal, not an internal flag.
         goal_reached = (sell_px > 0 and (hwm >= sell_px or last_price >= sell_px))
+        # Adam 2026-07-20 (feedback_trail_arm_at_buy_fill): once we own
+        # the position, the trail is active from own_avg + fee_safety
+        # upward. Not just after sell_px is reached. HWM only matters
+        # once it climbs above the break-even floor.
+        trail_active = (trail_engaged and own_avg > 0 and hwm > break_even_floor)
         if goal_reached:
             if trail_distance > 0:
                 # Trail active — ratchet from HWM but never below the goal.
                 raw_trail = hwm - trail_distance
-                if raw_trail < sell_px:
-                    target_px = sell_px
-                    stage = "trail_floored_at_sell"
+                # Floor: max(sell_px [locked-in profit], break_even_floor
+                # [don't lose money — belt-and-braces]).
+                floor_px = max(sell_px, break_even_floor)
+                if raw_trail < floor_px:
+                    target_px = floor_px
+                    stage = ("trail_floored_at_sell" if floor_px == sell_px
+                             else "trail_floored_at_break_even")
                 else:
                     target_px = raw_trail
                     stage = "trail"
             else:
                 # No trail configured — just lock in at the goal.
-                target_px = sell_px
+                target_px = max(sell_px, break_even_floor)
                 stage = "profit_lock"
+        elif trail_active:
+            # In profit territory but haven't hit sell_px yet. Trail ratchets
+            # up so we never give back all of the gain. Floor at break_even
+            # so this path can't sell in the red — that's stop_loss's job.
+            if trail_distance > 0:
+                raw_trail = hwm - trail_distance
+                if raw_trail < break_even_floor:
+                    target_px = break_even_floor
+                    stage = "trail_floored_at_break_even"
+                else:
+                    target_px = raw_trail
+                    stage = "trail_pre_goal"
+            else:
+                target_px = break_even_floor
+                stage = "break_even_lock"
         elif stop_loss_px > 0:
-            # Below goal — protective stop only.
+            # Below break-even (or no HWM yet) — protective stop only.
             target_px = stop_loss_px
             stage = "hard_bottom"
         if not target_px or target_px <= 0:
@@ -5050,7 +5104,25 @@ class SwingTrader:
             contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
         except Exception:
             contract_size = 1.0
-        profit = (fill_price - own_avg) * filled_qty * contract_size
+        gross = (fill_price - own_avg) * filled_qty * contract_size
+        # Adam 2026-07-20 problem-scout finding #1: this path credited
+        # gross profit while the sibling _sleeve_on_fill (line ~6637)
+        # correctly credits `gross - half_fee`. Result: every ratchet-
+        # stop / resting-stop credit silently overstated realized_pnl
+        # by half_fee × qty. Also poisoned recent_cycle_pnls fed into
+        # loss-streak auto-disable + Vince/Kelly sizing, making experts
+        # see phony wins. Fix: subtract half_fee here too — the sell
+        # side of the round-trip pays its share of the fee. Full round-
+        # trip is halved because the buy-back leg will pay the other
+        # half via _sleeve_on_fill's rebuy path (line ~6554).
+        half_fee = 0.0
+        try:
+            _rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            if _rt > 0:
+                half_fee = (_rt / 2.0) * filled_qty
+        except Exception:
+            half_fee = 0.0
+        profit = gross - half_fee
         ss.realized_pnl = float(ss.realized_pnl or 0) + profit
         ss.cycles = int(ss.cycles or 0) + 1
         ss.last_sell_qty = filled_qty
@@ -5729,26 +5801,57 @@ class SwingTrader:
     def _sleeve_lockin_ok(self, sc: SleeveConfig, ss: SleeveState, stop_price: float) -> bool:
         """Spec §5A minimum lock-in guard for trailing exits.
 
-        The sleeve's target net is the round-trip P/L it was configured for:
+        Two-tier gate (Adam 2026-07-20 — biggest rule: don't lose money):
+          Tier 1 (HARD FLOOR): stop_price >= own_avg + fee_safety. A trail
+            exit must NEVER close in the red. Only protective stop_loss may.
+          Tier 2 (SOFT TARGET): stop_price nets at least the sleeve's
+            configured target (sell_px - buy_px round-trip). Keeps trailing
+            until HWM climbs enough to clear the target.
+
+        Tier 1 is absolute. Tier 2 is skipped if unconfigured.
+        Formula:
           target_net = (sell_px - buy_px) × size × qty − fee_roundtrip × qty
-        The projected NET if the trail fires at `stop_price`:
           net_at_stop = (stop_price - cost_basis) × size × qty − fee_roundtrip × qty
-        Refuse to fire if net_at_stop < target_net. The trail keeps riding
-        until HWM climbs enough that the projected net clears the target.
         """
         cs = self.cfg.contract_size
         fees = self.cfg.fee_per_contract_roundtrip * sc.qty
-        # Sleeve's configured target: what the swing was designed to earn.
-        target_net = (sc.sell_px - sc.buy_px) * cs * sc.qty - fees
-        if target_net <= 0:
-            return True  # weirdly configured — don't gate
         basis = ss.sell_entry_avg
         if basis is None:
             basis = self._sleeve_avg_entry(sc)
             if basis is not None:
                 ss.sell_entry_avg = basis
         if basis is None:
-            basis = float(sc.buy_px)  # last-resort fallback
+            basis = float(ss.own_avg_entry) if ss.own_avg_entry else float(sc.buy_px)
+        # TIER 1 (HARD): stop must clear own_avg + fee_safety.
+        # fee_safety = per-contract share of roundtrip fee, plus max(1 tick,
+        # 5 bps of basis) — same safety margin as feedback_no_net_loss_cycles
+        # so the trail path can't sell for less than break-even + fees.
+        try:
+            fee_per_ct = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            per_ct_fee_price = fee_per_ct / max(1.0, cs) / max(1, int(sc.qty or 1))
+        except Exception:
+            per_ct_fee_price = 0.0
+        try:
+            tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
+        except Exception:
+            tick = 0.01
+        fee_safety = per_ct_fee_price + max(tick, basis * 0.0005)
+        hard_floor = basis + fee_safety
+        if stop_price < hard_floor:
+            self._record(
+                "sleeve_trail_lockin_hard_floor",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                stop=stop_price, cost_basis=basis,
+                hard_floor=round(hard_floor, 6),
+                fee_safety=round(fee_safety, 6),
+                severity="info",
+                reason="trail exit refused: would close in the red",
+            )
+            return False
+        # TIER 2 (SOFT): sleeve's configured target.
+        target_net = (sc.sell_px - sc.buy_px) * cs * sc.qty - fees
+        if target_net <= 0:
+            return True  # weirdly configured — don't gate on target
         net_at_stop = (stop_price - basis) * cs * sc.qty - fees
         if net_at_stop < target_net:
             self._record(
@@ -6778,6 +6881,16 @@ class SwingTrader:
                                     "cycle's realized will be off by fill_slippage")
             ss.own_avg_entry = own_avg
             ss.state = SleeveStateEnum.ARMED_SELL
+            # Adam 2026-07-20 (feedback_trail_arm_at_buy_fill +
+            # feedback_biggest_rule_dont_lose_take_best):
+            # Trail ARMS the moment a buy fills, floored at own_avg. HWM
+            # starts at own_avg and only ratchets UP. Every downstream
+            # trail-fire path checks stop >= own_avg + fee_safety via
+            # _sleeve_lockin_ok, so no take-profit exit can close in the
+            # red. Protective stop_loss remains free to fire below own_avg.
+            ss.trail_armed = True
+            ss.trail_high_water_price = own_avg
+            ss.hybrid_sell_triggered_ts = None  # fresh cycle, no prior trigger
             self._record(
                 "sleeve_rebuy_completed",
                 sleeve_id=sc.id, sleeve_name=sc.name,
@@ -6785,6 +6898,8 @@ class SwingTrader:
                 realized_pnl_total=ss.realized_pnl,
                 own_avg_entry=ss.own_avg_entry,
                 own_avg_source=avg_source,
+                trail_armed_at_own_avg=True,
+                trail_hwm_seed=own_avg,
             )
 
     def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:
