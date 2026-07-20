@@ -6840,38 +6840,74 @@ function refreshScannerDetailLive() {
       }
       const entryPx = Number(ss.own_avg_entry) || Number(avg) || 0;
       const posAvgPx = Number(avg) || 0;
-      // Stop-loss cell — mirrors the initial-render logic so column stays
-      // consistent across ticks. Without this the price-tick rebuild produced
-      // one fewer td than the header, shifting every following column left.
+      // Adam 2026-07-20 ROOT FIX (no more flicker): mirror the initial-
+      // render logic EXACTLY. Prior code here used older projected/config
+      // math that produced different values than the initial render (see
+      // app.js:6440+), so the row flickered between the two on every
+      // tick refresh (~2s cadence). Both renderers now read the same
+      // single-source-of-truth: ss.resting_stop_px + __slDisplayCache
+      // monotonic ratchet.
       let stopCell = '<span class="dim">off</span>';
-      let ifStoppedCell = '<span class="dim">—</span>';
       if (s.stop_loss_enabled) {
-        const baseStop = Number(s.stop_loss_px) || 0;
-        const hwm = Number(ss.stop_loss_hwm) || 0;
-        const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-        const activation = Number(s.stop_loss_ratchet_activation) || 0;
+        const restingPx = Number(ss.resting_stop_px) || 0;
+        const restingStage = String(ss.resting_stop_stage || '').toLowerCase();
         const ownAvgEntry = Number(ss.own_avg_entry) || 0;
-        const unrealizedPerContract = ownAvgEntry > 0 ? hwm - ownAvgEntry : 0;
-        const ratchetArmed = ownAvgEntry > 0 && unrealizedPerContract >= activation;
-        const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0 && ratchetArmed)
-          ? hwm - ratchetDist
-          : 0;
-        const effective = Math.max(baseStop, ratchetedFloor);
-        if (effective > 0) {
-          const ratcheted = ratchetedFloor > baseStop;
-          stopCell = ratcheted
-            ? `<span class="mono" title="Ratchet armed — floor lifted from base $${fmtPrice(baseStop)} to $${fmtPrice(effective)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">$${fmtPrice(effective)} <span class="sl-ratchet-badge">↑</span></span>`
-            : `<span class="mono" title="Base stop-loss (ratchet not yet armed)">$${fmtPrice(effective)}</span>`;
-          // Only project IF STOPPED when the sleeve actually holds contracts.
-          if (ownAvgEntry > 0) {
-            const qtyIf = Number(s.qty) || 0;
-            const cfgIf = currentStore?.[tenant]?.[symbol]?.config || {};
-            const sellFeeIf = Number(cfgIf.fee_per_fill_sell) || ((Number(cfgIf.fee_per_contract_roundtrip) || 0) / 2);
-            const stopPnlIf = (effective - ownAvgEntry) * contractSize * qtyIf;
-            const projectedIf = realized + stopPnlIf - sellFeeIf * qtyIf;
-            ifStoppedCell = `<span class="mono ${projectedIf >= 0 ? 'pos' : 'neg'}" title="Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(effective)}−${fmtPrice(ownAvgEntry)})×${contractSize}×${qtyIf} − sell fee $${(sellFeeIf * qtyIf).toFixed(2)}">${projectedIf >= 0 ? '+' : ''}${fmtMoney(projectedIf)}</span>`;
-          }
+        const holdsPosition = ownAvgEntry > 0;
+        window.__slDisplayCache = window.__slDisplayCache || {};
+        const cacheKey = `${tenant}:${symbol}:${s.id}`;
+        const cached = Number(window.__slDisplayCache[cacheKey]) || 0;
+        let displayPx = restingPx;
+        if (restingPx > 0 && restingPx >= cached) {
+          window.__slDisplayCache[cacheKey] = restingPx;
+          displayPx = restingPx;
+        } else if (restingPx > 0 && restingPx < cached) {
+          displayPx = cached;
+        } else if (restingPx === 0 && cached > 0) {
+          displayPx = cached;
         }
+        if (displayPx > 0) {
+          const isProfitLocked = holdsPosition && displayPx > ownAvgEntry;
+          const isBreakeven = holdsPosition && Math.abs(displayPx - ownAvgEntry) < ownAvgEntry * 0.001;
+          const color = isProfitLocked ? '#22c55e'
+                      : isBreakeven ? '#f59e0b'
+                      : (holdsPosition && displayPx < ownAvgEntry) ? '#f43f5e'
+                      : '';
+          const badge = isProfitLocked ? `<span class="sl-ratchet-badge">↑</span>` : '';
+          const staleNote = (restingPx === 0 || restingPx < cached) && cached > 0
+            ? ' · cached (state syncing)' : '';
+          const stageNote = restingStage ? `stage: ${restingStage}` : 'stage: unknown';
+          stopCell = `<span class="mono" style="${color ? `color:${color};font-weight:600` : ''}" title="ACTUAL exchange stop (${stageNote})${staleNote}">$${fmtPrice(displayPx)} ${badge}</span>`;
+        } else if (holdsPosition) {
+          stopCell = `<span class="mono" style="color:#f43f5e;font-weight:700;background:#7f1d1d;padding:2px 6px;border-radius:3px" title="🚨 UNPROTECTED: you hold this position but there is NO stop-limit sell on Coinbase. Reconciliation watchdog should auto-heal within one cycle.">🚨 NOT PLACED</span>`;
+        }
+      }
+      let ifStoppedCell = '<span class="dim">—</span>';
+      const ownAvg2 = Number(ss.own_avg_entry) || 0;
+      const qty2 = Number(s.qty) || 0;
+      const cfg2 = currentStore?.[tenant]?.[symbol]?.config || {};
+      const sellFee = Number(cfg2.fee_per_fill_sell) || ((Number(cfg2.fee_per_contract_roundtrip) || 0) / 2);
+      let slEff = 0;
+      if (s.stop_loss_enabled && ownAvg2 > 0) {
+        const restingPx2 = Number(ss.resting_stop_px) || 0;
+        const cacheKey2 = `${tenant}:${symbol}:${s.id}`;
+        const cached2 = Number((window.__slDisplayCache || {})[cacheKey2]) || 0;
+        slEff = Math.max(restingPx2, cached2);
+      }
+      let trailEff = 0;
+      const trailModes2 = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
+      if (trailModes2 && ownAvg2 > 0) {
+        const peak2 = Number(ss.trail_high_water_price) || 0;
+        const trailDist2 = Number(s.trail_distance) || 0;
+        if (peak2 > 0 && trailDist2 > 0) trailEff = peak2 - trailDist2;
+      }
+      if (trailEff > 0 && trailEff >= slEff && ownAvg2 > 0 && qty2 > 0) {
+        const trailPnl = (trailEff - ownAvg2) * contractSize * qty2;
+        const projected = realized + trailPnl - sellFee * qty2;
+        ifStoppedCell = `<span class="mono" style="color:#f59e0b;font-weight:600" title="TRAIL EXIT projection — sells at $${fmtPrice(trailEff)} if pullback triggers. Locks in this profit.">🔒 ${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
+      } else if (slEff > 0 && ownAvg2 > 0 && qty2 > 0) {
+        const stopPnl = (slEff - ownAvg2) * contractSize * qty2;
+        const projected = realized + stopPnl - sellFee * qty2;
+        ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${contractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
       }
       let trailCell = '<span class="dim">—</span>';
       const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
@@ -6881,9 +6917,9 @@ function refreshScannerDetailLive() {
         const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
         if (peak > 0 && trailDist > 0) {
           const effectiveStop = peak - trailDist;
-          trailCell = `<span class="mono trail-pill-on" title="Trail engaged — peak $${fmtPrice(peak)}, sells on $${fmtPrice(trailDist)} pullback (effective stop $${fmtPrice(effectiveStop)})">$${fmtPrice(effectiveStop)} <span class="trail-peak-note">$${fmtPrice(peak)}</span></span>`;
+          trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED — peak $${fmtPrice(peak)}. Sells at $${fmtPrice(effectiveStop)} (peak − $${fmtPrice(trailDist)} pullback). Every new high lifts the exit.">EXIT <b>$${fmtPrice(effectiveStop)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
         } else if (armPx > 0) {
-          trailCell = `<span class="mono trail-pill-off" title="Not yet activated — trail arms once price crosses $${fmtPrice(armPx)}">$${fmtPrice(armPx)}</span>`;
+          trailCell = `<span class="mono trail-pill-off" title="Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).">arms at $${fmtPrice(armPx)}</span>`;
         }
       }
       const productHaltReason = state === 'HALTED'
