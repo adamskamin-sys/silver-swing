@@ -4820,8 +4820,37 @@ class SwingTrader:
                                      target_px * 0.02)  # cap 2% of target
         except Exception:
             pass  # fall back to floor formula; never fail-hard here
-        buffer = max(tick * 2.0, target_px * 0.0005, vol_buffer)
-        limit_px = max(0.0, target_px - buffer)
+        # Adam 2026-07-20 §3.5 FIX: stage-aware buffer. Trail stages
+        # (profit-lock intent) MUST NOT sell below own_avg + fees, so the
+        # limit_px buffer stays minimal and gets hard-floored at
+        # break_even. Hard_bottom stages (stop-loss intent) accept a loss,
+        # so wider vol-buffer is correct for fill probability.
+        # Cite: Almgren-Chriss (2000) J.Risk 3:5-39 and Cartea-Jaimungal-
+        # Penalva (2015) ch.4 — limit orders at target-or-better preferred
+        # over market for illiquid + profit-lock; miss is preferable to
+        # filling below target since stop_loss is the accepted-loss backstop.
+        # Also Amihud (2002) J.Fin.Markets 5:31-56 — high-Amihud (illiquid)
+        # assets suffer 2-3× effective spread; wide buffer eats entire edge.
+        # Root cause: MC-17SEP26 sold at $2,688.25 vs $2,695.50 trigger
+        # ($7.25 gap) — vol_buffer of ~$7 dominated on this illiquid
+        # contract and pushed limit_px below break_even.
+        _trail_stages_for_tight_buffer = {
+            "trail", "trail_pre_goal", "trail_floored_at_sell",
+            "trail_floored_at_break_even", "break_even_lock",
+            "profit_lock",
+        }
+        if stage in _trail_stages_for_tight_buffer:
+            # TIGHT buffer only — no vol widening. §3.5 hard floor.
+            buffer = max(tick * 2.0, target_px * 0.0005)
+            limit_px = max(0.0, target_px - buffer)
+            _floor_bp = own_avg + _fee_price + tick
+            if own_avg > 0 and limit_px < _floor_bp:
+                # Never let a trail-stage limit fill below break-even.
+                limit_px = _floor_bp
+        else:
+            # HARD_BOTTOM stages: wide vol-buffer for fill certainty.
+            buffer = max(tick * 2.0, target_px * 0.0005, vol_buffer)
+            limit_px = max(0.0, target_px - buffer)
         # Adam 2026-07-20 Rule #1 (feedback_biggest_rule_dont_lose_take_best):
         # if target_px >= last_price and we're on a TRAIL stage while holding,
         # the trail has been breached — mark dropped below where the trail
@@ -4878,34 +4907,55 @@ class SwingTrader:
                     except Exception:
                         pass
                     return
+                # Adam 2026-07-20 §3.5 FIX: replace market-sell with LIMIT
+                # sell at target_px (or break_even floor, whichever is higher).
+                # Prior market-sell in illiquid products fills at the bid,
+                # which can be far below target — MC-17SEP26 fill at $2,688.25
+                # vs $2,695.50 trigger cost -$4.49 on a supposed-profit-lock.
+                # Cite: Almgren-Chriss (2000) J.Risk 3:5-39; Cartea-Jaimungal-
+                # Penalva (2015) ch.4 — limit orders at target-or-better are
+                # preferred over market for profit-lock exits, especially on
+                # illiquid (Amihud 2002). If the limit doesn't fill, mark
+                # keeps falling, and the sleeve's hard_bottom stop-loss is
+                # the accepted-loss backstop (§3.7 allows only stop_loss to
+                # close red).
+                _floor_bp2 = own_avg + _fee_price + tick
+                _breach_limit_px = float(target_px)
+                if own_avg > 0 and _breach_limit_px < _floor_bp2:
+                    _breach_limit_px = _floor_bp2
                 try:
-                    oid = self.b.place_market("SELL", sleeve_qty)
+                    _breach_limit_px = self._snap_to_tick(_breach_limit_px)
+                except Exception:
+                    pass
+                try:
+                    oid = self.b.place_limit("SELL", sleeve_qty, float(_breach_limit_px))
                     # Track as live_order_id so the standard fill poller
                     # (lines ~440-475) catches FILLED status and calls
                     # _sleeve_on_fill → credits cycle + clears own_avg +
-                    # advances state. Without this, market sell fires on
-                    # Coinbase but sleeve stays WAITING_FOR_SELL with
-                    # own_avg set — ghost.
+                    # advances state.
                     ss.live_order_id = oid
-                    self._record("trail_breach_market_sell",
+                    self._record("trail_breach_limit_sell",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  target_px=float(target_px),
                                  last_price=float(last_price),
+                                 limit_px=float(_breach_limit_px),
+                                 break_even_floor=float(_floor_bp2),
                                  stage=stage, hwm=float(hwm),
                                  trail_distance=float(trail_distance),
                                  qty=int(sleeve_qty), oid=oid,
                                  reason=("mark dropped below trail target; "
-                                         "market-sell enforces the trail decision"),
-                                 severity="critical")
+                                         "LIMIT sell at target (Almgren-Chriss / "
+                                         "Cartea-Jaimungal) — fill at target or "
+                                         "better; miss falls through to stop_loss "
+                                         "as accepted-loss backstop per §3.7"),
+                                 severity="warn")
                 except Exception as _e:
-                    self._record("trail_breach_market_sell_failed",
+                    self._record("trail_breach_limit_sell_failed",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  target_px=float(target_px),
                                  last_price=float(last_price),
                                  stage=stage, error=str(_e),
                                  severity="critical")
-                # ROOT FIX 2026-07-20: persist market-sell tracking so the
-                # standard fill poller sees live_order_id on next tick.
                 try:
                     self._save_state()
                 except Exception:
