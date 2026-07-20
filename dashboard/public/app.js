@@ -7147,8 +7147,14 @@ function updateScannerBuyButton() {
     : Number(scannerDetailContext.price) || 0;
 
   // Read spec off the row (scanner.compute_ranking populates it).
+  // Adam 2026-07-20: SPOT-aware preview. Spot pairs have no contract
+  // multiplier and no margin — full notional leaves the account.
+  // Futures use contract_size × price × margin_rate.
   const ctx = scannerDetailContext;
-  const contractSize = Number(ctx.contract_size) || 50;
+  const productType = String(ctx.product_type || '').toUpperCase();
+  const isSpot = productType === 'SPOT';
+  const unitLabel = isSpot ? 'unit' : 'contract';
+  const contractSize = Number(ctx.contract_size) || (isSpot ? 1 : 50);
   const intradayRate = Number(ctx.intraday_margin_rate) || 0;
   // For a live tenant we can also read the stored margin_per_contract as a
   // fallback if Coinbase didn't return an intraday rate for this product.
@@ -7157,52 +7163,84 @@ function updateScannerBuyButton() {
     : {};
   const storedMarginPer = Number(liveCfg.margin_per_contract) || 0;
   const notional = priceForPreview * contractSize * qty;
-  // Margin required = what actually leaves your account for a futures fill.
-  // Prefer the intraday rate from Coinbase; fall back to stored per-contract.
-  const marginRequired = intradayRate > 0
-    ? notional * intradayRate
-    : (storedMarginPer > 0 ? storedMarginPer * qty : 0);
+  // Cost required — what actually leaves the account:
+  //   FUTURE: notional × margin_rate (initial margin)
+  //   SPOT:   full notional (no margin on spot)
+  let cashRequired;
+  if (isSpot) {
+    cashRequired = notional;
+  } else if (intradayRate > 0) {
+    cashRequired = notional * intradayRate;
+  } else if (storedMarginPer > 0) {
+    cashRequired = storedMarginPer * qty;
+  } else {
+    cashRequired = 0;
+  }
   // Real per-fill fee for THIS product. Scanner attaches fee_per_fill from a
   // live Coinbase preview; tracked-product configs also store the round-trip
   // number. Fall back to silver's $2.34 only if we've genuinely never seen
   // this product before (a stale scanner cache, or bot never previewed it).
   const rowPerFill = Number(ctx.fee_per_fill) || 0;
   const cfgRt = Number(liveCfg.fee_per_contract_roundtrip) || 0;
-  const perFillFee = rowPerFill > 0
-    ? rowPerFill
-    : (cfgRt > 0 ? cfgRt / 2 : 2.34);
-  const feeEst = perFillFee * qty;
-  const feeIsEstimate = !(rowPerFill > 0 || cfgRt > 0);
+  // Spot fees are typically % of notional (Coinbase Advanced Trade ~0.4%
+  // maker, ~0.6% taker at retail tier). Use 0.5% blended if we don't
+  // have live-preview data.
+  const spotFeeRate = 0.005;
+  const perUnitFee = isSpot
+    ? (priceForPreview * contractSize * spotFeeRate)
+    : (rowPerFill > 0 ? rowPerFill : (cfgRt > 0 ? cfgRt / 2 : 2.34));
+  const feeEst = perUnitFee * qty;
+  const feeIsEstimate = isSpot
+    ? true  // spot fees always estimated (no preview endpoint used yet)
+    : !(rowPerFill > 0 || cfgRt > 0);
   const priceLabel = orderType === 'limit'
     ? (limitPrice > 0 ? `at your limit $${limitPrice.toFixed(3)}` : 'at your limit (enter price)')
     : `at market ~$${(Number(scannerDetailContext.price) || 0).toFixed(3)}`;
 
-  const notionalPerCt = priceForPreview * contractSize;
-  const marginPerCt = marginRequired > 0 ? marginRequired / qty : 0;
+  const notionalPerUnit = priceForPreview * contractSize;
+  const costPerUnit = cashRequired > 0 ? cashRequired / qty : 0;
   const fmt = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
-  // Per-contract cost line (Adam asked for "how much one contract would
-  // cost to purchase"). Shows margin/ct if we know it, notional/ct otherwise.
-  const perContractLine = marginPerCt > 0
-    ? `<b>1 contract costs</b> <b style="color:var(--text)">$${fmt(marginPerCt)}</b> margin <span class="dim">(notional $${fmt(notionalPerCt)})</span>`
-    : `<b>1 contract costs</b> <b style="color:var(--text)">$${fmt(notionalPerCt)}</b> notional <span class="dim">(margin unknown for this product)</span>`;
-  const feeSuffix = feeIsEstimate ? ' <span class="dim">(silver-tier estimate)</span>' : '';
-  const totalLine = marginRequired > 0
-    ? `Total margin: <b style="color:var(--text)">$${fmt(marginRequired)}</b> · fee ~$${feeEst.toFixed(2)}${feeSuffix}`
-    : `Total notional: <b style="color:var(--text)">$${fmt(notional)}</b> · fee ~$${feeEst.toFixed(2)}${feeSuffix}`;
+  // Per-unit cost line — Adam 2026-07-20 explicit ask "the total cost
+  // should also be made available before executing so we know what we
+  // are getting into". FUTURE = margin/contract; SPOT = full price × size.
+  let perUnitLine;
+  if (isSpot) {
+    perUnitLine = `<b>1 ${unitLabel} costs</b> <b style="color:var(--text)">$${fmt(notionalPerUnit)}</b> <span class="dim">(spot — full notional, no margin)</span>`;
+  } else {
+    perUnitLine = costPerUnit > 0
+      ? `<b>1 ${unitLabel} costs</b> <b style="color:var(--text)">$${fmt(costPerUnit)}</b> margin <span class="dim">(notional $${fmt(notionalPerUnit)})</span>`
+      : `<b>1 ${unitLabel} costs</b> <b style="color:var(--text)">$${fmt(notionalPerUnit)}</b> notional <span class="dim">(margin unknown for this product)</span>`;
+  }
+  const feeSuffix = feeIsEstimate
+    ? (isSpot ? ' <span class="dim">(0.5% blended estimate)</span>'
+              : ' <span class="dim">(silver-tier estimate)</span>')
+    : '';
+  const totalLabel = isSpot ? 'Total cost' : (cashRequired > 0 ? 'Total margin' : 'Total notional');
+  const totalDisplayed = isSpot ? notional : (cashRequired > 0 ? cashRequired : notional);
+  const totalLine = `${totalLabel}: <b style="color:var(--text)">$${fmt(totalDisplayed)}</b> · fee ~$${feeEst.toFixed(2)}${feeSuffix}`;
+  // Grand total: what you'll pay all-in.
+  const grandTotal = totalDisplayed + feeEst;
+  const grandLine = `<b style="color:var(--text)">All-in you will pay: $${fmt(grandTotal)}</b> for ${qty} ${unitLabel}${qty === 1 ? '' : (isSpot ? 's' : 's')}`;
 
   const previewEl = document.getElementById('scanner-buy-preview');
   if (previewEl) {
     previewEl.innerHTML = `
-      <div>Entering <b style="color:var(--text)">${qty}</b> contract${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
-      <div>${perContractLine}</div>
+      <div>Entering <b style="color:var(--text)">${qty}</b> ${unitLabel}${qty === 1 ? '' : 's'} of <b style="color:var(--text)">${escapeHtml(symbol)}</b> ${priceLabel}</div>
+      <div>${perUnitLine}</div>
       <div>${totalLine}</div>
+      <div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(148,163,184,0.15)">${grandLine}</div>
     `;
   }
 
   scannerBuyBtn.textContent = orderType === 'limit'
-    ? `enter ${mode} LIMIT · ${qty} ${symbol}`
-    : `enter ${mode} MARKET · ${qty} ${symbol}`;
+    ? `enter ${mode} LIMIT · ${qty} ${unitLabel}${qty === 1 ? '' : 's'} ${symbol}`
+    : `enter ${mode} MARKET · ${qty} ${unitLabel}${qty === 1 ? '' : 's'} ${symbol}`;
   scannerBuyBtn.disabled = orderType === 'limit' && !(limitPrice > 0);
+  // Also update the qty input label ("contracts" → "units" for SPOT).
+  const qtyLabelEl = document.querySelector('label[for="scanner-buy-qty"], label:has(#scanner-buy-qty)');
+  if (qtyLabelEl && qtyLabelEl.firstChild && qtyLabelEl.firstChild.nodeType === 3) {
+    qtyLabelEl.firstChild.textContent = `${unitLabel}s `;
+  }
 
   if (mode === 'live') {
     scannerDetailWarning.hidden = false;
