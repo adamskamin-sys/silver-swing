@@ -5396,12 +5396,40 @@ class SwingTrader:
                             "python3 diag_slr_ghost_detector.py --apply "
                             "(or per-product equivalent)."))
                 return
+            # Adam 2026-07-20 BROKER-AUTHORITATIVE PRE-PLACE GUARD: query
+            # Coinbase directly for existing open SELLs on this product. If
+            # sum(existing) + this_qty > pos_qty, sibling stops already cover
+            # the position — placing another would create the excess that
+            # leads to double-fire → SHORT. Sleeve-state check above uses
+            # resting_stop_oid tracking which can drift; this uses Coinbase
+            # truth. Cached 500ms so multi-sleeve-per-tick doesn't hammer API.
+            try:
+                _existing = self._broker_query_open_sells()
+                _existing_qty = sum(int(o.get("size") or 0) for o in _existing)
+                if _existing_qty + sleeve_qty > pos_qty:
+                    self._record(
+                        "resting_stop_placement_refused_broker_authoritative",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        existing_broker_sell_qty=_existing_qty,
+                        this_sleeve_qty=sleeve_qty,
+                        pos_qty=pos_qty,
+                        severity="critical",
+                        reason=("Coinbase already has SELLs covering this "
+                                "position — placing this stop would create "
+                                "excess → §3.8 double-fire SHORT risk. "
+                                "Sibling coverage sufficient; skipping."),
+                    )
+                    return
+            except Exception:
+                pass  # fail-open — proceed to place (sleeve-state check ran)
             try:
                 oid = self.b.place_stop_limit("SELL", sleeve_qty,
                                               float(target_px), float(limit_px))
                 ss.resting_stop_oid = oid
                 ss.resting_stop_px = float(target_px)
                 ss.resting_stop_stage = stage
+                # Invalidate cache — a fresh order just landed on Coinbase
+                self._open_sells_cache = None
                 self._record("resting_stop_placed",
                              sleeve_id=sc.id, sleeve_name=sc.name,
                              stage=stage, target_px=float(target_px),
@@ -7679,6 +7707,135 @@ class SwingTrader:
                 best_wall_px = px
         return best_wall_px
 
+    def _broker_query_open_sells(self, force: bool = False) -> list:
+        """Return list of Coinbase-open SELL orders on this product. Cached
+        500ms per SwingTrader instance to survive multi-sleeve-per-tick calls
+        without hammering the REST API.
+
+        Adam 2026-07-20 BROKER-AUTHORITATIVE fix: sleeve-state resting_stop_
+        oid tracking can drift from Coinbase truth (fill-not-credited race,
+        cross-sleeve state divergence, crash-recovery gaps). This helper is
+        the SOURCE OF TRUTH — anything not on Coinbase's book here does not
+        actually exist as a resting stop.
+
+        Returns a list of dicts, each with keys: order_id, size (int),
+        created_time (iso str). Empty list on any error (fail-open — we
+        prefer to place a fresh stop over leaving position unprotected)."""
+        import time as _t
+        _now = _t.time()
+        _cache = getattr(self, "_open_sells_cache", None)
+        if _cache and (_now - _cache.get("ts", 0)) < 0.5 and not force:
+            return _cache.get("orders", [])
+        try:
+            _resp = self.b.client.list_orders(
+                product_id=self.symbol, order_status="OPEN", limit=100
+            )
+            _raw = (_resp.to_dict() if hasattr(_resp, "to_dict")
+                    else (_resp if isinstance(_resp, dict) else {}))
+            _orders = []
+            for _o in (_raw.get("orders") or []):
+                if str(_o.get("side") or "").upper() != "SELL":
+                    continue
+                # Extract qty from order_configuration
+                _cfg = _o.get("order_configuration") or {}
+                _qty = 0
+                for _v in (_cfg.values() if isinstance(_cfg, dict) else []):
+                    if isinstance(_v, dict):
+                        _q_raw = (_v.get("base_size") or _v.get("size")
+                                  or _v.get("quote_size") or 0)
+                        try:
+                            _qty = int(float(_q_raw))
+                            if _qty > 0:
+                                break
+                        except (TypeError, ValueError):
+                            pass
+                if _qty <= 0:
+                    _qty = 1  # conservative fallback
+                _orders.append({
+                    "order_id": _o.get("order_id"),
+                    "size": _qty,
+                    "created_time": _o.get("created_time"),
+                })
+        except Exception as _e:
+            # Fail-open: return empty so caller treats "no known excess" and
+            # falls back to sleeve-state-based checks. Log so the drift is
+            # visible instead of swallowed.
+            try:
+                self._record("broker_open_sells_query_failed",
+                             error=str(_e), severity="warn",
+                             reason=("broker-authoritative check unavailable "
+                                     "this tick; falling back to sleeve state"))
+            except Exception:
+                pass
+            _orders = []
+        self._open_sells_cache = {"ts": _now, "orders": _orders}
+        return _orders
+
+    def _broker_cancel_excess_sells(self, current_pos_qty: int,
+                                      reason: str) -> int:
+        """Query broker for open SELLs on this product; if sum(sizes) exceeds
+        current_pos_qty, cancel the NEWEST excess first (keeps the oldest
+        stop which was likely placed against the earliest legitimate holder).
+
+        Returns count of orders cancelled. Invalidates the cache on cancel."""
+        _open = self._broker_query_open_sells(force=True)
+        if not _open:
+            return 0
+        _total = sum(int(o.get("size") or 0) for o in _open)
+        if _total <= current_pos_qty:
+            return 0
+        # Sort NEWEST FIRST so we cancel most-recently placed excess
+        _by_time = sorted(_open, key=lambda o: str(o.get("created_time") or ""),
+                          reverse=True)
+        _excess = _total - current_pos_qty
+        _cancelled = 0
+        for _o in _by_time:
+            if _excess <= 0:
+                break
+            _sz = int(_o.get("size") or 0)
+            _oid = _o.get("order_id")
+            if not _oid or _sz <= 0:
+                continue
+            try:
+                self.b.cancel(_oid)
+                _cancelled += 1
+                _excess -= _sz
+                # Clear ANY sleeve-state tracking pointing at this oid so
+                # we don't leave dangling resting_stop_oid references.
+                for _sid, _ss in (self.s.sleeves or {}).items():
+                    if getattr(_ss, "resting_stop_oid", None) == _oid:
+                        _ss.resting_stop_oid = None
+                        _ss.resting_stop_px = None
+                        _ss.resting_stop_stage = None
+                self._record(
+                    "broker_excess_sell_cancelled",
+                    oid=_oid, size=_sz, pos_qty=current_pos_qty,
+                    total_open_sells_before=_total,
+                    severity="critical",
+                    trigger_reason=reason,
+                    reason=("broker-authoritative check found sum(open "
+                            "SELLs) > pos_qty. Cancelled newest excess "
+                            "to prevent §3.8 double-fire → SHORT. This "
+                            "runs regardless of sleeve-state drift."),
+                )
+            except Exception as _e:
+                self._record(
+                    "broker_excess_sell_cancel_failed",
+                    oid=_oid, size=_sz, error=str(_e),
+                    severity="critical",
+                    reason=("cancel raised — excess sell remains on "
+                            "Coinbase, short risk still open. Will retry "
+                            "on next hook fire."),
+                )
+        if _cancelled > 0:
+            # Invalidate cache so next check re-queries
+            self._open_sells_cache = None
+            try:
+                self._save_state()
+            except Exception:
+                pass
+        return _cancelled
+
     def _maybe_calibrate_fee_from_fill(self, order_id: Optional[str],
                                         contract_qty: int) -> None:
         """Sample the actual fee from a just-filled order and, once we have
@@ -7769,6 +7926,24 @@ class SwingTrader:
         # ETH PERP, 4× on OIL/XLM/HYPE — clamps sell_px too high → take-profit
         # rarely fires → cycles close via stop_loss → guaranteed losses).
         self._maybe_calibrate_fee_from_fill(filled_order_id, sc.qty)
+        # Adam 2026-07-20 BROKER-AUTHORITATIVE POST-FILL SWEEP: every fill
+        # changes broker position. Immediately re-check whether the current
+        # open SELLs on Coinbase now exceed the (post-fill) position and
+        # cancel any excess. Runs SYNCHRONOUSLY here, not deferred to next
+        # tick — closes the "sibling sleeve's stale stop fires before excess-
+        # cancel tick runs" race that caused today's 3 SHORTs (MC/HYF/OND).
+        try:
+            _pos_after = int(self.b.position_qty() or 0)
+            if _pos_after >= 0:
+                self._broker_cancel_excess_sells(
+                    _pos_after, reason="post_fill_sweep"
+                )
+        except Exception as _e:
+            try:
+                self._record("post_fill_sweep_error",
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
         half_fee = (self.cfg.fee_per_contract_roundtrip / 2.0) * sc.qty
         if ss.state == SleeveStateEnum.ARMED_SELL:
             # Sell fill = profit realization. Anchor on the actual FIFO cost
