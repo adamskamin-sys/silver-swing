@@ -29,11 +29,12 @@ from typing import Optional
 
 
 LEDGER_SYMBOL = "__retirement_ledger__"
-# 5 min — beats every fast-race scenario (bot tick every ~1s, scanner every
-# 30s), short enough Adam can wait it out. Longer durations available via
-# the --cooldown-hours flag on diag_retire_sleeves. Clear immediately with
-# diag_clear_retirement.py PRODUCT_ID --apply.
-DEFAULT_COOLDOWN_HOURS = 5.0 / 60.0
+# 15 min — matches SWING_EVICT_COOLDOWN_SECS (900 s). A retired product must
+# not become re-armable before the eviction window closes, or a failed track
+# can ghost-respawn via the scanner before its penalty expires. Longer
+# durations available via --cooldown-hours on diag_retire_sleeves. Clear
+# immediately with diag_clear_retirement.py PRODUCT_ID --apply.
+DEFAULT_COOLDOWN_HOURS = 15.0 / 60.0
 
 
 def _load(store, tenant: str) -> dict:
