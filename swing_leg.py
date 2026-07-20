@@ -5137,6 +5137,46 @@ class SwingTrader:
             return
         # Fresh place — no existing resting order.
         if not ss.resting_stop_oid:
+            # Adam 2026-07-20 GHOST-SHORT GUARD: multi-sleeve mutual
+            # exclusion. Sum up qty of stop-limits ALREADY placed by
+            # sibling sleeves on this same product. If placing this
+            # sleeve's stop would push the total resting-SELL qty above
+            # actual position, THIS sleeve is a ghost (its own_avg is
+            # set but it doesn't actually own a slice). Placing the stop
+            # would create a §3.8 short-risk: both stops trigger → 2
+            # sells against 1 real contract → SHORT.
+            #
+            # broker.place_stop_limit uses include_pending=False in
+            # _no_short_check (rationale: avoids ratchet cancel-then-
+            # place false positives). That's correct for the ratchet
+            # case but leaves the multi-sleeve ghost gap open. Close it
+            # here at the swing_leg layer, where we have per-sleeve
+            # context.
+            _sibling_stop_qty = 0
+            for _other_sid, _other_ss in (self.s.sleeves or {}).items():
+                if _other_sid == sc.id:
+                    continue
+                if getattr(_other_ss, "resting_stop_oid", None):
+                    _other_sc = self._sleeve_cfg_by_id(_other_sid) if hasattr(
+                        self, "_sleeve_cfg_by_id") else None
+                    _oq = int(getattr(_other_sc, "qty", 1) if _other_sc
+                              else int(getattr(_other_ss, "qty", 1) or 1))
+                    _sibling_stop_qty += _oq
+            if _sibling_stop_qty + sleeve_qty > pos_qty:
+                self._record(
+                    "resting_stop_placement_refused_multi_sleeve",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    sibling_stop_qty=_sibling_stop_qty,
+                    this_sleeve_qty=sleeve_qty,
+                    actual_position=pos_qty,
+                    severity="critical",
+                    reason=("placing this stop would push total resting SELL "
+                            "qty above actual position — this sleeve is a "
+                            "ghost (own_avg set but no real slice). Refusing "
+                            "to prevent §3.8 short-risk. Ghost cleanup needed: "
+                            "python3 diag_slr_ghost_detector.py --apply "
+                            "(or per-product equivalent)."))
+                return
             try:
                 oid = self.b.place_stop_limit("SELL", sleeve_qty,
                                               float(target_px), float(limit_px))
