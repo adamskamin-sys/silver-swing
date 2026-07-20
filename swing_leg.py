@@ -4708,58 +4708,12 @@ class SwingTrader:
         except Exception:
             pos_qty = 0
         sleeve_qty = int(getattr(sc, "qty", 1) or 1)
-        # Adam 2026-07-20 §3.6 AUTO-HEAL missing stop_loss_px: if stop_loss is
-        # enabled on the sleeve config but stop_loss_px is 0 (user toggled ON
-        # but no price provided, or preset shipped enabled=true+px=0), fill
-        # the gap with broker_avg × 0.98 (2% default matching server-side
-        # enforcement at dashboard/server.js:733). Prevents "STOP LOSS: NOT
-        # PLACED" chip on held sleeves — no need for user to re-arm.
-        try:
-            _sl_enabled = bool(getattr(sc, "stop_loss_enabled", False))
-            _sl_px = float(getattr(sc, "stop_loss_px", 0) or 0)
-            if (_sl_enabled and _sl_px <= 0 and pos_qty > 0
-                    and ss.state == SleeveStateEnum.ARMED_SELL):
-                _own_avg = float(getattr(ss, "own_avg_entry", 0) or 0)
-                if _own_avg <= 0:
-                    try:
-                        _own_avg = float(self.b.position.avg_entry or 0)
-                    except Exception:
-                        _own_avg = 0.0
-                if _own_avg > 0:
-                    _default_stop = round(_own_avg * 0.98, 6)
-                    _tick = float(getattr(self.cfg, "tick_size", 0) or 0)
-                    if _tick > 0:
-                        _default_stop = round(_default_stop / _tick) * _tick
-                    sc.stop_loss_px = _default_stop
-                    # Persist to store so restart preserves it
-                    try:
-                        cfg_dict = (self.store.get_config(self.tenant_id,
-                                                          self.symbol) or {})
-                        sleeves = list(cfg_dict.get("sleeves") or [])
-                        for s in sleeves:
-                            if s.get("id") == sc.id:
-                                s["stop_loss_px"] = _default_stop
-                                s["_stop_loss_auto_healed_by_bot"] = True
-                                break
-                        cfg_dict["sleeves"] = sleeves
-                        self.store.put_config(self.tenant_id, self.symbol,
-                                              cfg_dict)
-                    except Exception:
-                        pass
-                    self._record(
-                        "sleeve_stop_loss_px_auto_healed",
-                        sleeve_id=sc.id, sleeve_name=sc.name,
-                        own_avg=_own_avg,
-                        new_stop_loss_px=_default_stop,
-                        severity="warn",
-                        reason=("stop_loss_enabled=true but stop_loss_px=0 "
-                                "on held ARMED_SELL sleeve — §3.6 violation. "
-                                "Auto-set to own_avg × 0.98 (2%) so bot's "
-                                "_maintain_resting_stop has a target. Same "
-                                "default as dashboard server-side seed."),
-                    )
-        except Exception:
-            pass  # heal is best-effort; never block trading
+        # Adam 2026-07-20: NO hardcoded default for stop_loss_px. Per
+        # feedback_experts_all_algo_params, every algorithmic parameter comes
+        # from expert consensus (§3.15). The expert-consulted fallback at
+        # line ~5091 already handles the case where stop_loss_enabled=true +
+        # stop_loss_px=0 — computes protective stop via expert_stop
+        # (Wilder/CJP/Kyle/Menkveld/Van Tharp). No hardcoded fraction needed.
         # Adam 2026-07-20 §3.8 EXCESS-STOP CANCEL: XLP double-fire → SHORT
         # incident. Prior guard at "fresh place" only REFUSED new stops when
         # sum(sibling stops) + this_qty > pos_qty. But if position shrinks

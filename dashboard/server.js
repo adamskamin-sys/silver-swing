@@ -607,11 +607,16 @@ export function makeApp({
           issues.push({ field: `${s.id}.scale_up_buffer_mult`, message: 'scale_up_buffer_mult must be >= 1.0' });
       }
       // Per-sleeve stop-loss validation. Only enforced when enabled.
+      // Adam 2026-07-20: px=0 is allowed — signals "let experts decide."
+      // Bot's _maintain_resting_stop expert fallback (swing_leg.py:~5091)
+      // computes the value via expert_stop consensus on first tick.
+      // Per feedback_experts_all_algo_params, no hardcoded defaults.
       if (s.stop_loss_enabled) {
         const stopPx = Number(s.stop_loss_px);
-        if (!Number.isFinite(stopPx) || stopPx <= 0)
-          issues.push({ field: `${s.id}.stop_loss_px`, message: 'stop_loss_px must be > 0' });
-        else if (Number.isFinite(buy) && stopPx >= buy)
+        // Only reject NEGATIVE or NaN — 0 means "consult experts."
+        if (!Number.isFinite(stopPx) || stopPx < 0)
+          issues.push({ field: `${s.id}.stop_loss_px`, message: 'stop_loss_px must be >= 0 (0 = experts decide)' });
+        else if (stopPx > 0 && Number.isFinite(buy) && stopPx >= buy)
           issues.push({ field: `${s.id}.stop_loss_px`, message: `stop_loss_px (${stopPx}) must be < buy_px (${buy}); otherwise it fires as soon as you're armed` });
         const mode = String(s.stop_loss_qty_mode || 'all').toLowerCase();
         if (!['all', 'original', 'custom'].includes(mode))
@@ -734,19 +739,18 @@ export function makeApp({
         for (const s of sleeves) {
           const _isNew = !s.id || !_existingSleeves[s.id];
           if (!_isNew) continue;
-          // Adam 2026-07-20: was ONLY setting default when enabled===false.
-          // But if user toggles stop_loss ON manually with no price, we hit
-          // enabled=true + px=0 → validation error OR silent §3.6 hole.
-          // Now: any brand-new sleeve on a held long gets a default stop_loss_px
-          // if it's missing/zero, regardless of the enabled toggle. Enabled
-          // flips true only if it was false — preserves user's explicit toggle.
-          const _pxMissing = !Number.isFinite(Number(s.stop_loss_px)) || Number(s.stop_loss_px) <= 0;
-          if (s.stop_loss_enabled === false || _pxMissing) {
-            if (s.stop_loss_enabled === false) s.stop_loss_enabled = true;
-            const _defaultStop = Number((_brokerAvgS * 0.98).toFixed(6));
-            if (_pxMissing) {
-              s.stop_loss_px = _defaultStop;
-            }
+          // Adam 2026-07-20: NO hardcoded percentage defaults. Per
+          // feedback_experts_all_algo_params, every algorithmic parameter
+          // comes from expert consensus — including stop_loss_px. If
+          // stop_loss_enabled is true but no price is provided, we ENABLE
+          // the flag and leave px=0. The bot's _maintain_resting_stop has
+          // an expert-consulted fallback (swing_leg.py:~5091, uses
+          // expert_stop.optimal_stop_distance with Wilder/CJP/Kyle/Menkveld/
+          // Van Tharp) that computes the correct value on first tick.
+          // Ensures §3.6 (never leave held position unprotected) without
+          // violating §3.15 (experts decide every algo param).
+          if (s.stop_loss_enabled === false) {
+            s.stop_loss_enabled = true;
             s._stop_loss_auto_enabled_at_seed = true;
           }
         }
