@@ -26,6 +26,7 @@ so a chart re-open within a minute doesn't re-hit Coinbase.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -294,6 +295,43 @@ def _handle_scanner_order_job(r, job_id: str) -> None:
 
     elapsed = time.time() - started
     result["_elapsed_secs"] = round(elapsed, 2)
+    # Adam 2026-07-20 VISIBILITY: emit a trade-log event for EVERY scanner
+    # order attempt (success + failure) so the dashboard's Recent Events
+    # panel surfaces both what worked and what Coinbase rejected. Prior
+    # behavior swallowed errors into a job-response dict that only reached
+    # the transient toast; if Adam didn't catch the toast, the failure
+    # was invisible. Now every attempt lives in the trade log.
+    try:
+        from safety import make_trade_log
+        log = make_trade_log(os.getenv("SWING_DATA_DIR", "data"))
+        if result.get("ok"):
+            log.record(
+                "scanner_order_placed",
+                symbol=product_id, product_id=product_id,
+                side=side, qty=qty, mode=mode,
+                order_type=order_type, limit_price=limit_price,
+                order_id=result.get("order_id"),
+                elapsed_secs=result.get("_elapsed_secs"),
+                severity="info",
+            )
+        else:
+            log.record(
+                "scanner_order_failed",
+                symbol=product_id, product_id=product_id,
+                side=side, qty=qty, mode=mode,
+                order_type=order_type, limit_price=limit_price,
+                error=result.get("error"),
+                elapsed_secs=result.get("_elapsed_secs"),
+                severity="critical",
+                reason=("Coinbase rejected the scanner order. See error field "
+                        "for the exact broker response — often 'INVALID_ORDER_"
+                        "CONFIGURATION' means base_size vs quote_size mismatch "
+                        "(spot BUY needs quote_size), 'MIN_ORDER_SIZE' means "
+                        "notional below the product minimum, 'INSUFFICIENT_"
+                        "FUND' is self-explanatory."),
+            )
+    except Exception:
+        pass  # never let logging failure break the response
     r.set(res_key, json.dumps(result), ex=_RESULT_TTL_SECS)
     r.delete(req_key)
     _log(f"scanner_order {job_id}: done in {elapsed:.1f}s ok={result.get('ok')}")
