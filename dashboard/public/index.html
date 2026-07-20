@@ -52,7 +52,7 @@
             <table id="scanner-table-crypto" class="scanner-table">
               <thead>
                 <tr>
-                  <th>#</th><th>Product</th><th>Price</th><th title="Capital per contract — FUTURE: intraday_margin × price × contract_size (initial margin required). SPOT: price × contract_size (full notional).">Cost / contract</th><th>Tier</th><th>Gate</th><th>Best Spread</th><th title="Expert forward-looking $/day (Yang-Zhang vol × expected cycles × liquidity/regime gates)">Expert $/day</th><th>Cycles</th><th>24h Volume</th><th></th>
+                  <th>#</th><th>Product</th><th>Price</th><th title="Capital per contract/unit — FUTURE: intraday_margin × price × contract_size (initial margin). SPOT: full unit price (no margin).">Cost / unit</th><th title="Liquidity tier: liquid = tight spread / cheap ratchet; illiquid = wider fees, tier drives ratchet cadence + fee floor.">Tier</th><th title="Experts SAY (arm-gate consensus): ✓ GO = market conditions favor entry now; ✗ WAIT = supermajority of experts (Kaufman/Wilder-ADX/CJP-OFI/Kyle/Connors/Bollinger) voted against. Advisory — you can still Buy.">Gate</th><th title="Expert-recommended tick-snapped spread between buy and sell (Yang-Zhang forward-looking).">Best Spread</th><th title="Expert forward-looking $/day (Yang-Zhang vol × expected cycles × liquidity/regime gates)">Expert $/day</th><th title="Expected round-trip cycles per day at the recommended spread">Cycles/day</th><th>24h Volume</th><th></th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -64,7 +64,7 @@
             <table id="scanner-table-derivative" class="scanner-table">
               <thead>
                 <tr>
-                  <th>#</th><th>Product</th><th>Price</th><th title="Capital per contract — FUTURE: intraday_margin × price × contract_size (initial margin required). SPOT: price × contract_size (full notional).">Cost / contract</th><th>Tier</th><th>Gate</th><th>Best Spread</th><th title="Expert forward-looking $/day (Yang-Zhang vol × expected cycles × liquidity/regime gates)">Expert $/day</th><th>Cycles</th><th>24h Volume</th><th></th>
+                  <th>#</th><th>Product</th><th>Price</th><th title="Capital per contract/unit — FUTURE: intraday_margin × price × contract_size (initial margin). SPOT: full unit price (no margin).">Cost / unit</th><th title="Liquidity tier: liquid = tight spread / cheap ratchet; illiquid = wider fees, tier drives ratchet cadence + fee floor.">Tier</th><th title="Experts SAY (arm-gate consensus): ✓ GO = market conditions favor entry now; ✗ WAIT = supermajority of experts (Kaufman/Wilder-ADX/CJP-OFI/Kyle/Connors/Bollinger) voted against. Advisory — you can still Buy.">Gate</th><th title="Expert-recommended tick-snapped spread between buy and sell (Yang-Zhang forward-looking).">Best Spread</th><th title="Expert forward-looking $/day (Yang-Zhang vol × expected cycles × liquidity/regime gates)">Expert $/day</th><th title="Expected round-trip cycles per day at the recommended spread">Cycles/day</th><th>24h Volume</th><th></th>
                 </tr>
               </thead>
               <tbody></tbody>

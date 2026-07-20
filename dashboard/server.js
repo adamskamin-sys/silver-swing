@@ -968,8 +968,20 @@ export function makeApp({
     const s = String(side || '').toUpperCase();
     if (!['BUY', 'SELL'].includes(s)) return res.status(400).json({ ok: false, error: 'side must be BUY or SELL' });
     const q = Number(qty);
-    if (!Number.isFinite(q) || q < 1 || q > 100 || q !== Math.floor(q)) {
-      return res.status(400).json({ ok: false, error: 'qty must be a whole number 1-100' });
+    // Adam 2026-07-20: qty cap dispatches by product surface. Futures
+    // (product_id ending in -CDE or containing -PERP-) cap at 100 contracts
+    // — real-money guardrail. Spot lifts to 1M units so penny-priced tokens
+    // (HIGH-USD $0.02, PEPE etc.) can be ordered in reasonable quantities.
+    // Client (app.js clampQty / qtyMaxFor) enforces the same limit; both
+    // must stay in sync.
+    const pid = String(product_id);
+    const isFutures = pid.endsWith('-CDE') || pid.includes('-PERP-');
+    const qtyCap = isFutures ? 100 : 1_000_000;
+    if (!Number.isFinite(q) || q < 1 || q > qtyCap || q !== Math.floor(q)) {
+      return res.status(400).json({
+        ok: false,
+        error: `qty must be a whole number 1-${qtyCap.toLocaleString('en-US')} (${isFutures ? 'futures cap' : 'spot cap'})`,
+      });
     }
     const m = String(mode || 'paper').toLowerCase();
     if (!['paper', 'live', 'lab'].includes(m)) return res.status(400).json({ ok: false, error: 'mode must be paper, lab, or live' });

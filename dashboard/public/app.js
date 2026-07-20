@@ -248,6 +248,23 @@ function fmtNum(n, decimals = 2) {
   return Number.isNaN(v) ? '—' : v.toFixed(decimals);
 }
 
+// Adam 2026-07-20: qty cap dispatches on product type. Futures caps at 100
+// contracts (real-money guardrail — each contract is a meaningful $ amount).
+// Spot caps at 1,000,000 units so penny-priced tokens (HIGH at $0.02, PEPE
+// at $0.00001) can be ordered in reasonable quantities. Server enforces the
+// same limit; both must stay in sync.
+const QTY_MAX_FUTURE = 100;
+const QTY_MAX_SPOT = 1_000_000;
+function qtyMaxFor(row) {
+  const t = String(row?.product_type || '').toUpperCase();
+  return t === 'FUTURE' ? QTY_MAX_FUTURE : QTY_MAX_SPOT;
+}
+function clampQty(raw, row) {
+  const cap = qtyMaxFor(row);
+  const n = parseInt(raw || '1', 10) || 1;
+  return Math.max(1, Math.min(cap, n));
+}
+
 // Pick a sensible decimal precision for a product's price. Micro-priced perps
 // (PEPE at $0.00001) need 6-8 decimals; silver at $60 only needs 3. Prefers
 // the product's tick_size when present in config; otherwise infers from
@@ -1074,6 +1091,14 @@ function sleeveOnlyUnrealized(tenant, product, mark, coinbasePnl, positionQty, p
   const sleeveStates = (block.state || {}).sleeves || {};
   const posQty = Number(positionQty) || 0;
   const posAvg = Number(positionAvg) || 0;
+  // Adam 2026-07-20 GHOST-SUPPRESS: if actual Coinbase position is 0, no
+  // sleeve can legitimately hold contracts. Prior code walked the else
+  // branch (mark − basis × contract_size) and computed non-zero unrealized
+  // from a stale sleeve state that still had own_avg_entry set — SLVR
+  // showed "+$18.25 unrealized" after Adam manually closed the position.
+  // Fake positive PnL on 0 contracts. Return null; caller falls back to
+  // r.pnl (=0 for WAITING rows), producing the correct $0 display.
+  if (posQty <= 0) return null;
   const cbPnl = Number(coinbasePnl);
   const cbPnlValid = Number.isFinite(cbPnl) && posQty > 0;
   const AVG_TOL = 0.005;
@@ -3269,6 +3294,32 @@ function renderScannerClassTable(tableId, rows) {
     tbody.appendChild(tr);
     return;
   }
+  // Adam 2026-07-20 READABILITY: collapse USD / USDC duplicates.
+  // Coinbase lists many spot assets as both BASE-USD and BASE-USDC — same
+  // asset, different quote-currency wrapper (USDC is a fungible 1:1 stable).
+  // The scanner returned 11 crypto rows with 5 pairs of exact duplicates
+  // (ALICE, PRIME, HIGH, G, FIS) — noise. Keep the first-seen row, stash
+  // the alternate quote currencies as .alt_quotes for the detail modal.
+  const seen = new Map();  // baseCurrency → first row
+  const deduped = [];
+  for (const r of rows) {
+    const pid = String(r.product_id || '');
+    // "ALICE-USDC" → base "ALICE"; "XLM-31JUL26-CDE" → keep as-is
+    const parts = pid.split('-');
+    const isSpot = parts.length === 2 && ['USD', 'USDC', 'EUR', 'GBP'].includes(parts[1]);
+    const base = isSpot ? parts[0] : pid;
+    if (isSpot && seen.has(base)) {
+      const prior = seen.get(base);
+      prior.alt_quotes = prior.alt_quotes || [];
+      prior.alt_quotes.push(parts[1]);
+      continue;
+    }
+    if (isSpot) {
+      r._primary_quote = parts[1];
+      seen.set(base, r);
+    }
+    deduped.push(r);
+  }
   const tierPill = (tier) => {
     if (!tier) return '<span class="dim">—</span>';
     const cls = {
@@ -3277,14 +3328,16 @@ function renderScannerClassTable(tableId, rows) {
       illiquid: 'neg',
       very_illiquid: 'neg',
     }[tier] || '';
-    return `<span class="${cls}" title="expert_liquidity tier — determines ratchet cadence + exit style">${tier}</span>`;
+    const label = tier.replace('_', ' ');
+    return `<span class="${cls}" title="Liquidity tier from Amihud + Kyle + effective spread. Drives ratchet cadence + fee floor.">${label}</span>`;
   };
   const gatePill = (allow) => {
     if (allow === undefined || allow === null) return '<span class="dim">—</span>';
     return allow
-      ? '<span class="pos" title="expert_arm_gate: regime OK for entry">✓ allow</span>'
-      : '<span class="neg" title="expert_arm_gate: regime BLOCKED — supermajority voted deny">✗ deny</span>';
+      ? '<span class="pos" title="Experts say GO — arm-gate supermajority (Kaufman regime, Wilder ADX, CJP OFI, Kyle λ, Connors, Bollinger) says market conditions favor a swing entry right now.">✓ GO</span>'
+      : '<span class="neg" title="Experts say WAIT — arm-gate supermajority voted against entry (regime unfavorable, low signal, adverse order flow, or squeezed volatility). You CAN still Buy — this is advisory, not a lock.">✗ WAIT</span>';
   };
+  rows = deduped;
   rows.forEach((row, i) => {
     const tr = document.createElement('tr');
     tr.className = 'scanner-row';
@@ -3309,16 +3362,24 @@ function renderScannerClassTable(tableId, rows) {
     const cyclesLive = cycles > 0
       ? `<span title="Completed round-trips across all tenants"><b>${cycles}</b></span>`
       : '<span class="dim">0</span>';
-    // Cost per contract — capital tied up by ONE contract. Backend computes:
+    // Cost per contract/unit — capital tied up by ONE unit. Backend computes:
     //   FUTURE: intraday_margin × price × contract_size
-    //   SPOT:   price × contract_size (no margin)
+    //   SPOT:   price × contract_size (no margin) — for spot contract_size=1
+    // Adam 2026-07-20: was rendering as "$$0.15" — fmtMoney already returns
+    // "$0.15" so the leading $ was doubling. Drop the extra $.
     const costPerContract = Number(row.cost_per_contract) || 0;
+    const isFuture = row.product_type === 'FUTURE';
+    const unitLabel = isFuture ? 'contract' : 'unit';
     const costCell = costPerContract > 0
-      ? `<span title="Capital required to hold ONE contract. ${row.product_type === 'FUTURE' ? 'Initial margin (intraday_rate × price × contract_size)' : 'Full notional (price × contract_size, spot has no margin)'}. Contract size: ${row.contract_size || 1}">$${fmtMoney(costPerContract)}</span>`
+      ? `<span title="Capital required to hold ONE ${unitLabel}. ${isFuture ? 'Initial margin (intraday_rate × price × contract_size)' : 'Full notional (price × 1, spot has no margin)'}. Contract size: ${row.contract_size || 1}">${fmtMoney(costPerContract)}</span>`
       : '<span class="dim">—</span>';
+    // Product cell: show base pretty; add USD/USDC alt-quote badge if deduped
+    const displayPid = row.alt_quotes && row.alt_quotes.length
+      ? `${escapeHtml(row.product_id)} <span class="dim" style="font-size:0.85em" title="Also available as: ${row.alt_quotes.map(q => `${row.product_id.split('-')[0]}-${q}`).join(', ')}">+${row.alt_quotes.join('/')}</span>`
+      : escapeHtml(row.product_id);
     tr.innerHTML = `
       <td>${i + 1}</td>
-      <td class="mono">${escapeHtml(row.product_id)}</td>
+      <td class="mono">${displayPid}</td>
       <td class="mono">$${fmtNum(row.price, 4)}</td>
       <td class="mono">${costCell}</td>
       <td class="mono">${tierPill(row.liquidity_tier)}</td>
@@ -6396,7 +6457,7 @@ async function armScannerAsSleeve() {
   const tenant = tenantForMode(mode);
   if (!tenant) { showToast(`no tenant configured for ${mode} mode`, 'error'); return; }
   const symbol = row.product_id;
-  const qty = Math.max(1, Math.min(100, parseInt(document.getElementById('scanner-buy-qty')?.value || '1', 10) || 1));
+  const qty = clampQty(document.getElementById('scanner-buy-qty')?.value, row);
 
   const existing = (currentStore[tenant]?.[symbol]?.config?.sleeves || []).slice();
   const id = `scan-${Date.now().toString(36)}`;
@@ -7148,7 +7209,7 @@ function updateScannerBuyButton() {
   const orderType = selectedScannerOrderType();
   const side = selectedScannerSide();
   const qtyInput = document.getElementById('scanner-buy-qty');
-  const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
+  const qty = clampQty(qtyInput?.value, scannerDetailContext);
   const limitPrice = Number(document.getElementById('scanner-limit-price')?.value) || 0;
   const priceForPreview = orderType === 'limit' && limitPrice > 0
     ? limitPrice
@@ -7249,6 +7310,10 @@ function updateScannerBuyButton() {
   if (qtyLabelEl && qtyLabelEl.firstChild && qtyLabelEl.firstChild.nodeType === 3) {
     qtyLabelEl.firstChild.textContent = `${unitLabel}s `;
   }
+  // Adam 2026-07-20: cap dispatches by product_type. Futures stays at 100
+  // (real-money guardrail); SPOT lifts to 1M so penny-priced tokens
+  // (HIGH-USD $0.02, PEPE, etc.) can be sized reasonably.
+  if (qtyInput) qtyInput.max = String(qtyMaxFor(scannerDetailContext));
 
   if (mode === 'live') {
     scannerDetailWarning.hidden = false;
@@ -7302,7 +7367,7 @@ scannerBuyBtn.addEventListener('click', async () => {
   const orderType = selectedScannerOrderType();
   const side = selectedScannerSide();
   const qtyInput = document.getElementById('scanner-buy-qty');
-  const qty = Math.max(1, Math.min(100, parseInt(qtyInput?.value || '1', 10) || 1));
+  const qty = clampQty(qtyInput?.value, scannerDetailContext);
   const limitPrice = Number(document.getElementById('scanner-limit-price')?.value) || 0;
   if (orderType === 'limit' && !(limitPrice > 0)) {
     showToast('enter a limit price above 0', 'error');
