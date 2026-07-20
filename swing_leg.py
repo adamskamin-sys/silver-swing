@@ -4607,13 +4607,30 @@ class SwingTrader:
                             position_age_secs=_age,
                         )
                         if _dec is not None and _dec.trail_distance > 0:
+                            # Adam 2026-07-20 ROOT FIX (Rule #1 take profit):
+                            # cap expert trail_distance at the sleeve's
+                            # config value. Expert may only TIGHTEN (protect
+                            # more profit); never WIDEN (give more back).
+                            # Prior code let expert widen from config $7 →
+                            # expert $35, so the actual exchange stop sat
+                            # much lower than the dashboard TRAIL column
+                            # suggested (which uses config). Bot rode down
+                            # $28 more before firing. Take-profit exits fired
+                            # far below where the config trail said they would.
+                            _expert_td = float(_dec.trail_distance)
+                            _config_td = float(trail_distance)  # still the config value here
+                            _final_td = (min(_expert_td, _config_td)
+                                          if _config_td > 0 else _expert_td)
+                            _capped = _final_td < _expert_td
                             self._record(
                                 "expert_trail_applied",
                                 sleeve_id=sc.id, sleeve_name=sc.name,
                                 method=_dec.method,
                                 citation=_dec.citation,
-                                legacy_trail_distance=round(trail_distance, 6),
-                                expert_trail_distance=_dec.trail_distance,
+                                legacy_trail_distance=round(_config_td, 6),
+                                expert_trail_distance=_expert_td,
+                                final_trail_distance=_final_td,
+                                capped_by_config=_capped,
                                 candidates=_dec.candidates,
                                 consensus=_dec.consensus,
                                 fee_floor=_dec.fee_floor,
@@ -4623,7 +4640,7 @@ class SwingTrader:
                                 age_tightener_factor=_dec.age_tightener_factor,
                                 position_age_secs=round(_age, 1),
                             )
-                            trail_distance = _dec.trail_distance
+                            trail_distance = _final_td
             except Exception as _e:
                 try:
                     self._record("expert_trail_error",
