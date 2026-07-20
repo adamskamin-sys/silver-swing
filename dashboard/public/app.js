@@ -3229,6 +3229,90 @@ async function triggerScannerRefresh() {
   }
 }
 
+// Adam 2026-07-20 §3.15 scanner-class panel renderer. Renders a single
+// class list (crypto or derivative), pre-sorted by expert_adjusted_score,
+// with columns tuned for expert visibility: Tier (liquidity), Gate (arm
+// gate allow), Best Spread, Expert $/day (forward-looking Yang-Zhang
+// forecast × liquidity/regime multipliers), Cycles, 24h Volume.
+function renderScannerClassTable(tableId, rows) {
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const tbody = table.querySelector('tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const tr = document.createElement('tr');
+    const cols = table.querySelectorAll('thead th').length || 10;
+    tr.innerHTML = `<td colspan="${cols}" class="dim" style="text-align:center;padding:12px;">no products in this class</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+  const tierPill = (tier) => {
+    if (!tier) return '<span class="dim">—</span>';
+    const cls = {
+      liquid: 'pos',
+      medium: '',
+      illiquid: 'neg',
+      very_illiquid: 'neg',
+    }[tier] || '';
+    return `<span class="${cls}" title="expert_liquidity tier — determines ratchet cadence + exit style">${tier}</span>`;
+  };
+  const gatePill = (allow) => {
+    if (allow === undefined || allow === null) return '<span class="dim">—</span>';
+    return allow
+      ? '<span class="pos" title="expert_arm_gate: regime OK for entry">✓ allow</span>'
+      : '<span class="neg" title="expert_arm_gate: regime BLOCKED — supermajority voted deny">✗ deny</span>';
+  };
+  rows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+    tr.className = 'scanner-row';
+    tr.dataset.product = row.product_id;
+    tr.dataset.price = String(row.price);
+    // Prefer expert forward-looking $/day; fall back to legacy best_score.
+    const fwd = row.expert_forecast || {};
+    const expertScore = Number(row.expert_adjusted_score) || Number(fwd.expected_daily_pnl) || Number(row.best_score) || 0;
+    const expertSpread = Number(fwd.spread) || Number(row.best_spread) || 0;
+    const expertCycles = Number(fwd.cycles_per_day) || Number(row.best_roundtrips) || 0;
+    const spreadCell = expertSpread > 0
+      ? `<span class="mono" title="Expert-recommended spread (Yang-Zhang forward-looking, tick-snapped)">$${fmtNum(expertSpread, 6)}</span>`
+      : '<span class="dim">—</span>';
+    const scoreCell = expertScore > 0
+      ? `<b class="pos" title="expert_adjusted_score = base × liquidity_mult × arm_gate_mult; base = YZ-vol forecast when available, else empirical grid">$${fmtNum(expertScore, 2)}</b>`
+      : '<span class="dim">—</span>';
+    const cyclesCell = expertCycles > 0
+      ? `<b>${fmtNum(expertCycles, 1)}</b>`
+      : '<span class="dim">—</span>';
+    const cycles = (typeof totalCyclesForProduct === 'function')
+      ? totalCyclesForProduct(row.product_id) : 0;
+    const cyclesLive = cycles > 0
+      ? `<span title="Completed round-trips across all tenants"><b>${cycles}</b></span>`
+      : '<span class="dim">0</span>';
+    tr.innerHTML = `
+      <td>${i + 1}</td>
+      <td class="mono">${escapeHtml(row.product_id)}</td>
+      <td class="mono">$${fmtNum(row.price, 4)}</td>
+      <td class="mono">${tierPill(row.liquidity_tier)}</td>
+      <td class="mono">${gatePill(row.arm_gate_allow)}</td>
+      <td class="mono">${spreadCell}</td>
+      <td class="mono">${scoreCell}</td>
+      <td class="mono">${cyclesCell}</td>
+      <td class="mono dim">${row.volume_24h ? fmtMoney(row.volume_24h) : '—'}</td>
+      <td><button class="small primary scanner-buy-btn">Buy / Short →</button></td>
+    `;
+    tr.onclick = (e) => {
+      if (e.target.closest('button')) e.stopPropagation();
+      if (typeof openScannerDetail === 'function') openScannerDetail(row);
+    };
+    const buyBtn = tr.querySelector('.scanner-buy-btn');
+    if (buyBtn) buyBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (typeof openScannerDetail === 'function') openScannerDetail(row);
+    };
+    tbody.appendChild(tr);
+  });
+}
+
+
 async function refreshScanner() {
   // On-demand only: trigger a scan when the tab opens and every ~60s while
   // it stays open. Saves the Coinbase API cost of ~30 candle fetches per
@@ -3245,6 +3329,19 @@ async function refreshScanner() {
     const updated = document.getElementById('scanner-updated');
     if (!tbody) return;
     tbody.innerHTML = '';
+    // Adam 2026-07-20 §3.15: backend now publishes top_crypto +
+    // top_derivative pre-split + pre-sorted by expert_adjusted_score
+    // (Yang-Zhang forward-looking $/day × liquidity_mult × arm_gate_mult).
+    // Render each list into its own class panel. Fall back to combined
+    // `top` if the backend hasn't been redeployed yet.
+    const topCrypto = Array.isArray(data.top_crypto) ? data.top_crypto : [];
+    const topDerivative = Array.isArray(data.top_derivative) ? data.top_derivative : [];
+    renderScannerClassTable('scanner-table-crypto', topCrypto);
+    renderScannerClassTable('scanner-table-derivative', topDerivative);
+    const cUpd = document.getElementById('scanner-crypto-updated');
+    const dUpd = document.getElementById('scanner-derivative-updated');
+    if (cUpd) cUpd.textContent = `${topCrypto.length} crypto product${topCrypto.length === 1 ? '' : 's'} ranked by expert-belief $/day`;
+    if (dUpd) dUpd.textContent = `${topDerivative.length} derivative product${topDerivative.length === 1 ? '' : 's'} ranked by expert-belief $/day`;
     const top = Array.isArray(data.top) ? data.top : [];
     if (top.length === 0) {
       updated.innerHTML = 'no ranking yet — scan requested, results arrive shortly. <button id="scanner-force-refresh" class="small ghost">Refresh now</button>';
