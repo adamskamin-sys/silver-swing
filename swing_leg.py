@@ -4626,19 +4626,30 @@ class SwingTrader:
                                  oid=ss.resting_stop_oid, error=str(_e),
                                  severity="warn")
             if ss.resting_stop_oid and not _fill_credited:
-                # Not FILLED (CANCELLED / UNKNOWN / probe failed). Safe to
-                # cancel + clear — matches original behavior.
+                # Not FILLED (CANCELLED / UNKNOWN / probe failed). Try to
+                # cancel + clear.
+                # Adam 2026-07-20 ORPHAN GUARD: only clear tracking if cancel
+                # succeeded. Prior code cleared unconditionally after
+                # `except log`, so a failed cancel produced an orphan SELL
+                # stop with position=0. If mark drops through the stop, it
+                # fires → SHORT (§3.8 violation).
+                _np_ok = False
                 try:
                     self.b.cancel(ss.resting_stop_oid)
+                    _np_ok = True
                 except Exception as e:
                     self._record("resting_stop_cancel_failed", sleeve_id=sc.id,
                                  sleeve_name=sc.name, oid=ss.resting_stop_oid,
-                                 error=str(e))
-                self._record("resting_stop_cleared", sleeve_id=sc.id,
-                             sleeve_name=sc.name, reason="no_position")
-                ss.resting_stop_oid = None
-                ss.resting_stop_px = None
-                ss.resting_stop_stage = None
+                                 error=str(e), severity="critical",
+                                 reason=("cancel raised on no-position clear; "
+                                         "keeping tracking so next tick retries "
+                                         "— avoids orphan short-risk"))
+                if _np_ok:
+                    self._record("resting_stop_cleared", sleeve_id=sc.id,
+                                 sleeve_name=sc.name, reason="no_position")
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
                 # ROOT FIX 2026-07-20: persist so next tick's reload sees cleared state.
                 try:
                     self._save_state()
