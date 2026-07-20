@@ -4835,6 +4835,11 @@ class SwingTrader:
         # Adopt: set own_avg_entry + flip state
         ss.own_avg_entry = float(avg)
         ss.state = SleeveStateEnum.ARMED_SELL
+        # Ghost-recurrence root fix (Adam 2026-07-20): snapshot into
+        # sell_entry_avg so _credit_stop_fill has a fallback if own_avg
+        # gets cleared before the resting stop credits. Prevents the
+        # "own_avg unknown" halt class.
+        ss.sell_entry_avg = float(avg)
         ss.live_order_id = None  # will re-arm SELL on next tick
         self._save_state()
         self._record(
@@ -4917,6 +4922,11 @@ class SwingTrader:
         if abs(new_avg - prev_avg) < tick:
             return  # already matches broker within one tick — no-op
         ss.own_avg_entry = new_avg
+        # Ghost-recurrence root fix: refresh sell_entry_avg to match the
+        # new blended basis. Reblend = new cost basis; the persistent
+        # fallback must track it or _credit_stop_fill will credit the
+        # stale sell_entry_avg on a stop fill and mis-report P&L.
+        ss.sell_entry_avg = new_avg
         self._record(
             "sleeve_own_avg_reblended_on_manual_add",
             sleeve_id=sc.id, sleeve_name=sc.name,
@@ -6893,6 +6903,17 @@ class SwingTrader:
                                     "cycle's realized will be off by fill_slippage")
             ss.own_avg_entry = own_avg
             ss.state = SleeveStateEnum.ARMED_SELL
+            # Adam 2026-07-20 GHOST RECURRENCE ROOT FIX: snapshot own_avg
+            # into sell_entry_avg the moment we transition to ARMED_SELL.
+            # This is the persistent cost-basis copy that _credit_stop_fill
+            # falls back to when own_avg gets cleared by ANY path (reblend,
+            # reconcile-autocorrect, sibling sleeve, race). Without this,
+            # the fallback chain empties → halt with "own_avg unknown" →
+            # the SLR recurrence pattern that halted us all night.
+            # Only set if empty — don't clobber a live sell_entry_avg
+            # that already captured a differently-priced entry.
+            if not (ss.sell_entry_avg and float(ss.sell_entry_avg) > 0):
+                ss.sell_entry_avg = own_avg
             # Adam 2026-07-20 (feedback_trail_arm_at_buy_fill +
             # feedback_biggest_rule_dont_lose_take_best):
             # Trail ARMS the moment a buy fills, floored at own_avg. HWM
