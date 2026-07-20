@@ -81,7 +81,7 @@ def main() -> None:
 
     # ---- 3. Check open orders on Coinbase (idempotency) ----------------
     open_orders_resp = _dump(b.client.list_orders(product_id=PID,
-                                                   order_status=["OPEN", "PENDING"]))
+                                                   order_status=["OPEN"]))
     open_orders = open_orders_resp.get("orders") or []
     open_stops = [o for o in open_orders
                   if (o.get("order_configuration") or {}).get("stop_limit_stop_limit_gtc")]

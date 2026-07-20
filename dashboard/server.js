@@ -654,6 +654,19 @@ export function makeApp({
         const pfSnap = store[tenant]?.__portfolio__?.config;
         const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
         if (posRow) pos = Math.abs(Number(posRow.qty)) || 0;
+        // Adam 2026-07-20 SPOT: also check crypto array. Spot balances
+        // live in pf.crypto (broker.py:898), never in derivatives. Without
+        // this, capacity check rejects every sleeve on a spot holding
+        // ("position 0 - core 0"). Adam's META 23 LONG got hit by this
+        // — 4 arm attempts all failed silently OR blocked with the
+        // "exceeds available 0" error.
+        if (pos === 0) {
+          const spotRow = (pfSnap?.crypto || []).find(c => c.product_id === symbol);
+          if (spotRow) {
+            const bal = Number(spotRow.balance) || 0;
+            pos = Math.floor(bal); // whole units for capacity math
+          }
+        }
       }
       // Adam 2026-07-15 (Option B): a sleeve consumes position-budget ONLY
       // when it's currently HOLDING contracts. A brand-new sleeve with no
@@ -704,9 +717,18 @@ export function makeApp({
       const _existingSleeves = _stateBlockCheck.sleeves || {};
       const _pfSnapS = store[tenant]?.__portfolio__?.config;
       const _posRowS = (_pfSnapS?.derivatives || []).find(d => d.product_id === symbol);
-      const _brokerQtyS = Math.abs(Number(_posRowS?.qty) || 0);
-      const _brokerAvgS = Number(_posRowS?.avg_entry) || 0;
-      const _brokerSideS = String(_posRowS?.side || '').toUpperCase();
+      let _brokerQtyS = Math.abs(Number(_posRowS?.qty) || 0);
+      let _brokerAvgS = Number(_posRowS?.avg_entry) || 0;
+      let _brokerSideS = String(_posRowS?.side || '').toUpperCase();
+      // Adam 2026-07-20 SPOT: fall back to crypto[] for spot holdings.
+      if (_brokerQtyS === 0) {
+        const _spotRowS = (_pfSnapS?.crypto || []).find(c => c.product_id === symbol);
+        if (_spotRowS) {
+          _brokerQtyS = Math.floor(Number(_spotRowS.balance) || 0);
+          _brokerAvgS = Number(_spotRowS.mark) || 0;
+          _brokerSideS = 'LONG';
+        }
+      }
       const _heldLong = _brokerQtyS > 0 && _brokerAvgS > 0 && _brokerSideS === 'LONG';
       if (_heldLong) {
         for (const s of sleeves) {
@@ -763,9 +785,24 @@ export function makeApp({
       // See project_reconcile_fill_bug.md + feedback_no_ghost_sleeves.md.
       const _pfSnap = store[tenant]?.__portfolio__?.config;
       const _posRow = (_pfSnap?.derivatives || []).find(d => d.product_id === symbol);
-      const _brokerQty = Math.abs(Number(_posRow?.qty) || 0);
-      const _brokerAvg = Number(_posRow?.avg_entry) || 0;
-      const _brokerSide = String(_posRow?.side || '').toUpperCase();
+      let _brokerQty = Math.abs(Number(_posRow?.qty) || 0);
+      let _brokerAvg = Number(_posRow?.avg_entry) || 0;
+      let _brokerSide = String(_posRow?.side || '').toUpperCase();
+      // Adam 2026-07-20 SPOT: spot holdings live in crypto[] not derivatives[].
+      // Coinbase spot doesn't track avg_entry (no per-position cost basis;
+      // that's a portfolio-management concept), so fall back to current
+      // MARK as own_avg — this is a reasonable "adopt at current price"
+      // baseline. User can edit own_avg via sleeve editor if they know
+      // the real entry (e.g., from the trade log). Spot is always LONG
+      // (no margin-short outside INTX perps).
+      if (_brokerQty === 0) {
+        const _spotRow = (_pfSnap?.crypto || []).find(c => c.product_id === symbol);
+        if (_spotRow) {
+          _brokerQty = Math.floor(Number(_spotRow.balance) || 0);
+          _brokerAvg = Number(_spotRow.mark) || 0;
+          _brokerSide = 'LONG';
+        }
+      }
       // Only auto-adopt for LONG positions (adam-live is long-only per §3.8).
       const _adoptCandidate = _brokerQty > 0 && _brokerAvg > 0 && _brokerSide === 'LONG';
       // Sum qty already claimed by pre-existing sleeves (own_avg_entry set)
