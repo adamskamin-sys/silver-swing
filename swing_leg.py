@@ -1561,7 +1561,22 @@ class SwingTrader:
         # Post-trigger housekeeping — only when the sell actually fired.
         ss.consecutive_stops = int(ss.consecutive_stops or 0) + 1
         ss.stop_loss_hwm = None  # reset — no longer holding, HWM restarts on next buy
-        ss.own_avg_entry = None  # position now flat
+        # Adam 2026-07-20 ACCOUNTING FIX: track the market-sell oid as
+        # live_order_id so the next tick's fill poller catches FILLED,
+        # calls _sleeve_on_fill's SELL branch, and credits realized_pnl +
+        # cycles + clears own_avg. Prior code cleared own_avg here
+        # UNCONDITIONALLY and never tracked the oid, so _sleeve_on_fill
+        # never ran → dashboard showed stale (pre-stop) realized_pnl even
+        # though the position sold at a loss. §3.7 allows stop_loss to
+        # close red, but the accounting must reflect it.
+        #
+        # Also: snapshot own_avg to sell_entry_avg first if not already
+        # set, so _credit_stop_fill's fallback chain has a basis to
+        # compute realized against.
+        if ss.own_avg_entry is not None and not (ss.sell_entry_avg
+                                                  and float(ss.sell_entry_avg) > 0):
+            ss.sell_entry_avg = float(ss.own_avg_entry)
+        ss.live_order_id = oid
 
         # Safety brake: after N consecutive stops without a winner in between,
         # halt regardless of reanchor/re-entry flags. Requires manual review.
