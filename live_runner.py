@@ -1114,6 +1114,20 @@ def run() -> int:
                     continue
                 if float(deriv.get("qty") or 0) != 0:
                     should_track_critical.add(sym)
+            # Adam 2026-07-20 SPOT SUPPORT: iterate held spot balances too.
+            # portfolio_snapshot() stores non-USD/USDC spot balances under
+            # 'crypto' (broker.py:898). Without this, an armed spot sleeve
+            # sits ARMED_BUY forever because no track spawns to tick it.
+            for spot in (pf.get("crypto") or []):
+                sym = spot.get("product_id")
+                if not sym or sym.startswith("__") or sym == SYMBOL:
+                    continue
+                try:
+                    bal = float(spot.get("balance") or 0)
+                except (TypeError, ValueError):
+                    bal = 0.0
+                if bal > 0:
+                    should_track_critical.add(sym)
         except Exception:
             pass
         # Armed sleeves — regular priority (unless product already in critical)
@@ -1521,14 +1535,25 @@ def run() -> int:
             # the primary loop. Failure counter evicts traders that fail
             # STEP_FAILURE_EVICT_THRESHOLD ticks in a row.
             if TICK_NON_PRIMARY:
+                # Adam 2026-07-20 TIMING INSTRUMENTATION: measure per-section
+                # duration so diag_tick_cadence can show WHERE the loop is
+                # spending time. All fields stashed on _maybe_recover_dead_
+                # tracks as attrs, picked up by the heartbeat below.
+                import time as _timing
+                _sec_ts = {}
+                _sec_ts["iter_start"] = _timing.time()
                 # Adam 2026-07-15: auto-recover any dead Tracks BEFORE the
                 # tick sweep so a fresh spawn attempt goes through the tick
                 # loop this iteration instead of waiting one more cycle.
                 try:
+                    _t0 = _timing.time()
                     _maybe_recover_dead_tracks()
+                    _sec_ts["recovery_ms"] = int((_timing.time() - _t0) * 1000)
                 except Exception as _rerr:
+                    _sec_ts["recovery_ms"] = int((_timing.time() - _t0) * 1000)
                     _log(f"[non-primary] track health check failed: "
                          f"{type(_rerr).__name__}: {_rerr}")
+                setattr(_maybe_recover_dead_tracks, "_last_iter_timing", _sec_ts)
                 # Adam 2026-07-19: periodic tick-cadence heartbeat. Writes
                 # each Track's tick_count + last_step_ok_ts + spawn_ts to
                 # Redis every 5s so diag_tick_cadence.py can read them

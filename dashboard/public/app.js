@@ -6400,6 +6400,11 @@ async function armScannerAsSleeve() {
 
   const existing = (currentStore[tenant]?.[symbol]?.config?.sleeves || []).slice();
   const id = `scan-${Date.now().toString(36)}`;
+  // Adam 2026-07-20: scanner sleeves ship with stop_loss ON + accumulate ON
+  // by default ("purchase more contract with cycles should be default when
+  // opening a sleeve"). Realized-only per feedback_scale_up_realized_only.md
+  // — max_qty allows up to 5x the initial size; scale_up_buffer_mult=1.0
+  // means each new slice must clear cost+fees before scaling in.
   const newSleeve = {
     id,
     name: `Scanner ${new Date().toISOString().slice(11, 16)}`,
@@ -6416,6 +6421,9 @@ async function armScannerAsSleeve() {
     stop_loss_ratchet_enabled: true,
     stop_loss_ratchet_distance: Number(rec.stop_loss_ratchet_distance.toFixed(6)),
     stop_loss_ratchet_activation: Number(rec.stop_loss_ratchet_activation.toFixed(6)),
+    accumulate_enabled: true,
+    max_qty: qty * 5,
+    scale_up_buffer_mult: 1.0,
     anchor_type: 'current_market',  // new sleeves anchor to Current Market
   };
 
