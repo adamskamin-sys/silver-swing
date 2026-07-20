@@ -626,6 +626,227 @@ def _fetch_recent_candles_ts(coinbase_client, product_id: str,
         return ([], [])
 
 
+# Asset-class classification (Adam 2026-07-20). Two buckets for the
+# dashboard: CRYPTO (perpetual + nano crypto futures) and DERIVATIVE
+# (commodities, indexes, everything else). Different vol/liquidity
+# regimes → experts already treat them differently per-contract; the
+# split is UI-level so operator can filter by asset class.
+_COMMODITY_INDEX_PREFIXES = {
+    # Metals + energy nano futures
+    "SLR", "NOL", "CU", "NGS", "PT",
+    # Index nano futures (S&P subsets, Mag 7, China ETF, etc.)
+    "MC", "MAG7C", "CHN",
+}
+
+
+def classify_asset_class(product_id: str) -> str:
+    """Return 'crypto' or 'derivative' for a Coinbase CFM product_id.
+
+    Prefix-match against _COMMODITY_INDEX_PREFIXES. Default = 'crypto'.
+    Kept simple: any misclassification is fixable by adjusting the set;
+    the important thing is stable/reproducible bucketing for the UI.
+    """
+    if not product_id or "-" not in product_id:
+        return "derivative"  # unknown / malformed → conservative
+    prefix = product_id.split("-", 1)[0].upper()
+    return "derivative" if prefix in _COMMODITY_INDEX_PREFIXES else "crypto"
+
+
+def _fetch_recent_ohlcv(coinbase_client, product_id: str,
+                         granularity: str = "ONE_HOUR",
+                         lookback_secs: int = 7 * 24 * 3600) -> list[dict]:
+    """Fetch full OHLCV bars (not just closes) for indicator computation.
+
+    Same paging/dedup pattern as _fetch_recent_closes but preserves the
+    full {open, high, low, close, volume, start} shape per bar so
+    scanner_indicators can compute ATR, Amihud, Yang-Zhang, etc.
+
+    Returns bars oldest → newest. Empty list on error (never raises).
+    """
+    try:
+        per = _GRANULARITY_SECS.get(granularity, 3600)
+        page_seconds = per * 300
+        end = int(time.time())
+        start = end - lookback_secs
+        all_raws: list[dict] = []
+        cursor = start
+        while cursor < end:
+            page_end = min(cursor + page_seconds, end)
+            resp = coinbase_client.get_candles(
+                product_id=product_id,
+                start=str(cursor), end=str(page_end),
+                granularity=granularity,
+            )
+            d = resp.to_dict() if hasattr(resp, "to_dict") else resp
+            for r in (d.get("candles") or []):
+                all_raws.append(r)
+            cursor = page_end
+            if cursor < end:
+                time.sleep(0.02)
+        # Coinbase returns descending; de-dup + sort ascending.
+        seen: set = set()
+        bars: list[dict] = []
+        for r in sorted(all_raws, key=lambda x: float(x.get("start", 0))):
+            ts = float(r.get("start", 0))
+            if ts in seen:
+                continue
+            seen.add(ts)
+            try:
+                bars.append({
+                    "start": ts,
+                    "open": float(r.get("open") or 0),
+                    "high": float(r.get("high") or 0),
+                    "low": float(r.get("low") or 0),
+                    "close": float(r.get("close") or 0),
+                    "volume": float(r.get("volume") or 0),
+                })
+            except (TypeError, ValueError):
+                continue
+        return bars
+    except Exception as e:
+        print(f"[scanner] ohlcv fetch failed for {product_id} @ {granularity}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return []
+
+
+def apply_expert_gates(entry: dict, bars: list[dict]) -> dict:
+    """Run the full §3.15 expert consensus on a scanner ranking entry.
+
+    Adds these fields to `entry` (in-place + returns for chaining):
+        indicators           — per-contract ATR/Amihud/Roll/Kyle/YZ/etc
+        liquidity_tier       — expert_liquidity: liquid|medium|illiquid|very_illiquid
+        arm_gate_allow       — expert_arm_gate: bool (regime OK for entry?)
+        arm_gate_votes       — expert_arm_gate: per-expert vote dict
+        expert_stop_distance — expert_stop.optimal_stop_distance (or None)
+        expert_trail_distance— expert_trail.optimal_trail_distance (or None)
+        expert_adjusted_score— best_score × liquidity_multiplier × gate_multiplier
+        expert_citation      — combined citation string
+        asset_class          — 'crypto' or 'derivative'
+
+    Fails open: any expert error leaves that field unset + logs to stderr;
+    the underlying best_score stays intact so downstream ranking still
+    works even if experts can't vote.
+    """
+    import scanner_indicators as _ind
+    pid = entry.get("product_id") or ""
+    mark = float(entry.get("price") or 0)
+    fee_rt = float(entry.get("fee_per_contract_roundtrip") or 0)
+    csize = float(entry.get("contract_size") or 0)
+    tick = float(entry.get("tick_size") or 0)
+
+    entry["asset_class"] = classify_asset_class(pid)
+
+    if not bars or mark <= 0 or csize <= 0:
+        entry["expert_gate_skipped"] = "insufficient inputs"
+        return entry
+
+    ind = _ind.compute_all(bars, mid_price=mark)
+    entry["indicators"] = {k: round(v, 8) if isinstance(v, float) else v
+                            for k, v in ind.items()}
+
+    # 1. Liquidity tier
+    tier = "unknown"
+    liq_mult = 1.0
+    try:
+        import expert_liquidity as _el
+        if getattr(_el, "MODE", "expert") == "expert":
+            liq_bars = [{"close": b["close"], "volume": b["volume"],
+                         "high": b["high"], "low": b["low"]} for b in bars]
+            liq_dec = _el.assess_liquidity(
+                bars=liq_bars, mark=mark,
+                fee_per_roundtrip=fee_rt, contract_size=csize, qty=1,
+            )
+            if liq_dec is not None:
+                tier = liq_dec.tier
+                entry["liquidity_tier"] = tier
+                entry["liquidity_decision"] = {
+                    "tier": tier,
+                    "amihud_illiq": liq_dec.amihud_illiq,
+                    "roll_spread": liq_dec.roll_spread,
+                    "kyle_lambda": liq_dec.kyle_lambda,
+                    "preferred_exit_style": liq_dec.preferred_exit_style,
+                    "ratchet_min_improvement_dollars":
+                        liq_dec.ratchet_min_improvement_dollars,
+                    "citation": liq_dec.citation,
+                }
+                # Score multiplier: liquid = 1.0, penalize progressively down.
+                liq_mult = {
+                    "liquid": 1.0, "medium": 0.75,
+                    "illiquid": 0.4, "very_illiquid": 0.15,
+                }.get(tier, 1.0)
+    except Exception as e:
+        entry["liquidity_expert_error"] = f"{type(e).__name__}: {e}"
+
+    # 2. Arm-gate (regime filter)
+    gate_mult = 1.0
+    try:
+        import expert_arm_gate as _eag
+        if getattr(_eag, "MODE", "expert") == "expert":
+            prices = [b["close"] for b in bars]
+            arm_dec = _eag.arm_allowed(
+                prices=prices, arm_direction="buy",
+                order_flow_imbalance=ind.get("ofi") or None,
+                kyle_lambda=ind.get("kyle_lambda") or None,
+                kyle_baseline=None,
+            )
+            entry["arm_gate_allow"] = bool(arm_dec.allow)
+            entry["arm_gate_votes"] = arm_dec.votes
+            entry["arm_gate_method"] = arm_dec.method
+            # Score multiplier: allowed = 1.0, denied = 0.1 (still show but
+            # deeply demoted so operator can see it was scored but gated).
+            gate_mult = 1.0 if arm_dec.allow else 0.1
+    except Exception as e:
+        entry["arm_gate_error"] = f"{type(e).__name__}: {e}"
+
+    # 3. Expected stop distance (informs realistic profit-per-cycle)
+    try:
+        import expert_stop as _est
+        if getattr(_est, "MODE", "expert") == "expert" and ind.get("atr", 0) > 0:
+            stop_dec = _est.optimal_stop_distance(
+                mark=mark, atr_est=ind["atr"],
+                fee_per_roundtrip=fee_rt, contract_size=csize, qty=1,
+                order_flow_imbalance=ind.get("ofi") or None,
+                kyle_lambda=ind.get("kyle_lambda") or None,
+                wilder_multiplier=2.0,
+                tick_size=(tick if tick > 0 else None),
+            )
+            if stop_dec is not None:
+                entry["expert_stop_distance"] = stop_dec.stop_distance
+                entry["expert_stop_px"] = stop_dec.stop_px
+    except Exception as e:
+        entry["expert_stop_error"] = f"{type(e).__name__}: {e}"
+
+    # 4. Expected trail distance
+    try:
+        import expert_trail as _etr
+        if getattr(_etr, "MODE", "expert") == "expert" and ind.get("atr", 0) > 0:
+            prices = [b["close"] for b in bars]
+            trail_dec = _etr.optimal_trail_distance(
+                mid_price=mark, highest_high=max(b["high"] for b in bars),
+                atr_est=ind["atr"], prices=prices,
+                fee_per_roundtrip=fee_rt, contract_size=csize, qty=1,
+            )
+            if trail_dec is not None:
+                entry["expert_trail_distance"] = trail_dec.trail_distance
+    except Exception as e:
+        entry["expert_trail_error"] = f"{type(e).__name__}: {e}"
+
+    # 5. Combined expert-adjusted score
+    base_score = float(entry.get("best_score") or 0)
+    entry["expert_adjusted_score"] = round(base_score * liq_mult * gate_mult, 4)
+    entry["expert_multipliers"] = {
+        "liquidity": round(liq_mult, 3),
+        "arm_gate": round(gate_mult, 3),
+    }
+    entry["expert_citation"] = (
+        "expert_liquidity (Amihud/Roll/Kyle/Hasbrouck/A-M/Timmermann); "
+        "expert_arm_gate (Kaufman/Wilder-ADX/CJP-OFI/Kyle-λ/Connors/Bollinger); "
+        "expert_stop (Wilder-2N/CJP/Kyle/Menkveld/Van Tharp); "
+        "expert_trail (Chande/Wilder-SAR/Turtle/Ho-Stoll)"
+    )
+    return entry
+
+
 def fetch_and_rank(
     coinbase_client,
     top_n: int = 10,
@@ -923,10 +1144,38 @@ def fetch_and_rank(
         # ~30 products/scan × 60s cadence = well under Coinbase's rate limit,
         # but a tiny sleep prevents burst spikes.
         time.sleep(0.03)
-    # Rank by expected $/day at best spread; tie-break on 24h range.
-    ranking.sort(key=lambda r: (-(r.get("best_score") or 0.0),
-                                -(r.get("vol_pct") or 0.0),
-                                -(r.get("volume_24h") or 0.0)))
+    # Adam 2026-07-20 §3.15 EXPERT GATE PASS: fetch OHLCV per product and
+    # run the full expert consensus (liquidity tier + arm-gate + expert_stop
+    # + expert_trail) to compute expert_adjusted_score. Failures leave the
+    # base best_score intact so a broken expert never zeros out ranking.
+    for entry in ranking:
+        pid = entry.get("product_id")
+        if not pid:
+            continue
+        try:
+            # OHLCV: 30 days of 1H bars = ~720 bars. Enough for stable ATR,
+            # Amihud, Yang-Zhang. Reuses the same cadence Coinbase serves
+            # for the closes fetch above so we don't hammer the API.
+            ohlcv_bars = _fetch_recent_ohlcv(
+                coinbase_client, pid,
+                granularity="ONE_HOUR", lookback_secs=30 * 24 * 3600,
+            )
+            apply_expert_gates(entry, ohlcv_bars)
+        except Exception as _eg_err:
+            entry["expert_gate_error"] = f"{type(_eg_err).__name__}: {_eg_err}"
+        time.sleep(0.02)
+
+    # Rank by EXPERT-ADJUSTED score (base_score × liquidity_mult × gate_mult).
+    # Falls back to best_score if expert-adjusted wasn't computed. Tie-break
+    # on 24h range then volume.
+    def _rank_key(r):
+        primary = r.get("expert_adjusted_score")
+        if primary is None:
+            primary = r.get("best_score") or 0.0
+        return (-(primary or 0.0),
+                -(r.get("vol_pct") or 0.0),
+                -(r.get("volume_24h") or 0.0))
+    ranking.sort(key=_rank_key)
     # Force-included products MUST survive the top_n truncation. The scanner's
     # job is to help Adam discover NEW products worth trading; anything he
     # already has a strategy on (force_include) needs its BEST tile populated
@@ -972,12 +1221,27 @@ def check_and_clear_refresh_request(url: str) -> bool:
 
 
 def write_ranking_to_redis(url: str, ranking: list[dict], generated_at: Optional[float] = None) -> None:
-    """Publish the ranking under REDIS_KEY. Dashboard reads from here."""
+    """Publish the ranking under REDIS_KEY. Dashboard reads from here.
+
+    Adam 2026-07-20: also publishes `top_crypto` and `top_derivative`
+    (split by classify_asset_class). Dashboard can render either the
+    combined `top` (backward compat) or the two class-split lists
+    without re-classifying client-side. `top` remains the full ordered
+    ranking for any consumer that hasn't been updated.
+    """
     import redis
     r = redis.Redis.from_url(url, decode_responses=True)
+    top_crypto = [e for e in ranking
+                  if (e.get("asset_class") or
+                      classify_asset_class(e.get("product_id") or "")) == "crypto"]
+    top_derivative = [e for e in ranking
+                      if (e.get("asset_class") or
+                          classify_asset_class(e.get("product_id") or "")) == "derivative"]
     payload = {
         "generated_at": generated_at if generated_at is not None else time.time(),
         "top": ranking,
+        "top_crypto": top_crypto,
+        "top_derivative": top_derivative,
     }
     r.set(REDIS_KEY, json.dumps(payload))
 
