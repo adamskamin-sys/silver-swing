@@ -554,8 +554,18 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
             "cost_per_contract": (round(cost_per_contract, 2)
                                    if cost_per_contract is not None else None),
         })
+    # Adam 2026-07-20: return TOP N PER ASSET CLASS instead of top N
+    # overall. Prior code sorted all products by vol_pct and truncated
+    # at top_n=30. Since derivatives (perps + commodities) typically
+    # have higher 24h vol than spot crypto pairs, all 30 slots went to
+    # derivatives → crypto section always empty even after b413327
+    # (SPOT filter fix) shipped. Now: split by product_type, take top_n
+    # from EACH class, return concatenated. fetch_and_rank's expert
+    # pass then re-sorts by expert_adjusted_score.
     scored.sort(key=lambda r: (-r["vol_pct"], -r["volume_24h"]))
-    return scored[:top_n]
+    spot_scored = [r for r in scored if r.get("product_type") == "SPOT"]
+    future_scored = [r for r in scored if r.get("product_type") == "FUTURE"]
+    return spot_scored[:top_n] + future_scored[:top_n]
 
 
 # Coinbase's Advanced Trade candles endpoint caps at ~350 candles per call,
