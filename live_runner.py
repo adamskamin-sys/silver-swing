@@ -284,6 +284,33 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
 
         cancel_reason = None
         if side == "SELL":
+            # Adam 2026-07-20 RACE FIX: don't cancel SELL orders younger
+            # than 5 minutes. Boot orphan sweep runs BEFORE all tracks
+            # respawn + adopt their existing resting_stop_oids from state,
+            # so a stop-limit just placed by the prior session (or by the
+            # current session mid-Redis-save) reads as "orphan" and gets
+            # cancelled. Race root cause: 5 stop-place events in Adam's
+            # Coinbase fill history for HIGH + META (all cancelled seconds
+            # after placement across successive Render deploys). The §3.8
+            # short-risk that motivated the aggressive sweep is a MULTI-
+            # HOUR concern — orders from prior bot sessions are hours+
+            # old. Fresh orders (<300s) are almost certainly current
+            # session's own stops.
+            import datetime as _dt_orph
+            _created_recent = False
+            try:
+                _ct = o.get("created_time")
+                if _ct:
+                    _ts = _dt_orph.datetime.fromisoformat(
+                        str(_ct).replace("Z", "+00:00")).timestamp()
+                    if (time.time() - _ts) < 300:
+                        _created_recent = True
+            except Exception:
+                pass
+            if _created_recent:
+                _log(f"[orphan-sweep] SKIP recent SELL {pid}/{oid} "
+                     f"(< 300s old — likely current-session race with state save)")
+                continue
             # Any orphan SELL is a short-flip risk — cancel.
             cancel_reason = "would have flipped account short"
         elif side == "BUY":
