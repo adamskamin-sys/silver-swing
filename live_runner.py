@@ -1149,14 +1149,170 @@ def run() -> int:
             # coverage isn't gated by the recovery cadence. META held
             # unprotected for 40+ min at 1 spawn/cycle behind 7 futures.
             try:
+                # Adam 2026-07-20 ROOT-FIX (the "circles" fix): don't trust
+                # value_usd alone. broker.py:1063 computes it as balance × mark;
+                # if get_product() returns 0 mark (transient Coinbase 404 or
+                # rate-limit), value_usd = 0 → this product silently drops off
+                # the critical list even though a real balance is held.
+                # Symptom before this fix: 8 spot products (BTC, ETH, SOL, ADA,
+                # HBAR, MOODENG, ONDO, SHIB) all showed as CRITICAL DEAD in
+                # diag_dead_tracks_deep with ZERO track_ events — never even
+                # attempted spawn.
+                #
+                # New rule: include every spot with non-dust balance. Dust
+                # threshold uses value_usd if available; else falls back to a
+                # per-currency floor via balance (rough $10-equivalent). Missing
+                # mark logged as info so the underlying API issue is visible
+                # rather than swallowed.
+                _DUST_BALANCE_FLOOR = {
+                    # currency: min balance considered "not dust" (~$10 at
+                    # 2026 prices — err on the side of tracking). Anything
+                    # missing from this table defaults to balance > 0 =
+                    # track it (safest for §3.6 stop-loss coverage).
+                    "BTC": 0.00009,   # ~$10 at $110k
+                    "ETH": 0.0025,    # ~$10 at $4k
+                    "SOL": 0.05,      # ~$10 at $200
+                    "ADA": 20.0,      # ~$10 at $0.5
+                    "HBAR": 40.0,     # ~$10 at $0.25
+                    "SHIB": 500000.0, # ~$10 at $0.00002
+                    "ONDO": 25.0,     # ~$10 at $0.4
+                    "MOODENG": 500.0, # ~$10 at $0.02
+                }
                 for spot in (pf.get("crypto") or []):
                     sym = spot.get("product_id")
+                    currency = str(spot.get("currency") or "").upper()
                     if not sym or sym.startswith("__") or sym == SYMBOL:
                         continue
-                    if float(spot.get("value_usd") or 0) >= 10.0:
+                    _val = float(spot.get("value_usd") or 0)
+                    _bal = float(spot.get("balance") or 0)
+                    _mark = float(spot.get("mark") or 0)
+                    _include = False
+                    _reason = ""
+                    if _val >= 10.0:
+                        _include = True
+                        _reason = f"value_usd={_val:.2f} >= 10"
+                    elif _bal > 0 and _mark <= 0:
+                        # Mark fetch failed — can't compute value. Trust balance
+                        # against per-currency floor to prevent silent §3.6 gap.
+                        floor = _DUST_BALANCE_FLOOR.get(currency)
+                        if floor is None:
+                            # No floor entry — safest is to include if balance > 0
+                            _include = True
+                            _reason = ("no per-currency dust floor + missing mark; "
+                                       "including to prevent silent stop-loss gap")
+                        elif _bal >= floor:
+                            _include = True
+                            _reason = (f"missing mark but balance {_bal} >= "
+                                       f"per-currency floor {floor}")
+                        # else: below dust floor — genuine dust, skip
+                        if not _include:
+                            try:
+                                log.record("critical_track_spot_dust_skipped",
+                                           tenant=TENANT, symbol=sym,
+                                           currency=currency, balance=_bal,
+                                           per_currency_floor=floor,
+                                           severity="info",
+                                           reason="balance below per-currency dust floor")
+                            except Exception:
+                                pass
+                    elif _bal > 0 and _val < 10.0:
+                        # Priced but under threshold — real dust
+                        pass
+                    if _include:
                         should_track_critical.add(sym)
+                        # Log mark-missing case explicitly so we notice the
+                        # underlying broker.get_product() failure instead of
+                        # having it swallowed by the 0-value fallback.
+                        if _mark <= 0:
+                            try:
+                                log.record("critical_track_spot_mark_missing",
+                                           tenant=TENANT, symbol=sym,
+                                           currency=currency, balance=_bal,
+                                           reason=_reason, severity="warn")
+                            except Exception:
+                                pass
             except Exception:
                 pass
+            # Adam 2026-07-20 SYSTEMIC GUARD ("stop this from happening again"):
+            # after building should_track_critical from the pf snapshot, verify
+            # it against broker truth via a fresh CoinbaseBroker read. Any
+            # product broker holds that isn't classified critical = invariant
+            # violation → force-add + log severity=critical so it's visible.
+            # No silent-swallow: if this block itself throws, log severity=
+            # critical with the exception so the invariant guard failure is
+            # noisy rather than becoming another silent hole.
+            _INVARIANT_ERR = None
+            try:
+                _b = CoinbaseBroker(BrokerConfig(product_id=SYMBOL or "BTC-USD"))
+                _bad = []
+                # Derivatives truth
+                _fp = _b.client.list_futures_positions()
+                _positions = (_fp.to_dict() if hasattr(_fp, "to_dict")
+                              else (_fp if isinstance(_fp, dict) else {}))
+                for p in (_positions.get("positions") or []):
+                    _pid = p.get("product_id") if isinstance(p, dict) else None
+                    if not _pid or _pid == SYMBOL:
+                        continue
+                    try:
+                        _nq = int(float(p.get("number_of_contracts") or 0))
+                    except Exception:
+                        _nq = 0
+                    if _nq != 0 and _pid not in should_track_critical:
+                        should_track_critical.add(_pid)
+                        _bad.append({"kind": "derivative", "pid": _pid, "qty": _nq})
+                # Spot truth via broker.get_accounts
+                _ac = _b.client.get_accounts(limit=250)
+                _resp = (_ac.to_dict() if hasattr(_ac, "to_dict")
+                         else (_ac if isinstance(_ac, dict) else {}))
+                _floor_map = {"BTC": 0.00009, "ETH": 0.0025, "SOL": 0.05,
+                              "ADA": 20.0, "HBAR": 40.0, "SHIB": 500000.0,
+                              "ONDO": 25.0, "MOODENG": 500.0}
+                for a in (_resp.get("accounts") or []):
+                    _cur = (a.get("currency") or "").upper()
+                    if _cur in ("USD", "USDC", ""):
+                        continue
+                    _av = float((a.get("available_balance") or {}).get("value") or 0)
+                    _hl = float((a.get("hold") or {}).get("value") or 0)
+                    _bl = _av + _hl
+                    if _bl <= 0:
+                        continue
+                    _pid_spot = f"{_cur}-USD"
+                    if _pid_spot in should_track_critical:
+                        continue
+                    _floor = _floor_map.get(_cur)
+                    if _floor is None or _bl >= _floor:
+                        should_track_critical.add(_pid_spot)
+                        _bad.append({"kind": "spot", "pid": _pid_spot,
+                                     "currency": _cur, "balance": _bl,
+                                     "floor": _floor})
+                if _bad:
+                    try:
+                        log.record("position_invariant_violation",
+                                   tenant=TENANT,
+                                   missing_from_pf_snapshot=_bad,
+                                   severity="critical",
+                                   reason=("held products absent from pf snapshot "
+                                           "should_track_critical set — force-added "
+                                           "from broker truth. This means the pf "
+                                           "snapshot builder (main.py + broker.py:1064) "
+                                           "or the classifier field-mapping above is "
+                                           "wrong. Fix the source; this guard is a "
+                                           "safety net, not a solution."))
+                    except Exception:
+                        pass
+            except Exception as _e:
+                _INVARIANT_ERR = _e
+            if _INVARIANT_ERR is not None:
+                try:
+                    log.record("position_invariant_guard_error",
+                               tenant=TENANT, error=str(_INVARIANT_ERR),
+                               error_type=type(_INVARIANT_ERR).__name__,
+                               severity="critical",
+                               reason=("invariant guard itself raised — this is "
+                                       "the same silent-hole class Adam called out. "
+                                       "Loud logging so it's not swallowed."))
+                except Exception:
+                    pass
         except Exception:
             pass
         # Armed sleeves — regular priority (unless product already in critical)
