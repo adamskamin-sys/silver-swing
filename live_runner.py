@@ -1540,9 +1540,42 @@ def run() -> int:
                 except Exception:
                     pass
                 _to_evict = []
+                # Adam 2026-07-20 BOTTLENECK FIX: cap synchronous feed
+                # restarts to ONE per tick sweep. Prior code called
+                # _maybe_resync_stale_feed unconditionally for every
+                # track. If 3+ feeds were stale simultaneously (MC + XLP +
+                # ZEC), each restart blocked ~30s on the WS handshake →
+                # 90s+ sequential block → entire fleet ticked at ~0.01 tps
+                # (observed 92s between ticks across all 9 healthy tracks
+                # per diag_tick_cadence output). Healthy majority held
+                # hostage by the dead minority.
+                #
+                # Simple budget: track ages sorted by staleness; call
+                # _maybe_resync_stale_feed for at most 1 track per sweep.
+                # Additional stale feeds wait for the next sweep. Loop
+                # cadence returns to ~50ms design for the healthy majority
+                # while stale feeds recover one-per-tick.
+                _now_sweep = now
+                _stale_candidates = []  # (age, pid, track)
+                _FEED_STALE_HINT_SECS = 45.0  # slightly under FEED_STALE_THRESHOLD_SECS
                 for _pid, _track in list(_non_primary_tracks.items()):
-                    # Aggressive re-sync if the feed has gone quiet.
-                    _maybe_resync_stale_feed(_track)
+                    _t_seen = float(getattr(_track, "last_tick_seen_ts", 0) or 0)
+                    _t_ok = float(getattr(_track, "last_step_ok_ts", 0) or 0)
+                    _t_spawn = float(getattr(_track, "spawn_ts", 0) or 0)
+                    _ref = _t_seen or _t_ok or _t_spawn or _now_sweep
+                    _age = _now_sweep - _ref
+                    if _age > _FEED_STALE_HINT_SECS:
+                        _stale_candidates.append((_age, _pid, _track))
+                # Only restart the ONE oldest-stale feed this sweep.
+                if _stale_candidates:
+                    _stale_candidates.sort(reverse=True)
+                    _oldest_age, _oldest_pid, _oldest_track = _stale_candidates[0]
+                    try:
+                        _maybe_resync_stale_feed(_oldest_track)
+                    except Exception as _rsr:
+                        _log(f"[non-primary] {_oldest_pid} single-restart "
+                             f"attempt failed: {type(_rsr).__name__}: {_rsr}")
+                for _pid, _track in list(_non_primary_tracks.items()):
                     _track.last_tick_attempt_ts = now
                     _tt = _track.feed.latest_ticker()
                     if _tt is None:
