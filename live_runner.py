@@ -1233,86 +1233,14 @@ def run() -> int:
                                 pass
             except Exception:
                 pass
-            # Adam 2026-07-20 SYSTEMIC GUARD ("stop this from happening again"):
-            # after building should_track_critical from the pf snapshot, verify
-            # it against broker truth via a fresh CoinbaseBroker read. Any
-            # product broker holds that isn't classified critical = invariant
-            # violation → force-add + log severity=critical so it's visible.
-            # No silent-swallow: if this block itself throws, log severity=
-            # critical with the exception so the invariant guard failure is
-            # noisy rather than becoming another silent hole.
-            _INVARIANT_ERR = None
-            try:
-                _b = CoinbaseBroker(BrokerConfig(product_id=SYMBOL or "BTC-USD"))
-                _bad = []
-                # Derivatives truth
-                _fp = _b.client.list_futures_positions()
-                _positions = (_fp.to_dict() if hasattr(_fp, "to_dict")
-                              else (_fp if isinstance(_fp, dict) else {}))
-                for p in (_positions.get("positions") or []):
-                    _pid = p.get("product_id") if isinstance(p, dict) else None
-                    if not _pid or _pid == SYMBOL:
-                        continue
-                    try:
-                        _nq = int(float(p.get("number_of_contracts") or 0))
-                    except Exception:
-                        _nq = 0
-                    if _nq != 0 and _pid not in should_track_critical:
-                        should_track_critical.add(_pid)
-                        _bad.append({"kind": "derivative", "pid": _pid, "qty": _nq})
-                # Spot truth via broker.get_accounts
-                _ac = _b.client.get_accounts(limit=250)
-                _resp = (_ac.to_dict() if hasattr(_ac, "to_dict")
-                         else (_ac if isinstance(_ac, dict) else {}))
-                _floor_map = {"BTC": 0.00009, "ETH": 0.0025, "SOL": 0.05,
-                              "ADA": 20.0, "HBAR": 40.0, "SHIB": 500000.0,
-                              "ONDO": 25.0, "MOODENG": 500.0}
-                for a in (_resp.get("accounts") or []):
-                    _cur = (a.get("currency") or "").upper()
-                    if _cur in ("USD", "USDC", ""):
-                        continue
-                    _av = float((a.get("available_balance") or {}).get("value") or 0)
-                    _hl = float((a.get("hold") or {}).get("value") or 0)
-                    _bl = _av + _hl
-                    if _bl <= 0:
-                        continue
-                    _pid_spot = f"{_cur}-USD"
-                    if _pid_spot in should_track_critical:
-                        continue
-                    _floor = _floor_map.get(_cur)
-                    if _floor is None or _bl >= _floor:
-                        should_track_critical.add(_pid_spot)
-                        _bad.append({"kind": "spot", "pid": _pid_spot,
-                                     "currency": _cur, "balance": _bl,
-                                     "floor": _floor})
-                if _bad:
-                    try:
-                        log.record("position_invariant_violation",
-                                   tenant=TENANT,
-                                   missing_from_pf_snapshot=_bad,
-                                   severity="critical",
-                                   reason=("held products absent from pf snapshot "
-                                           "should_track_critical set — force-added "
-                                           "from broker truth. This means the pf "
-                                           "snapshot builder (main.py + broker.py:1064) "
-                                           "or the classifier field-mapping above is "
-                                           "wrong. Fix the source; this guard is a "
-                                           "safety net, not a solution."))
-                    except Exception:
-                        pass
-            except Exception as _e:
-                _INVARIANT_ERR = _e
-            if _INVARIANT_ERR is not None:
-                try:
-                    log.record("position_invariant_guard_error",
-                               tenant=TENANT, error=str(_INVARIANT_ERR),
-                               error_type=type(_INVARIANT_ERR).__name__,
-                               severity="critical",
-                               reason=("invariant guard itself raised — this is "
-                                       "the same silent-hole class Adam called out. "
-                                       "Loud logging so it's not swallowed."))
-                except Exception:
-                    pass
+            # Adam 2026-07-20 ROLLBACK: invariant guard removed. Previous
+            # version created a fresh CoinbaseBroker every 5s recovery cycle
+            # and made 2 API calls (list_futures_positions + get_accounts),
+            # burning 1-3s of blocking per cycle. Caused recovery loop to back
+            # up → cascading dead tracks (13 dead → 2 dead → 15 dead in one
+            # session, worse than before). If we want this guard back, must
+            # run on a much longer cadence (60s+) AND share a broker instance,
+            # not construct one per cycle. Deferred for a proper redesign.
         except Exception:
             pass
         # Adam 2026-07-20: any product with a pending resume_intent is
