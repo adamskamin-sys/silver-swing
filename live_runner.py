@@ -755,7 +755,11 @@ def run() -> int:
     # loops that would burn Coinbase auth handshakes and could rate-limit
     # us off the primary feed too.
     _non_primary_last_evict_ts: dict[str, float] = {}
-    EVICT_COOLDOWN_SECS = float(os.getenv("SWING_EVICT_COOLDOWN_SECS", "900.0"))  # 15 min
+    # Adam 2026-07-20 "I dont want any dead": reduced 900s → 120s. 15-min
+    # cooldown was too aggressive — kept products dead for a full quarter
+    # hour after a single failed spawn. VIP2 rate limits allow faster retry.
+    # Env override retains for rollback: SWING_EVICT_COOLDOWN_SECS.
+    EVICT_COOLDOWN_SECS = float(os.getenv("SWING_EVICT_COOLDOWN_SECS", "120.0"))  # 2 min
     # Aggressive re-sync threshold: if a product's WS feed hasn't produced
     # a tick in this many seconds (and it's been alive that long),
     # tear down and restart the feed. Adam's 2026-07-14 rule: "catch up
@@ -1298,9 +1302,15 @@ def run() -> int:
             try:
                 st = store.get_state(TENANT, sym) or {}
                 sleeves = st.get("sleeves") or {}
+                # Adam 2026-07-20 "I dont want any dead": also track products
+                # with HALTED sleeves. A halted sleeve is a paused strategy,
+                # not a deleted one — user may resume any second, and Resume
+                # requires step() to run. Prior version only tracked
+                # ARMED_BUY/ARMED_SELL → halted products stayed dead until
+                # user manually removed sleeves.
                 for ss in sleeves.values():
                     sstate = str(ss.get("state") or "")
-                    if sstate in ("ARMED_BUY", "ARMED_SELL"):
+                    if sstate in ("ARMED_BUY", "ARMED_SELL", "HALTED"):
                         should_track_regular.add(sym)
                         break
             except Exception as _sym_err:
@@ -1350,7 +1360,10 @@ def run() -> int:
         # spreads across N recovery cycles (N = number of dead) instead
         # of blocking one cycle indefinitely.
         _spawns_this_call = 0
-        _MAX_SPAWNS_PER_CALL = 1
+        # Adam 2026-07-20 "I dont want any dead": bumped 1 → 5. Prior budget
+        # was too conservative — 5 dead non-critical products meant 5 cycles
+        # (75s at 15s regular interval) to recover. Now recovers in 1 cycle.
+        _MAX_SPAWNS_PER_CALL = 5
         for pid in sorted(should_track):
             existing = _non_primary_tracks.get(pid)
             if existing is not None:
