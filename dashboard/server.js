@@ -692,6 +692,36 @@ export function makeApp({
         });
       }
 
+      // Adam 2026-07-20 §3.6 ENFORCEMENT (NEW sleeves only): any brand-new
+      // sleeve attached to a product with a real LONG position MUST have
+      // stop_loss_enabled. §3.6 = never leave a held position unprotected.
+      // Model B "Defensive plus" preset ships stop_loss_enabled=false which
+      // produced XLM 31 sleeve holding 1 LONG with NO exchange stop.
+      // Restricted to NEW sleeves (no persisted state row yet) so a user
+      // editing an existing sleeve who explicitly turns off stop_loss
+      // isn't fought by the server. Default = 2% below broker avg.
+      const _stateBlockCheck = store[tenant][symbol].state || {};
+      const _existingSleeves = _stateBlockCheck.sleeves || {};
+      const _pfSnapS = store[tenant]?.__portfolio__?.config;
+      const _posRowS = (_pfSnapS?.derivatives || []).find(d => d.product_id === symbol);
+      const _brokerQtyS = Math.abs(Number(_posRowS?.qty) || 0);
+      const _brokerAvgS = Number(_posRowS?.avg_entry) || 0;
+      const _brokerSideS = String(_posRowS?.side || '').toUpperCase();
+      const _heldLong = _brokerQtyS > 0 && _brokerAvgS > 0 && _brokerSideS === 'LONG';
+      if (_heldLong) {
+        for (const s of sleeves) {
+          const _isNew = !s.id || !_existingSleeves[s.id];
+          if (!_isNew) continue;
+          if (s.stop_loss_enabled === false) {
+            s.stop_loss_enabled = true;
+            const _defaultStop = Number((_brokerAvgS * 0.98).toFixed(6));
+            if (!Number.isFinite(Number(s.stop_loss_px)) || Number(s.stop_loss_px) <= 0) {
+              s.stop_loss_px = _defaultStop;
+            }
+            s._stop_loss_auto_enabled_at_seed = true;
+          }
+        }
+      }
       cfg.sleeves = sleeves;
       // Adam 2026-07-15 fleet-wide rule: on live tenant, if this config has
       // no explicit core_qty, force it to 0. SwingConfig's dataclass default
