@@ -6973,7 +6973,7 @@ function openScannerDetail(row) {
           if (trailModes) {
             const peak = Number(ss.trail_high_water_price) || 0;
             const trailDist = Number(s.trail_distance) || 0;
-            const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
+            const armPx = Number(s.sell_px) || 0;
             if (isTrailStage2 && trailEff > 0) {
               trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED (stage: ${restingStage2}) — actual Coinbase stop at $${fmtPrice(trailEff)}. Peak $${fmtPrice(peak)}. Every new high lifts the exit.">EXIT <b>$${fmtPrice(trailEff)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
             } else if (armPx > 0) {
@@ -7337,7 +7337,7 @@ function refreshScannerDetailLive() {
       if (trailModes) {
         const peak = Number(ss.trail_high_water_price) || 0;
         const trailDist = Number(s.trail_distance) || 0;
-        const armPx = Number(s.trail_activation_px) || Number(s.sell_px) || 0;
+        const armPx = Number(s.sell_px) || 0;
         if (isTrailStageT && trailEff > 0) {
           trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED (stage: ${restingStageT}) — actual Coinbase stop at $${fmtPrice(trailEff)}. Peak $${fmtPrice(peak)}. Every new high lifts the exit.">EXIT <b>$${fmtPrice(trailEff)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
         } else if (armPx > 0) {
