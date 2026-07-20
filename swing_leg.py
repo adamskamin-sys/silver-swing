@@ -749,15 +749,31 @@ class SwingTrader:
         try:
             target = intent.get("sleeve_id")
             halt = bool(intent.get("halt"))
+            # Adam 2026-07-20 ORPHAN GUARD (cancel-intent handler): only
+            # clear tracking on cancel success. Prior code cleared
+            # unconditionally after `except log`, so a failed dashboard-
+            # triggered cancel produced an orphan. The dashboard button
+            # gives the user false confidence ("cancelled") while the
+            # order is still live on Coinbase.
             if target is None:
                 # Primary strategy cancel
                 if self.s.live_order_id:
-                    try: self.b.cancel(self.s.live_order_id)
+                    _ci_ok = False
+                    try:
+                        self.b.cancel(self.s.live_order_id)
+                        _ci_ok = True
                     except Exception as e:
-                        self._record("cancel_failed", order_id=self.s.live_order_id, error=str(e))
-                    self._record("primary_order_cancelled", order_id=self.s.live_order_id, requested_by="dashboard", halted=halt)
-                    self.s.live_order_id = None
-                    self.s.filled_qty = 0
+                        self._record("cancel_failed", order_id=self.s.live_order_id,
+                                     error=str(e), severity="critical",
+                                     reason=("dashboard-triggered cancel raised; "
+                                             "keeping tracking so next tick / "
+                                             "operator retry can clean up"))
+                    if _ci_ok:
+                        self._record("primary_order_cancelled",
+                                     order_id=self.s.live_order_id,
+                                     requested_by="dashboard", halted=halt)
+                        self.s.live_order_id = None
+                        self.s.filled_qty = 0
                 if halt:
                     self.s.state = State.HALTED
                     self.s.halt_reason = "paused via dashboard"
@@ -766,12 +782,24 @@ class SwingTrader:
                 ss = self.s.sleeves.get(target)
                 if ss:
                     if ss.live_order_id:
-                        try: self.b.cancel(ss.live_order_id)
+                        _sci_ok = False
+                        try:
+                            self.b.cancel(ss.live_order_id)
+                            _sci_ok = True
                         except Exception as e:
-                            self._record("cancel_failed", sleeve_id=target, order_id=ss.live_order_id, error=str(e))
-                        self._record("sleeve_order_cancelled", sleeve_id=target, order_id=ss.live_order_id, requested_by="dashboard", halted=halt)
-                        ss.live_order_id = None
-                        ss.filled_qty = 0
+                            self._record("cancel_failed", sleeve_id=target,
+                                         order_id=ss.live_order_id, error=str(e),
+                                         severity="critical",
+                                         reason=("dashboard-triggered sleeve cancel "
+                                                 "raised; keeping tracking to avoid "
+                                                 "orphan"))
+                        if _sci_ok:
+                            self._record("sleeve_order_cancelled",
+                                         sleeve_id=target,
+                                         order_id=ss.live_order_id,
+                                         requested_by="dashboard", halted=halt)
+                            ss.live_order_id = None
+                            ss.filled_qty = 0
                     if halt:
                         ss.state = SleeveStateEnum.HALTED
                         ss.halt_reason = "paused via dashboard"
