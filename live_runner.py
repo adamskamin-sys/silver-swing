@@ -1114,20 +1114,15 @@ def run() -> int:
                     continue
                 if float(deriv.get("qty") or 0) != 0:
                     should_track_critical.add(sym)
-            # Adam 2026-07-20 SPOT SUPPORT: iterate held spot balances too.
-            # portfolio_snapshot() stores non-USD/USDC spot balances under
-            # 'crypto' (broker.py:898). Without this, an armed spot sleeve
-            # sits ARMED_BUY forever because no track spawns to tick it.
-            for spot in (pf.get("crypto") or []):
-                sym = spot.get("product_id")
-                if not sym or sym.startswith("__") or sym == SYMBOL:
-                    continue
-                try:
-                    bal = float(spot.get("balance") or 0)
-                except (TypeError, ValueError):
-                    bal = 0.0
-                if bal > 0:
-                    should_track_critical.add(sym)
+            # Adam 2026-07-20 SPOT: intentionally NOT iterating pf.get("crypto")
+            # here. Rolled back — the discovery loop below already picks up
+            # any product with an ARMED_BUY/ARMED_SELL sleeve, which is the
+            # only reason we'd need a track. Iterating every crypto balance
+            # (including sub-cent dust from prior trades: 3.26e-10 BTC etc.)
+            # spawned bad tracks that failed contract_spec / feed handshake,
+            # incrementing the eviction counter across 15+ dust products and
+            # blowing HEALTH: 5 dead → 20 dead within 30min. Sleeve-driven
+            # discovery is the honest source of truth for spot tracking.
         except Exception:
             pass
         # Armed sleeves — regular priority (unless product already in critical)
