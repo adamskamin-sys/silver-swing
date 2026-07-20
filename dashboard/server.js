@@ -734,10 +734,17 @@ export function makeApp({
         for (const s of sleeves) {
           const _isNew = !s.id || !_existingSleeves[s.id];
           if (!_isNew) continue;
-          if (s.stop_loss_enabled === false) {
-            s.stop_loss_enabled = true;
+          // Adam 2026-07-20: was ONLY setting default when enabled===false.
+          // But if user toggles stop_loss ON manually with no price, we hit
+          // enabled=true + px=0 → validation error OR silent §3.6 hole.
+          // Now: any brand-new sleeve on a held long gets a default stop_loss_px
+          // if it's missing/zero, regardless of the enabled toggle. Enabled
+          // flips true only if it was false — preserves user's explicit toggle.
+          const _pxMissing = !Number.isFinite(Number(s.stop_loss_px)) || Number(s.stop_loss_px) <= 0;
+          if (s.stop_loss_enabled === false || _pxMissing) {
+            if (s.stop_loss_enabled === false) s.stop_loss_enabled = true;
             const _defaultStop = Number((_brokerAvgS * 0.98).toFixed(6));
-            if (!Number.isFinite(Number(s.stop_loss_px)) || Number(s.stop_loss_px) <= 0) {
+            if (_pxMissing) {
               s.stop_loss_px = _defaultStop;
             }
             s._stop_loss_auto_enabled_at_seed = true;
