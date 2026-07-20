@@ -1178,6 +1178,22 @@ def run() -> int:
         # every non-primary Track simultaneously; 10 min gives more room.
         # Env override: SWING_ZOMBIE_THRESHOLD_SECS.
         ZOMBIE_THRESHOLD_SECS = float(os.getenv("SWING_ZOMBIE_THRESHOLD_SECS", "600.0"))
+        # Adam 2026-07-20 BOTTLENECK FIX #2: cap synchronous spawns to
+        # ONE per _maybe_recover_dead_tracks call. Prior code spawned
+        # every silent product sequentially. With 3+ dead (MC, XLP, ZEC),
+        # each spawn blocked ~5-30s on CoinbaseBroker.contract_spec fetch
+        # + WS handshake, stacking to 15-90s+ per recovery cycle. Combined
+        # with the feed-restart bottleneck fix (5c413cc), the tick sweep
+        # STILL couldn't run because both spawns and restarts hogged the
+        # main thread.
+        #
+        # Simple budget: at most ONE new spawn per call. Additional dead
+        # tracks wait for the next call (5s critical / 15s regular). Loop
+        # cadence returns to design for the healthy majority. Full recovery
+        # spreads across N recovery cycles (N = number of dead) instead
+        # of blocking one cycle indefinitely.
+        _spawns_this_call = 0
+        _MAX_SPAWNS_PER_CALL = 1
         for pid in sorted(should_track):
             existing = _non_primary_tracks.get(pid)
             if existing is not None:
@@ -1290,10 +1306,26 @@ def run() -> int:
                     )
                 except Exception:
                     pass
+            # Spawn budget guard: only ONE spawn per call. Skip if budget
+            # exhausted — this pid will be retried on the next call.
+            if _spawns_this_call >= _MAX_SPAWNS_PER_CALL:
+                try:
+                    log.record(
+                        "track_spawn_deferred_budget",
+                        tenant=TENANT, symbol=pid,
+                        reason=("spawn budget exhausted this cycle — will "
+                                "retry next recovery call. Prevents main-tick "
+                                "block from stacking spawns."),
+                        severity="info",
+                    )
+                except Exception:
+                    pass
+                continue
             # Attempt recovery via the existing spawn path (handles all guards
             # + failure paths). We don't bypass its checks — if config missing
             # or spawn fails, _get_or_create_non_primary_track returns None + logs it.
             track = _get_or_create_non_primary_track(pid)
+            _spawns_this_call += 1
             try:
                 log.record(
                     "track_auto_respawn_attempted",
