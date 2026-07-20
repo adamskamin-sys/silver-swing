@@ -1176,13 +1176,21 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
         const stateSleeves = (spotBlock.state || {}).sleeves || {};
         let unreal = 0;
         let hasArmedSell = false;
+        // Adam 2026-07-20 NET: deduct sell-side fee so UNREALIZED matches
+        // take-home. Consistent with sleeve-editor UNREALIZED, IF STOPPED,
+        // tile projections. Prior gross calc misled — dashboard showed
+        // +$4.50 while actual exit-now take-home was $1.72.
+        const _spotCfg = spotBlock.config || {};
+        const _spotSellFee = Number(_spotCfg.fee_per_fill_sell)
+          || ((Number(_spotCfg.fee_per_contract_roundtrip) || 0) / 2);
         for (const s of cfgSleeves) {
           const ss = stateSleeves[s.id] || {};
           if (String(ss.state || '') !== 'ARMED_SELL') continue;
           hasArmedSell = true;
           const basis = Number(ss.own_avg_entry) || Number(c.mark) || 0;
           if (basis > 0 && c.mark > 0) {
-            unreal += (Number(c.mark) - basis) * Number(s.qty);
+            const gross = (Number(c.mark) - basis) * Number(s.qty);
+            unreal += gross - _spotSellFee * Number(s.qty);
           }
         }
         rows.push({
@@ -6805,6 +6813,13 @@ function openScannerDetail(row) {
           // a freshly-attached sleeve — Adam explicitly asked to see that.
           // A holding sleeve now always shows its current MTM. Fresh sleeves
           // (cycles=0) inherit basis from position avg via the fallback chain.
+          //
+          // Adam 2026-07-20: NET-of-fees. Prior code showed gross unrealized
+          // ((mark-basis)×cs×qty). But everything else is net (IF STOPPED,
+          // realized, tile projections) per feedback_optimize_realized_
+          // dollars_per_day.md. Deduct sell-side fee (exit-side only — buy
+          // fee already sunk on entry) so UNREALIZED matches what user
+          // would actually take home if exited at current mark.
           if (state === 'ARMED_SELL') {
             // Basis = own_avg_entry (sleeve traded) OR position avg (sleeve
             // inherited). NEVER entry_mark — that's just the mark at attach
@@ -6812,7 +6827,11 @@ function openScannerDetail(row) {
             // pos_avg=$1640, using entry_mark showed +$213 instead of -$102.
             const basis = Number(ss.own_avg_entry) || Number(row._live_avg) || 0;
             if (basis > 0 && liveMarkForSleeves > 0) {
-              unrealized = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
+              const gross = (liveMarkForSleeves - basis) * liveContractSize * Number(s.qty);
+              const _cfg = currentStore[row._live_tenant]?.[row.product_id]?.config || {};
+              const _sellFee = Number(_cfg.fee_per_fill_sell)
+                || ((Number(_cfg.fee_per_contract_roundtrip) || 0) / 2);
+              unrealized = gross - _sellFee * Number(s.qty);
             }
           }
           // ENTRY shows the SAME basis UNREALIZED uses. Retiring the "attach-
@@ -7228,10 +7247,17 @@ function refreshScannerDetailLive() {
       // at attach time, not a cost basis. PT bug: entry_mark=$1608.50,
       // pos_avg=$1640; using entry_mark showed +$213 (wrong) instead of
       // -$102 (right, matches Coinbase and the portfolio row).
+      // Adam 2026-07-20 NET: deduct sell-side fee so UNREALIZED matches
+      // take-home if exited now, consistent with IF STOPPED + realized +
+      // tile projections. Mirror of the fix in the initial-render path.
       if (state === 'ARMED_SELL') {
         const basis = Number(ss.own_avg_entry) || Number(avg) || 0;
         if (basis > 0 && markForSleeves > 0) {
-          unrealized = (markForSleeves - basis) * contractSize * Number(s.qty);
+          const gross = (markForSleeves - basis) * contractSize * Number(s.qty);
+          const _cfg = currentStore[tenant]?.[symbol]?.config || {};
+          const _sellFee = Number(_cfg.fee_per_fill_sell)
+            || ((Number(_cfg.fee_per_contract_roundtrip) || 0) / 2);
+          unrealized = gross - _sellFee * Number(s.qty);
         }
       }
       const entryPx = Number(ss.own_avg_entry) || Number(avg) || 0;
