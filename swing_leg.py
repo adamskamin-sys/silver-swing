@@ -5000,15 +5000,35 @@ class SwingTrader:
         # Meaningful move up = at least one tick higher than current.
         if target_px > current_px + (tick * 0.5):
             old_oid = ss.resting_stop_oid
+            # Adam 2026-07-20 ORPHAN GUARD: fail-closed on cancel failure.
+            # Prior code continued to place a new stop even if the cancel
+            # raised — if the old order was actually still open on Coinbase,
+            # we'd have TWO stops live (both trigger → double-fire → SHORT
+            # per §3.8), and the tracking pointed only at the new one =
+            # OLD ORDER BECOMES ORPHAN. SLR a6229a92 → orphan 2026-07-20
+            # is this class.
+            #
+            # Now: on cancel failure, RETURN. Old_oid stays tracked. Next
+            # tick retries the cancel. Small ratchet-latency cost; large
+            # short-risk avoided.
             try:
                 self.b.cancel(old_oid)
             except Exception as e:
                 self._record("resting_stop_ratchet_cancel_failed",
                              sleeve_id=sc.id, sleeve_name=sc.name,
-                             old_oid=old_oid, error=str(e))
-                # Continue anyway — old order may have already filled/been
-                # cancelled; the place below will either succeed (new stop)
-                # or fail (we clear tracking, retry next tick).
+                             old_oid=old_oid, error=str(e),
+                             severity="critical",
+                             reason=("skipping ratchet this tick — old stop "
+                                     "status unknown after cancel raised; "
+                                     "placing a new stop now would leave the "
+                                     "old one as an orphan SELL (short risk "
+                                     "per §3.8). Retry next tick."))
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
+                return
+            # Cancel succeeded — safe to place the ratcheted stop.
             try:
                 new_oid = self.b.place_stop_limit("SELL", sleeve_qty,
                                                   float(target_px), float(limit_px))
@@ -5027,11 +5047,18 @@ class SwingTrader:
                 except Exception:
                     pass
             except Exception as e:
+                # Cancel succeeded (Coinbase confirmed removal) + place
+                # failed. Position is now unprotected on the exchange. Clear
+                # tracking (nothing to reference) so next tick tries a fresh
+                # place from _maintain_resting_stop's "no existing order" path.
+                # Severity=critical because we've briefly lost stop coverage.
                 self._record("resting_stop_ratchet_place_failed",
                              sleeve_id=sc.id, sleeve_name=sc.name,
                              from_px=current_px, to_px=float(target_px),
-                             error=str(e))
-                # Clear tracking so next tick attempts a fresh place.
+                             error=str(e), severity="critical",
+                             reason=("cancel succeeded, place failed — "
+                                     "position UNPROTECTED until next tick's "
+                                     "fresh place attempt"))
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
                 ss.resting_stop_stage = None
