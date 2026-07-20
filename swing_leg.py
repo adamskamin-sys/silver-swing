@@ -455,9 +455,25 @@ class SwingTrader:
             if status == "FILLED":
                 sc = sleeves_cfg_by_id.get(sid)
                 if sc is None:
-                    # Config gone (sleeve removed while order was live). Best we
-                    # can do is clear the id — the fill happened but there's no
-                    # sleeve to credit it to.
+                    # Config gone (sleeve removed while order was live +
+                    # order then FILLED). Best we can do is clear the id —
+                    # the fill happened but there's no sleeve to credit it
+                    # to. Adam 2026-07-20: record a severity=critical event
+                    # so operator has visibility into the tenant-level
+                    # accounting drift. Position changed on Coinbase but
+                    # no bot record tracks the fill_price / basis / P&L.
+                    self._record(
+                        "reconcile_fill_no_config_drift",
+                        sleeve_id=sid, order_id=ss.live_order_id,
+                        filled_qty=st.get("filled_qty", 0),
+                        average_filled_price=st.get("average_filled_price"),
+                        severity="critical",
+                        reason=("sleeve config was removed while its order "
+                                "was live; order then FILLED on Coinbase. "
+                                "Position changed but no sleeve to credit — "
+                                "tenant-level accounting drifted. Rare "
+                                "(user Remove during in-flight fill). Manual "
+                                "reconcile of realized_pnl may be needed."))
                     cleared_sleeves.append((sid, ss.live_order_id, "FILLED_NO_CONFIG"))
                     ss.live_order_id = None
                     ss.filled_qty = 0
