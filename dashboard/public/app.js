@@ -1162,11 +1162,48 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
       // and just clutters the portfolio (Coinbase returns dust as scientific
       // notation like 3.26e-10 BTC which renders as noise).
       if (Number(c.value_usd) < 1) continue;
+      // Adam 2026-07-20 SPOT PARITY: if this spot product has a sleeve
+      // attached, treat it as a strategy-managed position (kind='futures'
+      // for rendering purposes) so the row shows side/cycles/trigger/stop
+      // like a derivative. Without this override, spot rows short-circuit
+      // to a "dim value_usd" cell with no P/L context.
+      const spotPid = c.product_id || `${c.currency}-USD`;
+      const spotBlock = tenantBlock[spotPid];
+      const spotHasSleeve = spotBlock?.config?.sleeves?.length > 0;
+      if (spotHasSleeve) {
+        // Compute unrealized from the first ARMED_SELL sleeve's own_avg vs mark
+        const cfgSleeves = spotBlock.config.sleeves || [];
+        const stateSleeves = (spotBlock.state || {}).sleeves || {};
+        let unreal = 0;
+        let hasArmedSell = false;
+        for (const s of cfgSleeves) {
+          const ss = stateSleeves[s.id] || {};
+          if (String(ss.state || '') !== 'ARMED_SELL') continue;
+          hasArmedSell = true;
+          const basis = Number(ss.own_avg_entry) || Number(c.mark) || 0;
+          if (basis > 0 && c.mark > 0) {
+            unreal += (Number(c.mark) - basis) * Number(s.qty);
+          }
+        }
+        rows.push({
+          kind: 'futures',  // render as futures so sleeve UI renders
+          product: spotPid,
+          side: hasArmedSell ? 'LONG' : 'WAITING',
+          qty: Math.floor(Number(c.balance) || 0),
+          avg: hasArmedSell ? Number((stateSleeves[cfgSleeves[0].id] || {}).own_avg_entry || c.mark) : 0,
+          mark: c.mark,
+          pnl: unreal,
+          liq: 0,
+          _spot: true,  // marker: this is a spot product, not a real future
+        });
+        continue;
+      }
+      // No sleeve → keep as unmanaged spot row (dim, no P/L pretense).
       // Use product_id (BTC-USD) as the row's product, not the raw currency
       // code (BTC). Chart + get_product endpoints all need the -USD suffix.
       // Display name still shows the pretty currency code.
       rows.push({
-        kind: 'spot', product: c.product_id || `${c.currency}-USD`,
+        kind: 'spot', product: spotPid,
         display: c.currency,
         side: '', qty: c.balance,
         avg: 0, mark: c.mark, pnl: 0, liq: 0, value: c.value_usd,
