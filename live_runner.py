@@ -688,7 +688,7 @@ def run() -> int:
     class _NonPrimaryTrack:
         __slots__ = ("product_id", "feed", "trader",
                      "consecutive_step_failures", "last_step_ok_ts",
-                     "last_tick_seen_ts", "spawn_ts")
+                     "last_tick_seen_ts", "spawn_ts", "tick_count")
         def __init__(self, product_id, feed, trader):
             self.product_id = product_id
             self.feed = feed
@@ -705,6 +705,12 @@ def run() -> int:
             self.last_step_ok_ts = 0.0
             self.last_tick_seen_ts = 0.0
             self.spawn_ts = time.time()
+            # Adam 2026-07-19: cumulative tick count. Incremented only on
+            # successful (non-halted, non-raising) step(). Diag reads this
+            # via the periodic heartbeat to compute actual tick-rate per
+            # Track — decoupled from sleeve-event count (which was
+            # misleadingly used as a heartbeat before).
+            self.tick_count = 0
         def close(self):
             try: self.feed.stop()
             except Exception: pass
@@ -1474,6 +1480,42 @@ def run() -> int:
                 except Exception as _rerr:
                     _log(f"[non-primary] track health check failed: "
                          f"{type(_rerr).__name__}: {_rerr}")
+                # Adam 2026-07-19: periodic tick-cadence heartbeat. Writes
+                # each Track's tick_count + last_step_ok_ts + spawn_ts to
+                # Redis every 5s so diag_tick_cadence.py can read them
+                # cross-process. Includes prev_tick_count + prev_ts so the
+                # reader can compute instant tick_rate (delta / interval)
+                # in addition to lifetime average.
+                try:
+                    _hb_last = getattr(
+                        _maybe_recover_dead_tracks, "_hb_last_ts", 0.0)
+                    if now - _hb_last >= 5.0:
+                        _hb_prev = getattr(
+                            _maybe_recover_dead_tracks, "_hb_snap", {}) or {}
+                        _hb_snap = {}
+                        for _pid, _tr in _non_primary_tracks.items():
+                            _prev = _hb_prev.get(_pid, {}) or {}
+                            _hb_snap[_pid] = {
+                                "tick_count": int(getattr(_tr, "tick_count", 0) or 0),
+                                "last_step_ok_ts": float(_tr.last_step_ok_ts or 0),
+                                "last_tick_seen_ts": float(_tr.last_tick_seen_ts or 0),
+                                "spawn_ts": float(_tr.spawn_ts or 0),
+                                "consecutive_step_failures":
+                                    int(_tr.consecutive_step_failures or 0),
+                                "prev_tick_count": int(_prev.get("tick_count", 0) or 0),
+                                "prev_snap_ts": float(_prev.get("snap_ts", 0) or 0),
+                                "snap_ts": now,
+                            }
+                        try:
+                            store.put_config(TENANT, "__track_heartbeat__",
+                                             {"tracks": _hb_snap, "snap_ts": now,
+                                              "loop_interval_secs": LOOP_INTERVAL_SECS})
+                            setattr(_maybe_recover_dead_tracks, "_hb_snap", _hb_snap)
+                            setattr(_maybe_recover_dead_tracks, "_hb_last_ts", now)
+                        except Exception:
+                            pass  # never fail-hard on heartbeat write
+                except Exception:
+                    pass
                 _to_evict = []
                 for _pid, _track in list(_non_primary_tracks.items()):
                     # Aggressive re-sync if the feed has gone quiet.
@@ -1498,6 +1540,7 @@ def run() -> int:
                             _step_halted = False
                         if not _step_halted:
                             _track.last_step_ok_ts = now
+                            _track.tick_count += 1
                         # Adam 2026-07-15: successful step resets the
                         # zombie streak counter — a product that eventually
                         # starts ticking correctly shouldn't be penalized
