@@ -5738,10 +5738,26 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         const newAct = Number((currentSell + expertDollars.activation_offset).toFixed(pricePrec));
         trailActivationEl.value = newAct;
       }
-      // Stop loss (Van Tharp 1R below anchor — the entry price)
+      // Stop loss (Van Tharp 1R below anchor — the entry price).
+      // Adam 2026-07-20: enforce stop < buy_px invariant. The server-side
+      // validator refuses saves where stop_loss_px >= buy_px (fires before
+      // natural re-entry, nonsense), so the expert-derived stop MUST land
+      // below buy_px or the save silently rejects. For low-priced spot
+      // tokens (XLP at $0.18, ATR $0.0003), anchor - 2×ATR can land ABOVE
+      // buy_px when spread is tight. Cap at buy_px - safety margin so
+      // experts self-consistently satisfy the invariant per
+      // feedback_experts_all_algo_params.md.
       const stopPxEl = m.querySelector('#sl-stop-px');
       if (stopPxEl && expertDollars.stop_loss_distance > 0 && anchorPx > 0) {
-        const newStop = Number((anchorPx - expertDollars.stop_loss_distance).toFixed(pricePrec));
+        let newStop = Number((anchorPx - expertDollars.stop_loss_distance).toFixed(pricePrec));
+        // Cap at buy_px minus safety (max(tick, 0.1% of price) — enough
+        // margin that a mark blip doesn't trip the stop before buy_back).
+        const buyPxNow = Number(m.querySelector('#sl-buy-target')?.value) || 0;
+        if (buyPxNow > 0) {
+          const safety = Math.max(tickStep, buyPxNow * 0.001);
+          const stopCap = Number((buyPxNow - safety).toFixed(pricePrec));
+          if (newStop >= stopCap) newStop = stopCap;
+        }
         // Only update if stop-loss is enabled (otherwise leave user's
         // manual value alone — they've opted out of the ATR-derived stop).
         if (stopLossToggle && stopLossToggle.checked) {
