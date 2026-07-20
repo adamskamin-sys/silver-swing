@@ -7066,6 +7066,51 @@ class SwingTrader:
                 trail_armed_at_own_avg=True,
                 trail_hwm_seed=own_avg,
             )
+            # Adam 2026-07-20 THE ROOT FIX (no more bandaids, no more
+            # shell commands): place the exchange resting stop RIGHT NOW,
+            # inline with the fill event. Not on the next tick.
+            #
+            # This closes the persistent class where fresh buy fills sat
+            # unprotected for 1–5 seconds until _maintain_resting_stop
+            # ran on the next tick loop iteration. XLM 2026-07-19 sat
+            # unprotected for 5+ minutes because there wasn't even a
+            # next-tick placement — sleeve config lacked stop_loss_px
+            # and no stage in _maintain_resting_stop fired.
+            #
+            # With this inline call:
+            #   - Rule #1 (protect profit) is honored the instant a
+            #     buy fills, not "eventually"
+            #   - Reconciliation is a SAFETY NET, not the primary path
+            #   - No shell diag_reprice_stop needed for normal ops
+            #   - Deploy-restart windows shrink to "restart happens
+            #     between fill and next tick" (rare) instead of a
+            #     multi-second gap on every fill
+            #
+            # Falls back to reconciliation if this inline attempt fails
+            # (network hiccup, broker rejection). Never fails-hard.
+            try:
+                _stop_last_px = (float(fill_price) if fill_price and float(fill_price) > 0
+                                 else own_avg)
+                self._maintain_resting_stop(sc, ss, _stop_last_px)
+                self._record(
+                    "resting_stop_placed_inline_with_fill",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    own_avg=own_avg, fill_price=fill_price,
+                    resting_stop_px=ss.resting_stop_px,
+                    resting_stop_stage=ss.resting_stop_stage,
+                    severity="info",
+                    reason="inline stop placement on buy fill — no tick gap",
+                )
+            except Exception as _e:
+                self._record(
+                    "resting_stop_place_on_fill_failed",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    error=f"{type(_e).__name__}: {_e}",
+                    severity="critical",
+                    reason=("could not place resting stop inline with buy "
+                            "fill; next tick + reconciliation watchdog "
+                            "will retry — position temporarily unprotected"),
+                )
 
     def _sleeve_halt(self, sc: SleeveConfig, ss: SleeveState, reason: str) -> None:
         if ss.live_order_id:
