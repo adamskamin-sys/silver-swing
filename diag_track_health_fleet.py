@@ -113,13 +113,28 @@ def main() -> None:
         except Exception:
             pass
 
-        # Verdict
-        if sleeve_events > 0:
-            status = "ALIVE"
-        elif spawn_failed > 0:
+        # Verdict — Adam 2026-07-19 FIX: prior code said "ALIVE" for any
+        # product with sleeve_events > 0 in the WHOLE window (24h default).
+        # That labelled ZEC "ALIVE" while its LAST TICK was 1h ago. A
+        # Track that hasn't ticked in >60s can't ratchet stops, can't
+        # detect fills, can't apply HWM floor — it is NOT alive
+        # operationally, even if it emitted 378 events earlier today.
+        FRESH_TICK_MAX_SECS = 60
+        SILENT_ZOMBIE_MAX_SECS = 600
+        age = (time.time() - last_sleeve_ts) if last_sleeve_ts > 0 else float("inf")
+        if spawn_failed > 0:
             status = "SPAWN-FAIL"
         elif has_armed_sleeve or held_position:
-            status = "⚠ DEAD"
+            if last_sleeve_ts == 0:
+                status = "⚠ DEAD"
+            elif age <= FRESH_TICK_MAX_SECS:
+                status = "ALIVE"
+            elif age <= SILENT_ZOMBIE_MAX_SECS:
+                status = "⚠ SILENT"  # ticked recently but not now
+            else:
+                status = "💀 ZOMBIE"  # silent longer than auto-recovery threshold
+        elif sleeve_events > 0:
+            status = "ALIVE"  # ticked at least once, no current need to tick
         else:
             status = "idle"  # nothing armed, expected quiet
 
@@ -151,24 +166,34 @@ def main() -> None:
 
     print(f"\n[SUMMARY]")
     alive = sum(1 for d in products_data if d["status"] == "ALIVE")
+    silent = sum(1 for d in products_data if d["status"] == "⚠ SILENT")
+    zombie = sum(1 for d in products_data if d["status"] == "💀 ZOMBIE")
     dead = sum(1 for d in products_data if d["status"] == "⚠ DEAD")
     spawn_fail = sum(1 for d in products_data if d["status"] == "SPAWN-FAIL")
     idle = sum(1 for d in products_data if d["status"] == "idle")
     total = len(products_data)
-    print(f"  ALIVE:      {alive:>3d}  ({100.0*alive/total if total else 0:.0f}%)  ← Tracks are ticking normally")
-    print(f"  ⚠ DEAD:     {dead:>3d}  ({100.0*dead/total if total else 0:.0f}%)  ← should be ticking but 0 sleeve events")
+    print(f"  ALIVE:      {alive:>3d}  ({100.0*alive/total if total else 0:.0f}%)  ← ticked in last 60s (constitution §3.2)")
+    print(f"  ⚠ SILENT:   {silent:>3d}  ({100.0*silent/total if total else 0:.0f}%)  ← ticked in the past but > 60s ago (stops not ratcheting)")
+    print(f"  💀 ZOMBIE:  {zombie:>3d}  ({100.0*zombie/total if total else 0:.0f}%)  ← silent > 600s, auto-recovery should have fired")
+    print(f"  ⚠ DEAD:     {dead:>3d}  ({100.0*dead/total if total else 0:.0f}%)  ← never ticked with an armed sleeve")
     print(f"  SPAWN-FAIL: {spawn_fail:>3d}  ({100.0*spawn_fail/total if total else 0:.0f}%)  ← tried to spawn but errored")
     print(f"  idle:       {idle:>3d}  ({100.0*idle/total if total else 0:.0f}%)  ← nothing to tick (no armed sleeve, no position)")
 
-    if dead > 0 or spawn_fail > 0:
-        print(f"\n⚠ FLEET-WIDE FIX NEEDED")
-        print(f"  {dead + spawn_fail} products are not ticking despite having armed sleeves.")
-        print(f"  Simplest recovery: restart Render — clears in-memory eviction")
-        print(f"  cooldown and forces fresh spawn attempts on ALL products.")
-        print(f"  After restart, re-run this diag with a small window (60min)")
-        print(f"  to confirm every Track came back alive.")
+    if silent > 0 or zombie > 0 or dead > 0 or spawn_fail > 0:
+        problem_syms = [d["symbol"] for d in products_data
+                        if d["status"] in ("⚠ SILENT", "💀 ZOMBIE", "⚠ DEAD", "SPAWN-FAIL")]
+        print(f"\n⚠ FLEET-WIDE FIX NEEDED — §3.2 violation")
+        print(f"  {silent + zombie + dead + spawn_fail} product(s) not ticking despite "
+              f"armed sleeves / held positions:")
+        for sym in problem_syms:
+            print(f"    - {sym}")
+        print(f"")
+        print(f"  Force-respawn without Render restart:")
+        print(f"    python3 diag_force_track_respawn.py {' '.join(problem_syms)}")
+        print(f"    python3 diag_force_track_respawn.py {' '.join(problem_syms)} --apply")
+        print(f"  Then re-run this diag in 30s to confirm they came back.")
     else:
-        print(f"\n✓ Fleet healthy — every product with an armed sleeve is ticking.")
+        print(f"\n✓ Fleet healthy — every product with an armed sleeve is ticking (< 60s).")
     print("=" * 118)
 
 

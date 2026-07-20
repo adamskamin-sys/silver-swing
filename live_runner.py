@@ -987,6 +987,48 @@ def run() -> int:
 
     def _maybe_recover_dead_tracks() -> None:
         now = time.time()
+        # Adam 2026-07-19 force-respawn signal: an operator diag can write
+        # a list of product_ids to CONFIG `__force_respawn__` in Redis to
+        # request immediate eviction + spawn, bypassing the 15-min cooldown.
+        # Runs BEFORE the interval gates so it fires the same tick the
+        # signal was written. Signal is cleared after processing.
+        try:
+            _sig = store.get_config(TENANT, "__force_respawn__") or {}
+            _pids = _sig.get("product_ids") or []
+            if _pids and isinstance(_pids, list):
+                for _pid in _pids:
+                    if not isinstance(_pid, str) or not _pid:
+                        continue
+                    try:
+                        _evict_track(_pid, "operator force-respawn signal")
+                    except Exception:
+                        pass
+                    _non_primary_last_evict_ts.pop(_pid, None)
+                    _zombie_streak_map = getattr(
+                        _maybe_recover_dead_tracks, "_zombie_streak", {})
+                    _zombie_streak_map.pop(_pid, None)
+                    setattr(_maybe_recover_dead_tracks,
+                            "_zombie_streak", _zombie_streak_map)
+                    try:
+                        log.record(
+                            "track_force_respawn_signal_honored",
+                            tenant=TENANT, symbol=_pid,
+                            reason=("operator wrote __force_respawn__ signal — "
+                                    "cleared eviction cooldown + zombie streak; "
+                                    "next spawn attempt is immediate"),
+                            severity="warn",
+                        )
+                    except Exception:
+                        pass
+                # Clear the signal so we don't process it again next tick
+                try:
+                    store.put_config(TENANT, "__force_respawn__",
+                                     {"product_ids": [], "cleared_ts": now})
+                except Exception:
+                    pass
+        except Exception:
+            pass  # never fail-hard on the tick loop
+
         # Adam 2026-07-15: two-tier detection. Held-position dead Tracks
         # are money-at-risk (stop can't fire without a Track) so they check
         # every CRITICAL_INTERVAL (5s). Armed-sleeve dead Tracks are
