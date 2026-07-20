@@ -1902,6 +1902,111 @@ def run() -> int:
                     except Exception as _mce:
                         _log(f"[reconcile-autocorrect] mismatch pass failed: "
                              f"{type(_mce).__name__}: {_mce}")
+                    # Sleeve-level ghost auto-recover (2026-07-20).
+                    # Adam: "I dont want to keep clearing ghost I dont want
+                    # any more fucking ghosts." — feedback_no_ghost_sleeves.md
+                    #
+                    # Ghost sleeve = state.sleeves[sid].own_avg_entry is set
+                    # (bot thinks it holds) but Coinbase reports position=0
+                    # for that product. Two flavors we auto-fix here:
+                    #   (a) HALTED sleeve with dead resting_stop_oid — the
+                    #       halt-loop where Resume re-fires the credit path
+                    #       against the stale oid and re-halts (SLR incident).
+                    #   (b) ARMED_SELL sleeve with own_avg set + exchange=0 —
+                    #       stop fired, primary credit path missed (missed
+                    #       fill class).
+                    #
+                    # Auto-fix: reset sleeve to ARMED_BUY, clear own_avg +
+                    # resting_stop_* + halt_reason, stamp armed_buy_since_ts.
+                    # Preserves cycles/realized_pnl. Requires either:
+                    #   - snapshot fresh AND symbol present with qty=0, or
+                    #   - snapshot fresh AND symbol absent (confirmed zero)
+                    # Skips when a buy is in flight (live_order_id set).
+                    #
+                    # Recovery of missed P&L is NOT attempted here (would
+                    # require per-product broker calls in the reconcile
+                    # loop). If a stop actually filled uncredited, Adam
+                    # sees the "ghost auto-recovered w/ stale stop_oid"
+                    # log line and can run diag_force_credit_cycle.py to
+                    # backfill the specific cycle. Otherwise the reload-on-
+                    # tick fix (83dd31b) makes the recovered state visible
+                    # to the trader within ~1s.
+                    try:
+                        for _gsym in list(exch_positions.keys()) + list(
+                            {f.symbol for f in findings
+                             if f.kind in ("position_mismatch", "state_config_drift")}
+                        ):
+                            if _gsym.startswith("__"):
+                                continue
+                            if not _pf_fresh and _gsym not in exch_positions:
+                                continue  # can't verify — snapshot stale
+                            _gexch = int(exch_positions.get(_gsym, 0) or 0)
+                            if _gexch != 0:
+                                continue  # real position — not a ghost candidate
+                            _gst = store.get_state(live_tenant, _gsym) or {}
+                            _sleeves = _gst.get("sleeves") or {}
+                            if not isinstance(_sleeves, dict) or not _sleeves:
+                                continue
+                            _dirty_ids: list[str] = []
+                            for _sid, _ss in list(_sleeves.items()):
+                                if not isinstance(_ss, dict):
+                                    continue
+                                _own_avg = _ss.get("own_avg_entry")
+                                _has_avg = _own_avg not in (None, 0, 0.0)
+                                _sstate = str(_ss.get("state") or "").upper()
+                                _dead_stop = (_sstate == "HALTED"
+                                              and _ss.get("resting_stop_oid"))
+                                _ghost_hold = (_has_avg
+                                               and _sstate == "ARMED_SELL")
+                                if not (_has_avg or _dead_stop or _ghost_hold):
+                                    continue
+                                if _ss.get("live_order_id"):
+                                    continue  # buy in flight — wait
+                                _prev_avg = _own_avg
+                                _prev_state = _sstate
+                                _prev_oid = _ss.get("resting_stop_oid")
+                                _prev_halt = _ss.get("halt_reason")
+                                if _prev_halt:
+                                    _ss["_prev_halt_reason"] = _prev_halt
+                                if _prev_avg is not None:
+                                    _ss["_prev_ghost_own_avg"] = _prev_avg
+                                _ss["state"] = "ARMED_BUY"
+                                _ss["own_avg_entry"] = None
+                                _ss["resting_stop_oid"] = None
+                                _ss["resting_stop_px"] = None
+                                _ss["resting_stop_stage"] = None
+                                _ss["halt_reason"] = None
+                                _ss["armed_buy_since_ts"] = now
+                                _sleeves[_sid] = _ss
+                                _dirty_ids.append(_sid)
+                                _log(f"[reconcile-autocorrect] {_gsym}/{_sid}: "
+                                     f"sleeve ghost auto-recovered "
+                                     f"(exch=0, was state={_prev_state} "
+                                     f"own_avg={_prev_avg} stop_oid={_prev_oid})")
+                                try:
+                                    log.record("sleeve_ghost_auto_recovered",
+                                               tenant=TENANT, symbol=_gsym,
+                                               sleeve_id=_sid,
+                                               prev_state=_prev_state,
+                                               prev_own_avg=_prev_avg,
+                                               prev_stop_oid=_prev_oid,
+                                               prev_halt_reason=_prev_halt,
+                                               severity="warn",
+                                               reason=("bot state said held "
+                                                       "but exchange=0; auto-"
+                                                       "cleared per feedback_"
+                                                       "no_ghost_sleeves"))
+                                except Exception:
+                                    pass
+                            if _dirty_ids:
+                                _gst["sleeves"] = _sleeves
+                                store.put_state(live_tenant, _gsym, _gst)
+                                # reload-on-tick (swing_leg._reload_sleeves_
+                                # from_redis) picks this up within ~1s;
+                                # no state_patch needed for sleeves.
+                    except Exception as _gce:
+                        _log(f"[reconcile-autocorrect] sleeve ghost pass failed: "
+                             f"{type(_gce).__name__}: {_gce}")
                     _health.record_ok(store, "reconciliation_monitor", TENANT)
                 except Exception as e:
                     _log(f"reconciliation_monitor failed: {type(e).__name__}: {e}")

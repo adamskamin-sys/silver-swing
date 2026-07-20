@@ -4357,8 +4357,59 @@ class SwingTrader:
             pos_qty = 0
         sleeve_qty = int(getattr(sc, "qty", 1) or 1)
         if pos_qty <= 0 or sleeve_qty <= 0:
-            # Position closed — cancel any lingering resting stop and clear state.
+            # Position closed. Before we cancel + clear the stop_oid, check
+            # if that stop is what CAUSED pos_qty to hit 0 (i.e. it FILLED).
+            # If we blindly cancel + wipe stop_oid, the credit path will
+            # never see the fill → own_avg_entry stays set → ghost sleeve
+            # (2026-07-19 SLR incident — Adam: "no more fucking ghosts").
+            #
+            # Root cause of the ghost class this fix addresses: the tick
+            # loop runs _maintain_resting_stop BEFORE _maybe_credit_resting_
+            # stop_fill in the multi-sleeve step. On a multi-sleeve product
+            # where a sibling's stop fires and closes the shared position,
+            # every sleeve sees pos_qty=0 and wipes its stop_oid — even
+            # sleeves whose OWN stop just filled.
+            _fill_credited = False
             if ss.resting_stop_oid:
+                try:
+                    _oid = ss.resting_stop_oid
+                    _st = self.b.order_status(_oid)
+                    _status = (_st or {}).get("status")
+                    if _status == "FILLED":
+                        try:
+                            _fp = float(_st.get("average_filled_price") or 0)
+                        except (TypeError, ValueError):
+                            _fp = 0.0
+                        try:
+                            _fq = int(_st.get("filled_qty") or sleeve_qty or 1)
+                        except (TypeError, ValueError):
+                            _fq = sleeve_qty or 1
+                        # Route through the shared credit helper so we get
+                        # the same dedup + own_avg fallback + never-silent-$0
+                        # protection as the tick-credit path.
+                        _fill_credited = self._credit_stop_fill(
+                            sc, ss, _fp, _fq,
+                            source="maintain_stop_pos_zero_detect",
+                            oid=_oid,
+                        )
+                        if _fill_credited:
+                            self._record(
+                                "resting_stop_credit_via_pos_zero_race_fix",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                oid=_oid, fill_price=_fp, filled_qty=_fq,
+                                severity="info",
+                                reason=("_maintain_resting_stop detected pos=0 "
+                                        "but stop FILLED — credited before wipe "
+                                        "to prevent ghost sleeve"),
+                            )
+                except Exception as _e:
+                    self._record("maintain_stop_pos_zero_status_probe_failed",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 oid=ss.resting_stop_oid, error=str(_e),
+                                 severity="warn")
+            if ss.resting_stop_oid and not _fill_credited:
+                # Not FILLED (CANCELLED / UNKNOWN / probe failed). Safe to
+                # cancel + clear — matches original behavior.
                 try:
                     self.b.cancel(ss.resting_stop_oid)
                 except Exception as e:
@@ -4370,6 +4421,8 @@ class SwingTrader:
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
                 ss.resting_stop_stage = None
+            # If we credited above, _credit_stop_fill already cleared the
+            # oid + advanced state; no further work here.
             return
         # Resolve stage + target price.
         hwm = float(ss.trail_high_water_price or 0.0)
