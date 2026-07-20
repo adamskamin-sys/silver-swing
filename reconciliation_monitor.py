@@ -57,6 +57,41 @@ def check_orphans_and_missing(open_orders, sleeves):
     return out
 
 
+def check_unprotected_positions(exch_positions, open_orders):
+    """Adam 2026-07-20 ROOT FIX: flag any held position with insufficient
+    exchange stop coverage. Every long position (qty > 0) must have SELL
+    stop-limit orders totaling >= qty on the exchange. If not, the
+    position could exit unprotected — the "biggest rule" is violated.
+
+    XLM-31JUL26-CDE 2026-07-19: fresh buy fill at $0.18786 sat with
+    ZERO exchange stop for 5+ minutes because the sleeve had
+    stop_loss_px=0 and no trail/goal stage fired. This check catches
+    that class within one reconciliation cycle.
+    """
+    out = []
+    stop_qty_by_sym = defaultdict(int)
+    for o in open_orders:
+        if str(o.get("side") or "").upper() != "SELL":
+            continue
+        if str(o.get("kind") or "") != "stop_limit":
+            continue
+        stop_qty_by_sym[o.get("symbol")] += int(o.get("qty") or 0)
+    for sym, pos_qty in exch_positions.items():
+        try:
+            p = float(pos_qty)
+        except (TypeError, ValueError):
+            continue
+        if p <= 0:
+            continue
+        covered = stop_qty_by_sym.get(sym, 0)
+        if covered < p:
+            gap = int(p) - int(covered)
+            out.append(Finding("critical", "unprotected_position", sym,
+                       f"position={int(p)} but stop coverage={int(covered)} "
+                       f"(gap={gap}) — {gap} contract(s) exposed"))
+    return out
+
+
 def check_position_mismatch(exch_positions, sleeves, tol=0.0):
     expected = defaultdict(float)
     for s in sleeves:
@@ -156,6 +191,7 @@ def reconcile(*, open_orders, exch_positions, sleeves, now_ts,
     findings += check_duplicate_orders(open_orders, price_tick)
     findings += check_orphans_and_missing(open_orders, sleeves)
     findings += check_position_mismatch(exch_positions, sleeves)
+    findings += check_unprotected_positions(exch_positions, open_orders)
     findings += check_stale_entries(sleeves, now_ts, stale_after_s, price_lookup)
     findings += check_safety_halts(sleeves)
     findings += check_state_config_drift(state_config_pairs)

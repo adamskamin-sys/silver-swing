@@ -471,11 +471,18 @@ class CoinbaseBroker:
             side = str(o.get("side") or "").upper()
             oid = o.get("order_id")
             # Price + qty live under order_configuration for the various
-            # limit_* / market_* order shapes. We only care about limit
-            # orders that reconciliation might flag as duplicates.
+            # limit_* / stop_limit_* / market_* order shapes.
+            # Adam 2026-07-20: include STOP-LIMIT shapes too. Prior code
+            # only surfaced pure limit orders, so reconciliation could not
+            # see the resting protective stops — and had no way to flag
+            # "position held but no protective stop." Now every shape that
+            # has a price + qty surfaces, with `kind` set so downstream
+            # consumers can distinguish. Backward-compatible: `price`,
+            # `qty`, `order_id`, `symbol`, `side` remain on every entry.
             cfg = o.get("order_configuration") or {}
             price = None
             qty = None
+            kind = None
             for shape_key in ("limit_limit_gtc", "limit_limit_gtd",
                               "limit_limit_fok", "limit_limit_ioc"):
                 shape = cfg.get(shape_key)
@@ -483,14 +490,30 @@ class CoinbaseBroker:
                     try:
                         price = float(shape.get("limit_price") or 0)
                         qty = int(float(shape.get("base_size") or 0))
+                        kind = "limit"
                     except (TypeError, ValueError):
                         pass
                     break
+            if price is None:
+                # Try stop-limit shapes. price = trigger (stop_price); the
+                # limit_price is captured separately for context.
+                for shape_key in ("stop_limit_stop_limit_gtc",
+                                  "stop_limit_stop_limit_gtd"):
+                    shape = cfg.get(shape_key)
+                    if shape:
+                        try:
+                            price = float(shape.get("stop_price") or 0)
+                            qty = int(float(shape.get("base_size") or 0))
+                            kind = "stop_limit"
+                        except (TypeError, ValueError):
+                            pass
+                        break
             if price is None or qty is None or not pid or not oid or not side:
                 continue
             out.append({
                 "order_id": oid, "symbol": pid,
                 "side": side, "price": price, "qty": qty,
+                "kind": kind or "unknown",
             })
         return out
 
