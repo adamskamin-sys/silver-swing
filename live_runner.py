@@ -810,10 +810,14 @@ def run() -> int:
                 try:
                     seed_broker = CoinbaseBroker(BrokerConfig(product_id=product_id))
                     spec = seed_broker.contract_spec() or {}
+                    _mrate = float(spec.get("intraday_margin_rate") or 0)
+                    _cs    = float(spec.get("contract_size") or 1)
+                    _cpx   = float(spec.get("current_price") or 0)
                     seeded = {
                         "product_id": product_id,
                         "tick_size": float(spec.get("tick_size") or 0.01),
-                        "contract_size": float(spec.get("contract_size") or 1),
+                        "contract_size": _cs,
+                        "margin_per_contract": round(_mrate * _cs * _cpx, 4) if _mrate > 0 and _cpx > 0 else 0,
                         "fee_per_contract_roundtrip": 0.5,   # conservative
                         "swing_qty": 0,                       # sleeves only, no primary
                         "core_qty": 0,                        # no protected core
@@ -1584,6 +1588,10 @@ def run() -> int:
                                 notifier.send("margin sentinel", _a["detail"], _prio)
                             except Exception:
                                 pass
+                        if _ms.get("blind_positions"):
+                            _blind_syms = ", ".join(_ms["blind_positions"])
+                            _log(f"[margin-sentinel] WARN: {len(_ms['blind_positions'])} position(s) "
+                                 f"excluded from margin calc (no margin data): {_blind_syms}")
                         if _ms.get("alerts"):
                             try:
                                 log.record(
@@ -1592,6 +1600,7 @@ def run() -> int:
                                     nearest_distance_to_liq_pct=_ms.get("nearest_distance_to_liq_pct"),
                                     verdict=_ms.get("verdict"),
                                     alerts=_ms.get("alerts"),
+                                    blind_positions=_ms.get("blind_positions"),
                                     severity=("critical"
                                               if any(_a["severity"] == "critical"
                                                      for _a in _ms["alerts"])

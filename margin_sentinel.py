@@ -82,20 +82,14 @@ def margin_report(positions, balance: float, maint_margin_frac: float = 0.005,
                   warn_distance_pct: float = 15.0, warn_utilization: float = 0.6) -> dict:
     """positions: list of position dicts. Aggregates margin utilization and the
     correlated-cluster liquidation risk."""
-    rows = []
-    blind_spots: list[str] = []
-    for p in positions:
-        r = position_headroom(p, maint_margin_frac)
-        if r:
-            rows.append(r)
-        elif (float(p.get("margin_per_contract") or 0) <= 0
-              and float(p.get("liquidation_price") or 0) <= 0
-              and float(p.get("qty") or 0) > 0):
-            # Auto-seeded config with no margin_per_contract AND exchange
-            # didn't supply liquidation_price — position is invisible to margin
-            # math. Emit a high alert so it's not silently excluded.
-            blind_spots.append(str(p.get("symbol", "?")))
-
+    headrooms = [position_headroom(p, maint_margin_frac) for p in positions]
+    rows = [r for r in headrooms if r]
+    # Positions excluded from headroom calc (margin_per_contract=0 AND no
+    # liquidation_price from exchange) — surface explicitly rather than silently drop.
+    blind = [
+        p.get("symbol") for p, h in zip(positions, headrooms)
+        if h is None and float(p.get("qty") or 0) > 0
+    ]
     used = sum(r["margin_used"] for r in rows)
     utilization = used / balance if balance > 0 else 0.0
 
@@ -114,18 +108,18 @@ def margin_report(positions, balance: float, maint_margin_frac: float = 0.005,
 
     nearest = min((r["distance_to_liq_pct"] for r in rows), default=None)
     alerts = []
-    for sym in blind_spots:
-        alerts.append({"severity": "high",
-                       "detail": f"{sym}: excluded from margin check — no margin_per_contract and no liquidation_price from exchange; verify manually"})
     if utilization >= warn_utilization:
         alerts.append({"severity": "high", "detail": f"margin utilization {utilization*100:.0f}% (>= {warn_utilization*100:.0f}%)"})
     for fam, c in clusters.items():
         if c["nearest_liq_pct"] is not None and c["nearest_liq_pct"] <= warn_distance_pct:
             alerts.append({"severity": "critical",
                            "detail": f"cluster {fam} is {c['nearest_liq_pct']:.1f}% from liquidation on a correlated move ({', '.join(c['symbols'])})"})
+    for sym in blind:
+        alerts.append({"severity": "high",
+                       "detail": f"{sym}: excluded from margin calc — margin_per_contract=0 and no liquidation_price from exchange"})
     return {
         "positions": rows,
-        "blind_spots": blind_spots,
+        "blind_positions": blind,
         "margin_used": round(used, 2),
         "balance": round(balance, 2),
         "utilization_pct": round(utilization * 100, 1),
