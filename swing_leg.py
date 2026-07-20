@@ -4508,7 +4508,46 @@ class SwingTrader:
         self._maybe_consume_sleeve_state_reset()
 
         if self.s.state == State.HALTED:
-            return
+            # Adam 2026-07-20: auto-resume when there is literally nothing to
+            # defend against. XLP double-fire 07:07 halted the strategy; Adam
+            # manually flattened; sleeves already got removed. Dashboard
+            # showed "Strategy halted" with no position + no sleeves = no
+            # defensive purpose, just blocks future scanner arms + requires
+            # click-through Resume. Now: if halted AND no live_order_id AND
+            # no sleeves AND broker position is 0, auto-clear halt state.
+            # Loud log so the auto-resume is traceable (not silent).
+            try:
+                _has_sleeves = bool(self.s.sleeves)
+                _has_order = bool(self.s.live_order_id)
+                try:
+                    _pos_qty = int(self.b.position_qty() or 0)
+                except Exception:
+                    _pos_qty = -1  # unknown — do NOT auto-resume on error
+                if (not _has_sleeves and not _has_order and _pos_qty == 0):
+                    _prev_reason = self.s.halt_reason
+                    self.s.state = State.ARMED_SELL
+                    self.s.halt_reason = None
+                    self._save_state()
+                    self._record(
+                        "strategy_auto_resumed_empty",
+                        prev_halt_reason=_prev_reason,
+                        severity="info",
+                        reason=("halted strategy had no sleeves, no live "
+                                "order, and zero broker position — nothing "
+                                "to defend against. Auto-cleared halt so "
+                                "future scanner arms + manual attach work "
+                                "without click-through Resume."),
+                    )
+                    # Fall through — strategy is now ARMED_SELL with empty
+                    # state; the normal tick below handles it correctly.
+                else:
+                    return
+            except Exception as _e:
+                # Any failure = keep halted (defensive default). Log loud.
+                self._record("strategy_auto_resume_check_failed",
+                             error=str(_e), severity="warn",
+                             reason="auto-resume check raised; staying halted")
+                return
 
         # Kill switch is checked EVERY cycle — no arming, no fill processing.
         # We stop short of halting because the kill switch is meant to be
