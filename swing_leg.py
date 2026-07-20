@@ -6083,6 +6083,66 @@ class SwingTrader:
                              fallback_source=avg_source, used_avg=own_avg,
                              source=source, severity="warn")
         if own_avg <= 0:
+            # Adam 2026-07-20 AUTO-HEAL (feedback_no_ghost_sleeves): before
+            # halting, query Coinbase for the most recent BUY fill on this
+            # product. That's the actual entry price of the position we just
+            # exited — real exchange truth, not sleeve-state approximation.
+            # Kills the "manual diag_force_credit required" class Adam has hit
+            # repeatedly. HYP-20DEC30 2026-07-20 16:39 was one such case.
+            try:
+                _fills_resp = self.b.client.list_orders(
+                    product_id=self.symbol, order_status="FILLED", limit=50
+                )
+                _raw_fills = (_fills_resp.to_dict()
+                              if hasattr(_fills_resp, "to_dict")
+                              else (_fills_resp
+                                    if isinstance(_fills_resp, dict) else {}))
+                _fill_list = (_raw_fills.get("orders") or [])
+                # Sort by last_fill_time DESC to find most recent BUY.
+                def _fill_ts_key(_o):
+                    return str(_o.get("last_fill_time")
+                               or _o.get("created_time") or "")
+                _fill_list.sort(key=_fill_ts_key, reverse=True)
+                _recent_buy_px = 0.0
+                _recent_buy_oid = None
+                _recent_buy_ts = None
+                for _o in _fill_list:
+                    if str(_o.get("side") or "").upper() != "BUY":
+                        continue
+                    try:
+                        _px = float(_o.get("average_filled_price") or 0)
+                    except (TypeError, ValueError):
+                        _px = 0.0
+                    if _px > 0:
+                        _recent_buy_px = _px
+                        _recent_buy_oid = _o.get("order_id")
+                        _recent_buy_ts = _fill_ts_key(_o)
+                        break
+                if _recent_buy_px > 0:
+                    own_avg = _recent_buy_px
+                    avg_source = "coinbase_recent_buy_fallback"
+                    self._record(
+                        "resting_stop_credit_broker_history_fallback",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        source=source,
+                        fallback_source=avg_source,
+                        used_avg=own_avg,
+                        broker_buy_oid=_recent_buy_oid,
+                        broker_buy_ts=_recent_buy_ts,
+                        severity="warn",
+                        reason=("own_avg_entry AND sell_entry_avg both missing "
+                                "— queried Coinbase for most recent BUY fill "
+                                "and used its actual fill price as basis. "
+                                "Prevents halt + manual diag intervention per "
+                                "feedback_no_ghost_sleeves rule."),
+                    )
+            except Exception as _e:
+                self._record("resting_stop_credit_broker_fallback_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e), severity="warn",
+                             reason=("broker BUY history query failed — "
+                                     "falling through to halt"))
+        if own_avg <= 0:
             # No usable entry — halt for review. This is the HYPE 2026-07-15
             # class: cycles++ would have fired with profit=0 and the missing
             # $15 would vanish forever. Halt loudly instead.
@@ -6091,7 +6151,8 @@ class SwingTrader:
                          source=source, fill_price=fill_price,
                          filled_qty=filled_qty, severity="critical",
                          reason=("own_avg_entry AND sell_entry_avg both missing "
-                                 "— cannot compute realized P&L. Halted; use "
+                                 "AND Coinbase broker fallback failed — "
+                                 "cannot compute realized P&L. Halted; use "
                                  "diag_force_credit_cycle.py to backfill."))
             self._sleeve_halt(sc, ss,
                               f"resting stop-limit fill @ ${fill_price} but own_avg "
