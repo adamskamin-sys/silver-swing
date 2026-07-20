@@ -730,6 +730,32 @@ export function makeApp({
           armed_buy_since_ts: nowSec,
           ...(clientSeed && typeof clientSeed === 'object' ? clientSeed : {}),
         };
+        // Adam 2026-07-20: if this sleeve was seeded as ARMED_SELL
+        // (defensive/piggy-back on an existing position) but the client
+        // seed didn't include own_avg_entry, populate it from the
+        // exchange's blended avg NOW. Without this, the sleeve starts
+        // life in state=ARMED_SELL + own_avg=None — a bad state that
+        // will halt with "own_avg unknown" the moment its stop fires.
+        // This was the Model B XLP halt root cause 2026-07-19.
+        // See feedback_no_ghost_sleeves.md + feedback_cure_not_bandaid.md.
+        if (seed.state === 'ARMED_SELL' && (seed.own_avg_entry == null || Number(seed.own_avg_entry) === 0)) {
+          const pfSnap = store[tenant]?.__portfolio__?.config;
+          const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+          const brokerAvg = Number(posRow?.avg_entry) || 0;
+          if (brokerAvg > 0) {
+            seed.own_avg_entry = brokerAvg;
+            seed._own_avg_source = 'seed_enriched_from_portfolio_snapshot_at_attach_time';
+          } else {
+            // No exchange position OR snapshot missing/stale — downgrade
+            // to ARMED_BUY so the sleeve doesn't sit in an inconsistent
+            // ARMED_SELL/own_avg=None state. The tick loop's
+            // _maybe_reconcile_orphan_position will pick it up later if
+            // a real position appears.
+            seed.state = 'ARMED_BUY';
+            seed.armed_buy_since_ts = nowSec;
+            seed._downgrade_reason = 'seeded_ARMED_SELL_but_no_broker_avg_available';
+          }
+        }
         existing[s.id] = seed;
         seededAny = true;
       }

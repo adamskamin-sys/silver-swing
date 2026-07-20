@@ -4029,6 +4029,52 @@ class SwingTrader:
         """
         old_buy, old_sell = sc.buy_px, sc.sell_px
         old_stop = float(sc.stop_loss_px or 0.0)
+        # Adam day-one rule (formalized in feedback_no_net_loss_cycles.md
+        # 2026-07-20): every take-profit sell must clear fees. Clamp any
+        # incoming sell_px below the fee floor so a "profit-lock" fire
+        # can never close for a net loss. Only stop_loss / ratchet-stop
+        # exits are allowed to exit red — they're protective, not TP.
+        # SLR 2026-07-19 incident: bought $56.665, reanchor set sell_px
+        # $56.710 (+8bps), fees ~11bps, net -$0.72 loss on a "take-profit."
+        try:
+            _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            _cs = float(getattr(self.cfg, "contract_size", 0) or 0)
+            _q = max(1, int(getattr(sc, "qty", 1) or 1))
+            _tick = float(getattr(self.cfg, "tick_size", 0) or 0.0)
+            if _fee_rt > 0 and _cs > 0 and float(new_buy_px) > 0:
+                _fee_per_unit = _fee_rt / _cs / _q
+                _safety = max(_tick if _tick > 0 else 0.0,
+                              float(new_buy_px) * 0.0005)
+                _floor = float(new_buy_px) + _fee_per_unit + _safety
+                if float(new_sell_px) < _floor:
+                    _clamped = self._snap_to_tick(_floor) if _tick > 0 else _floor
+                    if _clamped < _floor:  # snap rounded us back under
+                        _clamped = _clamped + (_tick or 0.0)
+                    self._record(
+                        "sleeve_reanchor_sell_px_fee_floor_clamp",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        requested_sell_px=float(new_sell_px),
+                        fee_floor_sell_px=_clamped,
+                        new_buy_px=float(new_buy_px),
+                        fee_per_roundtrip=_fee_rt,
+                        contract_size=_cs, qty=_q,
+                        severity="info",
+                        reason=("expert/config sell_px was below "
+                                "buy + fees + safety — clamped up to "
+                                "prevent a net-loss profit-lock exit "
+                                "per feedback_no_net_loss_cycles"),
+                    )
+                    new_sell_px = _clamped
+        except Exception as _e:
+            # Fee floor is a guardrail — never fail-hard here. Log + fall
+            # through with the original sell_px so a math error can't
+            # block a legitimate reanchor.
+            try:
+                self._record("sleeve_reanchor_fee_floor_error",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
         sc.buy_px = float(new_buy_px)
         sc.sell_px = float(new_sell_px)
         sc.trail_trigger = float(new_sell_px)
