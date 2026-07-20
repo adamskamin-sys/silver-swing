@@ -4729,6 +4729,13 @@ class SwingTrader:
                     ss.resting_stop_stage = None
                 try:
                     oid = self.b.place_market("SELL", sleeve_qty)
+                    # Track as live_order_id so the standard fill poller
+                    # (lines ~440-475) catches FILLED status and calls
+                    # _sleeve_on_fill → credits cycle + clears own_avg +
+                    # advances state. Without this, market sell fires on
+                    # Coinbase but sleeve stays WAITING_FOR_SELL with
+                    # own_avg set — ghost.
+                    ss.live_order_id = oid
                     self._record("trail_breach_market_sell",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  target_px=float(target_px),
