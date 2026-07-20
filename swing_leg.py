@@ -4696,11 +4696,58 @@ class SwingTrader:
             pass  # fall back to floor formula; never fail-hard here
         buffer = max(tick * 2.0, target_px * 0.0005, vol_buffer)
         limit_px = max(0.0, target_px - buffer)
-        # Sanity: never place a stop at or above current mark (would fire
-        # immediately as a limit sell against the book — that's a market sell,
-        # not a protective stop). This can happen briefly if the market gaps
-        # past our intended stop; let bot-side triggers handle it.
+        # Adam 2026-07-20 Rule #1 (feedback_biggest_rule_dont_lose_take_best):
+        # if target_px >= last_price and we're on a TRAIL stage while holding,
+        # the trail has been breached — mark dropped below where the trail
+        # says the exit must fire. Coinbase rejects a stop-limit trigger
+        # above mark, so a market sell is the only way to enforce the
+        # trail decision (which was already made at arm time — this is
+        # execution, not a new decision). Fires only for trail stages;
+        # hard_bottom is a pre-arm protective floor at a lower price by
+        # definition and should never reach here above mark.
+        # Cite: Cartea & Jaimungal, Algorithmic and High-Frequency
+        # Trading (Cambridge 2015), ch.10 — stop-triggered execution
+        # requires marketable orders when the trigger sits above prevailing
+        # mid; limit orders above mid gap into fills, market is deterministic.
         if target_px >= last_price:
+            _trail_stages_needing_market_exit = {
+                "trail", "trail_pre_goal", "trail_floored_at_sell",
+                "trail_floored_at_break_even", "break_even_lock",
+                "profit_lock",
+            }
+            if _hold and trail_active and stage in _trail_stages_needing_market_exit:
+                if ss.resting_stop_oid:
+                    try:
+                        self.b.cancel(ss.resting_stop_oid)
+                    except Exception as _e:
+                        self._record("trail_breach_cancel_failed",
+                                     sleeve_id=sc.id, sleeve_name=sc.name,
+                                     oid=ss.resting_stop_oid, error=str(_e),
+                                     severity="warn")
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
+                try:
+                    oid = self.b.place_market("SELL", sleeve_qty)
+                    self._record("trail_breach_market_sell",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 target_px=float(target_px),
+                                 last_price=float(last_price),
+                                 stage=stage, hwm=float(hwm),
+                                 trail_distance=float(trail_distance),
+                                 qty=int(sleeve_qty), oid=oid,
+                                 reason=("mark dropped below trail target; "
+                                         "market-sell enforces the trail decision"),
+                                 severity="critical")
+                except Exception as _e:
+                    self._record("trail_breach_market_sell_failed",
+                                 sleeve_id=sc.id, sleeve_name=sc.name,
+                                 target_px=float(target_px),
+                                 last_price=float(last_price),
+                                 stage=stage, error=str(_e),
+                                 severity="critical")
+                return
+            # Non-trail stage (hard_bottom) above mark — record + skip.
             self._record("resting_stop_skipped_above_mark",
                          sleeve_id=sc.id, sleeve_name=sc.name,
                          target_px=target_px, last_price=last_price, stage=stage)
