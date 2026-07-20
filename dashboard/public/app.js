@@ -5952,7 +5952,27 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
     }
     if (stopLossEnabled) {
       if (!(stopPx > 0)) { errEl.hidden = false; errEl.innerHTML = 'Stop-loss trigger price must be > 0'; return; }
-      if (!(stopPx < buyPx)) { errEl.hidden = false; errEl.innerHTML = 'Stop-loss trigger must be below the buy-back target'; return; }
+      // Adam 2026-07-20: auto-heal stop > buy_px instead of rejecting.
+      // Experts should be self-consistent per feedback_experts_all_algo_
+      // params.md — if the derived stop lands above buy_px (tight-spread
+      // edge case on low-priced spot), clamp to buy_px - safety and update
+      // the UI so the user sees the correction. Only fires when
+      // stopLossEnabled + saved value violates invariant. Previously
+      // rejected the save, forcing manual edit — that's the opposite of
+      // experts-adjust-numbers-automatically.
+      if (!(stopPx < buyPx)) {
+        const safety = Math.max(tickStep, buyPx * 0.001);
+        const clamped = Number((buyPx - safety).toFixed(pricePrec));
+        if (clamped > 0) {
+          stopPx = clamped;
+          stopPxEl.value = clamped;
+          patch.stop_loss_px = clamped;
+        } else {
+          errEl.hidden = false;
+          errEl.innerHTML = `Stop-loss trigger clamp failed (buy_px $${fmtPrice(buyPx)} too small). Adjust buy-back higher or disable stop-loss.`;
+          return;
+        }
+      }
       if (stopMode === 'custom' && !(parseInt(stopQtyEl?.value || 0, 10) >= 1)) {
         errEl.hidden = false; errEl.innerHTML = 'Custom stop-loss qty must be at least 1'; return;
       }
