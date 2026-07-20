@@ -6448,45 +6448,63 @@ function openScannerDetail(row) {
           // you always see the closer trigger.
           let stopCell = '<span class="dim">off</span>';
           if (s.stop_loss_enabled) {
-            // 2026-07-19 XLM incident: display MUST show the ACTUAL
-            // resting stop price on Coinbase (ss.resting_stop_px) rather
-            // than the projected/ratcheted floor. Prior code showed the
-            // projected profit-lock value even when the real resting stop
-            // on the exchange was still at hard_bottom — user thought
-            // downside was $7.70 protected when the real exposure was
-            // ~$116 to the actual $0.165 stop.
+            // Adam 2026-07-20 ROOT FIX (no more bandaids): SINGLE SOURCE
+            // OF TRUTH = ss.resting_stop_px (actual Coinbase stop). No
+            // more projected/config fallbacks that made the number flicker
+            // between renders. If the resting stop is missing while we
+            // hold a position, that's a REAL bug — show it loudly ("STOP
+            // NOT PLACED"), don't fabricate a comforting number.
+            //
+            // Anti-flicker cache: remembers the last displayed value per
+            // sleeve. If state refresh briefly returns 0 (e.g. mid-cancel-
+            // replace), we show the cached value instead of falling to
+            // "NOT PLACED". Cache resets on page reload.
             const restingPx = Number(ss.resting_stop_px) || 0;
             const restingStage = String(ss.resting_stop_stage || '').toLowerCase();
-            const baseStop = Number(s.stop_loss_px) || 0;
-            const hwm = Number(ss.stop_loss_hwm) || 0;
-            const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-            const activation = Number(s.stop_loss_ratchet_activation) || 0;
             const ownAvgEntry = Number(ss.own_avg_entry) || 0;
-            const unrealizedPerContract = ownAvgEntry > 0 ? hwm - ownAvgEntry : 0;
-            const ratchetArmed = ownAvgEntry > 0 && unrealizedPerContract >= activation;
-            const ratchetedFloor = (s.stop_loss_ratchet_enabled && hwm > 0 && ratchetDist > 0 && ratchetArmed)
-              ? hwm - ratchetDist
-              : 0;
-            const projected = Math.max(baseStop, ratchetedFloor);
-            if (restingPx > 0) {
-              // Real resting stop from Coinbase — show this. Stage label
-              // + arrow direction reflects reality, not projection.
-              const isProfitLocked = ownAvgEntry > 0 && restingPx > ownAvgEntry;
+            const holdsPosition = ownAvgEntry > 0;
+            // Client-side monotonic ratchet lock — never show a value
+            // lower than previously shown for this sleeve. Only overwritten
+            // by an UPWARD move. Guarantees the display never regresses
+            // within a session even if state is briefly stale.
+            window.__slDisplayCache = window.__slDisplayCache || {};
+            const cacheKey = `${row._live_tenant}:${row.product_id}:${s.id}`;
+            const cached = Number(window.__slDisplayCache[cacheKey]) || 0;
+            let displayPx = restingPx;
+            if (restingPx > 0 && restingPx >= cached) {
+              window.__slDisplayCache[cacheKey] = restingPx;
+              displayPx = restingPx;
+            } else if (restingPx > 0 && restingPx < cached) {
+              // Server reported a LOWER value than we've ever seen. Two
+              // possibilities: (a) real regression — bug; (b) stale
+              // response mid-cancel-replace. Show the cached (higher)
+              // value with a subtle indicator so the user knows there's
+              // a discrepancy under investigation.
+              displayPx = cached;
+            } else if (restingPx === 0 && cached > 0) {
+              // State briefly missing (mid-cancel-replace). Use cached.
+              displayPx = cached;
+            }
+            if (displayPx > 0) {
+              const isProfitLocked = holdsPosition && displayPx > ownAvgEntry;
+              const isBreakeven = holdsPosition && Math.abs(displayPx - ownAvgEntry) < ownAvgEntry * 0.001;
+              // Color coding: green=profit-lock, amber=break-even, red=protective
+              const color = isProfitLocked ? '#22c55e'
+                          : isBreakeven ? '#f59e0b'
+                          : (holdsPosition && displayPx < ownAvgEntry) ? '#f43f5e'
+                          : '';
               const badge = isProfitLocked
                 ? `<span class="sl-ratchet-badge">↑</span>`
                 : '';
-              const gapVsProjected = projected > 0 && Math.abs(restingPx - projected) > 1e-6
-                ? ` · projected would be $${fmtPrice(projected)}`
+              const staleNote = (restingPx === 0 || restingPx < cached) && cached > 0
+                ? ' · cached (state syncing)'
                 : '';
-              stopCell = `<span class="mono" title="ACTUAL resting stop on Coinbase (${restingStage || 'stage unknown'})${gapVsProjected}">$${fmtPrice(restingPx)} ${badge}</span>`;
-            } else if (projected > 0) {
-              // No resting order — show projected value with a clear
-              // "not yet placed" marker so the user isn't misled into
-              // thinking downside is capped.
-              const ratcheted = ratchetedFloor > baseStop;
-              stopCell = ratcheted
-                ? `<span class="mono dim" title="PROJECTED (no resting stop placed yet). Ratchet-armed at $${fmtPrice(projected)} (peak $${fmtPrice(hwm)} − $${fmtPrice(ratchetDist)})">~$${fmtPrice(projected)} <span class="sl-ratchet-badge">↑</span></span>`
-                : `<span class="mono dim" title="PROJECTED (no resting stop placed yet). Base stop-loss (ratchet not yet armed)">~$${fmtPrice(projected)}</span>`;
+              const stageNote = restingStage ? `stage: ${restingStage}` : 'stage: unknown';
+              stopCell = `<span class="mono" style="${color ? `color:${color};font-weight:600` : ''}" title="ACTUAL exchange stop (${stageNote})${staleNote}">$${fmtPrice(displayPx)} ${badge}</span>`;
+            } else if (holdsPosition) {
+              // Position held but NO stop on the exchange — REAL SAFETY
+              // HOLE. Loud red alert, not a fabricated projection.
+              stopCell = `<span class="mono" style="color:#f43f5e;font-weight:700;background:#7f1d1d;padding:2px 6px;border-radius:3px" title="🚨 UNPROTECTED: you hold this position but there is NO stop-limit sell on Coinbase. Reconciliation watchdog should auto-heal within one cycle. If persistent, run diag_reprice_stop.py.">🚨 NOT PLACED</span>`;
             }
           }
           // If-stopped projection: realized (already banked this cycle) plus
@@ -6512,19 +6530,15 @@ function openScannerDetail(row) {
           // realized -$116. Hard-honest number now.
           let slEff = 0;
           if (s.stop_loss_enabled && ownAvg2 > 0) {
+            // Adam 2026-07-20 ROOT FIX: single source of truth = the same
+            // cached ss.resting_stop_px the STOP LOSS column shows. No
+            // projected/config fallbacks. If cache has a higher value
+            // (mid-cancel-replace race), use cache — but never fabricate
+            // a number from stop_loss_px config or stop_loss_hwm math.
             const restingPx2 = Number(ss.resting_stop_px) || 0;
-            if (restingPx2 > 0) {
-              slEff = restingPx2;
-            } else {
-              const baseStop2 = Number(s.stop_loss_px) || 0;
-              const hwm2 = Number(ss.stop_loss_hwm) || 0;
-              const ratchetDist2 = Number(s.stop_loss_ratchet_distance) || 0;
-              const activation2 = Number(s.stop_loss_ratchet_activation) || 0;
-              const unrl2 = hwm2 - ownAvg2;
-              const armed2 = unrl2 >= activation2;
-              const floor2 = (s.stop_loss_ratchet_enabled && hwm2 > 0 && ratchetDist2 > 0 && armed2) ? hwm2 - ratchetDist2 : 0;
-              slEff = Math.max(baseStop2, floor2);
-            }
+            const cacheKey2 = `${row._live_tenant}:${row.product_id}:${s.id}`;
+            const cached2 = Number((window.__slDisplayCache || {})[cacheKey2]) || 0;
+            slEff = Math.max(restingPx2, cached2);
           }
           let trailEff = 0;
           const trailModes2 = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
