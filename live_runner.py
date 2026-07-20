@@ -952,6 +952,17 @@ def run() -> int:
                 # stale") — mark the seen-at time as now.
                 track.last_tick_seen_ts = now_ts
             reference_ts = track.last_tick_seen_ts or track.last_step_ok_ts
+            # Adam 2026-07-19 FIX: fresh-boot Tracks have both timestamps=0,
+            # producing reference_ts=0, age=HUGE, and the code below then
+            # immediately tears down + rebuilds the WS feed on the very
+            # first tick. If new_feed.start() blocks (WS handshake), the
+            # tick loop hangs on the first Track and NEVER reaches later
+            # tracks (or the last_tick_attempt_ts assignment). Use spawn_ts
+            # as the baseline when both step/tick timestamps are 0 — gives
+            # a new feed its full staleness window to actually connect
+            # before we consider replacing it.
+            if reference_ts == 0:
+                reference_ts = float(track.spawn_ts or now_ts)
             age = now_ts - reference_ts
             if age > FEED_STALE_THRESHOLD_SECS:
                 _log(f"[non-primary] {track.product_id}: feed stale "
@@ -1847,6 +1858,13 @@ def run() -> int:
                                 "side": "SELL" if s_state_str == "ARMED_SELL" else "BUY",
                                 "state": s_state_str,
                                 "live_order_id": s_st.get("live_order_id"),
+                                # Adam 2026-07-20: include resting_stop_oid so
+                                # reconciliation_monitor.check_orphans_and_missing
+                                # can see it as a tracked order. Prior code only
+                                # included live_order_id, so every real resting
+                                # stop got reported as "orphan" — drowning
+                                # genuine orphans in noise.
+                                "resting_stop_oid": s_st.get("resting_stop_oid"),
                                 "armed_at": s_st.get("armed_buy_since_ts"),
                                 "last_sale_px": s_st.get("last_sell_fill_price"),
                             })

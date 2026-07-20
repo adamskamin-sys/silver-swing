@@ -57,8 +57,13 @@ def test_price_tick_groups_near_prices():
 
 # ---- orphan_order + missing_order ----------------------------------------
 
-def test_orphan_order_flagged_warn():
-    """Order open on exchange but no sleeve tracks it."""
+def test_orphan_order_flagged_critical():
+    """Order open on exchange but no sleeve tracks it.
+
+    Adam 2026-07-20: severity was 'warn' — bumped to 'critical' because
+    an orphan SELL is a §3.8 short-risk (if it triggers with position=0
+    or against another sleeve's stop, we go short).
+    """
     open_orders = [{"order_id": "x1", "symbol": "OIL", "side": "SELL",
                     "price": 74.5, "qty": 1}]
     sleeves = [{"symbol": "OIL", "state": "ARMED_SELL", "armed": True,
@@ -66,7 +71,31 @@ def test_orphan_order_flagged_warn():
     findings = rm.check_orphans_and_missing(open_orders, sleeves)
     orphans = [f for f in findings if f.kind == "orphan_order"]
     assert len(orphans) == 1
-    assert orphans[0].severity == "warn"
+    assert orphans[0].severity == "critical"
+
+
+def test_resting_stop_recognized_not_orphan():
+    """Adam 2026-07-20: resting_stop_oid must be recognized as tracked.
+    Prior code only checked live_order_id, so every real resting stop
+    got false-flagged as an orphan."""
+    open_orders = [{"order_id": "rs1", "symbol": "SLR", "side": "SELL",
+                    "price": 55.0, "qty": 1, "kind": "stop_limit"}]
+    sleeves = [{"symbol": "SLR", "state": "ARMED_SELL", "armed": True,
+                "live_order_id": None, "resting_stop_oid": "rs1"}]
+    findings = rm.check_orphans_and_missing(open_orders, sleeves)
+    orphans = [f for f in findings if f.kind == "orphan_order"]
+    assert len(orphans) == 0, "tracked resting_stop_oid should not be orphan"
+
+
+def test_missing_resting_stop_flagged_critical():
+    """Sleeve tracks a resting_stop_oid but it's not open on exchange —
+    position may be unprotected."""
+    sleeves = [{"symbol": "SLR", "state": "ARMED_SELL", "armed": True,
+                "live_order_id": None, "resting_stop_oid": "vanished-stop"}]
+    findings = rm.check_orphans_and_missing([], sleeves)
+    missing = [f for f in findings if f.kind == "missing_resting_stop"]
+    assert len(missing) == 1
+    assert missing[0].severity == "critical"
 
 
 def test_missing_order_flagged_warn():

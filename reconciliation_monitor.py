@@ -42,18 +42,37 @@ def check_duplicate_orders(open_orders, price_tick=None):
 
 
 def check_orphans_and_missing(open_orders, sleeves):
-    live_ids = {s.get("live_order_id") for s in sleeves if s.get("live_order_id")}
+    """Detect orphan orders (open on exchange, no sleeve tracks them) and
+    missing orders (sleeve tracks it, not open on exchange).
+
+    Adam 2026-07-20: previously this only checked `live_order_id`, so every
+    real resting_stop_oid showed as an "orphan" — false positives that
+    drowned real orphans in noise. Now also collects `resting_stop_oid` so
+    tracked resting stops are recognized as legit.
+    """
+    live_ids = set()
+    for s in sleeves:
+        loid = s.get("live_order_id")
+        if loid:
+            live_ids.add(loid)
+        rsoid = s.get("resting_stop_oid")
+        if rsoid:
+            live_ids.add(rsoid)
     open_ids = {o["order_id"] for o in open_orders}
     out = []
     for o in open_orders:
         if o["order_id"] not in live_ids:
-            out.append(Finding("warn", "orphan_order", o["symbol"],
-                       f"open {o['side']} {str(o['order_id'])[:8]} tracked by NO sleeve"))
+            out.append(Finding("critical", "orphan_order", o["symbol"],
+                       f"open {o['side']} {str(o['order_id'])[:8]} tracked by NO sleeve — §3.8 short risk if it fires against a flat position"))
     for s in sleeves:
         lid = s.get("live_order_id")
         if s.get("armed") and lid and lid not in open_ids:
             out.append(Finding("warn", "missing_order", s["symbol"],
                        f"sleeve armed ({s.get('state')}) but order {str(lid)[:8]} not open on exchange"))
+        rsid = s.get("resting_stop_oid")
+        if rsid and rsid not in open_ids:
+            out.append(Finding("critical", "missing_resting_stop", s["symbol"],
+                       f"sleeve tracks resting_stop {str(rsid)[:8]} but it is NOT open on exchange — position may be UNPROTECTED"))
     return out
 
 
