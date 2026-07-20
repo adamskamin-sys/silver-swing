@@ -709,6 +709,84 @@ def _fetch_recent_ohlcv(coinbase_client, product_id: str,
         return []
 
 
+def expert_expected_daily_pnl(bars: list[dict], indicators: dict,
+                                mark: float, fee_rt: float,
+                                contract_size: float, tick: float,
+                                asset_class: str = "crypto") -> dict:
+    """Compute expected daily $-PnL for a product using PURELY expert-derived
+    forward-looking inputs. Contrast: the empirical grid uses backward-
+    looking cycle counts from the last N bars.
+
+    Method (all citations in scanner_indicators or expert_*.py):
+      1. Yang-Zhang (2000) → drift-independent per-bar vol σ_YZ.
+      2. Scale to daily σ_d = σ_YZ × sqrt(bars_per_day). Crypto = 24 bars
+         (1H granularity, 24/7 market); derivative = ~6.5 bars (US session).
+      3. Expected daily $-range = σ_d × mark × k, where k = √(2π) ≈ 2.507
+         is the expected absolute-return multiplier for a Gaussian random
+         walk (E[|X|] = σ√(2/π) per step, telescoped over the day gives
+         ~2.5× σ_d × mark; see Cartea-Jaimungal ch.2 for full derivation).
+      4. Grid-search spreads: candidate spreads in [1×tick, 30×tick].
+         For each: cycles/day = daily_range / (2 × spread), capped at 200
+         (sanity cap — anything more is unrealistic even in ideal markets).
+      5. Profit per cycle = spread × contract_size − fee_rt.
+      6. Daily PnL = cycles × profit/cycle. Pick the spread that maximizes.
+
+    Returns {'spread', 'cycles_per_day', 'profit_per_cycle',
+             'expected_daily_pnl', 'daily_range_expected', 'sigma_daily'}.
+    Returns {'expected_daily_pnl': 0.0, ...} on unusable inputs.
+
+    Cite: Yang & Zhang (2000) J.Business 73(3):477; Cartea-Jaimungal-Penalva
+    (2015) ch.2 Gaussian scaling; Amihud-Mendelson (1986) frequency-spread
+    trade-off (spread search maximizes the joint objective).
+    """
+    import math as _math
+    default = {"spread": 0.0, "cycles_per_day": 0.0,
+               "profit_per_cycle": 0.0, "expected_daily_pnl": 0.0,
+               "daily_range_expected": 0.0, "sigma_daily": 0.0}
+    yz_vol = float(indicators.get("yang_zhang_vol") or 0.0)
+    if yz_vol <= 0 or mark <= 0 or contract_size <= 0:
+        return default
+    # Bars per day depends on granularity we fetched (1H) and market hours.
+    # Crypto = 24/7, derivative = ~6.5 sessions/day (US futures pit hours).
+    bars_per_day = 24.0 if asset_class == "crypto" else 6.5
+    sigma_daily = yz_vol * _math.sqrt(bars_per_day)
+    # Expected daily $-range: E[|R|] over a day using Gaussian scaling.
+    # k = sqrt(2/π) per step × ~sqrt(bars_per_day) telescoping ~ 2.5.
+    k = _math.sqrt(2.0 * _math.pi) / 2.0  # ≈ 1.25; tuned conservative
+    daily_range = sigma_daily * mark * (2.0 * k)  # 2×k for round-trip
+    if daily_range <= 0:
+        return default
+    tick_min = max(tick, mark * 0.0001) if tick > 0 else mark * 0.0001
+    # Spread grid — same shape as empirical grid so results are comparable.
+    spreads = [tick_min * m for m in (1, 2, 3, 5, 8, 12, 20, 30)]
+    best = default.copy()
+    best_pnl = -1.0
+    CYCLES_PER_DAY_CAP = 200.0
+    for s in spreads:
+        if s <= 0:
+            continue
+        cycles = min(daily_range / (2.0 * s), CYCLES_PER_DAY_CAP)
+        if cycles <= 0:
+            continue
+        profit_per_cycle = s * contract_size - fee_rt
+        # §3.7: profit must clear fees + safety. Skip spreads that would
+        # net negative even before slippage.
+        if profit_per_cycle <= 0:
+            continue
+        daily_pnl = cycles * profit_per_cycle
+        if daily_pnl > best_pnl:
+            best_pnl = daily_pnl
+            best = {
+                "spread": round(s, 6),
+                "cycles_per_day": round(cycles, 2),
+                "profit_per_cycle": round(profit_per_cycle, 4),
+                "expected_daily_pnl": round(daily_pnl, 4),
+                "daily_range_expected": round(daily_range, 6),
+                "sigma_daily": round(sigma_daily, 8),
+            }
+    return best
+
+
 def apply_expert_gates(entry: dict, bars: list[dict]) -> dict:
     """Run the full §3.15 expert consensus on a scanner ranking entry.
 
@@ -831,8 +909,28 @@ def apply_expert_gates(entry: dict, bars: list[dict]) -> dict:
     except Exception as e:
         entry["expert_trail_error"] = f"{type(e).__name__}: {e}"
 
-    # 5. Combined expert-adjusted score
-    base_score = float(entry.get("best_score") or 0)
+    # 5. Expert-driven forward-looking PnL forecast (Yang-Zhang vol path,
+    #    §3.15 fully expert-driven). Ranks products by EXPECTED $/day from
+    #    academic-cited vol × spread math, not backward-looking cycle count.
+    #    Existing best_score (empirical grid) still populated as a comparison
+    #    baseline; expert_expected_daily_pnl is the new primary ranking key.
+    fwd = expert_expected_daily_pnl(
+        bars=bars, indicators=ind, mark=mark,
+        fee_rt=fee_rt, contract_size=csize, tick=tick,
+        asset_class=entry["asset_class"],
+    )
+    entry["expert_forecast"] = fwd
+
+    # 6. Combined expert-adjusted score. Uses the FORWARD-LOOKING
+    #    expected_daily_pnl (from YZ vol + spread search) as base when
+    #    available, falls back to empirical best_score if not (cold product,
+    #    insufficient bars). Then multiplied by liquidity + arm-gate gates.
+    base_score = float(fwd.get("expected_daily_pnl") or 0)
+    if base_score <= 0:
+        base_score = float(entry.get("best_score") or 0)  # fallback
+        entry["expert_score_source"] = "empirical_fallback"
+    else:
+        entry["expert_score_source"] = "expert_forward_looking"
     entry["expert_adjusted_score"] = round(base_score * liq_mult * gate_mult, 4)
     entry["expert_multipliers"] = {
         "liquidity": round(liq_mult, 3),
@@ -842,7 +940,9 @@ def apply_expert_gates(entry: dict, bars: list[dict]) -> dict:
         "expert_liquidity (Amihud/Roll/Kyle/Hasbrouck/A-M/Timmermann); "
         "expert_arm_gate (Kaufman/Wilder-ADX/CJP-OFI/Kyle-λ/Connors/Bollinger); "
         "expert_stop (Wilder-2N/CJP/Kyle/Menkveld/Van Tharp); "
-        "expert_trail (Chande/Wilder-SAR/Turtle/Ho-Stoll)"
+        "expert_trail (Chande/Wilder-SAR/Turtle/Ho-Stoll); "
+        "expert_forecast (Yang-Zhang 2000 vol × Cartea-Jaimungal ch.2 scaling "
+        "× Amihud-Mendelson 1986 frequency-spread trade-off)"
     )
     return entry
 
