@@ -1,17 +1,21 @@
-"""Enumerate all dead (evicted / silent) non-primary tracks with their
-last-failure reasons.
+"""Enumerate all dead (silent) non-primary tracks — the ones behind the
+HEALTH badge "N dead" count.
 
-Adam 2026-07-20: HEALTH went 5 dead → 20 dead within 30min after recent
-commits. Rollback 97dede6 removed the aggressive spot iteration; this
-diag surfaces what's STILL failing so we can either purge the tracks
-or fix a specific root cause.
+Adam 2026-07-20: audit-first per feedback_audit_before_fix.md. The
+dashboard's "N dead" count comes from `track_silent_detected` events
+in the trade log in the last 5 min (app.js:474). The heartbeat lives
+in `store[TENANT].__track_heartbeat__` (live_runner.py:1585), not
+under a separate Redis key.
 
 Reads:
-  1. silver-swing:track_health (per-track cadence heartbeat)
-  2. silver-swing:trade_log (recent track_spawn_failed / track_evicted /
-     non_primary_config_auto_seed_failed events)
-  3. store keys (any tenant symbol) — cross-reference which products have
-     sleeves configured but no active track
+  1. `__track_heartbeat__` per live tenant — per-track snapshot
+     (tick_count, last_step_ok_ts, spawn_ts, consecutive_step_failures,
+     last_tick_reason)
+  2. Trade log — `track_silent_detected`, `track_auto_respawn_attempted`,
+     `non_primary_config_auto_seed_failed`, `non_primary_step_failure`,
+     `non_primary_track_evicted` events from the last 30 min with error
+     text for each
+  3. `_non_primary_last_evict_ts` state from live tenant (if published)
 
 Read-only. Usage:
     python3 diag_dead_tracks.py
@@ -35,52 +39,23 @@ def main() -> None:
         return
     r = redis.Redis.from_url(url, decode_responses=True)
 
-    # ---- 1. Track health snapshot ---------------------------------------
-    print("\n[1/4] Live track health snapshot")
-    print("-" * 78)
-    try:
-        raw = r.get("silver-swing:track_health")
-        health = json.loads(raw) if raw else {}
-    except Exception as e:
-        print(f"  ✗ read failed: {e}")
-        health = {}
-
-    tracks = health.get("tracks") or {}
-    dead_ct = health.get("dead_count", 0)
-    print(f"  Tracks reported: {len(tracks)}, dead_count={dead_ct}")
-    now = time.time()
-    dead_products = []
-    for pid, t in sorted(tracks.items()):
-        step_ok = float(t.get("last_step_ok_ts") or 0)
-        tick_seen = float(t.get("last_tick_seen_ts") or 0)
-        spawn_ts = float(t.get("spawn_ts") or 0)
-        tick_count = int(t.get("tick_count") or 0)
-        age_step = int(now - step_ok) if step_ok else -1
-        age_tick = int(now - tick_seen) if tick_seen else -1
-        is_dead = (age_step < 0 or age_step > 300) and (age_tick < 0 or age_tick > 300)
-        marker = "💀" if is_dead else "✓ "
-        print(f"  {marker} {pid:35s} tick_ct={tick_count:>4} "
-              f"step_age={age_step:>5}s tick_age={age_tick:>5}s "
-              f"spawn={int(now - spawn_ts) if spawn_ts else '?'}s ago")
-        if is_dead:
-            dead_products.append(pid)
-
-    # ---- 2. Recent track-related failures -------------------------------
-    print("\n[2/4] Recent track-related failure events (last 30 min)")
-    print("-" * 78)
-    interesting = {
-        "track_spawn_failed", "track_evicted", "non_primary_track_evicted",
-        "non_primary_config_auto_seed_failed",
-        "non_primary_spawn_refused_no_config",
-        "non_primary_step_failure", "track_health_discovery_failed_per_symbol",
-        "track_auto_respawn_attempted", "track_silent_detected",
-        "sleeve_orphan_reconcile_cancel_failed",
-    }
-    try:
-        raw_events = r.lrange("silver-swing:trade_log", 0, 5000) or []
-    except Exception as e:
-        print(f"  ✗ trade log read failed: {e}")
+    store_raw = r.get("silver-swing:store")
+    if not store_raw:
+        print("\n✗ store not found in Redis")
         return
+    store = json.loads(store_raw)
+    live_tenants = [k for k in store.keys() if k.endswith("-live")]
+    if not live_tenants:
+        print("\n✗ no live tenants found")
+        return
+
+    now = time.time()
+    dead_from_log = set()  # products flagged silent in last 5min (dashboard "N dead" source)
+
+    # ---- 1. Trade log — the dashboard's source of truth ---------------
+    print("\n[1/4] track_silent_detected events (last 5 min — dashboard source)")
+    print("-" * 78)
+    raw_events = r.lrange("silver-swing:trade_log", 0, 10000) or []
     events = []
     for line in raw_events:
         try:
@@ -88,84 +63,96 @@ def main() -> None:
         except Exception:
             continue
     events.reverse()
-    cutoff = now - 1800  # last 30 min
+    cutoff_5min = now - 300
+    silent_hits = [e for e in events
+                   if float(e.get("ts") or 0) > cutoff_5min
+                   and e.get("event_type") == "track_silent_detected"]
+    for e in silent_hits:
+        sym = e.get("symbol") or e.get("product_id") or "?"
+        dead_from_log.add(sym)
+    print(f"  {len(silent_hits)} silent-detected events, {len(dead_from_log)} unique products:")
+    for p in sorted(dead_from_log):
+        print(f"    💀 {p}")
+
+    # ---- 2. Heartbeat per-tenant --------------------------------------
+    print("\n[2/4] Per-tenant heartbeat (__track_heartbeat__)")
+    print("-" * 78)
+    for lt in live_tenants:
+        hb = (store.get(lt) or {}).get("__track_heartbeat__") or {}
+        cfg_block = hb.get("config") if isinstance(hb, dict) and "config" in hb else hb
+        if not isinstance(cfg_block, dict):
+            cfg_block = hb
+        tracks = (cfg_block or {}).get("tracks") or {}
+        snap_ts = float((cfg_block or {}).get("snap_ts") or 0)
+        age = int(now - snap_ts) if snap_ts else -1
+        print(f"\n  tenant: {lt}   heartbeat age: {age}s   tracks: {len(tracks)}")
+        for pid, t in sorted(tracks.items()):
+            step_ok = float(t.get("last_step_ok_ts") or 0)
+            tick_ct = int(t.get("tick_count") or 0)
+            spawn_ts = float(t.get("spawn_ts") or 0)
+            fails = int(t.get("consecutive_step_failures") or 0)
+            reason = t.get("last_tick_reason") or ""
+            age_step = int(now - step_ok) if step_ok else -1
+            age_spawn = int(now - spawn_ts) if spawn_ts else -1
+            marker = "💀" if age_step > 300 or age_step < 0 else "✓"
+            print(f"    {marker} {pid:35s} ticks={tick_ct:>5} step_age={age_step:>4}s "
+                  f"spawn_age={age_spawn:>5}s fails={fails:>2}")
+            if reason and marker == "💀":
+                print(f"       last_reason: {reason[:120]}")
+
+    # ---- 3. Track-related failure events (last 30 min) ----------------
+    print("\n[3/4] Track failure events (last 30 min)")
+    print("-" * 78)
+    cutoff_30 = now - 1800
+    failure_types = {
+        "track_silent_detected", "track_auto_respawn_attempted",
+        "non_primary_config_auto_seed_failed",
+        "non_primary_step_failure", "non_primary_track_evicted",
+        "non_primary_spawn_refused_no_config",
+        "track_health_discovery_failed_per_symbol",
+    }
     hits = [e for e in events
-            if float(e.get("ts") or 0) > cutoff
-            and e.get("event_type") in interesting]
+            if float(e.get("ts") or 0) > cutoff_30
+            and e.get("event_type") in failure_types]
     if not hits:
-        print(f"  (no track failure events in last 30 min)")
+        print("  (no track failure events)")
     else:
-        # Group by product + event type
+        # Group by (product, event_type)
         counts = {}
-        for e in hits[-100:]:
+        for e in hits:
             pid = e.get("symbol") or e.get("product_id") or "?"
-            et = e.get("event_type")
-            key = (pid, et)
+            key = (pid, e.get("event_type"))
             counts[key] = counts.get(key, 0) + 1
-        print(f"  {len(hits)} failure events in last 30 min:")
-        for (pid, et), n in sorted(counts.items(), key=lambda x: -x[1])[:30]:
+        print(f"  {len(hits)} events over last 30 min:")
+        for (pid, et), n in sorted(counts.items(), key=lambda x: -x[1]):
             print(f"    {pid:35s} × {n:>3}  {et}")
-        # Sample 3 recent errors with reason text
-        print(f"\n  Sample of latest 5 with reason/error:")
-        for e in hits[-5:]:
-            ts = int(now - float(e.get("ts") or 0))
-            print(f"    [{ts}s ago] {e.get('event_type')} {e.get('symbol') or e.get('product_id') or ''}")
+        # Latest 8 with detail
+        print(f"\n  Latest 8 with reason/error:")
+        for e in hits[-8:]:
+            age = int(now - float(e.get("ts") or 0))
+            sev = e.get("severity") or ""
+            mark = "🚨" if sev == "critical" else "⚠" if sev == "warn" else " "
+            pid = e.get("symbol") or e.get("product_id") or ""
+            print(f"    {mark} [{age:>4}s ago] {e.get('event_type'):45s} {pid}")
             for k in ("reason", "error", "error_type", "error_message"):
                 v = e.get(k)
                 if v:
-                    print(f"      {k}: {str(v)[:180]}")
+                    print(f"       {k}: {str(v)[:180]}")
 
-    # ---- 3. Products with sleeves but dead tracks ------------------------
-    print("\n[3/4] Products with sleeves configured but track is dead/silent")
+    # ---- 4. Recommendation --------------------------------------------
+    print("\n[4/4] What the data says")
     print("-" * 78)
-    try:
-        store_raw = r.get("silver-swing:store")
-        store = json.loads(store_raw) if store_raw else {}
-    except Exception as e:
-        print(f"  ✗ store read failed: {e}")
-        store = {}
-    for tenant, tblock in store.items():
-        if not tenant.endswith("-live"):
-            continue
-        for sym, block in (tblock or {}).items():
-            if sym.startswith("__"):
-                continue
-            state = (block or {}).get("state") or {}
-            sleeves = state.get("sleeves") or {}
-            armed = [s for s in sleeves.values()
-                     if str(s.get("state") or "") in ("ARMED_BUY", "ARMED_SELL")]
-            if armed and sym in dead_products:
-                print(f"  💀 {sym}  {len(armed)} armed sleeve(s) — WILL NOT TICK until track respawns")
-
-    # ---- 4. Purge suggestion --------------------------------------------
-    print("\n[4/4] Suggested purge (dead tracks with NO armed sleeves)")
-    print("-" * 78)
-    if not dead_products:
-        print("  (no dead products)")
-        return
-    purgeable = []
-    for pid in dead_products:
-        has_armed = False
-        for tenant, tblock in store.items():
-            if not tenant.endswith("-live"):
-                continue
-            block = (tblock or {}).get(pid) or {}
-            sleeves = (block.get("state") or {}).get("sleeves") or {}
-            for s in sleeves.values():
-                if str(s.get("state") or "") in ("ARMED_BUY", "ARMED_SELL"):
-                    has_armed = True
-                    break
-            if has_armed:
-                break
-        if not has_armed:
-            purgeable.append(pid)
-    if not purgeable:
-        print("  (no purgeable — every dead track has armed sleeves; investigate root cause)")
+    if not dead_from_log:
+        print("  ✓ No silent tracks detected in last 5 min — the badge might be stale.")
+        print("    (Live_runner emits track_silent_detected on each health check.")
+        print("     If none in last 5 min, the tracks may have recovered.)")
     else:
-        print(f"  {len(purgeable)} dead tracks have NO armed sleeves — safe to purge from track dict:")
-        for p in purgeable:
-            print(f"    {p}")
-        print(f"\n  (no auto-purge here — would need diag_purge_dead_tracks.py; report if needed)")
+        print(f"  {len(dead_from_log)} products currently silent:")
+        for p in sorted(dead_from_log):
+            print(f"    - {p}")
+        print("\n  Correlate with [3] above — the same products should appear")
+        print("  in failure events with an error/reason string. That's the")
+        print("  root cause to fix.")
 
 
 if __name__ == "__main__":

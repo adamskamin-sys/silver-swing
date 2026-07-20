@@ -4461,8 +4461,23 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   // the user's target ($/net swing) would silently be honored at wrong
   // scale and the sleeve would save prices producing a fraction of intent
   // (this exact bug hit NER + NGS: $2 preset → $0.60/$0.90 actual net).
-  const contractSize = Number(cfg.contract_size);
-  const feeRt = Number(cfg.fee_per_contract_roundtrip);
+  //
+  // Adam 2026-07-20 SPOT: crypto spot has NO contract concept ("crypto
+  // doesnt have contract sizes its just the amount of tokens"). Each
+  // unit is one token, fee is a percent of notional (0.5% round-trip
+  // taker-side estimate). Infer defaults for spot so preset application
+  // doesn't have to wait on bot's contract_spec fetch — spot specs are
+  // known-fixed at the client level.
+  const _spotSuffixes = ['-USD', '-USDC', '-EUR', '-GBP', '-BTC', '-ETH'];
+  const _symIsSpot = !symbol.endsWith('-CDE')
+    && !symbol.includes('-PERP-')
+    && _spotSuffixes.some(s => symbol.endsWith(s));
+  let contractSize = Number(cfg.contract_size);
+  let feeRt = Number(cfg.fee_per_contract_roundtrip);
+  if (_symIsSpot) {
+    if (!(contractSize > 0)) contractSize = 1.0;               // 1 unit = 1 token
+    if (!(feeRt > 0)) feeRt = Math.max(mark, 0.01) * 0.01;     // 1% round-trip estimate (0.5% × 2)
+  }
   const specMissing = !(contractSize > 0) || !(feeRt > 0);
   // Precision for price inputs — tick-driven so low-priced perps (XLP at
   // $0.186 with $0.0001 tick) don't collapse Sell/Buy-back to the same
