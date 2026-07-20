@@ -1358,11 +1358,21 @@ function renderLivePortfolio(tenantOverride, modeOverride) {
           // avg_down_signal.py — requires mean-revert regime + at channel
           // floor + calm flow + volatility settled + below your avg + margin.
           const adLight = r.kind === 'futures' ? productAvgDownLight(liveTenant, r.product) : null;
-          const adBadge = adLight === 'green'
-            ? ` <span class="ck-chip ck-ok avg-down-btn" style="font-size:0.7em;padding:1px 4px;cursor:pointer" title="AVG-DOWN GREEN — click for expert scale-in recommendation" data-symbol="${escapeHtml(r.product)}" data-tenant="${escapeHtml(liveTenant)}">🟢 avg↓</span>`
-            : adLight === 'amber'
-              ? ` <span class="ck-chip" style="font-size:0.7em;padding:1px 4px" title="AVG-DOWN AMBER — watching, but not all conditions met yet (regime, floor, calm, or below-avg missing)">🟡</span>`
-              : '';
+          // Adam 2026-07-20: avg-down button ALWAYS available on held
+          // positions, not only when the expert signal is green. Color
+          // reflects the signal (green/amber/dim) but click always opens
+          // the advisor modal so Adam can override + execute manually.
+          const heldForAvgDown = r.kind === 'futures' && Number(r.qty || 0) > 0;
+          let adBadge = '';
+          if (heldForAvgDown) {
+            if (adLight === 'green') {
+              adBadge = ` <span class="ck-chip ck-ok avg-down-btn" style="font-size:0.7em;padding:1px 4px;cursor:pointer" title="AVG-DOWN GREEN — expert stack aligned for scale-in. Click for recommendation + execute." data-symbol="${escapeHtml(r.product)}" data-tenant="${escapeHtml(liveTenant)}">🟢 avg↓</span>`;
+            } else if (adLight === 'amber') {
+              adBadge = ` <span class="ck-chip avg-down-btn" style="font-size:0.7em;padding:1px 4px;cursor:pointer;opacity:0.85" title="AVG-DOWN AMBER — some conditions unmet (regime/floor/calm/below-avg). Click to see the recommendation anyway; manual execute available." data-symbol="${escapeHtml(r.product)}" data-tenant="${escapeHtml(liveTenant)}">🟡 avg↓</span>`;
+            } else {
+              adBadge = ` <span class="ck-chip avg-down-btn" style="font-size:0.7em;padding:1px 4px;cursor:pointer;opacity:0.6" title="AVG-DOWN — expert signal not currently green, but manual scale-in is available. Click to open the advisor + execute." data-symbol="${escapeHtml(r.product)}" data-tenant="${escapeHtml(liveTenant)}">⚪ avg↓</span>`;
+            }
+          }
           return sideText + revBadge + adBadge + trailBadge;
         })()}</td>
         <td class="mono">${qtyText}</td>

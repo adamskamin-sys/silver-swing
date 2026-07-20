@@ -4733,6 +4733,90 @@ class SwingTrader:
             adopted_avg=float(avg),
         )
 
+    def _maybe_reblend_on_manual_add(self, sc: SleeveConfig, ss: SleeveState) -> None:
+        """Adam 2026-07-20: when Adam manually buys more of a held product
+        on Coinbase (scale-in / average-down), the exchange blends the new
+        buy into position.avg_entry automatically. The bot's per-sleeve
+        own_avg_entry stayed stuck at the pre-add value — dashboard showed
+        the OLD avg while Coinbase showed the new blended avg. Adam:
+        "I expect that new average to be reflected on the dashboard."
+
+        Detection: sleeve is ARMED_SELL (holds), own_avg_entry is set, no
+        buy in flight (live_order_id is None), AND
+            broker.position.qty > sum(claimed by ARMED_SELL sleeves) + core
+        The excess is a manual add unaccounted for by any sleeve.
+
+        Action: refresh this sleeve's own_avg_entry to
+        broker.position.avg_entry (Coinbase's blended). Same principle as
+        _maybe_reconcile_orphan_position (trust the exchange's blended
+        avg), just for the "already ARMED_SELL, more added" case.
+
+        Idempotent: after refresh, own_avg matches broker.avg_entry so
+        next tick's check is a no-op unless another add happens.
+
+        Multi-sleeve behavior: each ARMED_SELL sleeve on this product runs
+        this check independently on its own tick. All converge to the same
+        broker.avg_entry after the add — matches how Adam thinks about
+        aggregate cost basis for a shared position.
+
+        Safety:
+          - Skips if live_order_id set (in-flight buy would double-count).
+          - Skips if broker.position.qty == 0 (no position; nothing to
+            blend into — ghost auto-recover handles that class).
+          - Skips if new_avg matches current own_avg within one tick.
+        """
+        if ss.state != SleeveStateEnum.ARMED_SELL:
+            return
+        if ss.own_avg_entry is None:
+            return  # nothing to blend against; orphan-adopt handles this
+        if ss.live_order_id:
+            return  # in-flight buy would race the blend
+        try:
+            broker_qty = int(self.b.position_qty() or 0)
+        except Exception:
+            return
+        if broker_qty <= 0:
+            return
+        # Sum qty configured for ARMED_SELL sleeves on this product.
+        armed_sell_qty = 0
+        for _sid, _ss in (self.s.sleeves or {}).items():
+            if _ss.state != SleeveStateEnum.ARMED_SELL:
+                continue
+            _cfg = None
+            if hasattr(self, "_sleeve_cfg_by_id"):
+                try:
+                    _cfg = self._sleeve_cfg_by_id(_sid)
+                except Exception:
+                    _cfg = None
+            armed_sell_qty += int(getattr(_cfg, "qty", 1) if _cfg else 1)
+        core_qty = int(getattr(self.cfg, "core_qty", 0) or 0)
+        excess = broker_qty - armed_sell_qty - core_qty
+        if excess <= 0:
+            return  # no unaccounted qty — no manual add detected
+        # Read broker's current blended avg.
+        try:
+            new_avg = float((self.b.position or None).avg_entry or 0)
+        except Exception:
+            new_avg = 0.0
+        if new_avg <= 0:
+            return
+        prev_avg = float(ss.own_avg_entry)
+        tick = float(getattr(self.cfg, "tick_size", 0) or 0.0001)
+        if abs(new_avg - prev_avg) < tick:
+            return  # already matches broker within one tick — no-op
+        ss.own_avg_entry = new_avg
+        self._record(
+            "sleeve_own_avg_reblended_on_manual_add",
+            sleeve_id=sc.id, sleeve_name=sc.name,
+            prev_own_avg=prev_avg, new_own_avg=new_avg,
+            broker_qty=broker_qty, armed_sell_claims=armed_sell_qty,
+            core_qty=core_qty, excess=excess,
+            severity="info",
+            reason=("Coinbase position.qty > sleeve claims + core — manual "
+                    "add detected; own_avg refreshed to broker.avg_entry "
+                    "so future exit P&L uses the new blended basis"),
+        )
+
     def _maybe_arm_stop_on_recovery(self, sc: SleeveConfig, ss: SleeveState,
                                     last_price: float) -> None:
         """Adam 2026-07-15 (NGS-generalized): any underwater sleeve with
@@ -5052,6 +5136,11 @@ class SwingTrader:
         # Runs before ratchet-stop so ss.state is correct when maintenance
         # decides what to do.
         self._maybe_reconcile_orphan_position(sc, ss)
+        # Sibling to orphan-reconcile: when the sleeve is ALREADY ARMED_SELL
+        # (own_avg set) and Adam manually adds more contracts on Coinbase,
+        # refresh own_avg to the exchange's new blended avg so the dashboard
+        # + future exit P&L reflect the new cost basis. See method docstring.
+        self._maybe_reblend_on_manual_add(sc, ss)
 
         # [Adam 2026-07-15] Recovery-arm rule (fleet-wide from NGS directive):
         # any underwater sleeve with stop_loss_px=0 auto-arms stop at entry
