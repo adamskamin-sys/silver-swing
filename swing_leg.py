@@ -5265,8 +5265,52 @@ class SwingTrader:
             return
         # Existing resting order — check if we need to ratchet UP.
         current_px = float(ss.resting_stop_px or 0)
-        # Meaningful move up = at least one tick higher than current.
-        if target_px > current_px + (tick * 0.5):
+        # Adam 2026-07-20 RATCHET-NOISE FIX (§3.15 + Amihud-Mendelson 1986):
+        # Prior threshold was tick*0.5 — any half-tick move up triggered a
+        # cancel+replace, flooding Coinbase with API calls on illiquid
+        # products (MAG7C, ENA PERP, HYPE PERP all showed 2-3 back-to-back
+        # cancels within 30s intervals in Adam's order log). Amihud-Mendelson
+        # (1986) J.Fin.Econ 17(2):223 proves trading frequency should be
+        # INVERSELY related to effective spread: illiquid = fewer ratchets.
+        #
+        # New threshold: expert_liquidity.ratchet_min_improvement_dollars,
+        # which is fee_per_roundtrip × tier_multiplier (liquid=1×, medium=2×,
+        # illiquid=4×, very_illiquid=8×). If the improvement doesn't clear
+        # this dollar amount, don't ratchet — the API-call + fill-risk cost
+        # of the replace exceeds the tiny stop-improvement gain.
+        #
+        # Falls back to tick*0.5 (legacy) when expert_liquidity unavailable
+        # or the sleeve hasn't been through the scanner-gate yet.
+        # Preferred: expert_liquidity's ratchet_min_improvement_dollars
+        # (set by scanner if the sleeve was scanner-armed).
+        # Fallback: compute per-tick from expert_liquidity assessment on
+        # the sleeve's own price history (closes-only version — no volume
+        # data, so uses simplified Roll + realized vol).
+        # Last resort: 2× fee_price (means: don't ratchet unless the
+        # improvement covers 2× the round-trip fee-per-unit, so the
+        # cancel+place API round-trip isn't wasted).
+        _min_improvement_price = tick * 0.5  # legacy last-resort
+        try:
+            _liq_dict = getattr(ss, "liquidity_decision", None)
+            _min_dollars = None
+            if isinstance(_liq_dict, dict):
+                _min_dollars = float(_liq_dict.get(
+                    "ratchet_min_improvement_dollars") or 0)
+            # If sleeve doesn't have scanner-supplied liquidity_decision,
+            # apply the same principle via fee_price × 2 (Amihud-Mendelson
+            # 1986 minimum viable trade-cost gate: don't churn the API for
+            # improvements smaller than 2× the per-unit fee).
+            if _min_dollars and _min_dollars > 0 and self.cfg.contract_size > 0:
+                _qty_denom = max(1, int(sc.qty or 1))
+                _min_improvement_price = _min_dollars / self.cfg.contract_size / _qty_denom
+            elif _fee_price > 0:
+                _min_improvement_price = max(tick, 2.0 * _fee_price)
+            # Floor at 1 tick so we always have SOME threshold
+            if tick > 0 and _min_improvement_price < tick:
+                _min_improvement_price = tick
+        except Exception:
+            pass  # fall back to tick*0.5 legacy
+        if target_px > current_px + _min_improvement_price:
             old_oid = ss.resting_stop_oid
             # Adam 2026-07-20 ORPHAN GUARD: fail-closed on cancel failure.
             # Prior code continued to place a new stop even if the cancel
