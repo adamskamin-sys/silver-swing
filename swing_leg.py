@@ -5338,6 +5338,13 @@ class SwingTrader:
             return
         # Cancel any pending buy order — sleeve state changing to ARMED_SELL,
         # buy is meaningless
+        # Adam 2026-07-20 ORPHAN GUARD (adopt path): if the stale BUY
+        # cancel fails, DO NOT proceed to adoption. Prior code continued
+        # after `except log` and cleared live_order_id (line 5359), so
+        # the stale BUY became an orphan on Coinbase. It could still fill
+        # → position exceeds sleeve claim + core → over-accumulation
+        # (§3.10 impact). Not a short risk (BUY-side), but still a real
+        # accounting drift. Now: fail-closed. Retry adoption next tick.
         old_oid = ss.live_order_id
         if old_oid:
             try:
@@ -5345,9 +5352,13 @@ class SwingTrader:
             except Exception as e:
                 self._record("sleeve_orphan_reconcile_cancel_failed",
                              sleeve_id=sc.id, sleeve_name=sc.name,
-                             oid=old_oid, error=str(e))
-                # Continue anyway — worst case is a stale buy order that the
-                # position-full safety will refuse on any trigger
+                             oid=old_oid, error=str(e),
+                             severity="critical",
+                             reason=("stale BUY cancel raised — skipping "
+                                     "adoption this tick to avoid orphaning "
+                                     "the buy (over-accumulation risk). "
+                                     "Retry next tick."))
+                return  # DO NOT adopt if we couldn't cancel the stale buy
         # Adopt: set own_avg_entry + flip state
         ss.own_avg_entry = float(avg)
         ss.state = SleeveStateEnum.ARMED_SELL
@@ -5356,7 +5367,7 @@ class SwingTrader:
         # gets cleared before the resting stop credits. Prevents the
         # "own_avg unknown" halt class.
         ss.sell_entry_avg = float(avg)
-        ss.live_order_id = None  # will re-arm SELL on next tick
+        ss.live_order_id = None  # cancel succeeded above — safe to clear
         self._save_state()
         self._record(
             "sleeve_orphan_position_adopted",
