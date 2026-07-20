@@ -133,46 +133,33 @@ def main() -> None:
     print(f"  half_fee:         ${half_fee:.2f}")
     print(f"  real_profit:      ${real_profit:.2f}")
 
-    print(f"\nCORRECTION (proposed):")
+    print(f"\nCORRECTION (proposed — MINIMAL, accounting only):")
     print(f"  cycles:           {current_cycles} → {correct_cycles} "
           f"(removes {fake_cycles_delta} fake credits)")
     print(f"  realized_pnl:     ${current_realized:.2f} → ${correct_realized:.2f} "
           f"(removes ${fake_realized_delta:.2f} fake profit)")
-    print(f"  state:            {target_ss.get('state')} → ARMED_BUY")
-    print(f"  own_avg_entry:    → None")
-    print(f"  live_order_id:    → None")
-    print(f"  resting_stop_oid: → None")
-    print(f"  trail_armed:      → False")
-    print(f"  trail_hwm:        → 0.0")
     print(f"  recent_pnls:      → [${real_profit:.2f}]")
+    print(f"  last_cycle_realized: → ${correct_realized:.2f}")
+    print(f"\nPRESERVED (already correct, DO NOT touch):")
+    print(f"  state:            {target_ss.get('state')}")
+    print(f"  own_avg_entry:    {target_ss.get('own_avg_entry')}")
+    print(f"  live_order_id:    {target_ss.get('live_order_id')} "
+          f"(live buy — clearing would orphan)")
+    print(f"  resting_stop_oid: {target_ss.get('resting_stop_oid')}")
 
     if not apply:
         print("\n(dry-run — pass --apply to persist)")
         return
 
-    # Apply
+    # Apply — MINIMAL. Only touch accounting fields. Leave operational
+    # state (own_avg_entry, live_order_id, resting_stop_oid, state,
+    # trail_armed, etc) exactly as-is. The sleeve is currently ARMED_BUY
+    # with a live buy order tracked (c31bef91...); clearing live_order_id
+    # would orphan the buy on Coinbase.
     target_ss["cycles"] = correct_cycles
     target_ss["realized_pnl"] = round(correct_realized, 6)
-    target_ss["state"] = "ARMED_BUY"
-    target_ss["own_avg_entry"] = None
-    target_ss["sell_entry_avg"] = None
-    target_ss["live_order_id"] = None
-    target_ss["resting_stop_oid"] = None
-    target_ss["resting_stop_px"] = None
-    target_ss["resting_stop_stage"] = None
-    target_ss["trail_armed"] = False
-    target_ss["trail_high_water_price"] = 0.0
-    target_ss["hybrid_sell_triggered_ts"] = None
-    target_ss["buy_trail_armed"] = False
-    target_ss["buy_trail_low_water"] = 0.0
-    target_ss["stop_loss_hwm"] = None
-    target_ss["consecutive_stops"] = 0
     target_ss["recent_cycle_pnls"] = [round(real_profit, 6)]
-    target_ss["last_sell_qty"] = REAL_SELL_QTY
-    target_ss["last_sell_fill_price"] = REAL_MARKET_SELL_PRICE
     target_ss["last_cycle_realized"] = round(correct_realized, 6)
-    target_ss["armed_buy_since_ts"] = time.time()
-    target_ss["halt_reason"] = None
 
     sleeves[target_sid] = target_ss
     state["sleeves"] = sleeves
