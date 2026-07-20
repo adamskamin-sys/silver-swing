@@ -3309,10 +3309,18 @@ function renderScannerClassTable(tableId, rows) {
     const cyclesLive = cycles > 0
       ? `<span title="Completed round-trips across all tenants"><b>${cycles}</b></span>`
       : '<span class="dim">0</span>';
+    // Cost per contract — capital tied up by ONE contract. Backend computes:
+    //   FUTURE: intraday_margin × price × contract_size
+    //   SPOT:   price × contract_size (no margin)
+    const costPerContract = Number(row.cost_per_contract) || 0;
+    const costCell = costPerContract > 0
+      ? `<span title="Capital required to hold ONE contract. ${row.product_type === 'FUTURE' ? 'Initial margin (intraday_rate × price × contract_size)' : 'Full notional (price × contract_size, spot has no margin)'}. Contract size: ${row.contract_size || 1}">$${fmtMoney(costPerContract)}</span>`
+      : '<span class="dim">—</span>';
     tr.innerHTML = `
       <td>${i + 1}</td>
       <td class="mono">${escapeHtml(row.product_id)}</td>
       <td class="mono">$${fmtNum(row.price, 4)}</td>
+      <td class="mono">${costCell}</td>
       <td class="mono">${tierPill(row.liquidity_tier)}</td>
       <td class="mono">${gatePill(row.arm_gate_allow)}</td>
       <td class="mono">${spreadCell}</td>

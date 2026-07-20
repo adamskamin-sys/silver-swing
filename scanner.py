@@ -526,6 +526,17 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
         # divide by 0.
         effective_contract_size = contract_size if contract_size else (
             1.0 if product_type == "SPOT" else None)
+        # Adam 2026-07-20: cost per contract — how much capital does ONE
+        # contract tie up? For FUTURE = margin_rate × price × contract_size
+        # (initial margin required). For SPOT = price × contract_size
+        # (full notional, no margin). Lets operator compare capital
+        # efficiency across products at a glance.
+        cost_per_contract = None
+        if effective_contract_size and price > 0:
+            if product_type == "FUTURE" and intraday_margin and intraday_margin > 0:
+                cost_per_contract = intraday_margin * price * effective_contract_size
+            elif product_type == "SPOT":
+                cost_per_contract = price * effective_contract_size
         scored.append({
             "product_id": pid,
             "product_type": product_type,   # "SPOT" or "FUTURE"
@@ -540,6 +551,8 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
             "contract_expiry": contract_expiry,
             "intraday_margin_rate": intraday_margin,
             "overnight_margin_rate": overnight_margin,
+            "cost_per_contract": (round(cost_per_contract, 2)
+                                   if cost_per_contract is not None else None),
         })
     scored.sort(key=lambda r: (-r["vol_pct"], -r["volume_24h"]))
     return scored[:top_n]
