@@ -263,6 +263,12 @@ class SwingTrader:
         raw = self.store.get_config(self.tenant_id, self.symbol) or {}
         return [SleeveConfig.from_dict(s) for s in (raw.get("sleeves") or [])]
 
+    def _sleeve_cfg_by_id(self, sid: str) -> "SleeveConfig | None":
+        for _sc in self._load_sleeves_cfg():
+            if getattr(_sc, "id", None) == sid:
+                return _sc
+        return None
+
     def _save_state(self) -> None:
         """Persist tick state, but preserve any external writes that landed
         between reload and save.
@@ -4659,6 +4665,69 @@ class SwingTrader:
         except Exception:
             pos_qty = 0
         sleeve_qty = int(getattr(sc, "qty", 1) or 1)
+        # Adam 2026-07-20 §3.8 EXCESS-STOP CANCEL: XLP double-fire → SHORT
+        # incident. Prior guard at "fresh place" only REFUSED new stops when
+        # sum(sibling stops) + this_qty > pos_qty. But if position shrinks
+        # AFTER stops were placed (e.g. one sleeve's stop fires, pos 2→1,
+        # but the other sleeve's stop is still on Coinbase covering the now-
+        # gone contract), both stops eventually fire → 2 sells against 1
+        # long → SHORT. Fix: EVERY tick, sum ALL resting stop qty across
+        # sleeves; if total > pos_qty, deterministically cancel excess.
+        # Sort by sleeve_id for stable choice of which sleeve loses its stop.
+        if pos_qty > 0 and self.s.sleeves:
+            _all_stops = []
+            for _sid, _ss in (self.s.sleeves or {}).items():
+                if not getattr(_ss, "resting_stop_oid", None):
+                    continue
+                _sc_other = self._sleeve_cfg_by_id(_sid)
+                _q = int(getattr(_sc_other, "qty", None) or getattr(_ss, "qty", None) or 1)
+                _all_stops.append((_sid, _ss, _q))
+            _all_stops.sort(key=lambda x: x[0])  # deterministic order
+            _covered = 0
+            for _sid, _ss_o, _q in _all_stops:
+                if _covered + _q <= pos_qty:
+                    _covered += _q
+                    continue
+                # This sleeve's stop is (fully or partly) beyond pos coverage.
+                # Cancel it — position no longer justifies the stop-limit.
+                if _sid == sc.id:
+                    _oid_to_cancel = ss.resting_stop_oid
+                    try:
+                        self.b.cancel(_oid_to_cancel)
+                        ss.resting_stop_oid = None
+                        ss.resting_stop_px = None
+                        ss.resting_stop_stage = None
+                        self._record(
+                            "resting_stop_cancelled_excess_over_position",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            cancelled_oid=_oid_to_cancel,
+                            covered_before_this=_covered,
+                            this_qty=_q,
+                            pos_qty=pos_qty,
+                            severity="critical",
+                            reason=("total resting stop qty exceeded actual "
+                                    "position — cancelled to prevent double-"
+                                    "fire → §3.8 short-risk (XLP incident "
+                                    "2026-07-20). This sleeve lost coverage "
+                                    "priority via sleeve_id sort order."),
+                        )
+                        try:
+                            self._save_state()
+                        except Exception:
+                            pass
+                    except Exception as _e:
+                        self._record(
+                            "resting_stop_cancel_excess_failed",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            oid=_oid_to_cancel, error=str(_e),
+                            severity="critical",
+                            reason=("excess stop cancel FAILED — short-risk "
+                                    "remains. Will retry next tick."),
+                        )
+                    return  # done for this tick regardless
+                # Not our sleeve — some later sleeve step will cancel its
+                # own excess when its turn comes. Do nothing here.
+                _covered += _q
         if pos_qty <= 0 or sleeve_qty <= 0:
             # Position closed. Before we cancel + clear the stop_oid, check
             # if that stop is what CAUSED pos_qty to hit 0 (i.e. it FILLED).
