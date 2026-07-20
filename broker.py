@@ -150,6 +150,59 @@ class CoinbaseBroker:
     # LOW/MEDIUM callers we ALSO check acquire() first and abort/defer if
     # we're near the budget cap. CRITICAL always proceeds — a breakout
     # order-placement is worth an occasional 429.
+    def _is_spot_product(self, pid: str | None = None) -> bool:
+        """Adam 2026-07-20: Coinbase spot vs futures dispatcher.
+        Futures product_ids end in '-CDE' (dated CFM) or contain '-PERP-'
+        (perpetuals). Everything else with a fiat/stable quote suffix is spot.
+        Used to route market-order shape, position lookup, and no-short check
+        so a scanner-armed crypto sleeve actually executes."""
+        p = pid or self.cfg.product_id
+        if not p:
+            return False
+        if p.endswith("-CDE"):
+            return False
+        if "-PERP-" in p:
+            return False
+        return any(p.endswith(s) for s in
+                   ("-USD", "-USDC", "-EUR", "-GBP", "-BTC", "-ETH"))
+
+    def _spot_base_currency(self, pid: str | None = None) -> str:
+        """META-USDC → 'META', BTC-USD → 'BTC'. Empty if not spot-shaped."""
+        p = pid or self.cfg.product_id
+        if not self._is_spot_product(p):
+            return ""
+        return p.split("-", 1)[0]
+
+    def _spot_position_qty(self) -> float:
+        """Signed spot balance in base-currency units. LONG only on spot
+        (Coinbase doesn't margin-short outside of INTX perps), so this is
+        always >= 0. Returns 0.0 on any lookup failure so no-short checks
+        fail-safe (refuse the sell rather than allow an over-sell)."""
+        cur = self._spot_base_currency()
+        if not cur:
+            return 0.0
+        try:
+            cursor = None
+            for _ in range(20):
+                kwargs = {"limit": 250}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = _dump(self.client.get_accounts(**kwargs))
+                for a in resp.get("accounts") or []:
+                    if (a.get("currency") or "").upper() == cur:
+                        try:
+                            return float((a.get("available_balance") or {}).get("value") or 0)
+                        except (TypeError, ValueError):
+                            return 0.0
+                if not resp.get("has_next"):
+                    break
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+        except Exception:
+            return 0.0
+        return 0.0
+
     def _rl_call(self, priority: Priority, kind: str, fn, *args, **kwargs):
         ctrl = get_controller()
         # For non-critical, give the controller a chance to defer. If deferred,
@@ -240,8 +293,30 @@ class CoinbaseBroker:
         kwargs = {
             "client_order_id": client_order_id or str(uuid.uuid4()),  # [crew:#7] caller can supply for idempotent retry
             "product_id": self.cfg.product_id,
-            "base_size": str(int(qty)),
         }
+        # Adam 2026-07-20 SPOT SUPPORT: Coinbase Advanced Trade requires
+        # quote_size (USD notional) for a spot market BUY — base_size on
+        # spot BUY is rejected with INVALID_ORDER_CONFIGURATION. Convert
+        # unit qty → USD by fetching current price. Spot SELL uses base_size
+        # (base-currency units) exactly like futures. Futures orders always
+        # use base_size (contract count).
+        _is_spot = self._is_spot_product()
+        if _is_spot and s == "BUY":
+            try:
+                pd = _dump(self.client.get_product(self.cfg.product_id))
+                _px = float(pd.get("price") or 0)
+            except Exception:
+                _px = 0.0
+            if _px <= 0:
+                raise RuntimeError(
+                    f"place_market spot BUY: unable to get current price for "
+                    f"{self.cfg.product_id} — cannot compute quote_size")
+            notional = float(qty) * _px
+            kwargs["quote_size"] = f"{notional:.2f}"
+        else:
+            # Spot SELL uses base_size in units; futures use contract count.
+            # int() is safe because scanner UI caps qty at integer 1-100.
+            kwargs["base_size"] = str(int(qty))
         # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
         # _sell_lock: {check + submit} atomic per product (see __init__ docstring).
         if s == "SELL":
@@ -518,7 +593,15 @@ class CoinbaseBroker:
         return out
 
     def position_qty(self) -> int:
-        """Signed net contract count for this product. LONG > 0, SHORT < 0, flat = 0."""
+        """Signed net contract count for this product. LONG > 0, SHORT < 0, flat = 0.
+
+        Adam 2026-07-20 SPOT SUPPORT: for spot products, returns whole-unit
+        balance from the base-currency account (always LONG on Coinbase spot,
+        no margin-short outside INTX perps). Fractional balances truncate
+        down to the nearest whole unit so downstream int()-based sizing
+        doesn't try to sell a fractional slice that fails."""
+        if self._is_spot_product():
+            return int(self._spot_position_qty())
         for p in _dump(self.client.list_futures_positions()).get("positions") or []:
             if p.get("product_id") == self.cfg.product_id:
                 n = int(float(p.get("number_of_contracts") or 0))
@@ -661,10 +744,29 @@ class CoinbaseBroker:
     # ---- Empirical spec inputs (spec §3A refresh on startup) --------------
 
     def contract_spec(self) -> dict:
-        """Per-instrument spec block, pulled live so it can't drift from reality."""
+        """Per-instrument spec block, pulled live so it can't drift from reality.
+
+        Adam 2026-07-20 SPOT SUPPORT: spot products have no future_product_details
+        block — contract_size defaults to 1.0 (each unit is one base-currency
+        token), no margin (spot is fully-collateralized), no expiry."""
         resp = _dump(self.client.get_product(self.cfg.product_id))
-        details = resp.get("future_product_details") or {}
         tick = float(resp.get("price_increment") or 0)
+        if self._is_spot_product():
+            return {
+                "product_id": resp.get("product_id"),
+                "contract_size": 1.0,
+                "tick_size": tick,
+                "tick_value": tick,
+                "contract_expiry": None,
+                "intraday_margin_rate": None,
+                "overnight_margin_rate": None,
+                "current_price": resp.get("price"),
+                "best_bid": resp.get("best_bid_price"),
+                "best_ask": resp.get("best_ask_price"),
+                "session_open": True,  # spot always open
+                "is_spot": True,
+            }
+        details = resp.get("future_product_details") or {}
         size = float(details.get("contract_size") or 0)
         return {
             "product_id": resp.get("product_id"),

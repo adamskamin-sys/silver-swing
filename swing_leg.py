@@ -5203,6 +5203,13 @@ class SwingTrader:
                     # _sleeve_on_fill → credits cycle + clears own_avg +
                     # advances state.
                     ss.live_order_id = oid
+                    # Adam 2026-07-20 DISPLAY FIX: dashboard reads
+                    # resting_stop_px to render the STOP LOSS chip. Without
+                    # this, chip stays "NOT PLACED" even after a real limit
+                    # sell is protecting the position — false-positive alarm.
+                    # Set both so the chip shows the target price + stage.
+                    ss.resting_stop_px = float(_breach_limit_px)
+                    ss.resting_stop_stage = f"limit_breach_{_breach_kind}"
                     self._record("trail_breach_limit_sell",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  target_px=float(target_px),
