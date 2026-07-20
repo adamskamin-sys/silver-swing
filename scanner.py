@@ -1355,22 +1355,35 @@ def fetch_and_rank(
                 -(r.get("vol_pct") or 0.0),
                 -(r.get("volume_24h") or 0.0))
     ranking.sort(key=_rank_key)
+    # Adam 2026-07-20: apply top_n PER ASSET CLASS at final truncation.
+    # Prior code took top_n=10 by expert_adjusted_score globally, and
+    # derivatives always outrank spot on that score → 10 slots all
+    # derivatives → CRYPTO section empty. Per-class truncation guarantees
+    # both classes get their fair share (top_n each).
+    #
     # Force-included products MUST survive the top_n truncation. The scanner's
     # job is to help Adam discover NEW products worth trading; anything he
     # already has a strategy on (force_include) needs its BEST tile populated
-    # regardless of where it ranks on 24h volatility. Split the sorted list:
-    # keep the top_n by score, then append every force_include entry that
-    # didn't make that cut. That way the dashboard's Edit Strategy modal
-    # always finds swing_candidates for products he's actively trading.
+    # regardless of where it ranks on 24h volatility.
     forced_set = set(force_include or [])
+    crypto_ranked = [e for e in ranking
+                     if (e.get("asset_class") or
+                         classify_asset_class(e.get("product_id") or "",
+                                               product_type=e.get("product_type") or "")) == "crypto"]
+    derivative_ranked = [e for e in ranking
+                         if (e.get("asset_class") or
+                             classify_asset_class(e.get("product_id") or "",
+                                                   product_type=e.get("product_type") or "")) == "derivative"]
+    top_crypto = crypto_ranked[:top_n]
+    top_derivative = derivative_ranked[:top_n]
+    top_slice = top_crypto + top_derivative
     if forced_set:
-        top_slice = ranking[:top_n]
         top_ids = {e.get("product_id") for e in top_slice}
-        extras = [e for e in ranking[top_n:]
+        extras = [e for e in ranking
                   if e.get("product_id") in forced_set
                   and e.get("product_id") not in top_ids]
         return top_slice + extras
-    return ranking[:top_n]
+    return top_slice
 
 
 REDIS_KEY = "silver-swing:scanner"
