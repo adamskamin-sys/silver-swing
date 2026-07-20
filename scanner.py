@@ -468,15 +468,43 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
         if not pid:
             continue
         price = _f(p.get("price"))
-        high = _f(p.get("price_percentage_change_24h_high")) or _f(p.get("high_24_h")) or _f(p.get("high_24h"))
-        low = _f(p.get("low_24_h")) or _f(p.get("low_24h"))
-        if price is None or high is None or low is None or price <= 0:
+        if price is None or price <= 0:
             continue
+        # Adam 2026-07-20: SPOT products don't include high_24h / low_24h
+        # in Coinbase's get_products response — those fields are FUTURE-
+        # specific. Prior code required them and dropped every spot pair
+        # → CRYPTO section always empty. Fix: for SPOT, derive an
+        # approximate range from price_percentage_change_24h (a signed
+        # % change). For FUTURE, keep the direct high/low path.
+        high = _f(p.get("high_24_h")) or _f(p.get("high_24h"))
+        low = _f(p.get("low_24_h")) or _f(p.get("low_24h"))
+        if high is None or low is None or high <= 0 or low <= 0:
+            # Fallback: derive from price % change (works for SPOT).
+            # pct > 0 → current price is toward the day-high, opposite
+            # for pct < 0. Symmetric approximation good enough for
+            # scanner ranking; expert path uses full OHLCV later.
+            pct = _f(p.get("price_percentage_change_24h")) or 0.0
+            if pct != 0.0:
+                pct_frac = pct / 100.0
+                # If price is up X% on the day, low ≈ price / (1 + X);
+                # high ≈ price (we're near it). Vice versa if down.
+                if pct_frac > 0:
+                    low = price / (1.0 + pct_frac)
+                    high = price
+                else:
+                    high = price / (1.0 + pct_frac)
+                    low = price
+            else:
+                # No pct data either — use tiny synthetic range so vol_pct=0
+                # and the product still enters the ranking (Yang-Zhang from
+                # candles later will give the real vol).
+                high = price
+                low = price
         mid = (high + low) / 2 if (high > 0 and low > 0) else price
         if mid <= 0:
             continue
-        rng = high - low
-        vol_pct = (rng / mid) * 100
+        rng = max(0.0, high - low)
+        vol_pct = (rng / mid) * 100 if mid > 0 else 0.0
         vol_24h_usd = _f(p.get("approximate_quote_24h_volume")) or _f(p.get("volume_24h")) or 0
         # Contract specs — piggyback on what get_products returns so the
         # scanner-detail modal doesn't have to make another Coinbase call to
