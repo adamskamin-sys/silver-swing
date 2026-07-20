@@ -4471,13 +4471,25 @@ class SwingTrader:
             # oid + advanced state; no further work here.
             return
         # Resolve stage + target price.
-        # Adam 2026-07-20 fix: HWM was never updated on the resting-stop
-        # path (only _sleeve_step / _sleeve_hybrid_step updated it, and
-        # those return early when resting_stop_enabled + exit_mode in
-        # hybrid/trailing_stop). Result: for the modern config HWM stayed
-        # at own_avg forever, so the trail never ratcheted. Track HWM
-        # here every tick whenever the sleeve is armed to sell.
-        if bool(ss.trail_armed) and last_price and float(last_price) > float(ss.trail_high_water_price or 0.0):
+        # Adam 2026-07-20 fix (rev 2): HWM was never updated on the
+        # resting-stop path (only _sleeve_step / _sleeve_hybrid_step
+        # updated it, and those return early when resting_stop_enabled +
+        # exit_mode in hybrid/trailing_stop). Result: for the modern
+        # config HWM stayed at own_avg forever, so the trail never
+        # ratcheted.
+        #
+        # Rev 2: the gate must be "we HOLD this position" (own_avg > 0),
+        # NOT "trail_armed". Positions bought BEFORE the arm-at-buy fix
+        # deployed have trail_armed=False on disk; gating on trail_armed
+        # meant those positions could never ratchet. Any held position
+        # deserves HWM tracking so the trail engages retroactively. Also
+        # auto-arm trail_armed for held sleeves so downstream branches
+        # (goal_reached, trail_active) can rely on the flag.
+        _own_avg_check = float(ss.own_avg_entry or 0.0)
+        _hold = _own_avg_check > 0
+        if _hold and not ss.trail_armed:
+            ss.trail_armed = True
+        if (_hold or bool(ss.trail_armed)) and last_price and float(last_price) > float(ss.trail_high_water_price or 0.0):
             ss.trail_high_water_price = float(last_price)
         hwm = float(ss.trail_high_water_price or 0.0)
         trail_engaged = bool(ss.trail_armed)
