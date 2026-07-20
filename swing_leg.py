@@ -4507,6 +4507,11 @@ class SwingTrader:
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
                 ss.resting_stop_stage = None
+                # ROOT FIX 2026-07-20: persist so next tick's reload sees cleared state.
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
             # If we credited above, _credit_stop_fill already cleared the
             # oid + advanced state; no further work here.
             return
@@ -4527,10 +4532,28 @@ class SwingTrader:
         # (goal_reached, trail_active) can rely on the flag.
         _own_avg_check = float(ss.own_avg_entry or 0.0)
         _hold = _own_avg_check > 0
+        # Adam 2026-07-20 ROOT FIX (SLR ratchet-never-executed incident):
+        # every mutation on this path must be paired with _save_state()
+        # BEFORE the next tick's _reload_sleeves_from_redis (commit
+        # 83dd31b) wipes in-memory changes. Prior code updated
+        # trail_armed / trail_high_water_price / resting_stop_* in
+        # memory but the enclosing tick loop's save wasn't guaranteed
+        # to fire before reload. Result: SLR sat with initial $54.680
+        # stop for 90+ minutes while HWM climbed to $57.58 — ratchet
+        # target was correct in memory but reverted each tick, so the
+        # cancel+place never persisted through the reload cycle.
+        _dirty = False
         if _hold and not ss.trail_armed:
             ss.trail_armed = True
+            _dirty = True
         if (_hold or bool(ss.trail_armed)) and last_price and float(last_price) > float(ss.trail_high_water_price or 0.0):
             ss.trail_high_water_price = float(last_price)
+            _dirty = True
+        if _dirty:
+            try:
+                self._save_state()
+            except Exception:
+                pass  # never fail-hard on the stop path
         hwm = float(ss.trail_high_water_price or 0.0)
         trail_engaged = bool(ss.trail_armed)
         stop_loss_px = float(getattr(sc, "stop_loss_px", 0) or 0)
@@ -4753,6 +4776,12 @@ class SwingTrader:
                                  last_price=float(last_price),
                                  stage=stage, error=str(_e),
                                  severity="critical")
+                # ROOT FIX 2026-07-20: persist market-sell tracking so the
+                # standard fill poller sees live_order_id on next tick.
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
                 return
             # Non-trail stage (hard_bottom) above mark — record + skip.
             self._record("resting_stop_skipped_above_mark",
@@ -4771,6 +4800,11 @@ class SwingTrader:
                              sleeve_id=sc.id, sleeve_name=sc.name,
                              stage=stage, target_px=float(target_px),
                              limit_px=float(limit_px), qty=sleeve_qty, oid=oid)
+                # ROOT FIX 2026-07-20: persist so reload-on-tick doesn't wipe.
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
             except Exception as e:
                 # Fallback: bot-side trigger stays armed as backstop.
                 # Adam 2026-07-15: severity=critical per the "resting ratchet-
@@ -4808,6 +4842,12 @@ class SwingTrader:
                 ss.resting_stop_oid = new_oid
                 ss.resting_stop_px = float(target_px)
                 ss.resting_stop_stage = stage
+                # ROOT FIX 2026-07-20: persist the ratchet or reload-on-tick
+                # wipes it (SLR sat at $54.680 for 90+ min because of this).
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
             except Exception as e:
                 self._record("resting_stop_ratchet_place_failed",
                              sleeve_id=sc.id, sleeve_name=sc.name,
@@ -4817,6 +4857,10 @@ class SwingTrader:
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
                 ss.resting_stop_stage = None
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
         # target_px <= current_px → never lower (ratchet-up-only invariant)
 
     def _maybe_reconcile_orphan_position(self, sc: SleeveConfig, ss: SleeveState) -> None:
