@@ -126,6 +126,10 @@ class SwingState:
     # Why the primary halted (last _halt() call). Displayed on the dashboard
     # so the user can see what to fix before resuming. Cleared by resume.
     halt_reason: Optional[str] = None
+    # Adam 2026-07-20: rolling window of actual per-side fees ($/contract) from
+    # recent fills — used to auto-calibrate cfg.fee_per_contract_roundtrip
+    # away from the hardcoded $4.68 SLR default. Capped at last 20 samples.
+    recent_side_fees: list = field(default_factory=list)
 
 
 class SwingTrader:
@@ -7675,6 +7679,78 @@ class SwingTrader:
                 best_wall_px = px
         return best_wall_px
 
+    def _maybe_calibrate_fee_from_fill(self, order_id: Optional[str],
+                                        contract_qty: int) -> None:
+        """Sample the actual fee from a just-filled order and, once we have
+        enough samples, update cfg.fee_per_contract_roundtrip in Redis so the
+        fee-floor clamp uses reality instead of the $4.68 SLR default.
+
+        Adam 2026-07-20: hardcoded $4.68 was correct for SLR silver only;
+        applying it universally overstates perps/small futures by 3-10× and
+        makes take-profits impossible to fire on those products.
+
+        Idempotent: never mutates cfg unless drift > 10% (deadband prevents
+        thrashing on noise). Fail-open: any error skips calibration this
+        cycle, doesn't halt trading."""
+        if not order_id:
+            return
+        try:
+            st = self.b.order_status(order_id) or {}
+        except Exception:
+            return
+        try:
+            total_fees = float(st.get("total_fees") or 0)
+            filled = float(st.get("filled_qty") or 0)
+        except (TypeError, ValueError):
+            return
+        if total_fees <= 0 or filled <= 0:
+            return
+        # Per-CONTRACT fee for this side (filled is contracts, not underlying units)
+        fee_per_ct_per_side = total_fees / filled
+        # Guard: reject nonsense (e.g., fee > 10% of a $1000 fill = misparse)
+        if fee_per_ct_per_side <= 0 or fee_per_ct_per_side > 1000.0:
+            return
+        # Rolling window on SwingState (persists via _save_state)
+        recent = list(getattr(self.s, "recent_side_fees", None) or [])
+        recent.append(float(fee_per_ct_per_side))
+        if len(recent) > 20:
+            recent = recent[-20:]
+        self.s.recent_side_fees = recent
+        if len(recent) < 5:
+            return  # need more samples before touching cfg
+        avg_side = sum(recent) / len(recent)
+        new_rt = 2.0 * avg_side
+        try:
+            old_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+        except (TypeError, ValueError):
+            old_rt = 0.0
+        # Deadband: only update if drift > 10% (or old is zero/unset)
+        if old_rt > 0 and abs(new_rt - old_rt) / old_rt < 0.10:
+            return
+        try:
+            self.cfg.fee_per_contract_roundtrip = float(new_rt)
+            cfg_dict = self.store.get_config(self.tenant_id, self.symbol) or {}
+            cfg_dict["fee_per_contract_roundtrip"] = float(new_rt)
+            self.store.put_config(self.tenant_id, self.symbol, cfg_dict)
+            self._record(
+                "fee_per_contract_roundtrip_auto_calibrated",
+                old_rt=round(old_rt, 4),
+                new_rt=round(new_rt, 4),
+                samples=len(recent),
+                latest_side_fee=round(fee_per_ct_per_side, 4),
+                severity="info",
+                reason=("cfg.fee_per_contract_roundtrip drifted >10% from "
+                        "actual Coinbase fees averaged over last N fills. "
+                        "Updated so fee-floor clamp + realized P&L reflect "
+                        "reality. Kills $4.68-default-for-everything class."),
+            )
+        except Exception as _e:
+            try:
+                self._record("fee_auto_calibration_persist_failed",
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
+
     def _sleeve_on_fill(self, sc: SleeveConfig, ss: SleeveState, fill_price) -> None:
         # Capture order_id BEFORE clearing so the fill event carries it — makes
         # repair scripts (find unclaimed order_ids) trivial to write.
@@ -7687,6 +7763,12 @@ class SwingTrader:
             order_id=filled_order_id,
         )
         ss.live_order_id = None
+        # Adam 2026-07-20 FEE AUTO-CALIBRATION: sample this fill's actual fee
+        # and update cfg.fee_per_contract_roundtrip when drift exceeds 10%.
+        # Kills the $4.68 SLR-default-for-everything class (10× overcount on
+        # ETH PERP, 4× on OIL/XLM/HYPE — clamps sell_px too high → take-profit
+        # rarely fires → cycles close via stop_loss → guaranteed losses).
+        self._maybe_calibrate_fee_from_fill(filled_order_id, sc.qty)
         half_fee = (self.cfg.fee_per_contract_roundtrip / 2.0) * sc.qty
         if ss.state == SleeveStateEnum.ARMED_SELL:
             # Sell fill = profit realization. Anchor on the actual FIFO cost
