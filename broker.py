@@ -177,7 +177,18 @@ class CoinbaseBroker:
         """Signed spot balance in base-currency units. LONG only on spot
         (Coinbase doesn't margin-short outside of INTX perps), so this is
         always >= 0. Returns 0.0 on any lookup failure so no-short checks
-        fail-safe (refuse the sell rather than allow an over-sell)."""
+        fail-safe (refuse the sell rather than allow an over-sell).
+
+        Adam 2026-07-20 CANCEL-CASCADE ROOT FIX: use available + hold, NOT
+        just available. Coinbase moves spot tokens from `available_balance`
+        to `hold` when a SELL stop-limit is placed. If we read only
+        `available`, tick sees 0 the moment we place a stop → thinks
+        position is closed → cancels the stop → released back to available
+        → next tick sees position again → places new stop → moves to hold
+        → cycles. Every ~60s a new stop-place-then-cancel. Adam's Coinbase
+        fill history showed 7 META cancels in 13 min for exactly this
+        reason. TOTAL balance is the true position — Coinbase's own
+        portfolio page shows total (available+hold), not just available."""
         cur = self._spot_base_currency()
         if not cur:
             return 0.0
@@ -191,9 +202,14 @@ class CoinbaseBroker:
                 for a in resp.get("accounts") or []:
                     if (a.get("currency") or "").upper() == cur:
                         try:
-                            return float((a.get("available_balance") or {}).get("value") or 0)
+                            avail = float((a.get("available_balance") or {}).get("value") or 0)
                         except (TypeError, ValueError):
-                            return 0.0
+                            avail = 0.0
+                        try:
+                            hold = float((a.get("hold") or {}).get("value") or 0)
+                        except (TypeError, ValueError):
+                            hold = 0.0
+                        return avail + hold
                 if not resp.get("has_next"):
                     break
                 cursor = resp.get("cursor")
