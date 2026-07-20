@@ -688,7 +688,8 @@ def run() -> int:
     class _NonPrimaryTrack:
         __slots__ = ("product_id", "feed", "trader",
                      "consecutive_step_failures", "last_step_ok_ts",
-                     "last_tick_seen_ts", "spawn_ts", "tick_count")
+                     "last_tick_seen_ts", "spawn_ts", "tick_count",
+                     "last_tick_attempt_ts", "last_tick_reason")
         def __init__(self, product_id, feed, trader):
             self.product_id = product_id
             self.feed = feed
@@ -711,6 +712,12 @@ def run() -> int:
             # Track — decoupled from sleeve-event count (which was
             # misleadingly used as a heartbeat before).
             self.tick_count = 0
+            # Adam 2026-07-19: per-tick diagnostic. Every tick attempt
+            # sets these — even the ones that skip. Lets us see WHY a
+            # Track isn't advancing tick_count (feed_no_ticker,
+            # step_halted, step_error, evicting, etc.).
+            self.last_tick_attempt_ts = 0.0
+            self.last_tick_reason = ""
         def close(self):
             try: self.feed.stop()
             except Exception: pass
@@ -1030,24 +1037,23 @@ def run() -> int:
                 _zombie_streak_map.pop(_pid, None)
                 setattr(_maybe_recover_dead_tracks,
                         "_zombie_streak", _zombie_streak_map)
-                # SYNCHRONOUS spawn — don't wait for interval gate below.
-                _spawn_ok = False
-                _spawn_err = ""
-                _spawned_track = None
-                try:
-                    _spawned_track = _get_or_create_non_primary_track(_pid)
-                    _spawn_ok = _spawned_track is not None
-                except Exception as _e:
-                    _spawn_err = f"{type(_e).__name__}: {_e}"
+                # Adam 2026-07-19 REVERT: don't spawn synchronously here.
+                # Synchronous spawn can block if broker/feed init hangs,
+                # which would freeze the entire tick loop (no heartbeat,
+                # no ticks). Now we just clear the cooldown; the DOWNSTREAM
+                # interval-gated spawn (5s critical / 15s regular) picks up
+                # from the normal recovery path. Trades ~5s of extra
+                # respawn latency for main-loop safety.
                 try:
                     log.record(
                         "track_force_respawn_signal_honored",
                         tenant=TENANT, symbol=_pid,
                         evict_ok=_evict_ok, evict_error=_evict_err,
-                        spawn_ok=_spawn_ok, spawn_error=_spawn_err,
                         reason=("operator wrote __force_respawn__ signal — "
-                                "evict + spawn attempted synchronously"),
-                        severity=("info" if _spawn_ok else "critical"),
+                                "evicted + cleared cooldown; spawn deferred "
+                                "to normal interval gate (avoid main-loop "
+                                "block from long spawn)"),
+                        severity=("info" if _evict_ok else "warn"),
                     )
                 except Exception:
                     pass
@@ -1505,6 +1511,12 @@ def run() -> int:
                                 "prev_tick_count": int(_prev.get("tick_count", 0) or 0),
                                 "prev_snap_ts": float(_prev.get("snap_ts", 0) or 0),
                                 "snap_ts": now,
+                                # Per-tick diagnostics — tells us WHY a
+                                # Track isn't advancing tick_count
+                                "last_tick_attempt_ts":
+                                    float(getattr(_tr, "last_tick_attempt_ts", 0) or 0),
+                                "last_tick_reason":
+                                    str(getattr(_tr, "last_tick_reason", "") or ""),
                             }
                         try:
                             store.put_config(TENANT, "__track_heartbeat__",
@@ -1520,8 +1532,10 @@ def run() -> int:
                 for _pid, _track in list(_non_primary_tracks.items()):
                     # Aggressive re-sync if the feed has gone quiet.
                     _maybe_resync_stale_feed(_track)
+                    _track.last_tick_attempt_ts = now
                     _tt = _track.feed.latest_ticker()
                     if _tt is None:
+                        _track.last_tick_reason = "feed_no_ticker"
                         continue  # WS still spinning up, skip this iter
                     try:
                         _track.trader.step(float(_tt["price"]))
@@ -1541,6 +1555,9 @@ def run() -> int:
                         if not _step_halted:
                             _track.last_step_ok_ts = now
                             _track.tick_count += 1
+                            _track.last_tick_reason = "step_ok"
+                        else:
+                            _track.last_tick_reason = "step_halted"
                         # Adam 2026-07-15: successful step resets the
                         # zombie streak counter — a product that eventually
                         # starts ticking correctly shouldn't be penalized
@@ -1555,10 +1572,26 @@ def run() -> int:
                             pass
                     except Exception as e:
                         _track.consecutive_step_failures += 1
+                        _track.last_tick_reason = f"step_error:{type(e).__name__}"
                         _log(f"[non-primary] {_pid} step failed "
                              f"({_track.consecutive_step_failures}/"
                              f"{STEP_FAILURE_EVICT_THRESHOLD}): "
                              f"{type(e).__name__}: {e}")
+                        # Adam 2026-07-19: also record to trade log so
+                        # diag_silent_product_events / diag_throttle_check
+                        # can see step errors. Prior code only wrote to the
+                        # process log which is invisible to diags.
+                        try:
+                            log.record(
+                                "non_primary_step_failed",
+                                tenant=TENANT, symbol=_pid,
+                                error=f"{type(e).__name__}: {e}",
+                                consecutive_failures=_track.consecutive_step_failures,
+                                threshold=STEP_FAILURE_EVICT_THRESHOLD,
+                                severity="warn",
+                            )
+                        except Exception:
+                            pass
                         if _track.consecutive_step_failures >= STEP_FAILURE_EVICT_THRESHOLD:
                             _to_evict.append(_pid)
                 for _pid in _to_evict:

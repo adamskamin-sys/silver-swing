@@ -61,10 +61,10 @@ def main() -> None:
     if hb_age > 60:
         print(f"⚠ Heartbeat is > 60s stale — live_runner may itself be stalled")
 
-    print(f"\n{'PRODUCT':22s} {'LIFETIME':>12s} {'INSTANT':>12s} "
-          f"{'% OF DESIGN':>12s} {'LAST STEP':>12s} {'FAILS':>6s} "
-          f"{'STATUS':>18s}")
-    print("-" * 118)
+    print(f"\n{'PRODUCT':22s} {'LIFETIME':>10s} {'INSTANT':>10s} "
+          f"{'% OF DESIGN':>10s} {'LAST STEP':>10s} {'ATTEMPT':>10s} "
+          f"{'REASON':>20s} {'FAILS':>5s} {'STATUS':>16s}")
+    print("-" * 130)
 
     healthy = 0
     degraded = 0
@@ -95,6 +95,10 @@ def main() -> None:
 
         last_step_age = int(now - last_ok) if last_ok > 0 else -1
         last_step_str = f"{last_step_age}s ago" if last_step_age >= 0 else "never"
+        last_attempt_ts = float(t.get("last_tick_attempt_ts") or 0)
+        last_attempt_age = int(now - last_attempt_ts) if last_attempt_ts > 0 else -1
+        last_attempt_str = f"{last_attempt_age}s ago" if last_attempt_age >= 0 else "never"
+        last_reason = str(t.get("last_tick_reason") or "—")
 
         if inst_rate == 0 and tick_count > 0:
             status = "💀 STALLED NOW"
@@ -112,9 +116,9 @@ def main() -> None:
             status = "💀 NEVER TICKED"
             stalled += 1
 
-        print(f"{pid:22s} {life_rate:>9.2f}/s {inst_rate:>9.2f}/s "
-              f"{pct_of_design:>10.1f}% {last_step_str:>12s} {fails:>6d} "
-              f"{status:>18s}")
+        print(f"{pid:22s} {life_rate:>7.2f}/s {inst_rate:>7.2f}/s "
+              f"{pct_of_design:>8.1f}% {last_step_str:>10s} {last_attempt_str:>10s} "
+              f"{last_reason[:20]:>20s} {fails:>5d} {status:>16s}")
 
     total = len(tracks)
     print(f"\n[SUMMARY] {total} Tracks · designed {designed_tps:.1f} tps each")
