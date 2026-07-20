@@ -4558,96 +4558,15 @@ class SwingTrader:
         break_even_floor = 0.0
         if own_avg > 0:
             break_even_floor = own_avg + _fee_price + max(_tick, own_avg * 0.0005)
-        # Adam 2026-07-15: live-adaptive trail_distance. When enabled per
-        # sleeve (sc.adaptive_trail_enabled), recompute trail_distance from
-        # recent realized vol × mid so the trail widens in chaotic markets
-        # (won't false-trigger on noise) and tightens in calm ones (locks
-        # profit faster). Chuck LeBeau chandelier standard: k×ATR where
-        # k=3. Vol-based equivalent: k×sigma×mid where k~2-3.
-        #
-        # Only rewrites when live estimate diverges >20% from static —
-        # avoids thrashing the trail on every tick. Logged so audit can
-        # see adaptation vs static behavior.
-        # Adam 2026-07-16: trail distance now via expert_trail consensus
-        # (Chande + Wilder-SAR + Turtle) + Menkveld floor + Van Tharp cap +
-        # Ho-Stoll age tightener. Replaces the LeBeau vol-adaptive block.
-        # Applies whenever we have a valid trail_distance base; the expert
-        # OVERRIDES the base. Kill switch: expert_trail.MODE = "off".
-        if trail_distance > 0:
-            try:
-                import expert_trail as _et
-                if getattr(_et, "MODE", "expert") == "expert":
-                    _hist = list(self._sleeve_price_history.get(sc.id, []) or [])
-                    if len(_hist) >= 5:
-                        # ATR proxy from recent |Δclose|
-                        _deltas = [abs(_hist[i] - _hist[i - 1])
-                                    for i in range(1, len(_hist))]
-                        _atr = sum(_deltas[-14:]) / max(1, len(_deltas[-14:])) if _deltas else 0.0
-                        _hh = float(ss.trail_high_water_price or last_price)
-                        _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
-                        _contract_size = float(getattr(self.cfg, "contract_size", 1) or 1)
-                        # Position age from sleeve's own_avg_entry_ts if we have it,
-                        # else 0.0 (no age adjustment).
-                        import time as _t_at
-                        _age = 0.0
-                        _entry_ts = getattr(ss, "own_avg_entry_ts", None) or getattr(ss, "armed_since_ts", None)
-                        if _entry_ts:
-                            try:
-                                _age = max(0.0, _t_at.time() - float(_entry_ts))
-                            except (TypeError, ValueError):
-                                pass
-                        _dec = _et.optimal_trail_distance(
-                            mid_price=float(last_price),
-                            highest_high=_hh,
-                            atr_est=float(_atr),
-                            prices=_hist,
-                            fee_per_roundtrip=_fee_rt,
-                            contract_size=_contract_size,
-                            qty=max(1, int(sc.qty or 1)),
-                            position_age_secs=_age,
-                        )
-                        if _dec is not None and _dec.trail_distance > 0:
-                            # Adam 2026-07-20 ROOT FIX (Rule #1 take profit):
-                            # cap expert trail_distance at the sleeve's
-                            # config value. Expert may only TIGHTEN (protect
-                            # more profit); never WIDEN (give more back).
-                            # Prior code let expert widen from config $7 →
-                            # expert $35, so the actual exchange stop sat
-                            # much lower than the dashboard TRAIL column
-                            # suggested (which uses config). Bot rode down
-                            # $28 more before firing. Take-profit exits fired
-                            # far below where the config trail said they would.
-                            _expert_td = float(_dec.trail_distance)
-                            _config_td = float(trail_distance)  # still the config value here
-                            _final_td = (min(_expert_td, _config_td)
-                                          if _config_td > 0 else _expert_td)
-                            _capped = _final_td < _expert_td
-                            self._record(
-                                "expert_trail_applied",
-                                sleeve_id=sc.id, sleeve_name=sc.name,
-                                method=_dec.method,
-                                citation=_dec.citation,
-                                legacy_trail_distance=round(_config_td, 6),
-                                expert_trail_distance=_expert_td,
-                                final_trail_distance=_final_td,
-                                capped_by_config=_capped,
-                                candidates=_dec.candidates,
-                                consensus=_dec.consensus,
-                                fee_floor=_dec.fee_floor,
-                                fee_floor_binding=_dec.fee_floor_binding,
-                                sanity_cap=_dec.sanity_cap,
-                                sanity_cap_binding=_dec.sanity_cap_binding,
-                                age_tightener_factor=_dec.age_tightener_factor,
-                                position_age_secs=round(_age, 1),
-                            )
-                            trail_distance = _final_td
-            except Exception as _e:
-                try:
-                    self._record("expert_trail_error",
-                                 sleeve_id=sc.id, sleeve_name=sc.name,
-                                 error=str(_e), severity="warn")
-                except Exception:
-                    pass  # fall back to static — never fail-hard on the stop path
+        # Adam 2026-07-20 (feedback_experts_only_reentry_not_exit):
+        # once a sleeve owns a position, exit params are FROZEN at config
+        # values. No expert override, no per-tick adaptive recomputation.
+        # The bot's job during a hold is to extract profit at the pre-
+        # committed sale price + trail as configured. Experts decide the
+        # NEXT re-entry (see _reentry_reeval + scanner re-arm), not the
+        # current exit. A moving trail_distance defeats Rule #1
+        # (don't lose money AND take profit at its best). Prior expert_
+        # trail block deleted; trail_distance is used as-is from sc.
         target_px = None
         stage = None
         # Adam 2026-07-15: checkpoint-then-ratchet model.
