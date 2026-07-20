@@ -525,10 +525,31 @@ class SwingTrader:
                 continue
             sc = sleeves_cfg_by_id.get(sid)
             if sc is None:
-                # Sleeve config gone — best-effort clear the id
-                ss.resting_stop_oid = None
-                ss.resting_stop_px = None
-                ss.resting_stop_stage = None
+                # Adam 2026-07-20 ORPHAN GUARD (config gone edge case):
+                # sleeve config was deleted while its resting stop was
+                # still live on Coinbase. Prior code cleared tracking
+                # without canceling → orphan. Now: try to cancel first.
+                # Only clear tracking on success. If cancel fails, KEEP
+                # tracking so the orphan-sweep at startup catches it (the
+                # sweep looks at Coinbase for orphans, not our state).
+                _cfg_gone_ok = False
+                try:
+                    self.b.cancel(ss.resting_stop_oid)
+                    _cfg_gone_ok = True
+                    self._record("resting_stop_config_gone_cancelled",
+                                 sleeve_id=sid, oid=ss.resting_stop_oid,
+                                 source="reconcile")
+                except Exception as _cge:
+                    self._record("resting_stop_config_gone_cancel_failed",
+                                 sleeve_id=sid, oid=ss.resting_stop_oid,
+                                 error=str(_cge), severity="critical",
+                                 reason=("config deleted but resting stop still "
+                                         "live; keeping tracking so it's not "
+                                         "invisible if orphan-sweep misses"))
+                if _cfg_gone_ok:
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
                 continue
             try:
                 st = self.b.order_status(ss.resting_stop_oid)
@@ -539,19 +560,29 @@ class SwingTrader:
                 # If the sleeve already transitioned to ARMED_BUY the TP fill
                 # fired first — cancel the dangling stop so it doesn't create
                 # a spurious short if price recovers above stop_px.
+                # Adam 2026-07-20 ORPHAN GUARD: only clear tracking on cancel
+                # success. Prior code cleared unconditionally after `except`,
+                # so failed cancel produced an orphan (Coinbase still has the
+                # stop, no sleeve tracks it → §3.8 short risk).
                 if str(ss.state) == "ARMED_BUY":
+                    _tpb_ok = False
                     try:
                         self.b.cancel(ss.resting_stop_oid)
+                        _tpb_ok = True
                         self._record("resting_stop_cancelled_tp_beat_stop",
                                      sleeve_id=sid, oid=ss.resting_stop_oid,
                                      source="reconcile")
                     except Exception as _ce:
                         self._record("resting_stop_cancel_tp_beat_stop_failed",
                                      sleeve_id=sid, oid=ss.resting_stop_oid,
-                                     error=str(_ce))
-                    ss.resting_stop_oid = None
-                    ss.resting_stop_px = None
-                    ss.resting_stop_stage = None
+                                     error=str(_ce), severity="critical",
+                                     reason=("keeping resting_stop_oid tracked "
+                                             "so next reconcile retries; avoids "
+                                             "orphan"))
+                    if _tpb_ok:
+                        ss.resting_stop_oid = None
+                        ss.resting_stop_px = None
+                        ss.resting_stop_stage = None
                 continue  # still resting (or just cancelled above)
             if status == "FILLED":
                 try:
