@@ -85,8 +85,17 @@ def main() -> None:
     print(f"  halt_reason={target_ss.get('halt_reason')}")
     print(f"  cycles={target_ss.get('cycles')}  realized_pnl=${target_ss.get('realized_pnl', 0)}")
 
-    if target_ss.get("own_avg_entry") is None:
-        print(f"\n✓ Nothing to clear — own_avg_entry is already None.")
+    # Two ghost shapes we clear:
+    #   (a) own_avg set but Coinbase position=0 (classic ghost)
+    #   (b) own_avg=None but sleeve HALTED with a dead resting_stop_oid
+    #       — Resume alone won't stick because the credit path re-fires
+    #         against the stale oid and re-halts.
+    is_halted_with_dead_stop = (
+        target_ss.get("state") == "HALTED"
+        and target_ss.get("resting_stop_oid")
+    )
+    if target_ss.get("own_avg_entry") is None and not is_halted_with_dead_stop:
+        print(f"\n✓ Nothing to clear — own_avg_entry is None and no HALTED+stop_oid to reset.")
         return
 
     # Preview the transition

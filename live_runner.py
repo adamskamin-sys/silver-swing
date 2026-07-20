@@ -1789,6 +1789,24 @@ def run() -> int:
                             _old_sq = int(_dst.get("swing_qty") or 0)
                             _dst["swing_qty"] = _new_sq
                             store.put_state(live_tenant, _dsym, _dst)
+                            # Also push a state_patch so the SwingTrader
+                            # applies the correction to its in-memory
+                            # self.s.swing_qty on the next tick — otherwise
+                            # the trader's _save_state clobbers our Redis
+                            # write with its stale in-memory value, and
+                            # the autocorrect fires again every sweep
+                            # (MC-17SEP26-CDE re-inflation loop, 2026-07-19).
+                            try:
+                                if hasattr(store, "put_state_patch"):
+                                    store.put_state_patch(live_tenant, _dsym, {
+                                        "top_level": {"swing_qty": _new_sq},
+                                        "reason": (f"state_config_drift_autocorrect: "
+                                                   f"swing_qty {_old_sq}→{_new_sq} "
+                                                   f"(exch={_exch_qty}, cfg={_dcfg.get('swing_qty')})"),
+                                        "ts": int(now),
+                                    })
+                            except Exception:
+                                pass
                             _log(f"[reconcile-autocorrect] {_dsym}: state.swing_qty "
                                  f"{_old_sq}→{_new_sq} (exchange={_exch_qty}, "
                                  f"config={_dcfg.get('swing_qty')})")
@@ -1838,6 +1856,30 @@ def run() -> int:
                                     f"but state=ARMED_SELL qty={_msq} (2026-07-16)"
                                 )
                                 store.put_state(live_tenant, _msym, _mst)
+                                # Push state_patch so the trader's in-memory
+                                # copy adopts the correction on the next tick
+                                # instead of clobbering our Redis write.
+                                # Only scalar fields — `state` is a State enum
+                                # in memory; setattr with a raw string would
+                                # break equality checks against State.HALTED.
+                                # Setting swing_qty=0 + live_order_id=None is
+                                # enough to stop the sell-vs-nothing loop; the
+                                # trader will see the persisted HALTED state
+                                # on its next full state load / restart.
+                                try:
+                                    if hasattr(store, "put_state_patch"):
+                                        store.put_state_patch(live_tenant, _msym, {
+                                            "top_level": {
+                                                "swing_qty": 0,
+                                                "live_order_id": None,
+                                            },
+                                            "reason": (f"position_mismatch_autocorrect: "
+                                                       f"ghost clear, exch=0, "
+                                                       f"was ARMED_SELL qty={_msq}"),
+                                            "ts": int(now),
+                                        })
+                                except Exception:
+                                    pass
                                 _log(f"[reconcile-autocorrect] {_msym}: ghost cleared "
                                      f"(exchange=0, ARMED_SELL qty={_msq}→0, now HALTED)")
                                 try:
