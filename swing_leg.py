@@ -4507,48 +4507,6 @@ class SwingTrader:
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
                 ss.resting_stop_stage = None
-            # Adam 2026-07-20 (no_ghost_sleeves rule + constitution):
-            # AUTO-HEAL orphaned market-sold cycles. If we reach here
-            # with pos_qty=0 AND own_avg still set AND no tracked orders
-            # (resting_stop_oid + live_order_id both None) AND we didn't
-            # credit via the resting-stop-fill path above → a market sell
-            # fired via a path that didn't track its oid (e.g. trail-
-            # breach market sell before commit 3eee50c wired live_order_id
-            # tracking). Bot doesn't know, sleeve stays WAITING_FOR_SELL
-            # with stale own_avg forever = ghost. Credit at last_price
-            # (best-available approximation; typically within a few ticks
-            # of actual fill) to unstick the sleeve on THIS tick.
-            _own_avg_ghost_check = float(ss.own_avg_entry or 0)
-            if (not _fill_credited and _own_avg_ghost_check > 0
-                    and not ss.resting_stop_oid
-                    and not ss.live_order_id
-                    and last_price and float(last_price) > 0):
-                try:
-                    self._credit_stop_fill(
-                        sc, ss, float(last_price), sleeve_qty,
-                        source="orphan_market_sell_autoheal", oid=None,
-                    )
-                    self._record(
-                        "orphan_market_sell_autoheal",
-                        sleeve_id=sc.id, sleeve_name=sc.name,
-                        last_own_avg=_own_avg_ghost_check,
-                        credit_at_last_price=float(last_price),
-                        approx_profit=float(last_price) - _own_avg_ghost_check,
-                        reason=("position=0 + own_avg set + no tracked "
-                                "orders — market sell fired without "
-                                "tracking; auto-credit at last_price to "
-                                "unstick the sleeve. Bot self-heals; no "
-                                "manual diag needed."),
-                        severity="warn",
-                    )
-                except Exception as _e:
-                    self._record(
-                        "orphan_market_sell_autoheal_failed",
-                        sleeve_id=sc.id, sleeve_name=sc.name,
-                        last_own_avg=_own_avg_ghost_check,
-                        last_price=float(last_price),
-                        error=str(_e), severity="critical",
-                    )
             # If we credited above, _credit_stop_fill already cleared the
             # oid + advanced state; no further work here.
             return
