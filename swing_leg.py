@@ -1111,11 +1111,24 @@ class SwingTrader:
                     f"to avoid abandoning filled contracts"
                 )
             # Unfilled → safe to cancel and re-arm at the new price.
+            # Adam 2026-07-20 ORPHAN GUARD (primary _arm): if the cancel
+            # raises, we DO NOT proceed to place a new order. Prior code
+            # logged the failure and continued, overwriting live_order_id
+            # with the new oid — leaving the old order on Coinbase as an
+            # orphan (§3.8 short risk). Now: on cancel failure, return.
+            # Next tick re-enters _arm with live_order_id still set and
+            # retries the cancel.
             try:
                 self.b.cancel(self.s.live_order_id)
                 self._record("order_cancelled_for_rearm", order_id=self.s.live_order_id)
             except Exception as e:
-                self._record("cancel_failed", order_id=self.s.live_order_id, error=str(e))
+                self._record("cancel_failed", order_id=self.s.live_order_id,
+                             error=str(e), severity="critical",
+                             reason=("cancel raised during re-arm; NOT placing "
+                                     "new order — old order still tracked, "
+                                     "next tick retries. Avoids orphan."))
+                self._save_state()
+                return
         set_src = getattr(self.b, "set_pending_source", None)
         if callable(set_src):
             set_src("strategy", strategy_id=getattr(self, "sleeve_id", None))
@@ -3547,14 +3560,27 @@ class SwingTrader:
 
     def _reeval_expire(self, sc, ss, dec) -> None:
         """Clean expire: cancel resting order, transition sleeve to HALTED
-        (no re-arm next tick per Tier 2 #2), persist state."""
+        (no re-arm next tick per Tier 2 #2), persist state.
+
+        Adam 2026-07-20 ORPHAN GUARD: only clear tracking on cancel success.
+        Prior code cleared unconditionally after `except pass`, leaving a
+        potential orphan if cancel raised."""
         old_oid = ss.live_order_id
-        try:
-            if old_oid:
+        _exp_cancel_ok = True
+        if old_oid:
+            _exp_cancel_ok = False
+            try:
                 self.b.cancel(old_oid)
-        except Exception:
-            pass  # best-effort cancel; may already be gone
-        ss.live_order_id = None
+                _exp_cancel_ok = True
+            except Exception as _e:
+                self._record("reentry_reeval_expire_cancel_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             old_order_id=old_oid, error=str(_e),
+                             severity="critical",
+                             reason=("cancel raised on expire; keeping "
+                                     "tracking to avoid orphan"))
+        if _exp_cancel_ok:
+            ss.live_order_id = None
         if ss.state != SleeveStateEnum.HALTED:
             ss.pre_halt_state = ss.state.value
         ss.state = SleeveStateEnum.HALTED
