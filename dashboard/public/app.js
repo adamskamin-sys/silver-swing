@@ -5520,8 +5520,16 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Path A: delay expires without breakout — market-sell at sell_px area.
       const perContract = qty > 0 ? grossPerSwing / qty : 0;
       // Path B: activation crossed — trail engages. Worst case: trail fires
-      // at activation minus trail distance.
-      const estGrossTrailWorst = Math.max(0, (activation - trailDistance - buyPx) * contractSize * qty);
+      // at max(sell_target, activation - trail_distance). The floor at
+      // sell_target enforces feedback_trail_floor_at_sell_target.md:
+      // "once profit-locked, trail can only tighten (fire at HIGHER price)
+      // as HWM rises. Never drift below the goal." Prior display showed
+      // raw `activation - trail_distance` which for tight configs (e.g.
+      // XLP at $0.19 activation, $0.01 trail_distance = $0.18000 raw)
+      // rendered a scary negative net despite the bot code enforcing the
+      // sell_target floor — false alarm.
+      const trailFloorPx = Math.max(sellPx, activation - trailDistance);
+      const estGrossTrailWorst = Math.max(0, (trailFloorPx - buyPx) * contractSize * qty);
       const estNetTrailWorst = estGrossTrailWorst - feesPerSwing;
       previewEl.innerHTML = `
         ${belowCostBanner}
@@ -5536,9 +5544,9 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
         </div>
         <div class="preview-econ">
           <span><b>Path A</b> (no breakout): sell at target → net <b class="${netPerSwing > 0 ? 'pos' : 'neg'}">${netPerSwing >= 0 ? '+' : ''}$${netPerSwing.toFixed(2)}</b></span>
-          <span><b>Path B</b> (breakout, worst): trail sells at $${fmtPrice(activation - trailDistance)} → net <b class="${estNetTrailWorst > 0 ? 'pos' : 'neg'}">${estNetTrailWorst >= 0 ? '+' : ''}$${estNetTrailWorst.toFixed(2)}</b></span>
+          <span><b>Path B</b> (breakout, worst): trail sells at $${fmtPrice(trailFloorPx)} → net <b class="${estNetTrailWorst > 0 ? 'pos' : 'neg'}">${estNetTrailWorst >= 0 ? '+' : ''}$${estNetTrailWorst.toFixed(2)}</b></span>
         </div>
-        <div class="preview-note">Activation must be above the sell target. Path B is a floor — real breakouts can ride much higher before the trail fires.</div>
+        <div class="preview-note">Activation must be above the sell target. Path B floor = max(sell target, activation − trail distance) — trail never drifts below sell target once profit-locked.</div>
       `;
     } else {
       const perContract = qty > 0 ? grossPerSwing / qty : 0;
