@@ -4565,15 +4565,40 @@ class SwingTrader:
         # the take-profit path never closes in the red. Protective
         # stop_loss (hard_bottom) is separate — it may fire below.
         own_avg = float(ss.own_avg_entry or 0.0)
+        # Adam 2026-07-19 CRITICAL BUG FIX (SLR sat at $54.68 for 90+ min):
+        # prior code fell back to self.cfg.contract_size (default 1) when
+        # contract_spec_cache was empty. For SLR (real contract_size=50),
+        # this made _fee_price 50x too large: $3.14/1 = $3.14 per unit
+        # instead of $3.14/50 = $0.0628. break_even_floor became $60.21
+        # instead of $57.13, pushing target above HWM $57.615, making
+        # trail_active False and disabling BOTH ratchet + Part 2 market
+        # sell entirely. Bot logged resting_stop_skipped_above_mark every
+        # tick for 90 min without acting. Fix: query broker.contract_spec
+        # directly (source of truth), fall back to cache, then refuse to
+        # fake a fee_price if contract_size is still unknown.
+        _cs = 0.0
         try:
-            _cs = float((self.contract_spec_cache or {}).get("contract_size") or getattr(self.cfg, "contract_size", 1) or 1)
+            _spec = self.b.contract_spec() if hasattr(self.b, "contract_spec") else None
+            if _spec:
+                _cs = float(_spec.get("contract_size") or 0)
         except Exception:
-            _cs = 1.0
-        try:
-            _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
-            _fee_price = _fee_rt / max(1.0, _cs) / max(1, int(sc.qty or 1))
-        except Exception:
+            pass
+        if _cs <= 0:
+            try:
+                _cs = float((self.contract_spec_cache or {}).get("contract_size") or 0)
+            except Exception:
+                _cs = 0.0
+        if _cs <= 0:
+            # Unknown contract_size — safer to zero fee_price than to
+            # over-adjust break_even_floor. Under-adjustment costs fees;
+            # over-adjustment disables the entire trail path.
             _fee_price = 0.0
+        else:
+            try:
+                _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+                _fee_price = _fee_rt / _cs / max(1, int(sc.qty or 1))
+            except Exception:
+                _fee_price = 0.0
         try:
             _tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
         except Exception:
