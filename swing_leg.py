@@ -4690,6 +4690,34 @@ class SwingTrader:
             # Below break-even (or no HWM yet) — protective stop only.
             target_px = stop_loss_px
             stage = "hard_bottom"
+        # Adam 2026-07-20 ROOT FIX: guarantee every held position gets a
+        # protective stop. Prior code returned WITHOUT PLACING when: no
+        # trail (hwm not above break_even) AND no goal reached AND
+        # stop_loss_px unconfigured (== 0). Fresh scanner-armed sleeves
+        # often ship with stop_loss_px=0, so they'd sit ARMED_SELL with
+        # a real position but NO exchange stop until mark climbed —
+        # exactly XLM 2026-07-19 fresh $0.18786 buy fill.
+        #
+        # Fallback: if we hold + resting_stop_enabled + no stage fired,
+        # use own_avg × 0.95 as a conservative 5% protective floor. This
+        # is a wide default — user-configured stop_loss_px is always
+        # preferred, but SOMETHING beats NOTHING. Skips only when the
+        # user explicitly turned off stop_loss_enabled (Adam's NGS-style
+        # "let it ride" carve-out).
+        if (not target_px or target_px <= 0) and own_avg > 0 \
+                and getattr(sc, "stop_loss_enabled", True):
+            target_px = own_avg * 0.95
+            stage = "hard_bottom_default_5pct"
+            self._record(
+                "resting_stop_default_fallback",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                own_avg=own_avg, target_px=target_px,
+                reason=("stop_loss_px=0 unconfigured + no trail/goal "
+                        "stage fired; falling back to own_avg×0.95 to "
+                        "avoid leaving a held position unprotected. "
+                        "Configure sc.stop_loss_px for a tighter stop."),
+                severity="warn",
+            )
         if not target_px or target_px <= 0:
             return
         try:
