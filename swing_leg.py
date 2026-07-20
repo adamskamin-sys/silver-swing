@@ -5090,14 +5090,20 @@ class SwingTrader:
             buffer = max(tick * 2.0, target_px * 0.0005, vol_buffer)
             limit_px = max(0.0, target_px - buffer)
         # Adam 2026-07-20 Rule #1 (feedback_biggest_rule_dont_lose_take_best):
-        # if target_px >= last_price and we're on a TRAIL stage while holding,
-        # the trail has been breached — mark dropped below where the trail
-        # says the exit must fire. Coinbase rejects a stop-limit trigger
-        # above mark, so a market sell is the only way to enforce the
-        # trail decision (which was already made at arm time — this is
-        # execution, not a new decision). Fires only for trail stages;
-        # hard_bottom is a pre-arm protective floor at a lower price by
-        # definition and should never reach here above mark.
+        # if target_px >= last_price while holding, the stop has been breached
+        # — mark dropped below where the stop says the exit must fire. Coinbase
+        # rejects stop-limit triggers above mark, so a LIMIT sell at target is
+        # the only way to enforce the exit decision (already made at arm time
+        # — this is execution, not a new decision).
+        #
+        # Adam 2026-07-20 XLM 31 §3.6 FIX: extended to hard_bottom stages.
+        # Prior code assumed hard_bottom is always < mark ("pre-arm protective
+        # floor at a lower price by definition"). That's only true when
+        # stop_loss_px < own_avg (real loss floor). Scanner-armed sleeves
+        # commonly ship with stop_loss_px slightly ABOVE own_avg (tight
+        # profit-lock stop) — mark can drop below that while still above
+        # own_avg (e.g., XLM 31: own_avg $0.1849, stop_loss $0.18828, mark
+        # $0.1858 → stop above mark, position UNPROTECTED without this fix).
         # Cite: Cartea & Jaimungal, Algorithmic and High-Frequency
         # Trading (Cambridge 2015), ch.10 — stop-triggered execution
         # requires marketable orders when the trigger sits above prevailing
@@ -5108,7 +5114,28 @@ class SwingTrader:
                 "trail_floored_at_break_even", "break_even_lock",
                 "profit_lock",
             }
+            _hard_bottom_breach_stages = {
+                "hard_bottom", "hard_bottom_expert_consensus",
+                "hard_bottom_no_expert_data",
+            }
+            _breach_kind = None
             if _hold and trail_active and stage in _trail_stages_needing_market_exit:
+                _breach_kind = "trail"
+            elif _hold and stage in _hard_bottom_breach_stages:
+                _breach_kind = "hard_bottom"
+            if _breach_kind is not None:
+                # Adam 2026-07-20 IDEMPOTENCY GUARD: if live_order_id already
+                # tracks an open exit order, don't re-fire. Prevents double-
+                # fire → §3.8 short risk when the exit limit sits unfilled
+                # for multiple ticks (illiquid mark hovering just under target).
+                if ss.live_order_id:
+                    try:
+                        _st = self.b.order_status(ss.live_order_id)
+                        _open_status = (_st or {}).get("status") in ("OPEN", "PENDING", "QUEUED")
+                    except Exception:
+                        _open_status = True  # unknown → assume open, don't re-fire
+                    if _open_status:
+                        return
                 # ORPHAN GUARD 2026-07-19 (Adam SLR incident): only null the
                 # resting_stop tracking after cancel SUCCEEDS. Previously the
                 # None-clear ran unconditionally, so a failed cancel left
@@ -5159,7 +5186,11 @@ class SwingTrader:
                 # close red).
                 _floor_bp2 = own_avg + _fee_price + tick
                 _breach_limit_px = float(target_px)
-                if own_avg > 0 and _breach_limit_px < _floor_bp2:
+                # Adam 2026-07-20: only floor at break-even for TRAIL breaches.
+                # Hard_bottom is the accepted-loss floor (§3.7); flooring it up
+                # would push the limit above mark and it wouldn't fill, leaving
+                # the position unprotected. Honor the user's stop_loss_px as-is.
+                if _breach_kind == "trail" and own_avg > 0 and _breach_limit_px < _floor_bp2:
                     _breach_limit_px = _floor_bp2
                 try:
                     _breach_limit_px = self._snap_to_tick(_breach_limit_px)
