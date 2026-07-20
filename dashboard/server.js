@@ -817,12 +817,18 @@ export function makeApp({
       for (const s of sleeves) {
         if (!s.id || existing[s.id]) continue;      // never overwrite existing state
         const clientSeed = clientSeeds[s.id];
-        // Auto-adopt if: candidate exists, no client seed forces ARMED_BUY,
-        // and there's enough unclaimed position to fit this sleeve's qty.
+        // Adam 2026-07-20: clientSeed.state='ARMED_BUY' NO LONGER blocks
+        // auto-adopt when there's an unclaimed LONG. Scanner-arm at
+        // app.js:6565 always sends state='ARMED_BUY' — under the prior
+        // gate, arming a scanner sleeve on a held wallet stuck it in
+        // ARMED_BUY forever (HIGH-USD 5000 wallet, sleeve waited to buy
+        // 2500 more, would double the position + never fire the stop
+        // since state=ARMED_BUY skips _sleeve_step's stop-place path).
+        // The exchange position is the truth; the client's seed is a
+        // starting-state hint. Only when there's NO unclaimed long OR no
+        // adopt-candidate does clientSeed's state hint win.
         const _thisQty = Number(s.qty) || 1;
-        const _autoAdopt = _adoptCandidate
-          && _unclaimedRemaining >= _thisQty
-          && (!clientSeed || !clientSeed.state);
+        const _autoAdopt = _adoptCandidate && _unclaimedRemaining >= _thisQty;
         const seed = _autoAdopt
           ? {
               id: s.id,

@@ -636,13 +636,30 @@ class CoinbaseBroker:
     def position(self):
         """Compatibility with PaperBroker's .position.qty / .avg_entry access.
         Returns a tiny namespace populated from the live snapshot() call so
-        callers that read broker.position.qty (logs, _mirror helpers) work."""
+        callers that read broker.position.qty (logs, _mirror helpers) work.
+
+        Adam 2026-07-20 SPOT SUPPORT: snapshot() only iterates
+        list_futures_positions — for spot products it returns qty=0,
+        avg_entry=0. That broke _maybe_reconcile_orphan_position for
+        every spot sleeve (line 5488 exits early when avg <= 0), so
+        HIGH-USD stayed stuck in ARMED_BUY on a 5000-token wallet.
+        Coinbase spot doesn't track per-position cost basis, so use
+        current mark as the adopt baseline — matches what server.js
+        auto-adopt does at seed time."""
         snap = self.snapshot()
         class _Pos:
             pass
         p = _Pos()
-        p.qty = int(snap.get("position_qty") or 0)
-        p.avg_entry = float(snap.get("position_avg_entry") or 0.0)
+        if self._is_spot_product():
+            p.qty = int(self._spot_position_qty())
+            try:
+                spec = self.contract_spec() or {}
+                p.avg_entry = float(spec.get("current_price") or 0.0)
+            except Exception:
+                p.avg_entry = 0.0
+        else:
+            p.qty = int(snap.get("position_qty") or 0)
+            p.avg_entry = float(snap.get("position_avg_entry") or 0.0)
         return p
 
     @property
