@@ -987,47 +987,77 @@ def run() -> int:
 
     def _maybe_recover_dead_tracks() -> None:
         now = time.time()
-        # Adam 2026-07-19 force-respawn signal: an operator diag can write
-        # a list of product_ids to CONFIG `__force_respawn__` in Redis to
-        # request immediate eviction + spawn, bypassing the 15-min cooldown.
-        # Runs BEFORE the interval gates so it fires the same tick the
-        # signal was written. Signal is cleared after processing.
+        # Adam 2026-07-19 force-respawn signal: operator writes a list of
+        # product_ids to CONFIG `__force_respawn__` in Redis. This reader
+        # runs at the TOP of every _maybe_recover_dead_tracks call (which
+        # itself runs every 50ms tick), evicts + immediately re-spawns.
+        # Bypasses BOTH the 15-min eviction cooldown AND the interval gate
+        # below — spawn happens synchronously in this call, not delayed
+        # to the next 5s critical tick.
         try:
             _sig = store.get_config(TENANT, "__force_respawn__") or {}
-            _pids = _sig.get("product_ids") or []
-            if _pids and isinstance(_pids, list):
-                for _pid in _pids:
-                    if not isinstance(_pid, str) or not _pid:
-                        continue
-                    try:
-                        _evict_track(_pid, "operator force-respawn signal")
-                    except Exception:
-                        pass
-                    _non_primary_last_evict_ts.pop(_pid, None)
-                    _zombie_streak_map = getattr(
-                        _maybe_recover_dead_tracks, "_zombie_streak", {})
-                    _zombie_streak_map.pop(_pid, None)
-                    setattr(_maybe_recover_dead_tracks,
-                            "_zombie_streak", _zombie_streak_map)
-                    try:
-                        log.record(
-                            "track_force_respawn_signal_honored",
-                            tenant=TENANT, symbol=_pid,
-                            reason=("operator wrote __force_respawn__ signal — "
-                                    "cleared eviction cooldown + zombie streak; "
-                                    "next spawn attempt is immediate"),
-                            severity="warn",
-                        )
-                    except Exception:
-                        pass
-                # Clear the signal so we don't process it again next tick
+        except Exception as _sig_err:
+            _sig = {}
+            try:
+                log.record("force_respawn_signal_read_failed",
+                           tenant=TENANT, error=f"{type(_sig_err).__name__}: {_sig_err}",
+                           severity="warn")
+            except Exception:
+                pass
+        _pids = _sig.get("product_ids") if isinstance(_sig, dict) else None
+        if _pids and isinstance(_pids, list):
+            for _pid in _pids:
+                if not isinstance(_pid, str) or not _pid:
+                    continue
+                # Log every step explicitly so operator can see in trade
+                # log EXACTLY what happened per pid (not swallowed by try).
+                _evict_ok = False
+                _evict_err = ""
                 try:
-                    store.put_config(TENANT, "__force_respawn__",
-                                     {"product_ids": [], "cleared_ts": now})
+                    _evict_track(_pid, "operator force-respawn signal")
+                    _evict_ok = True
+                except Exception as _e:
+                    _evict_err = f"{type(_e).__name__}: {_e}"
+                _non_primary_last_evict_ts.pop(_pid, None)
+                _zombie_streak_map = getattr(
+                    _maybe_recover_dead_tracks, "_zombie_streak", {})
+                _zombie_streak_map.pop(_pid, None)
+                setattr(_maybe_recover_dead_tracks,
+                        "_zombie_streak", _zombie_streak_map)
+                # SYNCHRONOUS spawn — don't wait for interval gate below.
+                _spawn_ok = False
+                _spawn_err = ""
+                _spawned_track = None
+                try:
+                    _spawned_track = _get_or_create_non_primary_track(_pid)
+                    _spawn_ok = _spawned_track is not None
+                except Exception as _e:
+                    _spawn_err = f"{type(_e).__name__}: {_e}"
+                try:
+                    log.record(
+                        "track_force_respawn_signal_honored",
+                        tenant=TENANT, symbol=_pid,
+                        evict_ok=_evict_ok, evict_error=_evict_err,
+                        spawn_ok=_spawn_ok, spawn_error=_spawn_err,
+                        reason=("operator wrote __force_respawn__ signal — "
+                                "evict + spawn attempted synchronously"),
+                        severity=("info" if _spawn_ok else "critical"),
+                    )
                 except Exception:
                     pass
-        except Exception:
-            pass  # never fail-hard on the tick loop
+            # Clear the signal after processing so it isn't re-run.
+            try:
+                store.put_config(TENANT, "__force_respawn__",
+                                 {"product_ids": [], "cleared_ts": now,
+                                  "last_processed_pids": _pids})
+            except Exception as _clr_err:
+                try:
+                    log.record("force_respawn_signal_clear_failed",
+                               tenant=TENANT,
+                               error=f"{type(_clr_err).__name__}: {_clr_err}",
+                               severity="warn")
+                except Exception:
+                    pass
 
         # Adam 2026-07-15: two-tier detection. Held-position dead Tracks
         # are money-at-risk (stop can't fire without a Track) so they check
