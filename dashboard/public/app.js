@@ -4639,6 +4639,52 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       // Shadow-only: never gates arms.
       classicIndicatorsShadow: { enabled: true },
       note: 'Full expert stack: hybrid trail + accumulate + ratcheting stop-loss (locks in gains) + protect-half realized (never gives back >50% of booked gains) + trend-gated buys + volatility-contraction re-entry after stop + falling-knife protection on rebuys + funding-aware entries + Kelly-scaled sizing + vol-adaptive spread + cross-exchange fair-value check + dynamic correlation + ML shadow harness. Every feature is internally data-gated: no misfires when history is thin. Van Tharp / Livermore / Turtles / Le Beau / Andersen-Bollerslev / Aksoy-Cheng / Vince.',
+      // Adam 2026-07-20: no anchor override — Model B respects whatever
+      // anchor toggle is currently selected. Default for new sleeves is
+      // Current Market (Van Tharp 1R off today's price) per
+      // feedback_new_sleeve_anchor_current_market.md.
+    },
+    // Adam 2026-07-20: dedicated "defensive above water" preset. Same
+    // expert stack as Model B, but auto-clicks the "Your contract avg"
+    // anchor when applied so sell targets land ABOVE cost basis for
+    // held products (matches feedback_new_sleeve_anchor_current_market.md
+    // rule: "defensive sleeves anchor to Your Contract Avg"). Only makes
+    // sense when a position exists — the anchor click is a no-op if the
+    // anchor toggle doesn't have that option (no held position).
+    'Model B — Defensive (anchor at your contract avg)': {
+      exit_mode: 'hybrid',
+      profitDollarsFixed: 10,
+      trailDistance: 0.15,
+      trailActivationOffset: 0.10,
+      hybridDelay: 5,
+      accumulate: { enabled: true, buffer_mult: 1.5, max_qty_mult: 2.5 },
+      stopLoss: {
+        enabled: true, price_below_buy_pct: 0.05, qty_mode: 'all',
+        ratchet_enabled: true, ratchet_distance: 1.5, ratchet_activation: 0.5,
+        reanchor_on_trigger: false, max_consecutive: 3,
+        protect_realized_enabled: true, protect_realized_frac: 0.5,
+      },
+      reanchorThreshold: 0.75,
+      timeReanchorSecs: 3600,
+      volReanchorPercentile: 90,
+      volReanchorWindow: 60,
+      reentry: { mode: 'volatility', range_contraction: 0.5, min_wait_secs: 30 },
+      postTrailReentry: { mode: 'sequential', stage_b_max_wait_secs: 3600 },
+      entryTrendFilter: { enabled: true, sma_window: 20 },
+      microstructureGate: true,
+      postOnly: true,
+      pennyInside: { enabled: true, max_ticks: 5 },
+      bookImbalance: { enabled: true, depth: 5, sell_threshold: 0.65, buy_threshold: 0.65 },
+      buyTrail: { enabled: true },
+      fundingGate: { enabled: true, threshold: 0.0005 },
+      kelly: { enabled: true, fraction: 0.25, min_cycles: 8 },
+      adaptiveSpread: { enabled: true, max_multiplier: 2.0, vol_window_secs: 300 },
+      classicIndicatorsShadow: { enabled: true },
+      // KEY DIFFERENCE from Model B: anchor override. Preset apply logic
+      // will click the anchor toggle to "Your contract avg" (or "Sibling
+      // sleeve avg" fallback) so sell/buy targets center on your basis.
+      anchor: 'contract_avg',
+      note: 'Same expert stack as Model B, but ANCHORS at your contract avg (protect entry basis). Use when averaging down or holding through drawdown — sell target lands above cost, never sells red per §3.7.',
     },
     'Custom': {
       exit_mode: 'fixed_limit',
@@ -5088,6 +5134,25 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
       return;
     }
     exitEl.value = p.exit_mode;
+    // Adam 2026-07-20: preset can request an anchor override. When set,
+    // click the matching anchor button BEFORE computing spread targets so
+    // sell/buy_px land relative to the correct basis. 'contract_avg' maps
+    // to whichever anchor choice has "contract avg" or "sibling sleeve avg"
+    // in its label — whichever appeared based on data availability. Silent
+    // no-op when the option isn't present (no held position). This is the
+    // one-click "defensive" flow: pick preset, spreads land above your
+    // basis without a separate anchor toggle click.
+    if (p.anchor === 'contract_avg') {
+      const anchorBtns = m.querySelectorAll('.anchor-choice[data-anchor]');
+      let picked = null;
+      anchorBtns.forEach(btn => {
+        const label = (btn.querySelector('.anchor-choice-label')?.textContent || '').toLowerCase();
+        if (!picked && (label.includes('contract avg') || label.includes('sibling sleeve avg'))) {
+          picked = btn;
+        }
+      });
+      if (picked) picked.click();
+    }
     // Expert-derived per-product values override the preset's silver-tuned
     // defaults when we have ATR for this product. So Model B applied to oil
     // gets oil's trail distance (~$0.84), not silver's ($0.15).
