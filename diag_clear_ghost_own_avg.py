@@ -45,10 +45,44 @@ def main() -> None:
         print(f"✗ position_qty() failed: {e} — refusing to apply blind")
         return
     print(f"\nCoinbase {product_id} position: {cb_qty}")
+    # Load state early so we can check per-sleeve claims before refusing.
+    import state_store as _ss_early
+    _pre_store = _ss_early.make_store(os.getenv("SWING_DATA_DIR", "data"))
+    _pre_raw = _pre_store._load()
+    _pre_target_ss = None
+    for _t, _td in (_pre_raw or {}).items():
+        if not isinstance(_td, dict):
+            continue
+        _entry = _td.get(product_id)
+        if not isinstance(_entry, dict):
+            continue
+        _sleeves = (_entry.get("state") or {}).get("sleeves") or {}
+        _ss2 = _sleeves.get(sleeve_id)
+        if _ss2:
+            _pre_target_ss = _ss2
+            break
+    _pre_state = str((_pre_target_ss or {}).get("state") or "").upper()
+    _pre_halted = _pre_state == "HALTED"
+    _pre_own_avg = (_pre_target_ss or {}).get("own_avg_entry")
     if cb_qty != 0:
-        print(f"✗ REFUSING: Coinbase reports real position of {cb_qty} contracts.")
-        print(f"  own_avg is NOT a ghost — do not clear.")
-        return
+        # Multi-sleeve carve-out (2026-07-20): if THIS sleeve is HALTED
+        # (needs manual clearance) or claims nothing (own_avg=None), it
+        # doesn't own the position — a sibling sleeve does. Safe to clear.
+        # Only refuse if THIS sleeve legitimately claims the position AND
+        # isn't in a halt requiring intervention.
+        if _pre_halted:
+            print(f"  → Coinbase position {cb_qty} confirmed, but THIS sleeve is "
+                  f"HALTED (needs manual clearance). Position belongs to sibling "
+                  f"sleeve(s). Proceeding with clear.")
+        elif _pre_own_avg in (None, 0, 0.0):
+            print(f"  → Coinbase position {cb_qty} confirmed, but THIS sleeve "
+                  f"claims nothing (own_avg=None). Position belongs to sibling. "
+                  f"Proceeding with clear.")
+        else:
+            print(f"✗ REFUSING: Coinbase reports real position of {cb_qty} "
+                  f"contracts AND this sleeve claims own_avg=${_pre_own_avg}.")
+            print(f"  own_avg is NOT a ghost — do not clear.")
+            return
 
     # Load state
     import state_store
