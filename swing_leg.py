@@ -3376,7 +3376,47 @@ class SwingTrader:
         old_buy_px = float(sc.buy_px)
         ss.live_order_id = new_oid
         sc.buy_px = float(new_buy_px)
-        sc.sell_px = float(new_buy_px) + max(0.005, float(sc.sell_px) - old_buy_px)
+        # Preserved-spread sell_px, then FEE-FLOOR CLAMP (Adam 2026-07-20
+        # feedback_no_net_loss_cycles). Bare "+ max(0.005, spread)" was
+        # too permissive — half a cent doesn't clear typical fees. On a
+        # reeval buy-walk DOWN, the preserved spread can produce a
+        # sell_px that fires green but nets red once fees hit. Same
+        # class as SLR 2026-07-19 -$0.72 profit-lock loss. Clamp:
+        # sell_px_min = new_buy_px + fee_per_ct + max(tick, 5 bps).
+        _desired_sell = float(new_buy_px) + max(0.005, float(sc.sell_px) - old_buy_px)
+        try:
+            _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            _cs = float(getattr(self.cfg, "contract_size", 0) or 0)
+            _q = max(1, int(getattr(sc, "qty", 1) or 1))
+            _tick = float(getattr(self.cfg, "tick_size", 0) or 0.0)
+            if _fee_rt > 0 and _cs > 0 and float(new_buy_px) > 0:
+                _fee_per_unit = _fee_rt / _cs / _q
+                _safety = max(_tick if _tick > 0 else 0.0, float(new_buy_px) * 0.0005)
+                _floor = float(new_buy_px) + _fee_per_unit + _safety
+                if _desired_sell < _floor:
+                    _clamped = self._snap_to_tick(_floor) if _tick > 0 else _floor
+                    if _clamped < _floor:
+                        _clamped = _clamped + (_tick or 0.0)
+                    self._record(
+                        "reentry_reeval_sell_px_fee_floor_clamp",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        requested_sell_px=_desired_sell,
+                        fee_floor_sell_px=_clamped,
+                        new_buy_px=float(new_buy_px),
+                        severity="info",
+                        reason=("reeval buy-walk sell_px was below buy + "
+                                "fees + safety — clamped up per "
+                                "feedback_no_net_loss_cycles"),
+                    )
+                    _desired_sell = _clamped
+        except Exception as _e:
+            try:
+                self._record("reentry_reeval_fee_floor_error",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_e), severity="warn")
+            except Exception:
+                pass
+        sc.sell_px = float(_desired_sell)
         ss.armed_buy_since_ts = _t.time()  # anti-thrash reset (Tier 1 #3)
         # Also update persisted config so next boot has the new prices
         try:
