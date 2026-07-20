@@ -4695,25 +4695,91 @@ class SwingTrader:
         # exactly XLM 2026-07-19 fresh $0.18786 buy fill.
         #
         # Fallback: if we hold + resting_stop_enabled + no stage fired,
-        # use own_avg × 0.95 as a conservative 5% protective floor. This
-        # is a wide default — user-configured stop_loss_px is always
-        # preferred, but SOMETHING beats NOTHING. Skips only when the
+        # compute a protective stop via expert_stop consensus per §3.15.
+        # Wilder 2N + CJP OFI + Kyle λ (median), Menkveld fee floor,
+        # Van Tharp 10% cap. Uses THIS contract's own historical delta
+        # as an ATR proxy — no hardcoded fraction. Skips only when the
         # user explicitly turned off stop_loss_enabled (Adam's NGS-style
         # "let it ride" carve-out).
         if (not target_px or target_px <= 0) and own_avg > 0 \
                 and getattr(sc, "stop_loss_enabled", True):
-            target_px = own_avg * 0.95
-            stage = "hard_bottom_default_5pct"
-            self._record(
-                "resting_stop_default_fallback",
-                sleeve_id=sc.id, sleeve_name=sc.name,
-                own_avg=own_avg, target_px=target_px,
-                reason=("stop_loss_px=0 unconfigured + no trail/goal "
-                        "stage fired; falling back to own_avg×0.95 to "
-                        "avoid leaving a held position unprotected. "
-                        "Configure sc.stop_loss_px for a tighter stop."),
-                severity="warn",
-            )
+            _atr_est = 0.0
+            try:
+                _hist_fb = list(self._sleeve_price_history.get(sc.id, []) or [])
+                if len(_hist_fb) >= 3:
+                    _d = [abs(_hist_fb[i] - _hist_fb[i - 1])
+                          for i in range(1, len(_hist_fb))]
+                    _recent = _d[-14:]
+                    if _recent:
+                        _atr_est = sum(_recent) / len(_recent)
+            except Exception:
+                pass
+            _expert_stop_px = 0.0
+            _expert_citation = ""
+            try:
+                import expert_stop as _est_fb
+                if _atr_est > 0 and getattr(_est_fb, "MODE", "expert") == "expert":
+                    _fee_rt_fb = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
+                    _cs_fb = 0.0
+                    try:
+                        _spec_fb = self.b.contract_spec() if hasattr(self.b, "contract_spec") else None
+                        if _spec_fb:
+                            _cs_fb = float(_spec_fb.get("contract_size") or 0)
+                    except Exception:
+                        pass
+                    if _cs_fb <= 0:
+                        try:
+                            _cs_fb = float((self.contract_spec_cache or {}).get("contract_size") or 0)
+                        except Exception:
+                            _cs_fb = 0.0
+                    _tick_fb = float(getattr(self.cfg, "tick_size", 0) or 0)
+                    if _cs_fb > 0:
+                        _dec = _est_fb.optimal_stop_distance(
+                            mark=float(own_avg),
+                            atr_est=float(_atr_est),
+                            fee_per_roundtrip=_fee_rt_fb,
+                            contract_size=_cs_fb,
+                            qty=max(1, int(sc.qty or 1)),
+                            wilder_multiplier=2.0,
+                            tick_size=(_tick_fb if _tick_fb > 0 else None),
+                        )
+                        if _dec is not None:
+                            _expert_stop_px = float(_dec.stop_px)
+                            _expert_citation = _dec.citation
+            except Exception:
+                pass
+            if _expert_stop_px > 0:
+                target_px = _expert_stop_px
+                stage = "hard_bottom_expert_consensus"
+                self._record(
+                    "resting_stop_expert_fallback_applied",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    own_avg=own_avg, target_px=target_px,
+                    atr_est=round(_atr_est, 8),
+                    citation=_expert_citation,
+                    reason=("stop_loss_px=0 + no trail/goal stage; expert "
+                            "consensus (§3.15) computed protective floor."),
+                    severity="info",
+                )
+            else:
+                # Expert unavailable (no history, atr=0, contract_size missing).
+                # §3.6 says NEVER leave a held position unprotected — so we do
+                # place SOMETHING, but at severity=critical so it's visible and
+                # traceable to a data-gap. Uses last-resort own_avg×0.95 ONLY
+                # in this narrow "expert couldn't vote" path.
+                target_px = own_avg * 0.95
+                stage = "hard_bottom_no_expert_data"
+                self._record(
+                    "resting_stop_default_fallback",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    own_avg=own_avg, target_px=target_px,
+                    atr_est=round(_atr_est, 8),
+                    reason=("expert_stop unavailable (no ATR history or "
+                            "contract_size); using own_avg×0.95 last-resort. "
+                            "§3.15 requires expert consensus — backfill "
+                            "price history to enable it."),
+                    severity="critical",
+                )
         if not target_px or target_px <= 0:
             return
         try:

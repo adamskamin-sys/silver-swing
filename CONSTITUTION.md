@@ -148,6 +148,56 @@ refuse the save if the product isn't tradeable.
 Every $-denominated projection must use Coinbase-verified
 contract_size, not cached values.
 
+### §3.15 Every algorithmic parameter comes from expert consensus, per-contract.
+Stop-loss distance, trail distance, trail ratchet cadence, entry
+regime gate, buy price offset, take-profit price, and position size
+are all computed by the peer-reviewed expert modules in
+`expert_*.py` — never from hardcoded multipliers, hand-picked
+constants, or Claude's guesses. Each expert votes with a per-contract
+calculation using THAT CONTRACT'S historical ATR, OFI, fill rate,
+realized volatility, and spread statistics. Consensus is
+Timmermann (2006) median ensemble, floored at Menkveld (2013) fee
+safety, capped at Van Tharp (2008) 10% 1R.
+
+**The current expert roster** (as of 2026-07-19):
+- Stop: Wilder 2N + CJP OFI + Kyle λ → Menkveld floor → Van Tharp cap
+- Trail: Chande Chandelier + Wilder-SAR + Turtle lookback +
+  Ho-Stoll age → Menkveld floor → Van Tharp cap
+- Entry regime: Kaufman ER + Wilder ADX + CJP OFI + Connors RSI +
+  Bollinger BB
+- Spread/prices: CJ HFT + Ho-Stoll Poisson + Kyle λ → Menkveld
+  cost floor
+- Size: Van Tharp 1R + half-Kelly (Thorp) + Vince Optimal f →
+  Menkveld safety cap
+
+Applies to ALL contracts. Silver's stop uses silver's ATR, not
+gold's. XLP's trail uses XLP's OFI, not SLR's. Per-contract, always.
+
+**Interaction with §3.3 (frozen exit params):** experts run at
+ARM time — the moment a sleeve is armed for its NEXT cycle. Once
+the sleeve owns a position, those expert-derived parameters are
+FROZEN for the duration of the hold. Experts do NOT re-vote
+mid-hold. This preserves §3.3 while making sure the values that
+get frozen come from expert consensus, not constants.
+
+**Why:** Adam 2026-07-19: hardcoded constants (5% fallback in
+`swing_leg.py:4693`; contract_size fallback that produced 50×
+fee_price on SLR; hand-picked stop_loss_px values in configs)
+drifted from what the market-microstructure literature recommends
+and caused real losses. Expert consensus is auditable — every
+choice cites a paper — and per-contract, so different
+vol/liquidity regimes get different treatment automatically.
+
+**How to apply:** Before adding or changing any decision parameter
+in `expert_*.py`, `swing_leg.py`, `scanner.py`, `expert_tuner.py`,
+`presets.py`, or any diag that writes to config: if the change
+introduces a hardcoded number that will be served to a contract as
+a parameter, STOP and route it through the appropriate expert
+module. If no existing expert covers the decision, cite the
+academic source and propose a new expert module (§2.5). Every
+parameter served to a sleeve config must be traceable to
+`sc.expert_*` output on a per-contract input.
+
 ---
 
 ## §4 — Safety guardrails (never do this)
