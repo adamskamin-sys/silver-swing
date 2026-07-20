@@ -1315,6 +1315,36 @@ def run() -> int:
                     pass
         except Exception:
             pass
+        # Adam 2026-07-20: any product with a pending resume_intent is
+        # DEFINITIONALLY critical — the user explicitly asked the bot to
+        # act on it. If the track is dead, Resume writes to Redis but no
+        # one reads. Symptom: dashboard "click Resume, nothing happens."
+        # Force-add to critical so the spawn-budget bypass fires on next
+        # recovery cycle → step() runs → _maybe_consume_resume_intent
+        # clears halt_reason and resumes trading.
+        try:
+            for sym in list(store.list_symbols(TENANT)):
+                if sym.startswith("__") or sym == SYMBOL:
+                    continue
+                try:
+                    _intent = (store.get_resume_intent(TENANT, sym)
+                               if hasattr(store, "get_resume_intent") else None)
+                except Exception:
+                    _intent = None
+                if _intent:
+                    should_track_critical.add(sym)
+                    try:
+                        log.record("critical_track_resume_intent_pending",
+                                   tenant=TENANT, symbol=sym,
+                                   severity="warn",
+                                   reason=("resume_intent in Redis but track "
+                                           "may be dead — force-add critical "
+                                           "so intent gets consumed on next "
+                                           "spawn cycle"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # Armed sleeves — regular priority (unless product already in critical)
         # Adam 2026-07-15: per-product try/except (was outer wrapper). Outer
         # wrapper caused the "only AVE detected" bug — if get_state raised
