@@ -4424,6 +4424,29 @@ function openSleeveEditor(tenant, symbol, sleeveId, lotContext = null, portfolio
   } else {
     pushChoice('Current market', mark);
     pushChoice('Your contract avg', posAvgEntry);
+    // Adam 2026-07-20: sibling-sleeve fallback. When a user attaches a
+    // NEW sleeve to a product they already hold (via a prior sleeve OR
+    // manual buy), pf.derivatives.avg_entry may be stale or 0 (snapshot
+    // lag, or the manual buy hasn't hit __portfolio__ refresh yet).
+    // Fall back to any ARMED_SELL sleeve's own_avg_entry — that sleeve
+    // knows the price it inherited. Weighted-average across siblings if
+    // multiple ARMED_SELL sleeves exist. Better UX than "no avg option
+    // at all" — the user can pick Custom target if this is stale.
+    if (posAvgEntry <= 0) {
+      const existingCfgSleeves = cfg.sleeves || [];
+      const existingStateSleeves = (block.state || {}).sleeves || {};
+      let totalOwn = 0, totalQty = 0;
+      for (const s of existingCfgSleeves) {
+        const ss = existingStateSleeves[s.id] || {};
+        if (String(ss.state || '') !== 'ARMED_SELL') continue;
+        const own = Number(ss.own_avg_entry) || 0;
+        const q = Number(s.qty) || 0;
+        if (own > 0 && q > 0) { totalOwn += own * q; totalQty += q; }
+      }
+      if (totalQty > 0) {
+        pushChoice('Sibling sleeve avg', totalOwn / totalQty);
+      }
+    }
   }
   // Third option — user-entered target price. Rendered with an inline input
   // so the user can pick the exact price they want the strategy anchored on.
