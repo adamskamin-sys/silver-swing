@@ -6414,6 +6414,22 @@ class SwingTrader:
                             best_bid=best_bid, best_ask=best_ask,
                         )
                         post_only = False
+        # Fee sanity ceiling (Adam 2026-07-20): the legacy _arm path at
+        # line 971 always calls self._fee_gate_ok before placing — catches
+        # broker fee-blowout bugs (a bad quote can preview a commission
+        # 10× normal, e.g., XLP 2026-07-17 incident). But the sleeve
+        # arm path never called it, so every sleeve-armed order bypassed
+        # the sanity check entirely. Fix: gate here too. If preview says
+        # the fee is > fee_sanity_multiplier × expected, return without
+        # placing — next tick retries once preview normalizes.
+        if not self._fee_gate_ok(side, qty, price):
+            self._record("sleeve_arm_blocked_fee_gate",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         side=side, qty=qty, price=price,
+                         reason="_fee_gate_ok returned False — "
+                                "previewed commission exceeded sanity "
+                                "ceiling; deferring arm to next tick")
+            return
         # Cross-process dedup lock (arm_dedup, added 2026-07-14 after the
         # two-writer duplicate-orders incident). On TOP of the in-process
         # guard at 2423 (`not ss.live_order_id`) — the 2423 guard is
