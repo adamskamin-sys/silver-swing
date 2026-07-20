@@ -1114,15 +1114,22 @@ def run() -> int:
                     continue
                 if float(deriv.get("qty") or 0) != 0:
                     should_track_critical.add(sym)
-            # Adam 2026-07-20 SPOT: intentionally NOT iterating pf.get("crypto")
-            # here. Rolled back — the discovery loop below already picks up
-            # any product with an ARMED_BUY/ARMED_SELL sleeve, which is the
-            # only reason we'd need a track. Iterating every crypto balance
-            # (including sub-cent dust from prior trades: 3.26e-10 BTC etc.)
-            # spawned bad tracks that failed contract_spec / feed handshake,
-            # incrementing the eviction counter across 15+ dust products and
-            # blowing HEALTH: 5 dead → 20 dead within 30min. Sleeve-driven
-            # discovery is the honest source of truth for spot tracking.
+            # Adam 2026-07-20 SPOT: only iterate crypto[] for products with
+            # notional > $10 (filters out sub-cent dust: 3.26e-10 BTC that
+            # blew HEALTH: 5→20 dead in the prior iteration attempt). Real
+            # holdings like META (23 tokens ≈ $101) + HIGH (5000 tokens
+            # ≈ $118) DO need critical-track status so §3.6 stop-loss
+            # coverage isn't gated by the recovery cadence. META held
+            # unprotected for 40+ min at 1 spawn/cycle behind 7 futures.
+            try:
+                for spot in (pf.get("crypto") or []):
+                    sym = spot.get("product_id")
+                    if not sym or sym.startswith("__") or sym == SYMBOL:
+                        continue
+                    if float(spot.get("value_usd") or 0) >= 10.0:
+                        should_track_critical.add(sym)
+            except Exception:
+                pass
         except Exception:
             pass
         # Armed sleeves — regular priority (unless product already in critical)
@@ -1315,16 +1322,25 @@ def run() -> int:
                     )
                 except Exception:
                     pass
-            # Spawn budget guard: only ONE spawn per call. Skip if budget
-            # exhausted — this pid will be retried on the next call.
-            if _spawns_this_call >= _MAX_SPAWNS_PER_CALL:
+            # Spawn budget guard: only ONE spawn per call for NON-CRITICAL
+            # tracks (armed-sleeve-only, no held position). Critical tracks
+            # (held positions, in `should_track_critical`) bypass the budget:
+            # every minute they're not tracked is a minute they're without
+            # exchange stop-loss protection (§3.6). Adam 2026-07-20: META
+            # held 23 tokens for 40+ min with STOP LOSS: NOT PLACED because
+            # META was queued behind 7 other dead tracks at 1 spawn/cycle.
+            # Rate-limit risk on spawn burst is acceptable — Coinbase's WS
+            # + REST allow parallel handshakes; contract_spec is cached.
+            if (_spawns_this_call >= _MAX_SPAWNS_PER_CALL
+                    and pid not in should_track_critical):
                 try:
                     log.record(
                         "track_spawn_deferred_budget",
                         tenant=TENANT, symbol=pid,
                         reason=("spawn budget exhausted this cycle — will "
                                 "retry next recovery call. Prevents main-tick "
-                                "block from stacking spawns."),
+                                "block from stacking spawns. (Non-critical "
+                                "only; held-position products always spawn.)"),
                         severity="info",
                     )
                 except Exception:
