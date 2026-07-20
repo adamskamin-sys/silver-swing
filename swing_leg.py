@@ -5597,6 +5597,110 @@ class SwingTrader:
             adopted_avg=float(avg),
         )
 
+    def _maybe_heal_ghost_sleeve(self, sc: SleeveConfig, ss: SleeveState) -> None:
+        """Adam 2026-07-20: inverse of _maybe_reconcile_orphan_position.
+
+        Ghost sleeve = state is ARMED_SELL with own_avg_entry set, but the
+        broker has fewer contracts than sum(ARMED_SELL sleeves claim). XLP
+        2026-07-20 07:07: two sleeves both WAITING_FOR_SELL while Coinbase
+        showed Position: 0. The sleeve thinks it owns qty but the exchange
+        disagrees — either a double-fire fired more contracts than existed
+        or a stop credited the wrong sleeve.
+
+        Deterministic tiebreaker: sort ARMED_SELL sleeves by sleeve_id.
+        The first N sleeves (up to pos_qty) keep their claim; anyone beyond
+        pos_qty coverage is a ghost → flip to ARMED_BUY, clear own_avg_entry
+        (and sell_entry_avg + resting_stop tracking + live_order_id) so the
+        sleeve is ready to buy fresh.
+
+        Runs BEFORE _maintain_resting_stop so ghost sleeves don't waste API
+        calls placing stops for contracts they don't own.
+
+        Multi-sleeve safe: every sleeve independently evaluates; the sort
+        order ensures both sleeves agree on which is the ghost."""
+        if ss.state != SleeveStateEnum.ARMED_SELL:
+            return
+        if ss.own_avg_entry is None:
+            return  # nothing to heal
+        try:
+            pos_qty = int(self.b.position_qty() or 0)
+        except Exception:
+            return
+        # Collect all ARMED_SELL sleeves with own_avg_entry set, sorted by id.
+        armed_sell = []
+        for _sid, _ss in (self.s.sleeves or {}).items():
+            if _ss.state != SleeveStateEnum.ARMED_SELL:
+                continue
+            if _ss.own_avg_entry is None:
+                continue
+            _cfg = self._sleeve_cfg_by_id(_sid)
+            _q = int(getattr(_cfg, "qty", None) or getattr(_ss, "qty", None) or 1)
+            armed_sell.append((_sid, _ss, _q))
+        armed_sell.sort(key=lambda x: x[0])
+        core_qty = int(getattr(self.cfg, "core_qty", 0) or 0)
+        # Cover pos_qty from the front — sleeves beyond coverage are ghosts.
+        available = max(0, pos_qty - core_qty)
+        covered = 0
+        for _sid, _ss_o, _q in armed_sell:
+            if covered + _q <= available:
+                covered += _q
+                continue
+            # This sleeve is fully beyond coverage → ghost.
+            if _sid == sc.id and covered >= available:
+                _prev_own = ss.own_avg_entry
+                _prev_oid = ss.live_order_id
+                _prev_stop = ss.resting_stop_oid
+                # Cancel any dangling orders first — the sleeve thought it
+                # owned contracts, so a resting stop may be on Coinbase.
+                if _prev_stop:
+                    try:
+                        self.b.cancel(_prev_stop)
+                    except Exception as _e:
+                        self._record(
+                            "ghost_sleeve_heal_stop_cancel_failed",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            oid=_prev_stop, error=str(_e),
+                            severity="warn",
+                            reason=("ghost heal proceeded despite cancel "
+                                    "failure — excess-stop-cancel will retry "
+                                    "next tick"),
+                        )
+                if _prev_oid:
+                    try:
+                        self.b.cancel(_prev_oid)
+                    except Exception:
+                        pass
+                # Flip state
+                ss.state = SleeveStateEnum.ARMED_BUY
+                ss.own_avg_entry = None
+                ss.sell_entry_avg = None
+                ss.live_order_id = None
+                ss.resting_stop_oid = None
+                ss.resting_stop_px = None
+                ss.resting_stop_stage = None
+                self._save_state()
+                self._record(
+                    "ghost_sleeve_healed",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    prev_own_avg=_prev_own,
+                    prev_live_order_id=_prev_oid,
+                    prev_resting_stop_oid=_prev_stop,
+                    pos_qty=pos_qty, core_qty=core_qty,
+                    armed_sell_total_claim=sum(q for _, _, q in armed_sell),
+                    covered_before_this=covered,
+                    this_qty=_q,
+                    severity="warn",
+                    reason=("ARMED_SELL sleeve had no matching broker qty — "
+                            "sum(ARMED_SELL claims) > pos_qty. Deterministic "
+                            "sort assigned coverage to earlier sleeve(s); this "
+                            "one flipped back to ARMED_BUY to prevent stuck "
+                            "WAITING_FOR_SELL + phantom stop placement. Class: "
+                            "feedback_no_ghost_sleeves — bot self-heals, "
+                            "no diag intervention required."),
+                )
+            return  # done — one heal per tick per sleeve
+        # Fell through: this sleeve was within coverage → legitimate ARMED_SELL
+
     def _maybe_reblend_on_manual_add(self, sc: SleeveConfig, ss: SleeveState) -> None:
         """Adam 2026-07-20: when Adam manually buys more of a held product
         on Coinbase (scale-in / average-down), the exchange blends the new
@@ -6071,6 +6175,12 @@ class SwingTrader:
         # Runs before ratchet-stop so ss.state is correct when maintenance
         # decides what to do.
         self._maybe_reconcile_orphan_position(sc, ss)
+        # Adam 2026-07-20 INVERSE of orphan-reconcile: heal ghost sleeves
+        # (ARMED_SELL + own_avg set + broker has fewer contracts than
+        # sum(sleeve claims)). Must run BEFORE _maintain_resting_stop so
+        # ghosts don't place phantom stops. XLP double-fire 2026-07-20
+        # 07:07 left two sleeves both WAITING_FOR_SELL with Position: 0.
+        self._maybe_heal_ghost_sleeve(sc, ss)
         # Sibling to orphan-reconcile: when the sleeve is ALREADY ARMED_SELL
         # (own_avg set) and Adam manually adds more contracts on Coinbase,
         # refresh own_avg to the exchange's new blended avg so the dashboard
