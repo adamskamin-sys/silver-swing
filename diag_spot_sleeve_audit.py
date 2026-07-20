@@ -198,8 +198,36 @@ def main() -> None:
     hb = ((tenant_block.get("__track_heartbeat__") or {}).get("config") or {})
     if not hb:
         hb = tenant_block.get("__track_heartbeat__") or {}
-    tracks_alive = (hb.get("tracks") or {}).keys()
-    print(f"\n  alive tracks in __track_heartbeat__: {len(list(tracks_alive))}")
+    tracks_alive_dict = hb.get("tracks") or {}
+    tracks_alive = list(tracks_alive_dict.keys())
+    hb_snap_ts = float(hb.get("snap_ts") or 0)
+    hb_age = int(now - hb_snap_ts) if hb_snap_ts else -1
+    print(f"\n  __track_heartbeat__ age: {hb_age}s   alive tracks: {len(tracks_alive)}")
+    for pid, t in sorted(tracks_alive_dict.items()):
+        step_ok = float(t.get("last_step_ok_ts") or 0)
+        tick_ct = int(t.get("tick_count") or 0)
+        age_step = int(now - step_ok) if step_ok else -1
+        print(f"    ✓ {pid:35s} ticks={tick_ct:>5} step_age={age_step:>4}s")
+
+    # Trade log HEALTH check: is anything writing to it at all?
+    print(f"\n  trade log: read {len(events)} recent events")
+    if events:
+        latest_ts = max(float(e.get("ts") or 0) for e in events[-100:])
+        oldest_ts = min(float(e.get("ts") or 0) for e in events[:100])
+        latest_age = int(now - latest_ts) if latest_ts else -1
+        window = int(latest_ts - oldest_ts) if latest_ts and oldest_ts else -1
+        print(f"    latest event: {latest_age}s ago   window covered: {window}s "
+              f"({window/60:.1f} min)")
+        # Event-type histogram (last 5 min) — reveals if tick loop is actually running
+        cutoff_5 = now - 300
+        recent_events = [e for e in events if float(e.get("ts") or 0) > cutoff_5]
+        et_counts = {}
+        for e in recent_events:
+            et = e.get("event_type") or "?"
+            et_counts[et] = et_counts.get(et, 0) + 1
+        print(f"    events in last 5 min: {len(recent_events)}")
+        for et, n in sorted(et_counts.items(), key=lambda x: -x[1])[:15]:
+            print(f"      {n:>5}  {et}")
 
     # Should-track set: (a) derivatives with qty != 0, (b) any symbol with ARMED_* sleeve
     should_track = set()
