@@ -7028,6 +7028,12 @@ function refreshScannerDetailLive() {
   let high = Number(ctx.high_24h) || 0, low = Number(ctx.low_24h) || 0;
   const pfSnap = currentStore?.[tenant]?.['__portfolio__']?.config;
   const posRow = (pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+  // Adam 2026-07-20 SPOT: also check crypto[] — spot balances never land
+  // in derivatives[]. Without this, META-USD 23 tokens + HIGH-USD 5000
+  // tokens rendered as "Position: 0 LONG · avg $0.0000" because the
+  // pfFresh else-branch below zeroed them. That misled Adam into thinking
+  // the sleeves were ghost — they were fine, the display was lying.
+  const spotRow = (pfSnap?.crypto || []).find(c => c.product_id === symbol);
   // Phantom guard: broker.portfolio_snapshot() skips derivatives with 0
   // contracts. If __portfolio__ is fresh + refresh_ok but posRow is absent,
   // the product genuinely holds 0 — trust that over any stale ctx value
@@ -7040,6 +7046,13 @@ function refreshScannerDetailLive() {
     mark = Number(posRow.mark) || 0;
     avg = Number(posRow.avg_entry) || avg;
     qty = Number(posRow.qty) || qty;
+  } else if (spotRow) {
+    // Spot: qty = whole-unit wallet balance, avg = Coinbase's avg entry
+    // (from crypto snapshot) or mark as fallback. Coinbase spot does
+    // track per-currency cost basis on the accounts endpoint.
+    mark = Number(spotRow.mark) || 0;
+    avg = Number(spotRow.avg_entry) || Number(spotRow.mark) || avg;
+    qty = Math.floor(Number(spotRow.balance) || 0) || qty;
   } else if (pfFresh) {
     qty = 0;
     avg = 0;
