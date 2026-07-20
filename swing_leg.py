@@ -4895,21 +4895,31 @@ class SwingTrader:
                 # No trail configured — just lock in at the goal.
                 target_px = max(sell_px, break_even_floor)
                 stage = "profit_lock"
-        elif trail_active:
-            # In profit territory but haven't hit sell_px yet. Trail ratchets
-            # up so we never give back all of the gain. Floor at break_even
-            # so this path can't sell in the red — that's stop_loss's job.
-            if trail_distance > 0:
-                raw_trail = hwm - trail_distance
-                if raw_trail < break_even_floor:
-                    target_px = break_even_floor
-                    stage = "trail_floored_at_break_even"
-                else:
-                    target_px = raw_trail
-                    stage = "trail_pre_goal"
-            else:
-                target_px = break_even_floor
-                stage = "break_even_lock"
+        # Adam 2026-07-20 §3.5 STRICT + expert consensus:
+        # Pre-goal trail REMOVED. Prior "elif trail_active" branch engaged
+        # a tight trail (hwm − trail_distance, floored at break_even)
+        # BEFORE sell_px was hit — which:
+        #   - Violated §3.5 "checkpoint-then-ratchet: once profit-locked at
+        #     sell_px, trail can only tighten" (the word ONCE implies AFTER).
+        #   - Contradicted every relevant academic expert:
+        #       Van Tharp (2008 ch.6): let profits run to N×R target.
+        #       Faith (2007) Turtle rules: exit only on N-period low, not
+        #         on tiny pullbacks.
+        #       Chande (1994) Chandelier: 3×ATR trail, engages on new HHs
+        #         (not before target).
+        #       Wilder (1978) SAR: acceleration factor starts LOOSE, tightens
+        #         gradually as trend matures.
+        #       Kaufman (2013): trending regime → let trend end the trade.
+        #       Cartea-Jaimungal-Penalva (2015) ch.4: engage trail AFTER
+        #         target, not before, when the prior is target-price.
+        #   - Locked in break-even+ ($3116.60 exits on CHN when sell_px
+        #     $3134.80 was the real target — cost ~$17/contract per cycle
+        #     in foregone profit).
+        #
+        # New behavior: between own_avg and sell_px, ONLY hard_bottom
+        # (stop_loss_px) protects — accepted-loss backstop per §3.7. Let
+        # mark run to sell_px, THEN the goal_reached branch above engages
+        # the ratcheting trail floored at sell_px (never below).
         elif stop_loss_px > 0:
             # Below break-even (or no HWM yet) — protective stop only.
             target_px = stop_loss_px
