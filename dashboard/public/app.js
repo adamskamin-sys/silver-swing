@@ -1811,6 +1811,14 @@ function productHasReversalArmed(tenant, productId) {
 // distinguish "🔒 TRAIL" (hybrid — aggressive exit) from "⬆ STOP" (ratchet
 // — protective climb). BTC has ratchet active but NO hybrid trail; HYPE
 // has hybrid trail active. Same product may show both.
+// Adam 2026-07-20: trail-stage identifiers must match the swing_leg
+// authoritative set (swing_leg.py:_maintain_resting_stop stage names).
+// Keep in sync when adding new stages.
+const _TRAIL_STAGES_PORTFOLIO = new Set([
+  'trail', 'trail_pre_goal', 'trail_floored_at_sell',
+  'trail_floored_at_break_even', 'break_even_lock', 'profit_lock',
+]);
+
 function productTrailActiveInfo(tenant, productId) {
   const block = currentStore?.[tenant]?.[productId];
   if (!block) return null;
@@ -1822,43 +1830,57 @@ function productTrailActiveInfo(tenant, productId) {
     // GATE: sleeve must be currently holding a position (ARMED_SELL).
     // No live_order_id check — trails don't rest on the book.
     if (String(ss.state) !== 'ARMED_SELL') continue;
-    // (a) Hybrid exit trail — trail_armed=true means mark has crossed
-    //     trail_activation_px and HWM is being tracked. Sell fires when
-    //     mark drops trail_distance below HWM.
-    const trailArmed = ss.trail_armed === true;
+    // (a) TRAIL chip — Adam 2026-07-20 TRUTH FIX (portfolio row variant of
+    //     the sleeve-editor fix c6293c8). Prior code showed a "TRAIL"
+    //     chip with stopPx = hwm - trail_distance whenever trail_armed
+    //     was true. Since trail_armed is set on buy fill per §3.4, this
+    //     produced a lying TRAIL chip on EVERY held sleeve — and the
+    //     shown stopPx was BELOW own_avg (hwm=own_avg on fresh buy,
+    //     minus trail_distance = below entry). §3.4 says trail floor
+    //     must be max(own_avg+fees, sell_px, hwm-trail_dist). Also, no
+    //     TRAIL order is actually on Coinbase until trail_active fires
+    //     (hwm > break_even_floor), which happens only after mark climbs.
+    //
+    // Now: only show TRAIL chip when the ACTUAL resting_stop_stage is a
+    // trail stage on Coinbase. The stopPx is the actual resting_stop_px
+    // that exists on Coinbase. If stage is hard_bottom (or None), no
+    // TRAIL chip fires — the STOP chip at (b) below shows the real
+    // resting order.
+    const restingStage = String(ss.resting_stop_stage || '');
+    const restingPx = Number(ss.resting_stop_px) || 0;
     const hwm = Number(ss.trail_high_water_price) || 0;
     const trailDist = Number(s.trail_distance) || 0;
-    if (trailArmed && hwm > 0 && trailDist > 0) {
+    if (_TRAIL_STAGES_PORTFOLIO.has(restingStage) && restingPx > 0) {
       out.push({
         kind: 'trail',
-        stopPx: hwm - trailDist,
+        stopPx: restingPx,       // ACTUAL Coinbase order, not hwm-dist
         hwm, dist: trailDist,
         sleeveName: s.name || s.id,
+        stage: restingStage,
       });
     }
-    // (b) Ratcheting stop-loss — enabled + ratchet enabled + hwm climbing.
-    //     Only shown if stop_loss_enabled is true (respects NGS no-stop
-    //     directive). The ratchet raises the stop as mark rises but ONLY
-    //     fires on real drawdown, not on minor pullback.
+    // (b) STOP chip — ratcheting stop-loss / hard_bottom protective floor.
+    //     Adam 2026-07-20: only show this chip when the resting stage is
+    //     NOT a trail stage. Otherwise (a) already emitted a TRAIL chip
+    //     with the same restingPx and we'd double-render the same order.
     //
-    // 2026-07-19 XLM incident: prefer ACTUAL resting_stop_px from the
-    // exchange over the projected hwm-based value. Prior code showed
-    // "STOP $0.18995" on XLM when the real resting stop on Coinbase
-    // was at $0.165 — user thought profit was locked when downside
-    // was actually $116.
-    const restingPx = Number(ss.resting_stop_px) || 0;
+    // 2026-07-19 XLM incident: prefer ACTUAL resting_stop_px over
+    // projected value.
     const slHwm = Number(ss.stop_loss_hwm) || 0;
     const ratchetDist = Number(s.stop_loss_ratchet_distance) || 0;
-    if (restingPx > 0) {
-      // Real resting stop from Coinbase — this is the truth
+    const stageIsTrail = _TRAIL_STAGES_PORTFOLIO.has(restingStage);
+    if (restingPx > 0 && !stageIsTrail) {
+      // Real resting stop from Coinbase (hard_bottom / stop-loss stage)
       out.push({
         kind: 'ratchet',
         stopPx: restingPx,
         hwm: slHwm || restingPx, dist: ratchetDist,
         sleeveName: s.name || s.id,
-        stage: ss.resting_stop_stage || null,
+        stage: restingStage || null,
       });
-    } else if (s.stop_loss_enabled && s.stop_loss_ratchet_enabled && slHwm > 0 && ratchetDist > 0) {
+    } else if (restingPx <= 0
+               && s.stop_loss_enabled && s.stop_loss_ratchet_enabled
+               && slHwm > 0 && ratchetDist > 0) {
       // No resting order yet — show projected value with a marker
       out.push({
         kind: 'ratchet',
