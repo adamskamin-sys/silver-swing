@@ -4764,17 +4764,42 @@ class SwingTrader:
                 "profit_lock",
             }
             if _hold and trail_active and stage in _trail_stages_needing_market_exit:
+                # ORPHAN GUARD 2026-07-19 (Adam SLR incident): only null the
+                # resting_stop tracking after cancel SUCCEEDS. Previously the
+                # None-clear ran unconditionally, so a failed cancel left
+                # Coinbase holding the stop-limit while the bot forgot the
+                # oid, then we placed a market-sell that closed the long —
+                # leaving the resting SELL armed to open a SHORT on the next
+                # gap. Constitution §3.8 (no shorting on adam-live).
+                _cancel_ok = True
                 if ss.resting_stop_oid:
+                    _oid_to_cancel = ss.resting_stop_oid
                     try:
-                        self.b.cancel(ss.resting_stop_oid)
+                        self.b.cancel(_oid_to_cancel)
+                        ss.resting_stop_oid = None
+                        ss.resting_stop_px = None
+                        ss.resting_stop_stage = None
                     except Exception as _e:
+                        _cancel_ok = False
                         self._record("trail_breach_cancel_failed",
                                      sleeve_id=sc.id, sleeve_name=sc.name,
-                                     oid=ss.resting_stop_oid, error=str(_e),
-                                     severity="warn")
-                    ss.resting_stop_oid = None
-                    ss.resting_stop_px = None
-                    ss.resting_stop_stage = None
+                                     oid=_oid_to_cancel, error=str(_e),
+                                     severity="critical",
+                                     reason=("skipping market-sell — cancel "
+                                             "failed, so placing market-sell "
+                                             "would leave the resting stop "
+                                             "armed to open a SHORT after "
+                                             "position closes. Retry next tick."))
+                if not _cancel_ok:
+                    # Persist any state changes made so far, then skip the
+                    # market-sell for this tick. Next tick will re-enter the
+                    # branch and retry the cancel. Position remains protected
+                    # by the still-live resting stop in the meantime.
+                    try:
+                        self._save_state()
+                    except Exception:
+                        pass
+                    return
                 try:
                     oid = self.b.place_market("SELL", sleeve_qty)
                     # Track as live_order_id so the standard fill poller
