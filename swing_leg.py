@@ -4478,13 +4478,42 @@ class SwingTrader:
         sleeves_cfg = self._load_sleeves_cfg()
         configured_ids = {sc.id for sc in sleeves_cfg}
         # Drop state for removed sleeves; add fresh state for new ones.
+        # Adam 2026-07-20 ORPHAN GUARD: sleeve removal must cancel BOTH
+        # live_order_id AND resting_stop_oid before dropping tracking.
+        # Prior code only cancelled live_order_id (silently swallowing
+        # any exception) and completely ignored resting_stop_oid. If a
+        # sleeve held a position with a live stop-limit, the resting
+        # stop stayed on Coinbase forever after removal — orphan (§3.8
+        # short risk if it triggers with position=0).
         for sid in list(self.s.sleeves.keys()):
             if sid not in configured_ids:
-                # Cancel any live order first
                 st_obj = self.s.sleeves[sid]
+                # Cancel live order — log failure so operator can trace
                 if st_obj.live_order_id:
-                    try: self.b.cancel(st_obj.live_order_id)
-                    except Exception: pass
+                    try:
+                        self.b.cancel(st_obj.live_order_id)
+                    except Exception as _lce:
+                        self._record("sleeve_removed_live_order_cancel_failed",
+                                     sleeve_id=sid,
+                                     order_id=st_obj.live_order_id,
+                                     error=str(_lce), severity="critical",
+                                     reason=("sleeve removal cancel raised — "
+                                             "order may be orphan on Coinbase; "
+                                             "startup orphan-sweep or manual "
+                                             "diag_cancel needed"))
+                # Cancel resting stop-limit if held
+                if getattr(st_obj, "resting_stop_oid", None):
+                    try:
+                        self.b.cancel(st_obj.resting_stop_oid)
+                    except Exception as _rce:
+                        self._record("sleeve_removed_resting_stop_cancel_failed",
+                                     sleeve_id=sid,
+                                     oid=st_obj.resting_stop_oid,
+                                     error=str(_rce), severity="critical",
+                                     reason=("sleeve removal cancel raised — "
+                                             "resting stop may be orphan on "
+                                             "Coinbase; startup orphan-sweep "
+                                             "or manual diag_cancel needed"))
                 del self.s.sleeves[sid]
         # Retirement ledger: if the product is in cooldown from a prior
         # retire, refuse to instantiate NEW sleeve state. Existing sleeves
@@ -7264,19 +7293,32 @@ class SwingTrader:
             # just exited via take-profit; the stop order is dangling and
             # must be cancelled before price can recover above stop_px and
             # fill it (which would create an accidental short).
+            # Adam 2026-07-20 ORPHAN GUARD: only clear tracking on cancel
+            # success. Prior code cleared unconditionally after `except log`
+            # so a raised cancel produced exactly the short-risk the comment
+            # above warns about. If cancel fails, keep tracking so the next
+            # tick's reconcile / _maybe_credit_resting_stop_fill will re-try.
             if ss.resting_stop_oid:
+                _tpf_ok = False
                 try:
                     self.b.cancel(ss.resting_stop_oid)
+                    _tpf_ok = True
                     self._record("resting_stop_cancelled_on_tp_fill",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
                                  oid=ss.resting_stop_oid)
                 except Exception as _ce:
                     self._record("resting_stop_cancel_on_tp_fill_failed",
                                  sleeve_id=sc.id, sleeve_name=sc.name,
-                                 oid=ss.resting_stop_oid, error=str(_ce))
-                ss.resting_stop_oid = None
-                ss.resting_stop_px = None
-                ss.resting_stop_stage = None
+                                 oid=ss.resting_stop_oid, error=str(_ce),
+                                 severity="critical",
+                                 reason=("cancel raised after TP fill; keeping "
+                                         "resting_stop_oid tracked so next tick "
+                                         "retries — the comment above warns this "
+                                         "is a SHORT risk if not cancelled"))
+                if _tpf_ok:
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
             # Timestamp for time-based reanchor — starts counting from the
             # moment this cycle finished the sell leg.
             import time as _time
