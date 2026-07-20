@@ -721,15 +721,56 @@ export function makeApp({
       const existing = stateBlockOut.sleeves || {};
       const nowSec = Math.floor(Date.now() / 1000);
       let seededAny = false;
+      // Adam 2026-07-20 AUTO-ADOPT AT SEED TIME: if the product has an
+      // existing position on Coinbase AND no other sleeve currently claims
+      // it (own_avg_entry set), the NEW sleeve should adopt rather than
+      // seed ARMED_BUY. Otherwise a user clicking "+ Attach strategy" on
+      // a held position gets a ghost: sleeve is ARMED_BUY, position is
+      // full, safety net refuses the buy → sleeve does nothing forever.
+      // The tick-loop's _maybe_reconcile_orphan_position was supposed to
+      // catch this on next tick but that's async and depends on the track
+      // being alive; auto-adopt at seed removes the race entirely.
+      // See project_reconcile_fill_bug.md + feedback_no_ghost_sleeves.md.
+      const _pfSnap = store[tenant]?.__portfolio__?.config;
+      const _posRow = (_pfSnap?.derivatives || []).find(d => d.product_id === symbol);
+      const _brokerQty = Math.abs(Number(_posRow?.qty) || 0);
+      const _brokerAvg = Number(_posRow?.avg_entry) || 0;
+      const _brokerSide = String(_posRow?.side || '').toUpperCase();
+      // Only auto-adopt for LONG positions (adam-live is long-only per §3.8).
+      const _adoptCandidate = _brokerQty > 0 && _brokerAvg > 0 && _brokerSide === 'LONG';
+      // Sum qty already claimed by pre-existing sleeves (own_avg_entry set)
+      let _alreadyClaimedQty = 0;
+      for (const [_sid, _ss] of Object.entries(existing || {})) {
+        if (_ss && _ss.own_avg_entry != null && Number(_ss.own_avg_entry) > 0) {
+          const _sCfg = (sleeves || []).find(x => x.id === _sid);
+          _alreadyClaimedQty += Number(_sCfg?.qty || _ss.qty || 1);
+        }
+      }
+      let _unclaimedRemaining = Math.max(0, _brokerQty - _alreadyClaimedQty);
       for (const s of sleeves) {
         if (!s.id || existing[s.id]) continue;      // never overwrite existing state
         const clientSeed = clientSeeds[s.id];
-        const seed = {
-          id: s.id,
-          state: 'ARMED_BUY',
-          armed_buy_since_ts: nowSec,
-          ...(clientSeed && typeof clientSeed === 'object' ? clientSeed : {}),
-        };
+        // Auto-adopt if: candidate exists, no client seed forces ARMED_BUY,
+        // and there's enough unclaimed position to fit this sleeve's qty.
+        const _thisQty = Number(s.qty) || 1;
+        const _autoAdopt = _adoptCandidate
+          && _unclaimedRemaining >= _thisQty
+          && (!clientSeed || !clientSeed.state);
+        const seed = _autoAdopt
+          ? {
+              id: s.id,
+              state: 'ARMED_SELL',
+              own_avg_entry: _brokerAvg,
+              _own_avg_source: 'auto_adopt_existing_position_at_seed',
+              ...(clientSeed && typeof clientSeed === 'object' ? clientSeed : {}),
+            }
+          : {
+              id: s.id,
+              state: 'ARMED_BUY',
+              armed_buy_since_ts: nowSec,
+              ...(clientSeed && typeof clientSeed === 'object' ? clientSeed : {}),
+            };
+        if (_autoAdopt) _unclaimedRemaining -= _thisQty;
         // Adam 2026-07-20: if this sleeve was seeded as ARMED_SELL
         // (defensive/piggy-back on an existing position) but the client
         // seed didn't include own_avg_entry, populate it from the

@@ -2166,3 +2166,56 @@ header { padding: 20px 32px; }
     overflow-x: auto; -webkit-overflow-scrolling: touch;
   }
 }
+
+/* Adam 2026-07-20 MOBILE-FRIENDLY PASS ------------------------------------
+ * The dashboard was designed for a wide desktop; phones (≤560px) had
+ * modals overflowing off-screen (min-width 520/780/1000px), tables cut
+ * off, buttons too small for thumbs. This block covers the common wins:
+ *   - Modals go full-width on phones
+ *   - All large tables get horizontal scroll wrappers
+ *   - Buttons hit 44px min-height (Apple/Android tap-target guideline)
+ *   - Reduced padding so more content fits above the fold
+ */
+@media (max-width: 560px) {
+  main { padding: var(--s2); }
+  h1 { font-size: 18px; }
+  h2 { font-size: 15px; }
+  /* Modals: kill the min-width, let panel fill nearly full viewport. */
+  .modal-panel,
+  .modal-panel.wide,
+  #sleeve-modal .modal-panel {
+    min-width: 0;
+    max-width: 100vw;
+    width: 96vw;
+    max-height: 96vh;
+    padding: 12px;
+    border-radius: var(--r-md);
+  }
+  /* Every table wrapper gets horizontal scroll so wide tables don't
+   * push page width beyond the viewport (causing whole-page horizontal
+   * scroll which breaks touch layout). */
+  table, .scanner-split, .scanner-class-panel {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    max-width: 100%;
+  }
+  /* Tap targets: buttons + inputs at least 44px tall. */
+  button, .button, input[type="button"], input[type="submit"],
+  input[type="number"], input[type="text"], input[type="password"], select {
+    min-height: 44px;
+    font-size: 16px;   /* iOS refuses to autofocus zoom if ≥ 16 */
+  }
+  /* Small buttons in table rows are exempt (they'd blow up row height);
+   * they get their own bump so they're still tap-comfortable. */
+  button.small, .btn.small { min-height: 36px; }
+  /* Cockpit tiles: full width, one per row on very small screens. */
+  .ck-tile { min-width: 100%; flex: 1 1 100%; }
+  /* Portfolio + scanner tables: no minimum row height forcing dense text
+   * off-screen. Let cells wrap where possible. */
+  th, td { padding: 6px 8px; font-size: 13px; }
+  /* Nav / tab bar: allow wrapping instead of horizontal scroll. */
+  .tab-bar, .nav-tabs, .subtab-row { flex-wrap: wrap; gap: 4px; }
+  /* Toast width — was 480px min. */
+  .toast, #toast { max-width: 94vw; }
+}
