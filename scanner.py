@@ -487,16 +487,28 @@ def compute_ranking(products: list[dict], top_n: int = 10) -> list[dict]:
         contract_expiry = details.get("contract_expiry")
         intraday_margin = _f(details.get("intraday_margin_rate"))
         overnight_margin = _f(details.get("overnight_margin_rate"))
+        # Adam 2026-07-20: preserve product_type from Coinbase so
+        # classify_asset_class can differentiate SPOT crypto (BTC-USD,
+        # ETH-USD, etc.) from FUTURE derivatives (SLR-*, HYP-*, MC-*,
+        # PERPs). Prior code inferred type from product_id prefix which
+        # conflated spot crypto with crypto perps.
+        product_type = str(p.get("product_type") or "").upper()
+        # SPOT products have contract_size=None; use 1.0 as neutral so
+        # downstream $-denominated calcs (spread × size − fee) don't
+        # divide by 0.
+        effective_contract_size = contract_size if contract_size else (
+            1.0 if product_type == "SPOT" else None)
         scored.append({
             "product_id": pid,
+            "product_type": product_type,   # "SPOT" or "FUTURE"
             "price": price,
             "high_24h": high,
             "low_24h": low,
             "vol_pct": round(vol_pct, 3),
             "volume_24h": vol_24h_usd,
             "tick_size": tick,
-            "contract_size": contract_size,
-            "tick_value": (tick * contract_size) if (tick and contract_size) else None,
+            "contract_size": effective_contract_size,
+            "tick_value": (tick * effective_contract_size) if (tick and effective_contract_size) else None,
             "contract_expiry": contract_expiry,
             "intraday_margin_rate": intraday_margin,
             "overnight_margin_rate": overnight_margin,
@@ -626,30 +638,36 @@ def _fetch_recent_candles_ts(coinbase_client, product_id: str,
         return ([], [])
 
 
-# Asset-class classification (Adam 2026-07-20). Two buckets for the
-# dashboard: CRYPTO (perpetual + nano crypto futures) and DERIVATIVE
-# (commodities, indexes, everything else). Different vol/liquidity
-# regimes → experts already treat them differently per-contract; the
-# split is UI-level so operator can filter by asset class.
-_COMMODITY_INDEX_PREFIXES = {
-    # Metals + energy nano futures
-    "SLR", "NOL", "CU", "NGS", "PT",
-    # Index nano futures (S&P subsets, Mag 7, China ETF, etc.)
-    "MC", "MAG7C", "CHN",
-}
+# Asset-class classification (Adam 2026-07-20 revised).
+# Adam's ask: CRYPTO section = SPOT crypto only (BTC-USD, ETH-USD, etc.).
+# DERIVATIVE section = ALL CFM/CDE futures (crypto perps + nano
+# commodities + index futures) — everything Coinbase classifies as FUTURE.
+def classify_asset_class(product_id: str, product_type: str = "") -> str:
+    """Return 'crypto' (spot only) or 'derivative' (any future/CFM).
 
-
-def classify_asset_class(product_id: str) -> str:
-    """Return 'crypto' or 'derivative' for a Coinbase CFM product_id.
-
-    Prefix-match against _COMMODITY_INDEX_PREFIXES. Default = 'crypto'.
-    Kept simple: any misclassification is fixable by adjusting the set;
-    the important thing is stable/reproducible bucketing for the UI.
+    Preferred signal: `product_type` from Coinbase get_products response
+    ("SPOT" or "FUTURE"). Falls back to product_id heuristic (any product
+    with a date-suffix or "-CDE" / "-PERP" is a derivative) when
+    product_type is missing.
     """
-    if not product_id or "-" not in product_id:
-        return "derivative"  # unknown / malformed → conservative
-    prefix = product_id.split("-", 1)[0].upper()
-    return "derivative" if prefix in _COMMODITY_INDEX_PREFIXES else "crypto"
+    pt = str(product_type or "").upper()
+    if pt == "SPOT":
+        return "crypto"
+    if pt == "FUTURE":
+        return "derivative"
+    # Fallback heuristic for callers without product_type:
+    # any CDE/PERP/dated product_id is a derivative; short "-USD" /
+    # "-USDC" / "-USDT" pairs are spot crypto.
+    if not product_id:
+        return "derivative"
+    pid_upper = product_id.upper()
+    if "-CDE" in pid_upper or "PERP" in pid_upper:
+        return "derivative"
+    # Spot pairs end in a fiat/stablecoin ticker
+    for stable in ("-USD", "-USDC", "-USDT", "-EUR", "-GBP"):
+        if pid_upper.endswith(stable):
+            return "crypto"
+    return "derivative"  # unknown → conservative
 
 
 def _fetch_recent_ohlcv(coinbase_client, product_id: str,
@@ -812,7 +830,8 @@ def apply_expert_gates(entry: dict, bars: list[dict]) -> dict:
     csize = float(entry.get("contract_size") or 0)
     tick = float(entry.get("tick_size") or 0)
 
-    entry["asset_class"] = classify_asset_class(pid)
+    entry["asset_class"] = classify_asset_class(
+        pid, product_type=entry.get("product_type") or "")
 
     if not bars or mark <= 0 or csize <= 0:
         entry["expert_gate_skipped"] = "insufficient inputs"
@@ -973,16 +992,25 @@ def fetch_and_rank(
     Edit modal's "Recommended spreads" tiles disappear for products that
     happen to have low 24h range that day.
     """
+    # Adam 2026-07-20: fetch BOTH FUTURE (CFM derivatives, incl. crypto
+    # perps + nano commodities/indexes) AND SPOT (spot crypto pairs like
+    # BTC-USD, ETH-USD) so scanner covers everything Coinbase offers.
+    # Prior code short-circuited after FUTURE succeeded, meaning SPOT
+    # crypto was never scanned. Stamp product_type on each dict so
+    # classify_asset_class can distinguish.
     products = []
     for product_type in ("FUTURE", "SPOT"):
         try:
             resp = coinbase_client.get_products(product_type=product_type)
             payload = resp.to_dict() if hasattr(resp, "to_dict") else resp
             got = payload.get("products") or []
+            for p in got:
+                if isinstance(p, dict):
+                    p["product_type"] = product_type  # stamp for classifier
             products.extend(got)
-            if product_type == "FUTURE" and got:
-                break
-        except Exception:
+        except Exception as _e:
+            print(f"[scanner] fetch {product_type} products failed: "
+                  f"{type(_e).__name__}: {_e}", flush=True)
             continue
     ranking = compute_ranking(products, top_n=max(top_n * 3, 30))
     # Force-include any user-strategy product not in the natural ranking.
@@ -1333,10 +1361,14 @@ def write_ranking_to_redis(url: str, ranking: list[dict], generated_at: Optional
     r = redis.Redis.from_url(url, decode_responses=True)
     top_crypto = [e for e in ranking
                   if (e.get("asset_class") or
-                      classify_asset_class(e.get("product_id") or "")) == "crypto"]
+                      classify_asset_class(
+                          e.get("product_id") or "",
+                          product_type=e.get("product_type") or "")) == "crypto"]
     top_derivative = [e for e in ranking
                       if (e.get("asset_class") or
-                          classify_asset_class(e.get("product_id") or "")) == "derivative"]
+                          classify_asset_class(
+                              e.get("product_id") or "",
+                              product_type=e.get("product_type") or "")) == "derivative"]
     payload = {
         "generated_at": generated_at if generated_at is not None else time.time(),
         "top": ranking,
