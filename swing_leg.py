@@ -6651,6 +6651,56 @@ class SwingTrader:
         if adopted:
             return
 
+        # Adam 2026-07-21 PHASE A MIGRATION SWEEP: cancel any LIMIT SELLs
+        # on the book at our sleeve_qty that DON'T match sell_px within
+        # tolerance. Cleans up pre-Phase-A trail-breach residue where a
+        # LIMIT was placed at a trail-ratcheted price ABOVE mark (tracked
+        # in ss.live_order_id, not resting_profit_limit_oid — invisible to
+        # this method's normal flow). Without this sweep, we'd place a
+        # NEW LIMIT at the correct sell_px while the stale one still sits
+        # on the book → 2 LIMITs against 1 pos → §3.8 SHORT risk if mark
+        # spikes through both.
+        for _o in existing:
+            if _o.get("kind") != "limit":
+                continue
+            if int(_o.get("size") or 0) != sleeve_qty:
+                continue
+            lp = float(_o.get("limit_price") or 0)
+            if lp <= 0:
+                continue
+            if abs(lp - sell_px) <= tol:
+                continue  # matches — already handled by adoption block above
+            _stale_oid = _o.get("order_id")
+            if not _stale_oid:
+                continue
+            try:
+                self.b.cancel(_stale_oid)
+                self._record(
+                    "phase_a_migration_stale_limit_cancelled",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    cancelled_oid=_stale_oid,
+                    stale_px=lp, correct_sell_px=float(sell_px),
+                    severity="critical",
+                    reason=("stale LIMIT SELL at wrong price (likely pre-"
+                            "Phase-A trail-breach residue). Cancelled to "
+                            "prevent §3.8 double-fire when the fresh Phase A "
+                            "LIMIT at correct sell_px is placed."))
+            except Exception as _ce:
+                self._record(
+                    "phase_a_migration_stale_limit_cancel_failed",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    oid=_stale_oid, error=str(_ce),
+                    severity="critical")
+        # Also clear any stale live_order_id that pointed at a trail-breach
+        # LIMIT so subsequent order-poll paths don't chase a dead oid.
+        if getattr(ss, "resting_stop_stage", "") in (
+                "limit_breach_trail", "limit_breach_hard_bottom"):
+            ss.resting_stop_stage = None
+            ss.resting_stop_px = None
+        # Invalidate cache after our cancels so the place block below sees
+        # a clean book on its next _broker_query_open_sells (if it did one).
+        self._open_sells_cache = None
+
         # Place fresh LIMIT SELL at sell_px
         try:
             snapped = self._snap_to_tick(float(sell_px))
