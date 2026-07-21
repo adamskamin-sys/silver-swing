@@ -5362,6 +5362,95 @@ class SwingTrader:
             return
         # Fresh place — no existing resting order.
         if not ss.resting_stop_oid:
+            # Adam 2026-07-20 ROOT FIX (MC/HYF/XLM "NOT PLACED" chip class):
+            # Before deciding whether to place, reconcile against Coinbase
+            # truth. Three outcomes:
+            #   (a) Coinbase has a SELL at ~target_px covering this sleeve
+            #       → ADOPT it (set our oid/px/stage) → chip flips PLACED
+            #       within one tick. Fixes the state-desync that caused
+            #       MC 17SEP26 Scanner 23:48 to show NOT PLACED all night
+            #       while a valid stop was already on the book.
+            #   (b) Coinbase has SELLs at WRONG prices (stale from prior
+            #       cycle, wrong-price orphans) → cancel them so the
+            #       broker-authoritative guard below won't misread them
+            #       as legitimate coverage. Prior behavior: guard saw them
+            #       and refused to place, leaving §3.6 hole.
+            #   (c) Nothing on Coinbase → fall through to place path.
+            if pos_qty > 0 and target_px and target_px > 0:
+                try:
+                    _existing_sells = self._broker_query_open_sells()
+                    _tol = max(float(getattr(self.cfg, "tick_size", 0.0) or 0.01) * 2,
+                               float(target_px) * 0.005)
+                    _adopted = False
+                    _wrong_price = []
+                    for _o in _existing_sells:
+                        _osp = float(_o.get("stop_price") or 0)
+                        _osz = int(_o.get("size") or 0)
+                        if _osz != sleeve_qty:
+                            continue  # not our size — sibling coverage
+                        if _osp <= 0:
+                            continue  # non-stop order (limit sell?) — leave
+                        if abs(_osp - float(target_px)) <= _tol:
+                            # Match: adopt it into sleeve state.
+                            ss.resting_stop_oid = _o.get("order_id")
+                            ss.resting_stop_px = _osp
+                            ss.resting_stop_stage = stage
+                            self._record(
+                                "resting_stop_adopted_from_broker",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                oid=_o.get("order_id"),
+                                stop_px=_osp, target_px=float(target_px),
+                                stage=stage, size=_osz,
+                                severity="info",
+                                reason=("existing Coinbase SELL matches our "
+                                        "target within tolerance; adopting "
+                                        "into sleeve state so chip flips "
+                                        "PLACED. Fixes §3.6 state-desync "
+                                        "class without creating §3.8 excess."))
+                            try:
+                                self._save_state()
+                            except Exception:
+                                pass
+                            self._open_sells_cache = None
+                            _adopted = True
+                            break
+                        else:
+                            _wrong_price.append(_o)
+                    if _adopted:
+                        return
+                    # No adoption. Cancel wrong-price SELLs at our qty so
+                    # they don't block placement via the guard below. Only
+                    # cancel same-qty SELLs (sibling sleeve stops have
+                    # different qtys per their own configs — leave those).
+                    for _o in _wrong_price:
+                        _oid = _o.get("order_id")
+                        _osp = float(_o.get("stop_price") or 0)
+                        if not _oid:
+                            continue
+                        try:
+                            self.b.cancel(_oid)
+                            self._record(
+                                "resting_stop_wrong_price_cancelled",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                cancelled_oid=_oid,
+                                cancelled_stop_px=_osp,
+                                intended_target_px=float(target_px),
+                                severity="critical",
+                                reason=("stale SELL on Coinbase at wrong "
+                                        "price blocked new stop placement "
+                                        "via broker-authoritative guard. "
+                                        "Cancelling so §3.6 protective "
+                                        "stop can be placed this tick."))
+                        except Exception as _ce:
+                            self._record(
+                                "resting_stop_wrong_price_cancel_failed",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                oid=_oid, error=str(_ce),
+                                severity="critical")
+                    if _wrong_price:
+                        self._open_sells_cache = None
+                except Exception:
+                    pass  # fail-open — proceed to guards below
             # Adam 2026-07-20 GHOST-SHORT GUARD: multi-sleeve mutual
             # exclusion. Sum up qty of stop-limits ALREADY placed by
             # sibling sleeves on this same product. If placing this
@@ -7803,24 +7892,39 @@ class SwingTrader:
             for _o in (_raw.get("orders") or []):
                 if str(_o.get("side") or "").upper() != "SELL":
                     continue
-                # Extract qty from order_configuration
+                # Extract qty + stop_price + limit_price from
+                # order_configuration. stop_price is the trigger; limit_price
+                # is the fill floor. Adoption logic needs stop_price to match
+                # existing SELLs against sleeve target_px.
                 _cfg = _o.get("order_configuration") or {}
                 _qty = 0
+                _stop_px = 0.0
+                _limit_px = 0.0
                 for _v in (_cfg.values() if isinstance(_cfg, dict) else []):
                     if isinstance(_v, dict):
                         _q_raw = (_v.get("base_size") or _v.get("size")
                                   or _v.get("quote_size") or 0)
                         try:
                             _qty = int(float(_q_raw))
-                            if _qty > 0:
-                                break
                         except (TypeError, ValueError):
-                            pass
+                            _qty = 0
+                        try:
+                            _stop_px = float(_v.get("stop_price") or 0)
+                        except (TypeError, ValueError):
+                            _stop_px = 0.0
+                        try:
+                            _limit_px = float(_v.get("limit_price") or 0)
+                        except (TypeError, ValueError):
+                            _limit_px = 0.0
+                        if _qty > 0:
+                            break
                 if _qty <= 0:
                     _qty = 1  # conservative fallback
                 _orders.append({
                     "order_id": _o.get("order_id"),
                     "size": _qty,
+                    "stop_price": _stop_px,
+                    "limit_price": _limit_px,
                     "created_time": _o.get("created_time"),
                 })
         except Exception as _e:
