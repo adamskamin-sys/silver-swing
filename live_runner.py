@@ -513,9 +513,22 @@ def _preflight(coinbase, store, tenant, symbol, notifier) -> tuple[bool, list[st
         pass
 
     # 4. Kill switch off
+    # Adam 2026-07-21 escape hatch: SKIP_KILL_SWITCH_PREFLIGHT=1 env var
+    # bypasses this check AND auto-clears the kill switch so the bot boots
+    # into a working state. Use ONLY when the switch is stuck-active and
+    # you can't reach the Render shell (bot is crash-looping so shell
+    # unavailable). Remove the env var immediately after the bot boots.
     ks = KillSwitch(store, tenant)
     if ks.is_active():
-        issues.append(f"preflight: kill switch active: {ks.reason() or 'no reason'}")
+        if os.getenv("SKIP_KILL_SWITCH_PREFLIGHT"):
+            _log(f"WARN: SKIP_KILL_SWITCH_PREFLIGHT set — auto-clearing "
+                 f"stuck kill switch (was: {ks.reason() or 'no reason'})")
+            try:
+                ks.clear(cleared_by="SKIP_KILL_SWITCH_PREFLIGHT env var")
+            except Exception as _kse:
+                _log(f"WARN: failed to clear kill switch: {_kse}")
+        else:
+            issues.append(f"preflight: kill switch active: {ks.reason() or 'no reason'}")
 
     # 5. Roll check
     try:
