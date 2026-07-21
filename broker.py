@@ -295,6 +295,46 @@ class CoinbaseBroker:
         # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
         # _sell_lock serializes _no_short_check + submit so concurrent SELLs
         # can't both pass the check before either shows up as pending.
+        # Adam 2026-07-21 EMERGENCY TRACE: log the caller stack so we can
+        # find which code path is placing orders during the cancel-loop
+        # investigation. Set Redis flag `silver-swing:trace_place_limit`
+        # to "1" to enable. Prints 5 frames of stack to stdout.
+        try:
+            import os as _os
+            if _os.environ.get("SWING_TRACE_PLACE_LIMIT"):
+                import traceback as _tb
+                _stack = _tb.extract_stack(limit=8)
+                _frames = [
+                    f"{f.filename.rsplit('/',1)[-1]}:{f.lineno} {f.name}"
+                    for f in _stack[-6:-1]
+                ]
+                print(f"[trace place_limit] {s} {qty}@{price} product="
+                      f"{self.cfg.product_id} caller_stack="
+                      f"{' -> '.join(_frames)}", flush=True)
+        except Exception:
+            pass
+        # Adam 2026-07-21 EMERGENCY BROKER KILL: reads Redis flag
+        # `silver-swing:broker_freeze`. When set truthy, ALL place_limit
+        # calls raise so we can freeze the whole fleet regardless of
+        # which code path is placing. Existing orders on Coinbase are
+        # unaffected. Use only when a runaway loop can't be traced.
+        try:
+            _r = None
+            _url = _os.environ.get("REDIS_URL") or _os.environ.get(
+                "REDIS_INTERNAL_URL")
+            if _url:
+                import redis as _redis_mod
+                _r = _redis_mod.Redis.from_url(_url, decode_responses=True,
+                                                socket_timeout=1.0)
+                _frozen = _r.get("silver-swing:broker_freeze")
+                if _frozen and str(_frozen).lower() not in ("", "0", "false", "none"):
+                    raise RuntimeError(
+                        f"broker_freeze active — refusing place_limit "
+                        f"{s} {qty}@{price} product={self.cfg.product_id}")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # never fail-hard on the freeze check
         if s == "SELL":
             with self._sell_lock:
                 self._no_short_check(qty, kind="place_limit",
