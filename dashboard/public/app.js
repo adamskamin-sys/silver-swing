@@ -6964,24 +6964,25 @@ function openScannerDetail(row) {
             const projected = realized + stopPnl - sellFee * qty2;
             ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection (stage: ${restingStage2 || 'unknown'}) — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${liveContractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
           }
-          // Trail cell — show what the BOT actually placed. Only claim
-          // "TRAIL ENGAGED" when the resting order on Coinbase is at a
-          // trail stage; otherwise show the arm price we're waiting for
-          // or a warning that trail is dormant.
+          // Adam 2026-07-21 PHASE A: trail column now shows profit-lock
+          // LIMIT status. The "trail-above-mark stop" design is gone —
+          // sell_px is a real resting LIMIT SELL on the book (bracket
+          // OCO paired with the protective STOP-LIMIT at stop_loss_px).
+          // Show PLACED (green) if the LIMIT is actually resting on
+          // Coinbase; NO LIMIT (red) if we're holding but the profit-
+          // lock LIMIT is missing (§3.6-analog for the profit leg).
           let trailCell = '<span class="dim">—</span>';
-          const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
-          if (trailModes) {
-            const peak = Number(ss.trail_high_water_price) || 0;
-            const trailDist = Number(s.trail_distance) || 0;
-            const armPx = Number(s.sell_px) || 0;
-            if (isTrailStage2 && trailEff > 0) {
-              trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED (stage: ${restingStage2}) — actual Coinbase stop at $${fmtPrice(trailEff)}. Peak $${fmtPrice(peak)}. Every new high lifts the exit.">EXIT <b>$${fmtPrice(trailEff)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
-            } else if (armPx > 0) {
-              const dormantNote = peak > 0 && trailDist > 0
-                ? `Trail dormant — bot has stop-loss at hard_bottom stage. Trail arms once mark crosses $${fmtPrice(armPx)}; then EXIT ratchets from peak − $${fmtPrice(trailDist)}.`
-                : `Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).`;
-              trailCell = `<span class="mono trail-pill-off" title="${dormantNote}">arms at $${fmtPrice(armPx)}</span>`;
+          const profitLimitPx2 = Number(ss.resting_profit_limit_px) || 0;
+          const profitLimitOid2 = ss.resting_profit_limit_oid;
+          const sellTargetPx2 = Number(s.sell_px) || 0;
+          if (holdsPosition && sellTargetPx2 > 0) {
+            if (profitLimitOid2 && profitLimitPx2 > 0) {
+              trailCell = `<span class="mono" style="color:#22c55e;font-weight:600" title="Profit-lock LIMIT SELL resting on Coinbase at $${fmtPrice(profitLimitPx2)}. Fires INSTANTLY when mark reaches this price (queue priority — zero bot latency). Part of bracket OCO design (STOP-LIMIT below mark + LIMIT above mark). Adam 2026-07-21.">LIMIT $${fmtPrice(profitLimitPx2)}</span>`;
+            } else {
+              trailCell = `<span class="mono" style="color:#f43f5e;font-weight:700;background:#7f1d1d;padding:2px 6px;border-radius:3px" title="🚨 Profit-lock LIMIT SELL NOT on Coinbase. Bracket incomplete — sell_px target won't fire until bot re-places it (next tick). If persistent, check trade log for profit_lock_limit_place_failed events.">🚨 NO LIMIT</span>`;
             }
+          } else if (sellTargetPx2 > 0) {
+            trailCell = `<span class="mono dim" title="Not holding — no profit-lock LIMIT needed. Will place LIMIT SELL at $${fmtPrice(sellTargetPx2)} on next buy fill.">pending</span>`;
           }
           // Halt reason lives on the product-level state (not per-sleeve) when
           // the state machine crashes out (abort_below, reconcile). Show it as
@@ -7332,20 +7333,20 @@ function refreshScannerDetailLive() {
         const projected = realized + stopPnl - sellFee * qty2;
         ifStoppedCell = `<span class="mono ${projected >= 0 ? 'pos' : 'neg'}" title="STOP-LOSS projection (stage: ${restingStageT || 'unknown'}) — Realized ${fmtMoney(realized)} + stop-out (${fmtPrice(slEff)}−${fmtPrice(ownAvg2)})×${contractSize}×${qty2} − sell fee $${(sellFee * qty2).toFixed(2)}">${projected >= 0 ? '+' : ''}${fmtMoney(projected)}</span>`;
       }
+      // Adam 2026-07-21 PHASE A: profit-lock LIMIT status (bracket OCO).
       let trailCell = '<span class="dim">—</span>';
-      const trailModes = s.exit_mode === 'trailing_stop' || s.exit_mode === 'hybrid';
-      if (trailModes) {
-        const peak = Number(ss.trail_high_water_price) || 0;
-        const trailDist = Number(s.trail_distance) || 0;
-        const armPx = Number(s.sell_px) || 0;
-        if (isTrailStageT && trailEff > 0) {
-          trailCell = `<span class="mono trail-pill-on" title="TRAIL ENGAGED (stage: ${restingStageT}) — actual Coinbase stop at $${fmtPrice(trailEff)}. Peak $${fmtPrice(peak)}. Every new high lifts the exit.">EXIT <b>$${fmtPrice(trailEff)}</b> <span class="trail-peak-note">· peak $${fmtPrice(peak)}</span></span>`;
-        } else if (armPx > 0) {
-          const dormantNote = peak > 0 && trailDist > 0
-            ? `Trail dormant — bot has stop-loss at hard_bottom stage. Trail arms once mark crosses $${fmtPrice(armPx)}; then EXIT ratchets from peak − $${fmtPrice(trailDist)}.`
-            : `Trail NOT YET activated — arms once mark crosses $${fmtPrice(armPx)}; then EXIT = peak − trail_distance ($${fmtPrice(trailDist)}).`;
-          trailCell = `<span class="mono trail-pill-off" title="${dormantNote}">arms at $${fmtPrice(armPx)}</span>`;
+      const profitLimitPxT = Number(ss.resting_profit_limit_px) || 0;
+      const profitLimitOidT = ss.resting_profit_limit_oid;
+      const sellTargetPxT = Number(s.sell_px) || 0;
+      const holdsT = ownAvg2 > 0;
+      if (holdsT && sellTargetPxT > 0) {
+        if (profitLimitOidT && profitLimitPxT > 0) {
+          trailCell = `<span class="mono" style="color:#22c55e;font-weight:600" title="Profit-lock LIMIT SELL resting on Coinbase at $${fmtPrice(profitLimitPxT)}. Fires INSTANTLY when mark reaches this price (queue priority — zero bot latency). Part of bracket OCO design (STOP-LIMIT below mark + LIMIT above mark).">LIMIT $${fmtPrice(profitLimitPxT)}</span>`;
+        } else {
+          trailCell = `<span class="mono" style="color:#f43f5e;font-weight:700;background:#7f1d1d;padding:2px 6px;border-radius:3px" title="🚨 Profit-lock LIMIT SELL NOT on Coinbase. Bracket incomplete.">🚨 NO LIMIT</span>`;
         }
+      } else if (sellTargetPxT > 0) {
+        trailCell = `<span class="mono dim" title="Not holding — will place LIMIT SELL at $${fmtPrice(sellTargetPxT)} on next buy fill.">pending</span>`;
       }
       const productHaltReason = state === 'HALTED'
         ? (currentStore[tenant]?.[symbol]?.state?.halt_reason
