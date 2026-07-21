@@ -207,6 +207,53 @@ class SwingTrader:
             return float(price or 0.0)
         return round(round(float(price) / tick) * tick, 8)
 
+    # ---- contract spec source-of-truth -----------------------------------
+
+    def _get_contract_size(self) -> float:
+        """Return this product's contract_size, source-of-truth priority:
+
+          1. Cached value on self (populated first-call from broker).
+          2. broker.contract_spec()['contract_size'] — Coinbase truth.
+          3. self.cfg.contract_size — config value (may be stale/default).
+          4. 1.0 last-resort with a CRITICAL log.
+
+        Adam 2026-07-21 ROOT FIX (ENA -$0.32 phony loss on +$24 real cycle):
+        prior code used `self.contract_spec_cache` which is never assigned
+        anywhere. try/except swallowed the AttributeError, silently
+        returning 1. For ENA (real 5000), NER (500), ONDO (1000), LINK
+        (50), HYPE (10), AAVE (5), SLR (50) — every realized_pnl credit
+        was 1/N of the truth, dashboard showed negatives on real wins,
+        Vince/Kelly sizing and loss-streak auto-disable saw phony losses.
+        """
+        cached = getattr(self, "_contract_size_cached", None)
+        if cached and cached > 0:
+            return float(cached)
+        cs = 0.0
+        try:
+            if hasattr(self.b, "contract_spec"):
+                spec = self.b.contract_spec() or {}
+                cs = float(spec.get("contract_size") or 0)
+        except Exception:
+            cs = 0.0
+        if cs <= 0:
+            try:
+                cs = float(getattr(self.cfg, "contract_size", 0) or 0)
+            except Exception:
+                cs = 0.0
+        if cs <= 0:
+            try:
+                self._record("contract_size_unknown_fallback_to_1",
+                             severity="critical",
+                             reason=("broker.contract_spec() + cfg both empty; "
+                                     "using 1.0 which will mis-scale realized P&L "
+                                     "by the real multiplier. Populate config "
+                                     "immediately."))
+            except Exception:
+                pass
+            cs = 1.0
+        self._contract_size_cached = cs
+        return cs
+
     # ---- persistence / crash recovery ------------------------------------
 
     def _load_config(self) -> SwingConfig:
@@ -4960,29 +5007,12 @@ class SwingTrader:
         # tick for 90 min without acting. Fix: query broker.contract_spec
         # directly (source of truth), fall back to cache, then refuse to
         # fake a fee_price if contract_size is still unknown.
-        _cs = 0.0
+        _cs = self._get_contract_size()
         try:
-            _spec = self.b.contract_spec() if hasattr(self.b, "contract_spec") else None
-            if _spec:
-                _cs = float(_spec.get("contract_size") or 0)
+            _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+            _fee_price = _fee_rt / _cs / max(1, int(sc.qty or 1))
         except Exception:
-            pass
-        if _cs <= 0:
-            try:
-                _cs = float((self.contract_spec_cache or {}).get("contract_size") or 0)
-            except Exception:
-                _cs = 0.0
-        if _cs <= 0:
-            # Unknown contract_size — safer to zero fee_price than to
-            # over-adjust break_even_floor. Under-adjustment costs fees;
-            # over-adjustment disables the entire trail path.
             _fee_price = 0.0
-        else:
-            try:
-                _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
-                _fee_price = _fee_rt / _cs / max(1, int(sc.qty or 1))
-            except Exception:
-                _fee_price = 0.0
         try:
             _tick = float(getattr(self.cfg, "tick_size", 0) or 0.01)
         except Exception:
@@ -5102,18 +5132,7 @@ class SwingTrader:
                 import expert_stop as _est_fb
                 if _atr_est > 0 and getattr(_est_fb, "MODE", "expert") == "expert":
                     _fee_rt_fb = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0.0) or 0.0)
-                    _cs_fb = 0.0
-                    try:
-                        _spec_fb = self.b.contract_spec() if hasattr(self.b, "contract_spec") else None
-                        if _spec_fb:
-                            _cs_fb = float(_spec_fb.get("contract_size") or 0)
-                    except Exception:
-                        pass
-                    if _cs_fb <= 0:
-                        try:
-                            _cs_fb = float((self.contract_spec_cache or {}).get("contract_size") or 0)
-                        except Exception:
-                            _cs_fb = 0.0
+                    _cs_fb = self._get_contract_size()
                     _tick_fb = float(getattr(self.cfg, "tick_size", 0) or 0)
                     if _cs_fb > 0:
                         _dec = _est_fb.optimal_stop_distance(
@@ -6274,10 +6293,7 @@ class SwingTrader:
                               f"unknown; run diag_force_credit_cycle.py {self.symbol} "
                               f"{sc.id} <fill> <buy_avg> to reconcile")
             return False
-        try:
-            contract_size = float((self.contract_spec_cache or {}).get("contract_size") or 1)
-        except Exception:
-            contract_size = 1.0
+        contract_size = self._get_contract_size()
         gross = (fill_price - own_avg) * filled_qty * contract_size
         # Adam 2026-07-20 problem-scout finding #1: this path credited
         # gross profit while the sibling _sleeve_on_fill (line ~6637)
