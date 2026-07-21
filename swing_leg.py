@@ -6485,8 +6485,8 @@ class SwingTrader:
         protective STOP-LIMIT SELL at stop_loss_px below mark. Together
         they form a bracket order:
 
-          - LIMIT above mark   → profit target (fires on price rise to sell_px)
-          - STOP-LIMIT below   → protective floor (fires on drop through stop_loss_px)
+          - LIMIT above mark   -> profit target (fires on price rise to sell_px)
+          - STOP-LIMIT below   -> protective floor (fires on drop through stop_loss_px)
 
         Only one can fire from a continuous price path (Merton 1973 barrier
         options: up + down barriers on same asset partition state
@@ -6496,7 +6496,24 @@ class SwingTrader:
         This fixes the rule-#1 violation where a trail-ratcheted "stop"
         was placed ABOVE mark (mislabelled as STOP LOSS on the chip),
         leaving the position unprotected against pullbacks.
+
+        KILL SWITCH: set Redis key `silver-swing:phase_a_disabled` to any
+        truthy value to disable placement while investigating loops.
+        Existing orders on the book are unaffected; stop-limit path in
+        _maintain_resting_stop continues normally.
         """
+        # Adam 2026-07-21 KILL SWITCH: freeze Phase A placement when a
+        # cancel-replace loop is detected. Reads once per tick.
+        try:
+            _disabled = None
+            _redis = getattr(self.store, "_r", None) or getattr(
+                self.store, "r", None)
+            if _redis is not None:
+                _disabled = _redis.get("silver-swing:phase_a_disabled")
+            if _disabled and str(_disabled).lower() not in ("", "0", "false", "none"):
+                return
+        except Exception:
+            pass
         import time as _time
         if not (ss.own_avg_entry and float(ss.own_avg_entry) > 0):
             return  # not holding
