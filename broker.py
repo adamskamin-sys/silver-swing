@@ -297,6 +297,14 @@ class CoinbaseBroker:
         # can't both pass the check before either shows up as pending.
         if s == "SELL":
             with self._sell_lock:
+                # Adam 2026-07-21 DEBUG: temp log to confirm include_pending
+                # value reaching _no_short_check. Remove after verifying.
+                try:
+                    print(f"[broker.place_limit] SELL {qty} @ {price} "
+                          f"include_pending={include_pending} product="
+                          f"{self.cfg.product_id}", flush=True)
+                except Exception:
+                    pass
                 self._no_short_check(qty, kind="place_limit",
                                      include_pending=include_pending)
                 # CRITICAL — order placement always proceeds even under budget pressure.
@@ -506,9 +514,17 @@ class CoinbaseBroker:
         # Never negative (a short position is already past the invariant).
         available = max(pos - pending, 0)
         if int(sell_qty) > available:
+            # Adam 2026-07-21 DEBUG: log the actual include_pending seen so
+            # we can prove whether the caller's value reached us.
+            try:
+                print(f"[broker._no_short_check REJECT] kind={kind} sell_qty={sell_qty} "
+                      f"pos={pos} pending={pending} include_pending_seen={include_pending} "
+                      f"product={self.cfg.product_id}", flush=True)
+            except Exception:
+                pass
             raise RuntimeError(
                 f"no_short_check: {kind} SELL {sell_qty} exceeds available {available} "
-                f"(pos={pos}, pending_sells={pending}) on {self.cfg.product_id} "
+                f"(pos={pos}, pending_sells={pending}, include_pending={include_pending}) on {self.cfg.product_id} "
                 f"— refused (would net short)"
             )
 
