@@ -2674,8 +2674,17 @@ class SwingTrader:
 
     def _maybe_auto_refresh_stop_loss(self, sc, ss, last_price: float) -> None:
         """Auto-refresh stop_loss_px against current ATR-derived expert
-        distance. Fires for sleeves with stop_loss_enabled=True, both
-        WAITING (ARMED_BUY) and HELD (ARMED_SELL) states.
+        distance. Fires for sleeves with stop_loss_enabled=True in
+        ARMED_BUY state ONLY. Adam 2026-07-20: while HOLDING a position
+        (own_avg_entry > 0), stop_loss_px is FROZEN at whatever value the
+        expert set at ARM time. This enforces
+        feedback_experts_only_reentry_not_exit (locked 2026-07-19 after
+        SLR unratcheted-stop incident). Prior behavior refired every 60s
+        during holds, silently tightening the stop toward mark — which
+        turned normal wobbles into stop-outs at prices only cents below
+        own_avg. Root cause of 34 loss cycles on 2026-07-20 (OND/XLP/
+        SLR/HYF/HYP/NOL/XLM/NER/ENA — every product with 3+ losses
+        showed the same "sell $0.30 below buy" pattern).
 
         Formula (matches sleeve editor's `applyExpertCanonToForm`):
             new_stop_px = current_price - (expertATR × stop_x_atr)
@@ -2710,6 +2719,23 @@ class SwingTrader:
         except (TypeError, ValueError):
             return
         if current_stop <= 0:
+            return
+
+        # Gate 1.5 (Adam 2026-07-20): FREEZE while holding. Per
+        # feedback_experts_only_reentry_not_exit — once own_avg_entry > 0
+        # the exit params (stop_loss_px, sell_px, trail_distance) are
+        # FROZEN at the values the expert set at ARM time. This function
+        # previously re-fired every 60s during holds and silently tightened
+        # stop_loss_px toward mark. Result: 34 loss cycles on 2026-07-20
+        # (OND 8, XLP 7, SLR 5, HYF 4, HYP 3, NOL 3, XLM 2 — every product
+        # with immediate-fire losses showed the same "sell $0.0003 below
+        # buy" pattern where the refresh had raised stop within cents of
+        # mark).
+        try:
+            _own_avg_hold = float(getattr(ss, "own_avg_entry", 0) or 0)
+        except (TypeError, ValueError):
+            _own_avg_hold = 0.0
+        if _own_avg_hold > 0:
             return
 
         # Gate 2: Option B anchor-aware skip
