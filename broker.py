@@ -295,13 +295,23 @@ class CoinbaseBroker:
         # Adam 2026-07-15: no shorts allowed. Refuse SELL that would net short.
         # _sell_lock serializes _no_short_check + submit so concurrent SELLs
         # can't both pass the check before either shows up as pending.
-        # Adam 2026-07-21 EMERGENCY TRACE: log the caller stack so we can
-        # find which code path is placing orders during the cancel-loop
-        # investigation. Set Redis flag `silver-swing:trace_place_limit`
-        # to "1" to enable. Prints 5 frames of stack to stdout.
+        # Adam 2026-07-21 CALLER TRACE: prints 5-frame caller stack for
+        # every place_limit call when Redis flag
+        # `silver-swing:trace_place_limit` is truthy. Flippable at
+        # runtime without redeploy. Use to trace which code path is
+        # placing during a cancel-loop investigation.
+        import os as _os
         try:
-            import os as _os
-            if _os.environ.get("SWING_TRACE_PLACE_LIMIT"):
+            _trace_on = _os.environ.get("SWING_TRACE_PLACE_LIMIT")
+            if not _trace_on:
+                _url_t = _os.environ.get("REDIS_URL") or _os.environ.get(
+                    "REDIS_INTERNAL_URL")
+                if _url_t:
+                    import redis as _redis_t
+                    _rt = _redis_t.Redis.from_url(_url_t, decode_responses=True,
+                                                   socket_timeout=1.0)
+                    _trace_on = _rt.get("silver-swing:trace_place_limit")
+            if _trace_on and str(_trace_on).lower() not in ("", "0", "false", "none"):
                 import traceback as _tb
                 _stack = _tb.extract_stack(limit=8)
                 _frames = [
