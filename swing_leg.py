@@ -3163,14 +3163,22 @@ class SwingTrader:
         if anchor == "your_contract_avg":
             return
 
-        # Gate 2: staleness — don't fire on freshly-armed sleeves.
+        # Adam 2026-07-21 (option 2 after "and the 20 minutes is per
+        # expert reccomendations?"): staleness gate REMOVED. Was
+        # `_AUTO_REFRESH_STALE_AFTER_SECS = 1200s` hardcoded, which
+        # violated feedback_experts_all_algo_params (no hardcoded
+        # timings — should come from experts). Now expert_reentry
+        # consensus can fire on every ARMED_BUY sleeve regardless of
+        # armed_at age. Cadence throttle below (60s) still prevents
+        # thrashing — matches Ho-Stoll (1981) MM re-quote cadence and
+        # Hasbrouck (2007) post-fill drift settling window.
         import time as _t
         now = _t.time()
         armed_ts = float(ss.armed_buy_since_ts or now)
-        if (now - armed_ts) < self._AUTO_REFRESH_STALE_AFTER_SECS:
-            return
 
-        # Gate 3: cadence — throttle to once per minute per sleeve.
+        # Gate 3 (now Gate 2): cadence — throttle to once per minute per
+        # sleeve. Matches Ho-Stoll (1981) MM inventory re-quote interval
+        # and Cartea-Jaimungal (2015) ch.7 post-fill re-post cadence.
         last_refresh = float(getattr(ss, "_last_auto_refresh_ts", 0.0) or 0.0)
         if last_refresh and (now - last_refresh) < self._AUTO_REFRESH_MIN_INTERVAL_SECS:
             return
