@@ -6975,7 +6975,11 @@ function openScannerDetail(row) {
           const profitLimitPx2 = Number(ss.resting_profit_limit_px) || 0;
           const profitLimitOid2 = ss.resting_profit_limit_oid;
           const sellTargetPx2 = Number(s.sell_px) || 0;
-          if (holdsPosition && sellTargetPx2 > 0) {
+          // Recompute locally — `holdsPosition` above is scoped to the
+          // `if (s.stop_loss_enabled)` block; sleeves with stop_loss off
+          // would ReferenceError here without a local recompute.
+          const holdsPositionTrail = (Number(ss.own_avg_entry) || 0) > 0;
+          if (holdsPositionTrail && sellTargetPx2 > 0) {
             if (profitLimitOid2 && profitLimitPx2 > 0) {
               trailCell = `<span class="mono" style="color:#22c55e;font-weight:600" title="Profit-lock LIMIT SELL resting on Coinbase at $${fmtPrice(profitLimitPx2)}. Fires INSTANTLY when mark reaches this price (queue priority — zero bot latency). Part of bracket OCO design (STOP-LIMIT below mark + LIMIT above mark). Adam 2026-07-21.">LIMIT $${fmtPrice(profitLimitPx2)}</span>`;
             } else {
