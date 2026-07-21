@@ -5051,51 +5051,27 @@ class SwingTrader:
         # upward. Not just after sell_px is reached. HWM only matters
         # once it climbs above the break-even floor.
         trail_active = (trail_engaged and own_avg > 0 and hwm > break_even_floor)
-        if goal_reached:
-            if trail_distance > 0:
-                # Trail active — ratchet from HWM but never below the goal.
-                raw_trail = hwm - trail_distance
-                # Floor: max(sell_px [locked-in profit], break_even_floor
-                # [don't lose money — belt-and-braces]).
-                floor_px = max(sell_px, break_even_floor)
-                if raw_trail < floor_px:
-                    target_px = floor_px
-                    stage = ("trail_floored_at_sell" if floor_px == sell_px
-                             else "trail_floored_at_break_even")
-                else:
-                    target_px = raw_trail
-                    stage = "trail"
-            else:
-                # No trail configured — just lock in at the goal.
-                target_px = max(sell_px, break_even_floor)
-                stage = "profit_lock"
-        # Adam 2026-07-20 §3.5 STRICT + expert consensus:
-        # Pre-goal trail REMOVED. Prior "elif trail_active" branch engaged
-        # a tight trail (hwm − trail_distance, floored at break_even)
-        # BEFORE sell_px was hit — which:
-        #   - Violated §3.5 "checkpoint-then-ratchet: once profit-locked at
-        #     sell_px, trail can only tighten" (the word ONCE implies AFTER).
-        #   - Contradicted every relevant academic expert:
-        #       Van Tharp (2008 ch.6): let profits run to N×R target.
-        #       Faith (2007) Turtle rules: exit only on N-period low, not
-        #         on tiny pullbacks.
-        #       Chande (1994) Chandelier: 3×ATR trail, engages on new HHs
-        #         (not before target).
-        #       Wilder (1978) SAR: acceleration factor starts LOOSE, tightens
-        #         gradually as trend matures.
-        #       Kaufman (2013): trending regime → let trend end the trade.
-        #       Cartea-Jaimungal-Penalva (2015) ch.4: engage trail AFTER
-        #         target, not before, when the prior is target-price.
-        #   - Locked in break-even+ ($3116.60 exits on CHN when sell_px
-        #     $3134.80 was the real target — cost ~$17/contract per cycle
-        #     in foregone profit).
+        # Adam 2026-07-21 PHASE A (BRACKET DESIGN — Rule #1 fix): the
+        # goal_reached → trail branch is DISABLED. Prior behavior placed a
+        # "stop" ABOVE mark once HWM crossed sell_px, mislabelled as STOP
+        # LOSS on the chip and leaving the position UNPROTECTED against
+        # further drops (the protective stop-limit at stop_loss_px got
+        # cancelled to make room). Violated rule #1 (don't lose money).
         #
-        # New behavior: between own_avg and sell_px, ONLY hard_bottom
-        # (stop_loss_px) protects — accepted-loss backstop per §3.7. Let
-        # mark run to sell_px, THEN the goal_reached branch above engages
-        # the ratcheting trail floored at sell_px (never below).
-        elif stop_loss_px > 0:
-            # Below break-even (or no HWM yet) — protective stop only.
+        # New design: this function ONLY maintains the protective stop-limit
+        # at stop_loss_px BELOW mark. The profit-target at sell_px ABOVE
+        # mark is handled by _maintain_and_credit_profit_lock_limit as a
+        # separate resting LIMIT SELL. Both coexist on Coinbase (bracket
+        # OCO pattern) — exactly one can fire from a continuous price path.
+        # Cite: Merton (1973), barrier options — up-and-out + down-and-in
+        # barriers partition the terminal state space non-overlappingly;
+        # Almgren-Chriss (2000) J.Risk 3:5-39 for OCO bracket rationale.
+        # Adam 2026-07-21 PHASE A: stop-limit is ALWAYS at stop_loss_px,
+        # BELOW mark. Never trails past sell_px into "stop above mark"
+        # territory. Profit-target at sell_px is handled by
+        # _maintain_and_credit_profit_lock_limit as a separate LIMIT SELL.
+        if stop_loss_px > 0:
+            # Protective stop only. Never moved above mark.
             target_px = stop_loss_px
             stage = "hard_bottom"
         # Adam 2026-07-20 ROOT FIX: guarantee every held position gets a
@@ -5545,7 +5521,13 @@ class SwingTrader:
             # truth. Cached 500ms so multi-sleeve-per-tick doesn't hammer API.
             try:
                 _existing = self._broker_query_open_sells()
-                _existing_qty = sum(int(o.get("size") or 0) for o in _existing)
+                # Adam 2026-07-21 PHASE A: only count STOP-LIMITs as
+                # protective coverage. Profit-lock LIMITs above mark are
+                # NOT protective — they're the other leg of the bracket.
+                # Counting them would incorrectly block stop placement.
+                _existing_qty = sum(
+                    int(o.get("size") or 0) for o in _existing
+                    if o.get("kind") == "stop_limit")
                 if _existing_qty + sleeve_qty > pos_qty:
                     self._record(
                         "resting_stop_placement_refused_broker_authoritative",
@@ -6424,6 +6406,213 @@ class SwingTrader:
             return
         # UNKNOWN, PENDING, or other — do nothing this tick, retry next.
 
+    def _maintain_and_credit_profit_lock_limit(
+            self, sc: SleeveConfig, ss: SleeveState,
+            last_price: float) -> None:
+        """Phase A BRACKET DESIGN (Adam 2026-07-21).
+
+        Maintains a resting LIMIT SELL at sell_px whenever a position is
+        held. Complements _maintain_resting_stop which handles the
+        protective STOP-LIMIT SELL at stop_loss_px below mark. Together
+        they form a bracket order:
+
+          - LIMIT above mark   → profit target (fires on price rise to sell_px)
+          - STOP-LIMIT below   → protective floor (fires on drop through stop_loss_px)
+
+        Only one can fire from a continuous price path (Merton 1973 barrier
+        options: up + down barriers on same asset partition state
+        non-overlappingly). On fill, this method cancels the co-resting
+        stop-limit and credits the cycle at fill_price.
+
+        This fixes the rule-#1 violation where a trail-ratcheted "stop"
+        was placed ABOVE mark (mislabelled as STOP LOSS on the chip),
+        leaving the position unprotected against pullbacks.
+        """
+        import time as _time
+        if not (ss.own_avg_entry and float(ss.own_avg_entry) > 0):
+            return  # not holding
+        try:
+            pos_qty = int(self.b.position_qty() or 0)
+        except Exception:
+            return
+        if pos_qty <= 0:
+            return
+        try:
+            sell_px = float(getattr(sc, "sell_px", 0) or 0)
+        except (TypeError, ValueError):
+            sell_px = 0.0
+        if sell_px <= 0:
+            return  # no target configured
+        sleeve_qty = int(getattr(sc, "qty", 1) or 1)
+
+        # Poll existing tracked oid first (fill / cancel detection).
+        # _fall_through=True means we should proceed to adoption/placement;
+        # False means we've already handled this tick (return).
+        _fall_through = False
+        if ss.resting_profit_limit_oid:
+            try:
+                st = self.b.order_status(ss.resting_profit_limit_oid)
+            except Exception as _e:
+                self._record("profit_lock_limit_status_check_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             oid=ss.resting_profit_limit_oid, error=str(_e))
+                return
+            status = (st or {}).get("status")
+            if status == "OPEN":
+                # Reprice check: sell_px may have changed since we placed.
+                _tol_open = max(
+                    float(getattr(self.cfg, "tick_size", 0.01) or 0.01) * 2,
+                    float(sell_px) * 0.005,
+                )
+                try:
+                    _cur_px = float(ss.resting_profit_limit_px or 0)
+                except (TypeError, ValueError):
+                    _cur_px = 0.0
+                if _cur_px > 0 and abs(_cur_px - sell_px) > _tol_open:
+                    try:
+                        self.b.cancel(ss.resting_profit_limit_oid)
+                        self._record(
+                            "profit_lock_limit_cancelled_for_reprice",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            old_oid=ss.resting_profit_limit_oid,
+                            old_px=_cur_px, new_sell_px=float(sell_px),
+                            reason=("sell_px changed since limit was "
+                                    "placed; cancelling to reprice."))
+                        ss.resting_profit_limit_oid = None
+                        ss.resting_profit_limit_px = None
+                        self._save_state()
+                        self._open_sells_cache = None
+                        _fall_through = True
+                    except Exception as _ce:
+                        self._record(
+                            "profit_lock_limit_reprice_cancel_failed",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            oid=ss.resting_profit_limit_oid,
+                            error=str(_ce), severity="warn")
+                        return  # leave tracked oid; retry next tick
+                else:
+                    return  # price still matches — leave as-is
+            elif status == "FILLED":
+                fill_price = st.get("average_filled_price")
+                try:
+                    fill_price = float(fill_price) if fill_price is not None else sell_px
+                except Exception:
+                    fill_price = sell_px
+                filled_qty = int(st.get("filled_qty") or sleeve_qty)
+                old_oid = ss.resting_profit_limit_oid
+                credited = self._credit_stop_fill(
+                    sc, ss, fill_price, filled_qty,
+                    source="profit_lock_limit", oid=old_oid)
+                if not credited:
+                    self._save_state()
+                    return
+                # Bracket: cancel co-resting stop-limit (only ONE can fire)
+                if ss.resting_stop_oid:
+                    try:
+                        self.b.cancel(ss.resting_stop_oid)
+                        self._record("bracket_stop_cancelled_on_profit_fill",
+                                     sleeve_id=sc.id, sleeve_name=sc.name,
+                                     cancelled_oid=ss.resting_stop_oid,
+                                     profit_fill_oid=old_oid,
+                                     reason=("profit-lock LIMIT filled at "
+                                             f"${fill_price}; cancelling co-"
+                                             "resting stop-limit per bracket "
+                                             "OCO design."))
+                    except Exception as _ce:
+                        self._record("bracket_stop_cancel_failed",
+                                     sleeve_id=sc.id, sleeve_name=sc.name,
+                                     oid=ss.resting_stop_oid, error=str(_ce),
+                                     severity="critical",
+                                     reason=("stop-limit cancel failed after "
+                                             "profit-lock fired; orphan stop "
+                                             "may fire → §3.8 short-risk. Next "
+                                             "tick's excess-cancel guard will "
+                                             "sweep."))
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
+                ss.own_avg_entry = None
+                ss.resting_profit_limit_oid = None
+                ss.resting_profit_limit_px = None
+                ss.state = SleeveStateEnum.ARMED_BUY
+                ss.armed_buy_since_ts = _time.time()
+                self._reset_cycle_state_post_sell(ss)
+                self._save_state()
+                self._open_sells_cache = None
+                return
+            elif status in ("CANCELLED", "EXPIRED"):
+                self._record("profit_lock_limit_external_cancel_cleared",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             oid=ss.resting_profit_limit_oid, status=status)
+                ss.resting_profit_limit_oid = None
+                ss.resting_profit_limit_px = None
+                self._save_state()
+                _fall_through = True
+            elif status == "OPEN":
+                pass  # already handled above
+            elif status == "FILLED":
+                pass  # already handled above (returned)
+            else:
+                return  # UNKNOWN/PENDING — retry next tick
+
+        if ss.resting_profit_limit_oid and not _fall_through:
+            return  # still tracked; nothing more to do
+
+        # No tracked oid (or just cleared) — try to ADOPT an existing matching LIMIT on the
+        # book, then PLACE fresh if none found.
+        try:
+            existing = self._broker_query_open_sells()
+        except Exception:
+            existing = []
+        tol = max(
+            float(getattr(self.cfg, "tick_size", 0.01) or 0.01) * 2,
+            float(sell_px) * 0.005,
+        )
+        adopted = False
+        for _o in existing:
+            if _o.get("kind") != "limit":
+                continue
+            if int(_o.get("size") or 0) != sleeve_qty:
+                continue
+            lp = float(_o.get("limit_price") or 0)
+            if lp > 0 and abs(lp - sell_px) <= tol:
+                ss.resting_profit_limit_oid = _o.get("order_id")
+                ss.resting_profit_limit_px = lp
+                self._record("profit_lock_limit_adopted_from_broker",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             oid=_o.get("order_id"),
+                             limit_px=lp, sell_px=float(sell_px),
+                             reason="matching LIMIT SELL already on book")
+                self._save_state()
+                self._open_sells_cache = None
+                adopted = True
+                break
+        if adopted:
+            return
+
+        # Place fresh LIMIT SELL at sell_px
+        try:
+            snapped = self._snap_to_tick(float(sell_px))
+        except Exception:
+            snapped = float(sell_px)
+        try:
+            oid = self.b.place_limit("SELL", sleeve_qty, float(snapped))
+            ss.resting_profit_limit_oid = oid
+            ss.resting_profit_limit_px = float(snapped)
+            self._record("profit_lock_limit_placed",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         oid=oid, sell_px=float(snapped),
+                         qty=sleeve_qty)
+            self._save_state()
+            self._open_sells_cache = None
+        except Exception as _e:
+            self._record("profit_lock_limit_place_failed",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         sell_px=float(snapped),
+                         error=str(_e), severity="critical",
+                         reason=("failed to place profit-lock LIMIT at "
+                                 "sell_px; retry next tick"))
+
     def _sleeve_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
         """Independent state machine for one additional sleeve. Shares broker,
         position, and floor guard with siblings and with the primary strategy."""
@@ -6466,6 +6655,12 @@ class SwingTrader:
         # Runs BEFORE the trigger-check paths so a fresh HWM tick propagates
         # to Coinbase within one tick. Failure falls back to bot-side stops.
         self._maintain_resting_stop(sc, ss, last_price)
+
+        # Adam 2026-07-21 PHASE A BRACKET: profit-lock LIMIT SELL at sell_px
+        # runs ALONGSIDE the protective stop-limit above. Together they form
+        # an OCO bracket (one cancels the other on fill). Fixes rule-#1
+        # violation where trail-past-sell put a "stop" above mark.
+        self._maintain_and_credit_profit_lock_limit(sc, ss, last_price)
 
         # [crew] Channel re-anchor: after a confirmed + settled drop, walk the
         # whole channel (buy/sell/trail + stop) down to the new level so nothing
@@ -7962,11 +8157,19 @@ class SwingTrader:
                             break
                 if _qty <= 0:
                     _qty = 1  # conservative fallback
+                # Adam 2026-07-21 Phase A bracket: kind distinguishes
+                # protective STOP-LIMIT (below mark, has stop_price) from
+                # profit-lock LIMIT (above mark, no stop trigger). Excess-
+                # cancel + pre-place guards filter on kind=="stop_limit"
+                # so a profit-lock LIMIT never gets misread as protective
+                # coverage that blocks stop placement.
+                _kind = "stop_limit" if _stop_px > 0 else "limit"
                 _orders.append({
                     "order_id": _o.get("order_id"),
                     "size": _qty,
                     "stop_price": _stop_px,
                     "limit_price": _limit_px,
+                    "kind": _kind,
                     "created_time": _o.get("created_time"),
                 })
         except Exception as _e:
@@ -7991,9 +8194,14 @@ class SwingTrader:
         stop which was likely placed against the earliest legitimate holder).
 
         Returns count of orders cancelled. Invalidates the cache on cancel."""
-        _open = self._broker_query_open_sells(force=True)
-        if not _open:
+        _open_all = self._broker_query_open_sells(force=True)
+        if not _open_all:
             return 0
+        # Adam 2026-07-21 PHASE A: only sum STOP-LIMITs when checking
+        # for excess. Profit-lock LIMITs are the other leg of the bracket
+        # (can only fire on price rise) and don't compete with protective
+        # stops for double-fire risk.
+        _open = [o for o in _open_all if o.get("kind") == "stop_limit"]
         _total = sum(int(o.get("size") or 0) for o in _open)
         if _total <= current_pos_qty:
             return 0

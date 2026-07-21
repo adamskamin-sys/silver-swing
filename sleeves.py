@@ -684,6 +684,14 @@ class SleeveState:
     resting_stop_oid: Optional[str] = None
     resting_stop_px: Optional[float] = None
     resting_stop_stage: Optional[str] = None
+    # Adam 2026-07-21 BRACKET DESIGN: separate profit-lock LIMIT SELL
+    # tracked independently from the protective stop-limit. The stop
+    # (resting_stop_oid above) always sits BELOW mark; the profit-lock
+    # LIMIT sits AT sell_px (above mark). Both coexist on the book; one
+    # cancels the other via bracket logic. Fixes rule-#1 violation where
+    # a trail-ratcheted "stop" was placed ABOVE mark.
+    resting_profit_limit_oid: Optional[str] = None
+    resting_profit_limit_px: Optional[float] = None
     # Adam 2026-07-15: dedup guard against double-credit. Every time
     # _credit_stop_fill successfully credits a fill, the resting_stop_oid
     # gets appended here. Both the tick path (_maybe_credit_resting_stop_fill)
@@ -736,6 +744,8 @@ class SleeveState:
             resting_stop_oid=d.get("resting_stop_oid"),
             resting_stop_px=d.get("resting_stop_px"),
             resting_stop_stage=d.get("resting_stop_stage"),
+            resting_profit_limit_oid=d.get("resting_profit_limit_oid"),
+            resting_profit_limit_px=d.get("resting_profit_limit_px"),
             # 2026-07-19: sell-side cost basis (nullable). Missing here
             # would corrupt realized-P/L on the next reload-on-tick cycle.
             sell_entry_avg=d.get("sell_entry_avg"),
