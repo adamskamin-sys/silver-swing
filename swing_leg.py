@@ -3194,18 +3194,79 @@ class SwingTrader:
         # CRITICAL: use current market as sold_ref, NOT ancient
         # last_sell_fill_price. See docstring for the ZEC trap.
         current_spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
+
+        # Adam 2026-07-21: multi-expert consensus decision BEFORE arm_level's
+        # Chan+Connors compute. expert_reentry gates on Vince cooldown +
+        # Wilder ADX + Kaufman KAMA ER + Faith breakout + Menkveld fee floor
+        # in addition to Chan/Connors. If any gate says WAIT or COOL_OFF,
+        # skip the re-arm this tick. Kill switch: expert_reentry.MODE = "off"
+        # falls back to legacy Chan+Connors path.
         try:
-            import arm_level as _al
-            new_buy_px = _al.pullback_buy_px(
-                history,
-                spread=current_spread,
-                sold_price=float(last_price),  # current market as reference
-            )
-        except Exception as e:
-            self._record("sleeve_auto_refresh_error", sleeve_id=sc.id,
-                         sleeve_name=sc.name, error=str(e))
-            ss._last_auto_refresh_ts = now
-            return
+            import expert_reentry as _er
+            if getattr(_er, "MODE", "expert") == "expert":
+                _sold_ref = float(ss.last_sell_fill_price or last_price)
+                _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+                _cs = self._get_contract_size()
+                _losing = int(getattr(ss, "cycles_losing_streak", 0) or 0)
+                _last_loss = getattr(ss, "last_loss_ts", None)
+                _decision = _er.compute_reentry_decision(
+                    prices=history,
+                    last_sell_price=_sold_ref,
+                    spread=current_spread,
+                    losing_streak=_losing,
+                    fee_per_roundtrip=_fee_rt,
+                    contract_size=_cs,
+                    qty=max(1, int(sc.qty or 1)),
+                    now_ts=now,
+                    last_loss_ts=_last_loss,
+                )
+                self._record(
+                    "expert_reentry_decision",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    action=_decision.action,
+                    buy_px=_decision.buy_px,
+                    wait_secs=_decision.wait_secs,
+                    citations=_decision.citations,
+                    expert_votes=_decision.expert_votes,
+                    losing_streak=_losing,
+                    last_loss_ts=_last_loss,
+                )
+                if _decision.action in ("wait", "cool_off"):
+                    # Skip re-arm; caller re-evaluates next tick (or after
+                    # wait_secs if we implement a cooldown timer follow-up).
+                    ss._last_auto_refresh_ts = now
+                    return
+                # action == "rebuy" — use decision.buy_px
+                if _decision.buy_px is not None and _decision.buy_px > 0:
+                    new_buy_px = float(_decision.buy_px)
+                else:
+                    # Consensus said rebuy but no valid price — fall through
+                    # to arm_level as safety net.
+                    new_buy_px = None
+            else:
+                new_buy_px = None
+        except Exception as _ee:
+            self._record("expert_reentry_error",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         error=str(_ee), severity="warn",
+                         reason="expert_reentry raised; falling back to arm_level")
+            new_buy_px = None
+
+        # Fallback: legacy Chan+Connors path (also used when
+        # expert_reentry.MODE == "off" or when consensus was inconclusive).
+        if new_buy_px is None:
+            try:
+                import arm_level as _al
+                new_buy_px = _al.pullback_buy_px(
+                    history,
+                    spread=current_spread,
+                    sold_price=float(last_price),
+                )
+            except Exception as e:
+                self._record("sleeve_auto_refresh_error", sleeve_id=sc.id,
+                             sleeve_name=sc.name, error=str(e))
+                ss._last_auto_refresh_ts = now
+                return
 
         if new_buy_px is None:
             ss._last_auto_refresh_ts = now
@@ -8482,6 +8543,11 @@ class SwingTrader:
                 ss.cycles_losing_streak = 0
             else:
                 ss.cycles_losing_streak = int(getattr(ss, "cycles_losing_streak", 0) or 0) + 1
+                # Adam 2026-07-21 (expert_reentry Vince gate): record when
+                # the losing cycle closed so Vince cooldown timer can compute
+                # elapsed time. Only bumped on losses; wins leave it alone.
+                import time as _tt
+                ss.last_loss_ts = _tt.time()
             # TCA slippage: compare fill price to sell_px (what we ARMED at).
             # Positive slippage = we filled BETTER than target (rare on limit).
             # Negative = we filled WORSE (market sell during a drop, penny-inside

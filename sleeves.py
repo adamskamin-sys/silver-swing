@@ -616,6 +616,11 @@ class SleeveState:
     # Realized_pnl at the moment the LAST cycle completed, so we can compute
     # each new cycle's delta and know whether it won or lost.
     last_cycle_realized: float = 0.0
+    # Adam 2026-07-21 (expert_reentry): timestamp of the most recent LOSING
+    # cycle completion. Feeds Vince (1990) Optimal-f cooldown gate — after
+    # N consecutive losses, wait _VINCE_COOLDOWN_SECS from this timestamp
+    # before re-arming. None = no losses recorded (fresh sleeve or all wins).
+    last_loss_ts: Optional[float] = None
     # Rolling per-cycle P&Ls (most recent last, capped at 20). Powers the
     # TCA display and the auto-disable decision — a sleeve losing 5 in a
     # row is much more obvious than eyeballing totals.
@@ -737,6 +742,7 @@ class SleeveState:
             post_trail_stage_b_ref_high=float(d.get("post_trail_stage_b_ref_high") or 0.0),
             cycles_losing_streak=int(d.get("cycles_losing_streak") or 0),
             last_cycle_realized=float(d.get("last_cycle_realized") or 0.0),
+            last_loss_ts=d.get("last_loss_ts"),
             recent_cycle_pnls=list(d.get("recent_cycle_pnls") or []),
             buy_trail_armed=bool(d.get("buy_trail_armed") or False),
             buy_trail_low_water=float(d.get("buy_trail_low_water") or 0.0),
