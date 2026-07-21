@@ -6707,7 +6707,15 @@ class SwingTrader:
         except Exception:
             snapped = float(sell_px)
         try:
-            oid = self.b.place_limit("SELL", sleeve_qty, float(snapped))
+            # Phase A BRACKET: include_pending=False so the broker's
+            # no_short_check doesn't count the co-resting STOP-LIMIT at
+            # stop_loss_px as coverage. Merton (1973) non-overlap: only
+            # one can fire from a continuous price path. Mutual exclusion
+            # for §3.8 is enforced above by resting_profit_limit_oid
+            # tracking + migration sweep for stale wrong-price LIMITs.
+            oid = self.b.place_limit(
+                "SELL", sleeve_qty, float(snapped),
+                include_pending=False)
             ss.resting_profit_limit_oid = oid
             ss.resting_profit_limit_px = float(snapped)
             self._record("profit_lock_limit_placed",

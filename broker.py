@@ -248,7 +248,8 @@ class CoinbaseBroker:
     # ---- Broker Protocol -------------------------------------------------
 
     def place_limit(self, side: str, qty: int, price: float,
-                    post_only: bool = False, client_order_id=None) -> str:
+                    post_only: bool = False, client_order_id=None,
+                    include_pending: bool = True) -> str:
         """Place a GTC limit order. Returns the exchange order_id.
 
         Idempotency: generates a fresh client_order_id (UUIDv4) per call. The
@@ -261,6 +262,18 @@ class CoinbaseBroker:
         buy leg (or above best_bid on a sell leg) fill normally; only orders
         that would immediately cross get rejected. Caller re-arms next tick
         with a slightly different price.
+
+        include_pending: when False, _no_short_check skips the pending-SELL
+        count (position check still holds). Adam 2026-07-21 PHASE A BRACKET:
+        Phase A places a LIMIT SELL at sell_px above mark ALONGSIDE the
+        STOP-LIMIT SELL at stop_loss_px below mark. Merton (1973) barrier-
+        option non-overlap guarantees only ONE can fire from a continuous
+        price path, so it's not actually a §3.8 short-risk — but the
+        broker's pending-SELL count doesn't know about the bracket pattern
+        and refuses. Set include_pending=False when the caller has its
+        OWN mutual-exclusion guard (Phase A uses ss.resting_profit_limit_
+        oid tracking + migration sweep for stale wrong-price LIMITs).
+        Matches place_stop_limit's existing include_pending=False default.
         """
         s = side.upper()
         if s not in ("BUY", "SELL"):
@@ -284,7 +297,8 @@ class CoinbaseBroker:
         # can't both pass the check before either shows up as pending.
         if s == "SELL":
             with self._sell_lock:
-                self._no_short_check(qty, kind="place_limit")
+                self._no_short_check(qty, kind="place_limit",
+                                     include_pending=include_pending)
                 # CRITICAL — order placement always proceeds even under budget pressure.
                 resp = _dump(self._rl_call(Priority.CRITICAL, EndpointKind.PRIVATE, method, **kwargs))
         else:
