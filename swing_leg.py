@@ -5430,32 +5430,51 @@ class SwingTrader:
                 except Exception:
                     _spot = False
                 if _spot:
-                    # Auto-heal: if a prior tick placed an emergency LIMIT
-                    # (before this spot-aware fix, or via manual state),
-                    # cancel it to free the locked qty so profit-lock LIMIT
-                    # at sell_px can place next tick.
-                    if ss.live_order_id and str(ss.resting_stop_stage or "").startswith("limit_breach"):
+                    # Auto-heal: if live_order_id points to an open SELL LIMIT
+                    # on Coinbase, it's a lingering emergency exit (from a
+                    # prior tick or pre-fix state). Cancel it so the profit-
+                    # lock LIMIT at sell_px can place next tick. Adam 2026-07-22
+                    # HARDENED: don't gate on resting_stop_stage — the stage
+                    # flag gets cleared by other paths (Phase A migration
+                    # sweep, transition cleanup) but the exchange order can
+                    # still be live. Poll broker truth via order_status.
+                    if ss.live_order_id:
                         try:
-                            self.b.cancel(ss.live_order_id)
-                            self._record(
-                                "trail_breach_emergency_limit_cancelled_spot",
-                                sleeve_id=sc.id, sleeve_name=sc.name,
-                                cancelled_oid=ss.live_order_id,
-                                stage=stage,
-                                severity="warn",
-                                reason=("SPOT: cancelling emergency LIMIT at "
-                                        "stop_loss_px to free funds for the "
-                                        "profit-lock LIMIT at sell_px. Spot "
-                                        "OCO limitation — one SELL LIMIT slot."))
+                            _st = self.b.order_status(ss.live_order_id) or {}
+                        except Exception:
+                            _st = {}
+                        _stat = _st.get("status")
+                        if _stat in ("OPEN", "PENDING", "QUEUED"):
+                            try:
+                                self.b.cancel(ss.live_order_id)
+                                self._record(
+                                    "trail_breach_emergency_limit_cancelled_spot",
+                                    sleeve_id=sc.id, sleeve_name=sc.name,
+                                    cancelled_oid=ss.live_order_id,
+                                    stage=stage,
+                                    prior_stage=str(ss.resting_stop_stage or ""),
+                                    broker_status=str(_stat),
+                                    severity="warn",
+                                    reason=("SPOT: cancelling live LIMIT SELL "
+                                            "(live_order_id) to free funds for "
+                                            "the profit-lock LIMIT at sell_px. "
+                                            "Spot OCO limitation — one SELL "
+                                            "LIMIT slot."))
+                                ss.live_order_id = None
+                                ss.resting_stop_stage = None
+                                ss.resting_stop_px = None
+                                self._open_sells_cache = None
+                            except Exception as _ce:
+                                self._record(
+                                    "trail_breach_emergency_limit_cancel_failed_spot",
+                                    sleeve_id=sc.id, sleeve_name=sc.name,
+                                    oid=ss.live_order_id, error=str(_ce),
+                                    severity="critical")
+                        elif _stat in ("FILLED", "CANCELLED", "EXPIRED"):
+                            # Order already gone — just clear stale tracking.
                             ss.live_order_id = None
                             ss.resting_stop_stage = None
                             ss.resting_stop_px = None
-                        except Exception as _ce:
-                            self._record(
-                                "trail_breach_emergency_limit_cancel_failed_spot",
-                                sleeve_id=sc.id, sleeve_name=sc.name,
-                                oid=ss.live_order_id, error=str(_ce),
-                                severity="critical")
                     self._record(
                         "trail_breach_skipped_spot",
                         sleeve_id=sc.id, sleeve_name=sc.name,
