@@ -6501,6 +6501,18 @@ class SwingTrader:
                 ss.resting_stop_oid = None
                 ss.resting_stop_px = None
                 ss.resting_stop_stage = None
+                # Adam 2026-07-22 XPP PHANTOM-CYCLE FIX: also clear
+                # resting_profit_limit_oid when the dedup-skipped oid is a
+                # profit-lock fill. Prior code only cleared resting_stop_oid,
+                # so on profit_lock_limit dedup the stale filled oid stayed in
+                # resting_profit_limit_oid → next tick re-polled it → dedup
+                # again → infinite loop. XPP 2026-07-22 emitted 66 phantom
+                # cycles in 30 min at ~$2.92 each = ~$193 phantom realized_pnl
+                # because credited_oids didn't persist across reloads AND
+                # this branch didn't clear the profit-lock tracking.
+                if source == "profit_lock_limit":
+                    ss.resting_profit_limit_oid = None
+                    ss.resting_profit_limit_px = None
                 ss.state = SleeveStateEnum.ARMED_BUY
                 ss.armed_buy_since_ts = _time_dedup.time()
                 # Reset cycle-scoped state too (mirror the successful-credit path)
@@ -6885,6 +6897,36 @@ class SwingTrader:
                     fill_price = sell_px
                 filled_qty = int(st.get("filled_qty") or sleeve_qty)
                 old_oid = ss.resting_profit_limit_oid
+                # Adam 2026-07-22 XPP PHANTOM-CYCLE ROOT FIX: check credited_oids
+                # BEFORE calling _credit_stop_fill. If this oid was already
+                # credited (e.g. from a much-earlier legitimate fill whose
+                # tracking never got cleared), unconditionally clear
+                # resting_profit_limit_oid and return — do NOT re-credit and
+                # do NOT emit sleeve_cycle_completed. XPP loop: same oid
+                # 9063b40c-e4b was polled and "credited" 66 times in 30 min
+                # because credited_oids dedup wasn't sticking across reloads.
+                # This pre-check short-circuits the whole path so a broken
+                # dedup state can't inflate realized_pnl.
+                _already = list(getattr(ss, "credited_oids", None) or [])
+                if old_oid in _already:
+                    self._record(
+                        "profit_lock_limit_stale_filled_oid_cleared",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        stale_oid=old_oid, fill_price=fill_price,
+                        severity="warn",
+                        reason=("stale ss.resting_profit_limit_oid pointed at "
+                                "an already-credited FILLED order. Clearing "
+                                "tracking so fresh profit-lock LIMIT can place "
+                                "next tick. Prior code re-credited each poll → "
+                                "phantom cycle_completed events + inflated "
+                                "realized_pnl (XPP 2026-07-22 root)."))
+                    ss.resting_profit_limit_oid = None
+                    ss.resting_profit_limit_px = None
+                    try:
+                        self._save_state()
+                    except Exception:
+                        pass
+                    return
                 credited = self._credit_stop_fill(
                     sc, ss, fill_price, filled_qty,
                     source="profit_lock_limit", oid=old_oid)
