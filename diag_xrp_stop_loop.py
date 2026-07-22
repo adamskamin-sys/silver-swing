@@ -26,13 +26,16 @@ def main():
     events = log.tail(10000)
     now = time.time()
 
-    # Match any XRP product id shape
+    # Match any XRP product id shape — including XPP alias per
+    # project_xpp_xrp_alias memory (Coinbase display "XRP PERP CDE"
+    # is internal product_id XPP-20DEC30-CDE).
     xrp = [e for e in events
-           if "XRP" in str(e.get("symbol") or "").upper()
+           if (any(k in str(e.get("symbol") or "").upper()
+                    for k in ("XRP", "XPP")))
            and float(e.get("ts") or 0) >= now - 1800]
 
     if not xrp:
-        print("no XRP events in last 30min")
+        print("no XRP/XPP events in last 30min")
         return
 
     print("=" * 96)
