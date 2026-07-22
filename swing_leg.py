@@ -5589,6 +5589,48 @@ class SwingTrader:
                          sleeve_id=sc.id, sleeve_name=sc.name,
                          target_px=target_px, last_price=last_price, stage=stage)
             return
+        # Adam 2026-07-22 EMERGENCY-LIMIT TRANSITION CLEANUP: we reached
+        # this line because target_px < last_price (mark bounced above the
+        # protective stop). If a prior tick placed an emergency LIMIT via
+        # trail_breach and it's still tracked in live_order_id, cancel it
+        # before placing a fresh STOP-LIMIT — otherwise Coinbase would have
+        # BOTH orders live at ~stop_loss_px, and when mark drops back to the
+        # trigger both would fire: STOP-LIMIT triggers + fills to close the
+        # position, then emergency LIMIT fires against zero position →
+        # §3.8 SHORT. Cite: Merton (1973) barrier options require terminal-
+        # state partition; two barriers at the same price break that.
+        if ss.live_order_id and str(ss.resting_stop_stage or "").startswith("limit_breach"):
+            _emerg_oid = ss.live_order_id
+            try:
+                self.b.cancel(_emerg_oid)
+                self._record(
+                    "trail_breach_emergency_limit_cleared_on_transition",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    cancelled_oid=_emerg_oid,
+                    prior_stage=str(ss.resting_stop_stage),
+                    severity="info",
+                    reason=("mark bounced above stop_loss_px; cancelling "
+                            "emergency LIMIT so fresh STOP-LIMIT doesn't "
+                            "coexist with it (would double-fire → §3.8 "
+                            "SHORT when mark drops back to trigger)."))
+                ss.live_order_id = None
+                ss.resting_stop_stage = None
+                ss.resting_stop_px = None
+                self._open_sells_cache = None
+                try:
+                    self._save_state()
+                except Exception:
+                    pass
+            except Exception as _ce:
+                self._record(
+                    "trail_breach_emergency_limit_cleanup_failed",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    oid=_emerg_oid, error=str(_ce),
+                    severity="critical",
+                    reason=("cleanup cancel failed; skipping STOP-LIMIT "
+                            "placement this tick to avoid §3.8 co-existence. "
+                            "Retry next tick."))
+                return
         # Fresh place — no existing resting order.
         if not ss.resting_stop_oid:
             # Adam 2026-07-20 ROOT FIX (MC/HYF/XLM "NOT PLACED" chip class):
