@@ -5398,7 +5398,18 @@ class SwingTrader:
         # Trading (Cambridge 2015), ch.10 — stop-triggered execution
         # requires marketable orders when the trigger sits above prevailing
         # mid; limit orders above mid gap into fills, market is deterministic.
-        if target_px >= last_price:
+        # Adam 2026-07-22 STALE-MARK GUARD: only trigger a breach if we have
+        # a fresh, positive last_price. When a tick fires before the mark
+        # feed has populated (last_price=0.0), `target_px >= last_price`
+        # trivially matches for any positive target — causing spurious
+        # trail_breach fires. HYF-31JUL26-CDE 2026-07-22 root cause: the
+        # inverted-bracket guard correctly nulled stop_loss_px=$61.81 and
+        # expert fallback set target_px=$58.13, but last_price arrived as
+        # 0.0 on some ticks → trail_breach fired at $58.13 anyway →
+        # profit-lock migration sweep cascaded (previously). Feed-freshness
+        # is a WebSocket concern; missing marks are a §3.6 signal to skip
+        # this tick, not to fire. Next tick with fresh mark handles it.
+        if target_px >= last_price and last_price > 0:
             _trail_stages_needing_market_exit = {
                 "trail", "trail_pre_goal", "trail_floored_at_sell",
                 "trail_floored_at_break_even", "break_even_lock",
