@@ -6607,6 +6607,44 @@ class SwingTrader:
             filled_qty=filled_qty, profit=profit, oid=oid,
             new_realized=ss.realized_pnl, new_cycles=ss.cycles,
         )
+        # Adam 2026-07-22 AUDIT UNDERCOUNT FIX: also emit sleeve_cycle_completed
+        # so audit/tuner/dashboard consumers see this fill as a cycle. Prior to
+        # Phase A, all sell fills flowed through _sleeve_on_fill which emitted
+        # sleeve_cycle_completed. Phase A moved take-profit fills onto the
+        # profit-lock LIMIT (tracked in resting_profit_limit_oid) and STOP-LIMIT
+        # fills onto resting_stop_oid — both crediting via THIS helper, which
+        # only emits resting_stop_filled_credited. Result: diag_audit reported
+        # "no cycles completed 24h" while Coinbase fills showed active trading.
+        # Emit with matching field names (cycle_pnl, cost_basis, gross, fees)
+        # so all downstream consumers see a consistent cycle event.
+        try:
+            _expected_sell_px = float(getattr(sc, "sell_px", 0) or 0)
+            _slip_price = fill_price - _expected_sell_px if _expected_sell_px > 0 else 0.0
+            _slip_dollars = _slip_price * contract_size * filled_qty
+            self._record(
+                "sleeve_cycle_completed",
+                sleeve_id=sc.id, sleeve_name=sc.name,
+                cycles=ss.cycles,
+                cost_basis=own_avg, fill_price=fill_price,
+                gross=gross, fees=half_fee,
+                realized_pnl_total=ss.realized_pnl,
+                cycle_pnl=round(profit, 4),
+                cycles_losing_streak=int(getattr(ss, "cycles_losing_streak", 0) or 0),
+                expected_sell_px=_expected_sell_px,
+                slippage_price=round(_slip_price, 4),
+                slippage_dollars=round(_slip_dollars, 2),
+                source=source,
+                credited_via=source,  # "tick" | "reconcile" | "profit_lock_limit"
+                oid=oid,
+            )
+        except Exception as _cce:
+            # Never fail-hard on telemetry emission.
+            try:
+                self._record("sleeve_cycle_completed_emit_failed",
+                             sleeve_id=sc.id, sleeve_name=sc.name,
+                             error=str(_cce), severity="warn")
+            except Exception:
+                pass
         return True
 
     def _maybe_credit_resting_stop_fill(self, sc: SleeveConfig, ss: SleeveState) -> None:
