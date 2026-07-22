@@ -2100,6 +2100,55 @@ function totalCyclesForProduct(productId, tenantFilter) {
   return total;
 }
 
+// Adam 2026-07-22: scanner "already holding" indicator. Checks two sources:
+//   1. Live tenant's __portfolio__.derivatives (qty > 0 on this product_id).
+//      Cross-tenant authoritative — updated every 2 min by main.py's
+//      refresh_portfolio_snapshot.
+//   2. Any sleeve on any tenant with own_avg_entry set for this product
+//      (catches the case where portfolio snapshot is stale but a fresh fill
+//      just landed).
+// Returns { held: bool, qty: number, own_avg: number, source: str }.
+function isProductHeld(productId) {
+  const store = currentStore || {};
+  // 1. Portfolio snapshot
+  for (const tenant of Object.keys(store)) {
+    const pf = store[tenant]?.['__portfolio__']?.config;
+    if (!pf) continue;
+    const derivs = pf.derivatives || [];
+    const row = derivs.find(d => d.product_id === productId);
+    if (row && Math.abs(Number(row.qty) || 0) > 0) {
+      return {
+        held: true,
+        qty: Number(row.qty) || 0,
+        own_avg: Number(row.avg_entry) || 0,
+        source: 'portfolio',
+      };
+    }
+    // Spot balance check — non-derivatives products (product_id like BASE-USD)
+    // don't appear in derivatives. Fall through; sleeve check below covers.
+  }
+  // 2. Sleeve state
+  for (const tenant of Object.keys(store)) {
+    const entry = store[tenant]?.[productId];
+    if (!entry) continue;
+    const state = entry.state || {};
+    const sleeves = state.sleeves || {};
+    for (const sid of Object.keys(sleeves)) {
+      const ss = sleeves[sid];
+      const oa = Number(ss?.own_avg_entry) || 0;
+      if (oa > 0) {
+        return { held: true, qty: 1, own_avg: oa, source: 'sleeve' };
+      }
+    }
+    // Primary-level own_avg_entry (legacy path)
+    const primAvg = Number(state.own_avg_entry) || 0;
+    if (primAvg > 0) {
+      return { held: true, qty: 1, own_avg: primAvg, source: 'primary_sleeve' };
+    }
+  }
+  return { held: false, qty: 0, own_avg: 0, source: 'none' };
+}
+
 // Fetch scanner-ranked derivatives once and render them into the Live tab.
 // Runs after renderLivePortfolio has injected the placeholder <div>. Cached
 // briefly so switching asset-class subtabs doesn't spam Coinbase.
@@ -3419,9 +3468,22 @@ function renderScannerClassTable(tableId, rows) {
       ? `<span title="Capital required to hold ONE ${unitLabel}. ${isFuture ? 'Initial margin (intraday_rate × price × contract_size)' : 'Full notional (price × 1, spot has no margin)'}. Contract size: ${row.contract_size || 1}">${fmtMoney(costPerContract)}</span>`
       : '<span class="dim">—</span>';
     // Product cell: show base pretty; add USD/USDC alt-quote badge if deduped
-    const displayPid = row.alt_quotes && row.alt_quotes.length
+    const displayPidBase = row.alt_quotes && row.alt_quotes.length
       ? `${escapeHtml(row.product_id)} <span class="dim" style="font-size:0.85em" title="Also available as: ${row.alt_quotes.map(q => `${row.product_id.split('-')[0]}-${q}`).join(', ')}">+${row.alt_quotes.join('/')}</span>`
       : escapeHtml(row.product_id);
+    // Adam 2026-07-22: "HELD" indicator — tells Adam at a glance if the
+    // scanner is showing a product he already has a position on. Uses
+    // isProductHeld helper (portfolio + sleeve state cross-check).
+    let heldBadge = '';
+    try {
+      const heldInfo = isProductHeld(row.product_id);
+      if (heldInfo.held) {
+        const qtyStr = heldInfo.qty > 1 ? ` ×${heldInfo.qty}` : '';
+        const avgStr = heldInfo.own_avg > 0 ? ` @ $${fmtNum(heldInfo.own_avg, 6)}` : '';
+        heldBadge = ` <span class="pos" style="font-size:0.85em;padding:1px 6px;border-radius:3px;" title="You are already holding this contract (source: ${heldInfo.source}${avgStr})">✓ HELD${qtyStr}</span>`;
+      }
+    } catch (_e) { /* fail-open — indicator is informational, never block render */ }
+    const displayPid = displayPidBase + heldBadge;
     tr.innerHTML = `
       <td>${i + 1}</td>
       <td class="mono">${displayPid}</td>
