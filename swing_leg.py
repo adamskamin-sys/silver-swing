@@ -6963,12 +6963,77 @@ class SwingTrader:
             self._save_state()
             self._open_sells_cache = None
         except Exception as _e:
+            _err_s = str(_e)
             self._record("profit_lock_limit_place_failed",
                          sleeve_id=sc.id, sleeve_name=sc.name,
                          sell_px=float(snapped),
-                         error=str(_e), severity="critical",
+                         error=_err_s, severity="critical",
                          reason=("failed to place profit-lock LIMIT at "
                                  "sell_px; retry next tick"))
+            # Adam 2026-07-22 SPOT INSUFFICIENT_FUND SELF-HEAL: on spot, an
+            # INSUFFICIENT_FUND error means another SELL LIMIT is locking
+            # the underlying qty. Find the blocker on the book and cancel
+            # it so next tick can place. Recognizes the blocker as any
+            # LIMIT SELL at our sleeve_qty (or larger) that isn't at
+            # sell_px (i.e., the emergency LIMIT at stop_loss_px lingering
+            # from before this fix). Free the funds, retry next tick.
+            try:
+                _spot_here = (self.b._is_spot_product()
+                              if hasattr(self.b, "_is_spot_product") else False)
+            except Exception:
+                _spot_here = False
+            if _spot_here and "INSUFFICIENT_FUND" in _err_s.upper():
+                try:
+                    _blockers = self._broker_query_open_sells(force=True) or []
+                except Exception:
+                    _blockers = []
+                for _bo in _blockers:
+                    if _bo.get("kind") != "limit":
+                        continue
+                    _bsz = int(_bo.get("size") or 0)
+                    if _bsz <= 0:
+                        continue
+                    _blp = float(_bo.get("limit_price") or 0)
+                    if _blp <= 0:
+                        continue
+                    # Skip anything already at correct sell_px (adopt path
+                    # would have caught it before place). Actively cancel
+                    # anything else on our qty — that's the blocker.
+                    if abs(_blp - sell_px) <= tol:
+                        continue
+                    _boid = _bo.get("order_id")
+                    if not _boid:
+                        continue
+                    try:
+                        self.b.cancel(_boid)
+                        self._record(
+                            "profit_lock_limit_blocker_cancelled_spot",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            cancelled_oid=_boid,
+                            blocker_px=_blp,
+                            blocker_size=_bsz,
+                            sell_px=float(sell_px),
+                            severity="warn",
+                            reason=("SPOT INSUFFICIENT_FUND: cancelling "
+                                    "LIMIT SELL blocking profit-lock. Next "
+                                    "tick retries place at sell_px."))
+                        # If the blocker matches our tracked live_order_id,
+                        # clear tracking too.
+                        if _boid == getattr(ss, "live_order_id", None):
+                            ss.live_order_id = None
+                            ss.resting_stop_stage = None
+                            ss.resting_stop_px = None
+                        self._open_sells_cache = None
+                        try:
+                            self._save_state()
+                        except Exception:
+                            pass
+                    except Exception as _bce:
+                        self._record(
+                            "profit_lock_limit_blocker_cancel_failed_spot",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            oid=_boid, error=str(_bce),
+                            severity="critical")
 
     def _sleeve_step(self, sc: SleeveConfig, ss: SleeveState, last_price: float) -> None:
         """Independent state machine for one additional sleeve. Shares broker,
