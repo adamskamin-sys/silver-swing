@@ -6897,16 +6897,45 @@ class SwingTrader:
                     fill_price = sell_px
                 filled_qty = int(st.get("filled_qty") or sleeve_qty)
                 old_oid = ss.resting_profit_limit_oid
-                # Adam 2026-07-22 XPP PHANTOM-CYCLE ROOT FIX: check credited_oids
-                # BEFORE calling _credit_stop_fill. If this oid was already
-                # credited (e.g. from a much-earlier legitimate fill whose
-                # tracking never got cleared), unconditionally clear
-                # resting_profit_limit_oid and return — do NOT re-credit and
-                # do NOT emit sleeve_cycle_completed. XPP loop: same oid
-                # 9063b40c-e4b was polled and "credited" 66 times in 30 min
-                # because credited_oids dedup wasn't sticking across reloads.
-                # This pre-check short-circuits the whole path so a broken
-                # dedup state can't inflate realized_pnl.
+                # Adam 2026-07-22 STALE-FILL GUARD (v2): check the FILLED order's
+                # ACTUAL fill_time. If it's more than 5 minutes ago, treat as
+                # stale — clear tracking and return without crediting. Robust
+                # to credited_oids not persisting across reloads (root cause
+                # of the XPP 66-cycle phantom loop). A real profit-lock fill
+                # gets credited within a tick or two of firing (<10s), so a
+                # 5-min-old FILLED status can only mean stale-tracking-oid.
+                import time as _time_stale
+                _fill_epoch = None
+                try:
+                    _last_fill_time = (st or {}).get("last_fill_time") or ""
+                    if _last_fill_time:
+                        import datetime as _dt_stale
+                        _fill_epoch = _dt_stale.datetime.fromisoformat(
+                            str(_last_fill_time).replace("Z", "+00:00")
+                        ).timestamp()
+                except Exception:
+                    _fill_epoch = None
+                if _fill_epoch and (_time_stale.time() - _fill_epoch > 300):
+                    self._record(
+                        "profit_lock_limit_stale_filled_oid_cleared",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        stale_oid=old_oid, fill_price=fill_price,
+                        fill_age_sec=int(_time_stale.time() - _fill_epoch),
+                        severity="warn",
+                        reason=(f"FILLED oid is {int(_time_stale.time() - _fill_epoch)}s "
+                                "old — much older than any real profit-lock "
+                                "fill latency. Stale tracking. Clearing so "
+                                "fresh profit-lock LIMIT can place next tick. "
+                                "Prevents phantom cycle_completed / inflated "
+                                "realized_pnl from re-crediting historical fills."))
+                    ss.resting_profit_limit_oid = None
+                    ss.resting_profit_limit_px = None
+                    try:
+                        self._save_state()
+                    except Exception:
+                        pass
+                    return
+                # Fallback: also check credited_oids (belt-and-suspenders).
                 _already = list(getattr(ss, "credited_oids", None) or [])
                 if old_oid in _already:
                     self._record(
