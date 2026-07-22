@@ -58,6 +58,13 @@ def check_orphans_and_missing(open_orders, sleeves):
         rsoid = s.get("resting_stop_oid")
         if rsoid:
             live_ids.add(rsoid)
+        # Adam 2026-07-22 PHASE A FIX: recognize Phase A profit-lock LIMITs
+        # (tracked in resting_profit_limit_oid) as legit. Without this,
+        # every profit-lock LIMIT at sell_px flagged as an orphan on every
+        # reconcile sweep — noise that drowned real orphans.
+        rpid = s.get("resting_profit_limit_oid")
+        if rpid:
+            live_ids.add(rpid)
     open_ids = {o["order_id"] for o in open_orders}
     out = []
     for o in open_orders:

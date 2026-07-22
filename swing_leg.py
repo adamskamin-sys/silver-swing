@@ -6753,6 +6753,19 @@ class SwingTrader:
                 continue
             if abs(lp - sell_px) <= tol:
                 continue  # matches — already handled by adoption block above
+            # Adam 2026-07-22 CANCEL-LOOP FIX: only cancel LIMITs at prices
+            # ABOVE sell_px. LIMITs BELOW sell_px are trail_breach emergency
+            # exits at stop_loss_px, placed when mark dropped below the
+            # protective stop-limit's trigger and Coinbase can't accept a
+            # new stop-limit trigger above mark. Cancelling them re-opens
+            # the §3.6 hole every tick. Truly-stale residue is only the
+            # ABOVE-sell_px case (pre-Phase-A trail-ratcheted exits). Also
+            # skip our own tracked live_order_id — that's a live emergency
+            # exit we placed this tick.
+            if lp < sell_px:
+                continue  # emergency exit LIMIT (trail_breach hard_bottom)
+            if _o.get("order_id") == getattr(ss, "live_order_id", None):
+                continue  # own emergency LIMIT tracked in live_order_id
             _stale_oid = _o.get("order_id")
             if not _stale_oid:
                 continue
@@ -6764,8 +6777,8 @@ class SwingTrader:
                     cancelled_oid=_stale_oid,
                     stale_px=lp, correct_sell_px=float(sell_px),
                     severity="critical",
-                    reason=("stale LIMIT SELL at wrong price (likely pre-"
-                            "Phase-A trail-breach residue). Cancelled to "
+                    reason=("stale LIMIT SELL at price ABOVE sell_px (pre-"
+                            "Phase-A trail-ratcheted residue). Cancelled to "
                             "prevent §3.8 double-fire when the fresh Phase A "
                             "LIMIT at correct sell_px is placed."))
             except Exception as _ce:

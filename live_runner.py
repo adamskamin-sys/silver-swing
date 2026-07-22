@@ -210,15 +210,27 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
             for sid, ss in (state.get("sleeves") or {}).items():
                 if not isinstance(ss, dict):
                     continue
-                for k in ("live_order_id", "resting_stop_oid"):
+                # Adam 2026-07-22 PHASE A FIX: include resting_profit_limit_oid.
+                # Previously only tracked live_order_id + resting_stop_oid, so
+                # Phase A profit-lock LIMITs (at sell_px, tracked in
+                # resting_profit_limit_oid) showed as "orphan SELL" on every
+                # boot orphan-sweep. Sweep cancelled them as "would flip account
+                # short", which then triggered a same-tick cascade in
+                # _maintain_and_credit_profit_lock_limit: status=CANCELLED →
+                # fall_through → migration-sweep → cancelled the trail_breach
+                # emergency LIMIT → §3.6 hole (stop-limit gone, replacement path
+                # RETURNs before PLACE section). Root cause of the 2026-07-22
+                # CHN/HYF/META/HIGH-USD trail_breach loop.
+                for k in ("live_order_id", "resting_stop_oid",
+                          "resting_profit_limit_oid"):
                     v = ss.get(k)
                     if v:
                         known_oids.add(str(v))
                         # Track side/product for duplicate detection.
-                        # resting_stop_oid → SELL. live_order_id side
-                        # inferred from state.state (ARMED_SELL → SELL,
-                        # ARMED_BUY → BUY).
-                        if k == "resting_stop_oid":
+                        # resting_stop_oid + resting_profit_limit_oid → SELL.
+                        # live_order_id side inferred from state.state
+                        # (ARMED_SELL → SELL, ARMED_BUY → BUY).
+                        if k in ("resting_stop_oid", "resting_profit_limit_oid"):
                             side_of = "SELL"
                         else:
                             st = str(ss.get("state") or "").upper()
@@ -2133,6 +2145,10 @@ def run() -> int:
                                 # stop got reported as "orphan" — drowning
                                 # genuine orphans in noise.
                                 "resting_stop_oid": s_st.get("resting_stop_oid"),
+                                # Adam 2026-07-22 PHASE A FIX: include the
+                                # profit-lock LIMIT oid so reconciliation_monitor
+                                # doesn't flag it as orphan every sweep.
+                                "resting_profit_limit_oid": s_st.get("resting_profit_limit_oid"),
                                 "armed_at": s_st.get("armed_buy_since_ts"),
                                 "last_sale_px": s_st.get("last_sell_fill_price"),
                             })
