@@ -6906,28 +6906,53 @@ class SwingTrader:
                 # 5-min-old FILLED status can only mean stale-tracking-oid.
                 import time as _time_stale
                 _fill_epoch = None
+                _epoch_source = None
                 try:
-                    _last_fill_time = (st or {}).get("last_fill_time") or ""
-                    if _last_fill_time:
-                        import datetime as _dt_stale
-                        _fill_epoch = _dt_stale.datetime.fromisoformat(
-                            str(_last_fill_time).replace("Z", "+00:00")
-                        ).timestamp()
+                    # Prefer last_fill_time (when the actual fill happened);
+                    # fall back to created_time (when we placed the order).
+                    # For a stale profit-lock oid, either being >5min proves
+                    # this fill is historical.
+                    for _fld in ("last_fill_time", "created_time"):
+                        _val = (st or {}).get(_fld) or ""
+                        if _val:
+                            import datetime as _dt_stale
+                            _fill_epoch = _dt_stale.datetime.fromisoformat(
+                                str(_val).replace("Z", "+00:00")
+                            ).timestamp()
+                            _epoch_source = _fld
+                            break
                 except Exception:
                     _fill_epoch = None
+                # Diagnostic emit — if we can't determine age, we need to know.
+                if _fill_epoch is None:
+                    try:
+                        self._record(
+                            "profit_lock_stale_guard_no_timestamp",
+                            sleeve_id=sc.id, sleeve_name=sc.name,
+                            oid=old_oid,
+                            st_keys=list((st or {}).keys()),
+                            severity="critical",
+                            reason=("stale-fill guard cannot determine fill "
+                                    "age; broker.order_status did not return "
+                                    "last_fill_time or created_time. Cannot "
+                                    "safeguard against re-crediting historical "
+                                    "fills without a timestamp."))
+                    except Exception:
+                        pass
                 if _fill_epoch and (_time_stale.time() - _fill_epoch > 300):
                     self._record(
                         "profit_lock_limit_stale_filled_oid_cleared",
                         sleeve_id=sc.id, sleeve_name=sc.name,
                         stale_oid=old_oid, fill_price=fill_price,
                         fill_age_sec=int(_time_stale.time() - _fill_epoch),
+                        age_from=_epoch_source,
                         severity="warn",
                         reason=(f"FILLED oid is {int(_time_stale.time() - _fill_epoch)}s "
-                                "old — much older than any real profit-lock "
-                                "fill latency. Stale tracking. Clearing so "
-                                "fresh profit-lock LIMIT can place next tick. "
-                                "Prevents phantom cycle_completed / inflated "
-                                "realized_pnl from re-crediting historical fills."))
+                                f"old (from {_epoch_source}) — much older "
+                                "than any real profit-lock fill latency. "
+                                "Stale tracking. Clearing so fresh profit-lock "
+                                "LIMIT can place next tick. Prevents phantom "
+                                "cycle_completed / inflated realized_pnl."))
                     ss.resting_profit_limit_oid = None
                     ss.resting_profit_limit_px = None
                     try:
