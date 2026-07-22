@@ -591,6 +591,11 @@ class CoinbaseBroker:
             "filled_qty": filled,
             "raw_status": raw,
             "average_filled_price": order.get("average_filled_price"),
+            # Adam 2026-07-22 XPP stale-fill guard needs the actual fill
+            # timestamp to detect resting_profit_limit_oid pointing at a
+            # long-ago FILLED order. Pass through Coinbase's field.
+            "last_fill_time": order.get("last_fill_time"),
+            "created_time": order.get("created_time"),
         }
 
     def cancel(self, order_id: str) -> None:
