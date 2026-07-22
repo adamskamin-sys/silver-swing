@@ -4902,6 +4902,56 @@ class SwingTrader:
         No-short guard in broker.place_stop_limit ensures qty ≤ position."""
         if not getattr(sc, "resting_stop_enabled", True):
             return
+        # Adam 2026-07-22 SPOT PHASE A: on spot products, do NOT place or
+        # maintain STOP-LIMITs. Spot Coinbase reserves funds for STOP-LIMITs
+        # at placement (not just at trigger), so a STOP-LIMIT SELL for
+        # sleeve_qty locks all our tokens — blocking the profit-lock LIMIT
+        # at sell_px with INSUFFICIENT_FUND. HIGH-USD 2026-07-22 root cause:
+        # STOP-LIMIT SELL 2500 @ trigger $0.02386 locked all 2500 HIGH,
+        # profit-lock LIMIT 2500 @ $0.03052 failed every tick for hours.
+        # Per Adam 2026-07-22 spot design decision (option 4), profit-lock
+        # LIMIT at sell_px is the sole SELL — take-profit at its best
+        # (Adam "biggest rule"). Real loss protection on spot needs a
+        # separate design; today's trade-off accepted.
+        try:
+            _spot = (self.b._is_spot_product()
+                     if hasattr(self.b, "_is_spot_product") else False)
+        except Exception:
+            _spot = False
+        if _spot:
+            # Log once (info-level) so telemetry shows we ran but skipped.
+            # If a STOP-LIMIT is already on the book (e.g. adopted from
+            # broker or placed by a pre-fix session), cancel it so funds
+            # release for the profit-lock LIMIT.
+            if ss.resting_stop_oid:
+                _rs_oid = ss.resting_stop_oid
+                try:
+                    self.b.cancel(_rs_oid)
+                    self._record(
+                        "resting_stop_cancelled_spot_release_funds",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        cancelled_oid=_rs_oid,
+                        severity="warn",
+                        reason=("SPOT: cancelling STOP-LIMIT to release "
+                                "locked funds for profit-lock LIMIT at "
+                                "sell_px. Spot OCO limitation — one SELL "
+                                "order slot; Adam 2026-07-22 chose "
+                                "profit-lock over stop."))
+                    ss.resting_stop_oid = None
+                    ss.resting_stop_px = None
+                    ss.resting_stop_stage = None
+                    self._open_sells_cache = None
+                    try:
+                        self._save_state()
+                    except Exception:
+                        pass
+                except Exception as _ce:
+                    self._record(
+                        "resting_stop_cancel_spot_release_failed",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        oid=_rs_oid, error=str(_ce),
+                        severity="critical")
+            return
         # Only maintain a resting stop while we have a real position.
         try:
             pos_qty = int(self.b.position_qty() or 0)
@@ -7037,19 +7087,28 @@ class SwingTrader:
                 except Exception:
                     _blockers = []
                 for _bo in _blockers:
-                    if _bo.get("kind") != "limit":
+                    # Adam 2026-07-22 HIGH-USD FIX: extend to STOP-LIMIT
+                    # blockers, not just LIMIT. On spot, STOP-LIMIT SELL
+                    # reserves funds at placement (not just at trigger),
+                    # so a STOP-LIMIT SELL for sleeve_qty locks all our
+                    # tokens. HIGH-USD 2026-07-22: STOP-LIMIT SELL 2500
+                    # locked all 2500 HIGH, profit-lock failed every tick.
+                    _bkind = _bo.get("kind") or ""
+                    if _bkind not in ("limit", "stop_limit"):
                         continue
                     _bsz = int(_bo.get("size") or 0)
                     if _bsz <= 0:
                         continue
                     _blp = float(_bo.get("limit_price") or 0)
-                    if _blp <= 0:
-                        continue
-                    # Skip anything already at correct sell_px (adopt path
-                    # would have caught it before place). Actively cancel
-                    # anything else on our qty — that's the blocker.
-                    if abs(_blp - sell_px) <= tol:
-                        continue
+                    _bstp = float(_bo.get("stop_price") or 0)
+                    # For a LIMIT, skip if already at correct sell_px (the
+                    # adopt path would have caught it). For a STOP-LIMIT,
+                    # always cancel — spot doesn't allow OCO with a LIMIT.
+                    if _bkind == "limit":
+                        if _blp <= 0:
+                            continue
+                        if abs(_blp - sell_px) <= tol:
+                            continue
                     _boid = _bo.get("order_id")
                     if not _boid:
                         continue
@@ -7059,19 +7118,26 @@ class SwingTrader:
                             "profit_lock_limit_blocker_cancelled_spot",
                             sleeve_id=sc.id, sleeve_name=sc.name,
                             cancelled_oid=_boid,
-                            blocker_px=_blp,
+                            blocker_kind=_bkind,
+                            blocker_px=(_blp if _bkind == "limit" else _bstp),
                             blocker_size=_bsz,
                             sell_px=float(sell_px),
                             severity="warn",
-                            reason=("SPOT INSUFFICIENT_FUND: cancelling "
-                                    "LIMIT SELL blocking profit-lock. Next "
-                                    "tick retries place at sell_px."))
-                        # If the blocker matches our tracked live_order_id,
-                        # clear tracking too.
+                            reason=(f"SPOT INSUFFICIENT_FUND: cancelling "
+                                    f"{_bkind} SELL blocking profit-lock. "
+                                    "Spot reserves funds for both LIMIT and "
+                                    "STOP-LIMIT at placement — one SELL slot. "
+                                    "Next tick retries place at sell_px."))
+                        # If the blocker matches tracked live_order_id or
+                        # resting_stop_oid, clear tracking too.
                         if _boid == getattr(ss, "live_order_id", None):
                             ss.live_order_id = None
                             ss.resting_stop_stage = None
                             ss.resting_stop_px = None
+                        if _boid == getattr(ss, "resting_stop_oid", None):
+                            ss.resting_stop_oid = None
+                            ss.resting_stop_px = None
+                            ss.resting_stop_stage = None
                         self._open_sells_cache = None
                         try:
                             self._save_state()
