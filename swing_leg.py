@@ -5198,9 +5198,33 @@ class SwingTrader:
         # territory. Profit-target at sell_px is handled by
         # _maintain_and_credit_profit_lock_limit as a separate LIMIT SELL.
         if stop_loss_px > 0:
-            # Protective stop only. Never moved above mark.
-            target_px = stop_loss_px
-            stage = "hard_bottom"
+            # Adam 2026-07-22 INVERTED-BRACKET GUARD: if stop_loss_px >= sell_px,
+            # the config is inverted (stop above profit target). Coinbase rejects
+            # SELL STOP-LIMIT triggers above mark, so the stop can never place
+            # when mark is below stop_loss_px; even if mark climbs above the
+            # stop, the profit-lock LIMIT at sell_px would fire first and leave
+            # the "stop" as orphan. HYF-31JUL26-CDE 2026-07-22 root cause:
+            # sleeve config stored stop_loss_px=61.81 with sell_px=61.54, so
+            # every trail_breach fired with target_px above mark, cancelling
+            # any co-resting profit-lock LIMIT via the migration sweep and
+            # spinning. Treat inverted values as unset and fall through to the
+            # expert_stop consensus fallback below (§3.15).
+            if sell_px > 0 and stop_loss_px >= sell_px:
+                self._record(
+                    "stop_loss_px_inverted_ignored",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    stop_loss_px=stop_loss_px, sell_px=sell_px,
+                    severity="critical",
+                    reason=("stop_loss_px >= sell_px is inverted (stop above "
+                            "profit target — Coinbase would reject STOP-LIMIT "
+                            "placement and profit-lock LIMIT would fire first "
+                            "leaving stop orphan). Ignoring; falling through "
+                            "to expert_stop consensus for a valid protective "
+                            "floor. Config needs manual fix (task #90)."))
+            else:
+                # Protective stop only. Never moved above mark.
+                target_px = stop_loss_px
+                stage = "hard_bottom"
         # Adam 2026-07-20 ROOT FIX: guarantee every held position gets a
         # protective stop. Prior code returned WITHOUT PLACING when: no
         # trail (hwm not above break_even) AND no goal reached AND
