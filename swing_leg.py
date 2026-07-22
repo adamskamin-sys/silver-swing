@@ -5390,6 +5390,63 @@ class SwingTrader:
             elif _hold and stage in _hard_bottom_breach_stages:
                 _breach_kind = "hard_bottom"
             if _breach_kind is not None:
+                # Adam 2026-07-22 SPOT PHASE A FIX: on spot products, don't
+                # place a trail_breach emergency LIMIT. Every SELL LIMIT on
+                # spot locks the underlying qty, so an emergency LIMIT at
+                # stop_loss_px would consume all of position — blocking the
+                # profit-lock LIMIT at sell_px with INSUFFICIENT_FUND. On
+                # spot we get one SELL LIMIT slot; profit-lock wins because
+                # take-profit at sell_px is the primary rule (Adam "biggest
+                # rule" = don't lose money AND take profit at its best).
+                # META-USD 2026-07-22 loop root cause. Futures/perps keep
+                # existing OCO behavior below (both LIMITs can coexist).
+                try:
+                    _spot = (self.b._is_spot_product()
+                             if hasattr(self.b, "_is_spot_product") else False)
+                except Exception:
+                    _spot = False
+                if _spot:
+                    # Auto-heal: if a prior tick placed an emergency LIMIT
+                    # (before this spot-aware fix, or via manual state),
+                    # cancel it to free the locked qty so profit-lock LIMIT
+                    # at sell_px can place next tick.
+                    if ss.live_order_id and str(ss.resting_stop_stage or "").startswith("limit_breach"):
+                        try:
+                            self.b.cancel(ss.live_order_id)
+                            self._record(
+                                "trail_breach_emergency_limit_cancelled_spot",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                cancelled_oid=ss.live_order_id,
+                                stage=stage,
+                                severity="warn",
+                                reason=("SPOT: cancelling emergency LIMIT at "
+                                        "stop_loss_px to free funds for the "
+                                        "profit-lock LIMIT at sell_px. Spot "
+                                        "OCO limitation — one SELL LIMIT slot."))
+                            ss.live_order_id = None
+                            ss.resting_stop_stage = None
+                            ss.resting_stop_px = None
+                        except Exception as _ce:
+                            self._record(
+                                "trail_breach_emergency_limit_cancel_failed_spot",
+                                sleeve_id=sc.id, sleeve_name=sc.name,
+                                oid=ss.live_order_id, error=str(_ce),
+                                severity="critical")
+                    self._record(
+                        "trail_breach_skipped_spot",
+                        sleeve_id=sc.id, sleeve_name=sc.name,
+                        target_px=float(target_px),
+                        last_price=float(last_price),
+                        stage=stage,
+                        severity="info",
+                        reason=("SPOT: skipping emergency LIMIT. Profit-lock "
+                                "LIMIT at sell_px will be sole SELL coverage "
+                                "(Adam 2026-07-22 spot-aware Phase A)."))
+                    try:
+                        self._save_state()
+                    except Exception:
+                        pass
+                    return
                 # Adam 2026-07-20 IDEMPOTENCY GUARD: if live_order_id already
                 # tracks an open exit order, don't re-fire. Prevents double-
                 # fire → §3.8 short risk when the exit limit sits unfilled
