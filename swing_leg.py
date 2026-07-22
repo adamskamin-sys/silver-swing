@@ -3450,6 +3450,64 @@ class SwingTrader:
                          sleeve_name=sc.name, error=str(e))
             return
 
+        # Adam 2026-07-21 (coverage gap fix): consult the 7-expert
+        # expert_reentry consensus IN ADDITION to reentry_reeval. Prior
+        # to this fix, sleeves with a live BUY order only saw Chan +
+        # Connors (via reentry_reeval), missing Vince cooldown, Wilder
+        # ADX, Kaufman ER, Faith Turtle, and Menkveld fee floor. If the
+        # consensus disagrees with reentry_reeval, prefer the consensus
+        # (broader academic coverage, matches _maybe_auto_refresh_stale_
+        # sleeve behavior for consistency across ARMED_BUY code paths).
+        try:
+            import expert_reentry as _er
+            if getattr(_er, "MODE", "expert") == "expert":
+                _sold_ref = float(ss.last_sell_fill_price or last_price)
+                _spread = max(0.005, float(sc.sell_px) - float(sc.buy_px))
+                _fee_rt = float(getattr(self.cfg, "fee_per_contract_roundtrip", 0) or 0)
+                _cs = self._get_contract_size()
+                _losing = int(getattr(ss, "cycles_losing_streak", 0) or 0)
+                _last_loss_ts = getattr(ss, "last_loss_ts", None)
+                _ercon = _er.compute_reentry_decision(
+                    prices=prices,
+                    last_sell_price=_sold_ref,
+                    spread=_spread,
+                    losing_streak=_losing,
+                    fee_per_roundtrip=_fee_rt,
+                    contract_size=_cs,
+                    qty=max(1, int(sc.qty or 1)),
+                    now_ts=now,
+                    last_loss_ts=_last_loss_ts,
+                )
+                self._record(
+                    "expert_reentry_decision",
+                    sleeve_id=sc.id, sleeve_name=sc.name,
+                    action=_ercon.action, buy_px=_ercon.buy_px,
+                    wait_secs=_ercon.wait_secs,
+                    citations=_ercon.citations,
+                    expert_votes=_ercon.expert_votes,
+                    losing_streak=_losing,
+                    last_loss_ts=_last_loss_ts,
+                    source_path="reeval_pending_arm",
+                )
+                # Overwrite reentry_reeval's decision with consensus when
+                # they disagree meaningfully.
+                if _ercon.action in ("wait", "cool_off"):
+                    dec.action = "hold"  # expert says WAIT — don't touch order
+                elif _ercon.action == "rebuy" and _ercon.buy_px:
+                    # Consensus REBUY at potentially different price.
+                    if abs(float(_ercon.buy_px) - float(dec.new_buy_px or sc.buy_px)) > \
+                            float(sc.buy_px) * 0.001:
+                        # Consensus price differs by > 0.1% — override
+                        dec.new_buy_px = float(_ercon.buy_px)
+                        dec.action = "replace"
+                        dec.why = (dec.why or "") + (
+                            f" | overridden by 7-expert consensus "
+                            f"@ ${_ercon.buy_px:.6f} — {'; '.join(_ercon.citations[:2])}")
+        except Exception as _ee:
+            self._record("expert_reentry_error_in_reeval",
+                         sleeve_id=sc.id, sleeve_name=sc.name,
+                         error=str(_ee), severity="warn")
+
         # Log every decision (Tier 3 requirement) — action + why + old/new px.
         # `mode` field lets the operator distinguish shadow observations from
         # executed decisions when auditing the trade log.
