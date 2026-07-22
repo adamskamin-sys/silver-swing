@@ -7199,6 +7199,18 @@ class SwingTrader:
         # violation where trail-past-sell put a "stop" above mark.
         self._maintain_and_credit_profit_lock_limit(sc, ss, last_price)
 
+        # Adam 2026-07-22 PHASE B SHADOW (log-only observation): compute
+        # what a ratcheting TP/SL bracket WOULD do this tick, emit
+        # phase_b_would_exit / phase_b_hwm_ratchet events for post-cycle
+        # comparison against Phase A actual outcomes. ZERO broker calls.
+        # Chandelier N×ATR trailing floor (Le Beau/Lucas 1999). Compare
+        # via diag_phase_b_compare.py after cycles complete.
+        try:
+            import phase_b_shadow as _pb_shadow
+            _pb_shadow.tick(self, sc, ss, last_price)
+        except Exception:
+            pass  # shadow must never take down the tick loop
+
         # [crew] Channel re-anchor: after a confirmed + settled drop, walk the
         # whole channel (buy/sell/trail + stop) down to the new level so nothing
         # strands above price. Opt-in; cannot fire mid-crash. Off by default.
@@ -9104,6 +9116,14 @@ class SwingTrader:
                                     "cycle's realized will be off by fill_slippage")
             ss.own_avg_entry = own_avg
             ss.state = SleeveStateEnum.ARMED_SELL
+            # Adam 2026-07-22 PHASE B SHADOW: reset shadow HWM + would_exit
+            # tracking on new cycle start so the ratcheting bracket
+            # simulation begins fresh with the actual buy fill as baseline.
+            try:
+                import phase_b_shadow as _pb_shadow_reset
+                _pb_shadow_reset.reset_on_new_cycle(ss)
+            except Exception:
+                pass
             # Adam 2026-07-20 GHOST RECURRENCE ROOT FIX: snapshot own_avg
             # into sell_entry_avg the moment we transition to ARMED_SELL.
             # This is the persistent cost-basis copy that _credit_stop_fill

@@ -697,6 +697,12 @@ class SleeveState:
     # a trail-ratcheted "stop" was placed ABOVE mark.
     resting_profit_limit_oid: Optional[str] = None
     resting_profit_limit_px: Optional[float] = None
+    # Adam 2026-07-22 Phase B shadow — log-only ratcheting bracket
+    # observation. See phase_b_shadow.py. Zero broker effect.
+    phase_b_shadow_hwm: float = 0.0
+    phase_b_shadow_would_exit_ts: float = 0.0
+    phase_b_shadow_would_exit_px: float = 0.0
+    phase_b_shadow_would_exit_hwm: float = 0.0
     # Adam 2026-07-15: dedup guard against double-credit. Every time
     # _credit_stop_fill successfully credits a fill, the resting_stop_oid
     # gets appended here. Both the tick path (_maybe_credit_resting_stop_fill)
@@ -752,6 +758,11 @@ class SleeveState:
             resting_stop_stage=d.get("resting_stop_stage"),
             resting_profit_limit_oid=d.get("resting_profit_limit_oid"),
             resting_profit_limit_px=d.get("resting_profit_limit_px"),
+            # 2026-07-22: Phase B shadow observation state.
+            phase_b_shadow_hwm=float(d.get("phase_b_shadow_hwm") or 0.0),
+            phase_b_shadow_would_exit_ts=float(d.get("phase_b_shadow_would_exit_ts") or 0.0),
+            phase_b_shadow_would_exit_px=float(d.get("phase_b_shadow_would_exit_px") or 0.0),
+            phase_b_shadow_would_exit_hwm=float(d.get("phase_b_shadow_would_exit_hwm") or 0.0),
             # 2026-07-19: sell-side cost basis (nullable). Missing here
             # would corrupt realized-P/L on the next reload-on-tick cycle.
             sell_entry_avg=d.get("sell_entry_avg"),
