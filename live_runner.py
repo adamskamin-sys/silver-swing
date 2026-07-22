@@ -323,6 +323,75 @@ def _sweep_orphan_orders(store, live_tenant: str) -> int:
                 _log(f"[orphan-sweep] SKIP recent SELL {pid}/{oid} "
                      f"(< 300s old — likely current-session race with state save)")
                 continue
+            # Adam 2026-07-22 ADOPT-BEFORE-CANCEL: try to match this order
+            # to a sleeve on the same product at a similar price. If any
+            # sleeve on `pid` has an expected sell_px (profit-lock) or
+            # stop_loss_px within tolerance of this order, ADOPT it
+            # (set the appropriate _oid field in sleeve state) instead
+            # of cancelling. Fixes the class where every deploy triggers
+            # an orphan-sweep, which sees the previous session's freshly-
+            # placed order (>300s old by now) as an orphan and cancels
+            # it — even though a sleeve on that product WANTED that
+            # exact order at that exact price. Repro: 2026-07-22 diag_
+            # identical_price_cancel_scan showed fleet-wide synchronized
+            # cancel-bursts on every deploy for 7+ products at once.
+            try:
+                _px = _order_price(o)
+                _cfg_o = o.get("order_configuration") or {}
+                _kind = ""
+                _shape = None
+                for _k, _v in (_cfg_o.items() if isinstance(_cfg_o, dict) else []):
+                    _kind = _k
+                    _shape = _v if isinstance(_v, dict) else None
+                    break
+                _adopted_this_order = False
+                if _px > 0:
+                    _state = store.get_state(live_tenant, pid) or {}
+                    _prod_cfg = store.get_config(live_tenant, pid) or {}
+                    _tick = float(_prod_cfg.get("tick_size") or 0) or 0.01
+                    _tol = max(_tick * 2, _px * 0.005)
+                    for _sc in (_prod_cfg.get("sleeves") or []):
+                        _sid = _sc.get("id")
+                        if not _sid:
+                            continue
+                        _ss = (_state.get("sleeves") or {}).get(_sid) or {}
+                        _sell = float(_sc.get("sell_px") or 0)
+                        _stop = float(_sc.get("stop_loss_px") or 0)
+                        # Profit-lock LIMIT: kind=limit, price ~ sell_px,
+                        # sleeve's resting_profit_limit_oid is empty
+                        if (_kind == "limit_limit_gtc"
+                                and _sell > 0
+                                and abs(_px - _sell) <= _tol
+                                and not _ss.get("resting_profit_limit_oid")):
+                            _ss["resting_profit_limit_oid"] = oid
+                            _ss["resting_profit_limit_px"] = _px
+                            _state.setdefault("sleeves", {})[_sid] = _ss
+                            store.put_state(live_tenant, pid, _state)
+                            _log(f"[orphan-sweep] ADOPTED SELL {pid}/{oid} "
+                                 f"as profit-lock LIMIT for sleeve {_sid} "
+                                 f"(px={_px} ~ sell_px {_sell})")
+                            _adopted_this_order = True
+                            break
+                        # STOP-LIMIT: kind=stop_limit, stop_price ~ stop_loss_px,
+                        # sleeve's resting_stop_oid is empty
+                        if (_kind == "stop_limit_stop_limit_gtc"
+                                and _stop > 0
+                                and _shape
+                                and abs(float(_shape.get("stop_price") or 0) - _stop) <= _tol
+                                and not _ss.get("resting_stop_oid")):
+                            _ss["resting_stop_oid"] = oid
+                            _ss["resting_stop_px"] = _stop
+                            _state.setdefault("sleeves", {})[_sid] = _ss
+                            store.put_state(live_tenant, pid, _state)
+                            _log(f"[orphan-sweep] ADOPTED SELL {pid}/{oid} "
+                                 f"as STOP-LIMIT for sleeve {_sid} "
+                                 f"(stop_price ~ stop_loss_px {_stop})")
+                            _adopted_this_order = True
+                            break
+                if _adopted_this_order:
+                    continue
+            except Exception as _adopte:
+                _log(f"[orphan-sweep] adopt attempt failed for {pid}/{oid}: {_adopte}")
             # Any orphan SELL is a short-flip risk — cancel.
             cancel_reason = "would have flipped account short"
         elif side == "BUY":
