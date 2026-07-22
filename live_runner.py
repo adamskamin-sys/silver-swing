@@ -1671,6 +1671,41 @@ def run() -> int:
         _log(f"WARN: startup spec refresh failed: {type(e).__name__}: {e}")
     last_spec_refresh = time.time()
 
+    # Adam 2026-07-22: prune expired futures from the tracked-product list.
+    # NOL-20JUL26-CDE expired 2 days ago (0 held); every deploy re-tracks it
+    # and burns state + API on a contract that no longer trades. Parse
+    # DDMMMYY date suffix from product_id, remove any that are past expiry
+    # AND have no held positions. Log near-expiry (<= 3 days) as a warning.
+    try:
+        from main import _derive_live_tenant
+        import expired_products
+        live_tenant = _derive_live_tenant(TENANT)
+        _all_pids = [p for p in (store.list_symbols(live_tenant) or [])
+                     if not p.startswith("__")]
+        _exp, _near, _healthy = expired_products.classify_products(_all_pids)
+        for _epid in _exp:
+            _safe, _reason = expired_products.is_safe_to_prune(
+                store, live_tenant, _epid)
+            if _safe:
+                try:
+                    if hasattr(store, "delete_symbol"):
+                        store.delete_symbol(live_tenant, _epid)
+                    else:
+                        # Fallback: overwrite config + state with empty dicts
+                        store.put_config(live_tenant, _epid, {})
+                        store.put_state(live_tenant, _epid, {})
+                    _log(f"[expiry-prune] REMOVED expired {_epid} (0 held)")
+                except Exception as _pe:
+                    _log(f"[expiry-prune] failed to remove {_epid}: {_pe}")
+            else:
+                _log(f"[expiry-prune] SKIP {_epid} (expired but not safe): "
+                     f"{_reason} — MANUAL RECONCILE NEEDED")
+        for _npid, _days in _near:
+            _log(f"[expiry-prune] NEAR-EXPIRY: {_npid} expires in {_days}d "
+                 f"— sleeve should exit or roll before then")
+    except Exception as e:
+        _log(f"WARN: expiry prune failed: {type(e).__name__}: {e}")
+
     # 2026-07-19: orphan-order sweep at boot. Prevents the CHN/NER class
     # where a prior bot session left resting SELL orders untracked; when
     # the primary sell fires and closes position, the orphans flip us
